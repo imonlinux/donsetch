@@ -212,6 +212,123 @@ The bundled `docker-compose.yml`:
 - An opt-in `http` profile running the same image as a long-lived
   HTTP server with `restart: unless-stopped` (see above).
 
+## Running as a systemd quadlet (Podman)
+
+The same image runs under Podman as a native systemd service via a
+quadlet — no daemon, no compose. This is the natural fit for the
+HTTP transport's long-lived deployment: systemd is the supervisor
+(crash recovery, boot startup, `journalctl` logs), replacing the
+compose `restart: unless-stopped` policy.
+
+stdio clients should keep launching the container per connection
+(`podman run -i --rm --init ... donsetch mcp --supervised`, same
+shape as the Docker stdio config above) — a per-connection stdio
+lifecycle does not fit a systemd service; the quadlet pattern is for
+the HTTP transport.
+
+Build the image first (quadlet does not build):
+
+```bash
+git clone https://github.com/dondai44423/donsetch.git
+cd donsetch
+podman build -t localhost/donsetch-mcp .
+```
+
+### Rootless (recommended)
+
+`~/.config/containers/systemd/donsetch-cache.volume`:
+
+```ini
+[Volume]
+```
+
+`~/.config/containers/systemd/donsetch-http.container`:
+
+```ini
+[Unit]
+Description=DonSeTch MCP server (HTTP transport)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=localhost/donsetch-mcp:latest
+ContainerName=donsetch-http
+Environment=DONSETCH_TRANSPORT=http
+# Listen on all interfaces inside the container; PublishPort decides
+# who can actually reach it.
+Environment=DONSETCH_HTTP_HOST=0.0.0.0
+# Require `Authorization: Bearer <token>` on /mcp — set before
+# publishing the port beyond localhost. /health stays open.
+#Environment=DONSETCH_HTTP_TOKEN=change-me
+PublishPort=127.0.0.1:8765:8765
+Volume=donsetch-cache.volume:/home/donsetch/.cache/donsetch
+# Same ceiling as the compose service (OCR + reranking peak 1–2GB).
+#Memory=2G
+
+[Service]
+# Crash recovery: release builds are panic=abort and the HTTP
+# transport has no in-process supervisor — systemd restarts the
+# container, like compose's restart: unless-stopped. A manual
+# `systemctl --user stop` stays stopped.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user start donsetch-http.service
+curl http://localhost:8765/health   # expect 200
+
+# logs / status
+journalctl --user -u donsetch-http -f
+systemctl --user status donsetch-http
+```
+
+To serve remote clients, change the publish to
+`PublishPort=8765:8765` **and** set `DONSETCH_HTTP_TOKEN`, then
+`systemctl --user restart donsetch-http`.
+
+For the service to run at boot without an open login session
+(rootless), enable lingering for the user:
+
+```bash
+loginctl enable-linger $USER
+```
+
+### Rootful
+
+Same two files under `/etc/containers/systemd/`, with two changes:
+`WantedBy=multi-user.target` in the `[Install]` section, and plain
+`systemctl` instead of `systemctl --user`:
+
+```bash
+sudo cp donsetch-cache.volume donsetch-http.container /etc/containers/systemd/
+sudo systemctl daemon-reload
+sudo systemctl start donsetch-http
+```
+
+### Quadlet notes
+
+- Quadlet ships in Podman 4.4+; anything newer works unchanged.
+- The `.container` filename becomes the service name
+  (`donsetch-http.container` → `donsetch-http.service`); drop
+  `ContainerName=` if you prefer the service name to be the only
+  name.
+- Referencing `donsetch-cache.volume` in `Volume=` makes systemd
+  create the named volume through its own quadlet — the same
+  persistence as the compose cache volume.
+- To serve remote clients on a headless box, remember
+  `enable-linger` (rootless) or the rootful variant; without it the
+  service only runs while a session is open.
+- The image's `HEALTHCHECK` is not consumed by systemd — probe
+  `/health` yourself (or wire a watchdog) if you want
+  health-gated supervision.
+
 ### Architecture notes
 
 Multi-stage build (`rust:slim` → `debian:trixie-slim`, kept on the
