@@ -108,6 +108,24 @@ fn probe_output_stays_tiny() {
 }
 
 #[test]
+fn mcp_instructions_stay_cheap() {
+    // The handshake blurb is the one string an agent pays for in
+    // every session, whether or not it ever calls us — so it is a
+    // token invariant like any response size. Generated live, not
+    // read from the fixture: a fixture is only as fresh as its
+    // last blessing, so measuring it would pass on stale text and
+    // report the bloat one run too late.
+    let text = donsetch::mcp::tools::instructions();
+
+    // chars/4 — the estimator the rest of the codebase uses.
+    let tokens = text.len() / 4;
+    assert!(
+        tokens <= 150,
+        "instructions cost ~{tokens} tokens (>150) — resident in every session"
+    );
+}
+
+#[test]
 fn links_on_renders_real_links() {
     // Wikipedia article body: hundreds of interwiki links. With
     // links=true the pipeline must render them as markdown links

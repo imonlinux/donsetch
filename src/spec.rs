@@ -83,7 +83,8 @@ pub struct ToolSpec {
     pub name: &'static str,
     /// CLI subcommand (`fetch`).
     pub cli_cmd: &'static str,
-    /// One-liner for `donsetch --help` listing.
+    /// One-liner — `donsetch --help` listing AND the MCP
+    /// `instructions` blurb sent at initialize.
     pub summary: &'static str,
     /// Full description — MCP tool description AND CLI long help.
     pub description: &'static str,

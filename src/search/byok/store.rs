@@ -27,6 +27,7 @@ pub const PROVIDERS: &[&str] = &[
     "exa",
     "serper",
     "serpapi",
+    "bravesearch",
     "tinyfish",
     "parallel",
     "brightdata",

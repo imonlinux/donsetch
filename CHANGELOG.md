@@ -5,15 +5,26 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.4.4] - 2026-08-31
 
 ### Added
 
+- **MCP `instructions` at initialize:** the handshake now carries a
+  short server blurb (one line per tool, generated from the spec
+  table) so deferred-loading MCP clients can tell the agent these
+  tools exist before their schemas load. Kept small, gated at 150
+  est. tokens by a token invariant, with a golden fixture pinning
+  the whole initialize result.
 - **SerpApi BYOK provider:** `donsetch keys add serpapi <key>` wires
   up [SerpApi](https://serpapi.com) as a Google-SERP BYOK backend,
   alongside the existing Serper.dev provider. Routes by intent like
   the other providers: `google_scholar` engine for paper queries,
   `tbm=nws` for news.
+- **Brave Search API BYOK provider:** `donsetch keys add bravesearch <key>`
+  wires up the official, keyed
+  [Brave Search API](https://api.search.brave.com) — distinct from
+  the existing keyless `brave` SERP scraper. Uses a dedicated news
+  endpoint for news-intent queries.
 - **Playwright-managed Chromium discovery (issue #84):** the browser
   probe now finds every Playwright layout (chrome-linux64,
   chrome-win64, chrome-mac-arm64 plus the legacy dirs), honors
@@ -23,6 +34,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **frontier focus scoring now has real IDF (issue #86):** the
+  crawl frontier scored every query-token hit with flat weights,
+  so ubiquitous site-furniture tokens (/docs, /api) buried precise
+  matches. The map phase now builds an Okapi IDF table from the
+  site's own sitemap inventory and the frontier scores with it:
+  distinctive tokens multiply their hits, common ones shrink. No
+  inventory (BFS mode, resume) keeps the exact pre-IDF flat
+  weights as a separate tested path.
+- **focus tool descriptions now match the code:** web_fetch focus
+  is BM25 keyword matching with the cross-encoder pass only on
+  pages of 80 blocks or fewer AND only when the rerank model is
+  already cached (never a mid-fetch download); web_crawl focus is
+  BM25-lite link-text/URL-path scoring, no semantic matching
+  before fetch, hard no-shared-token gate at enqueue.
 - **macOS build broken by the Playwright-discovery change above:**
   `known_chrome_paths()` on macOS referenced an undefined `paths`
   variable (`E0425`) — the hardcoded-app-bundle list's `.collect()`

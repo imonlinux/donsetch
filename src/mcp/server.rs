@@ -364,6 +364,7 @@ fn initialize(params: &Value) -> Value {
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
+        "instructions": tools::instructions(),
         "serverInfo": {
             "name": tools::SERVER_NAME,
             "version": tools::SERVER_VERSION
@@ -3920,5 +3921,65 @@ mod error_code_tests {
             "crawl.resume"
         );
         assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
+    }
+}
+
+#[cfg(test)]
+mod initialize_tests {
+    use super::{initialize, tools};
+    use serde_json::{Value, json};
+
+    /// The package version moves every release; the fixture holds a
+    /// sentinel there so a version bump never touches it.
+    const VERSION_SENTINEL: &str = "<CARGO_PKG_VERSION>";
+
+    fn fixture() -> Value {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/initialize.json"
+        ))
+        .expect("read fixture");
+        let mut v: Value = serde_json::from_str(&raw).expect("parse fixture");
+        // Patch the one moving field on the parsed value, never on
+        // the text: a textual substitution would also hit the
+        // version wherever else it appeared.
+        let slot = &mut v["serverInfo"]["version"];
+        assert_eq!(slot, VERSION_SENTINEL, "fixture lost its version sentinel");
+        *slot = json!(tools::SERVER_VERSION);
+        v
+    }
+
+    /// Golden fixture: the whole initialize result — capabilities,
+    /// serverInfo, and the `instructions` blurb the client injects
+    /// into every session's context. If this fails, the handshake
+    /// an agent sees changed; bless the fixture deliberately.
+    #[test]
+    fn initialize_matches_fixture() {
+        // Unknown protocol version → we answer with our newest.
+        let got = initialize(&json!({ "protocolVersion": "1999-01-01" }));
+        assert_eq!(got, fixture(), "initialize result drifted from fixture");
+    }
+
+    /// Generated from the spec table, so a new tool must announce
+    /// itself with no prose edit — and announce itself once: zero
+    /// means an agent never learns the tool exists (deferred-loading
+    /// clients see only names up front), twice is paid-for noise.
+    #[test]
+    fn instructions_list_every_tool_once() {
+        let text = tools::instructions();
+        for t in crate::spec::TOOLS {
+            let hits = text.matches(t.name).count();
+            assert_eq!(hits, 1, "{} announced {hits}x, expected once", t.name);
+        }
+    }
+
+    #[test]
+    fn known_protocol_version_is_echoed() {
+        for v in tools::PROTOCOL_VERSIONS {
+            assert_eq!(
+                initialize(&json!({ "protocolVersion": v }))["protocolVersion"],
+                json!(v)
+            );
+        }
     }
 }

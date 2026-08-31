@@ -24,6 +24,30 @@ pub const PROTOCOL_VERSIONS: &[&str] = &[
 pub const SERVER_NAME: &str = "donsetch";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The `instructions` string sent at initialize. Generated from
+/// the spec table — a new tool appears here with no prose edit.
+pub fn instructions() -> String {
+    // Name + summary, one per line. Summaries are already
+    // one-liners — they double as the `--help` subcommand listing.
+    let tools = crate::spec::TOOLS
+        .iter()
+        .map(|t| format!("- {0}: {1}", t.name, t.summary))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Clients inject this alongside the system prompt, and unlike
+    // tool descriptions it arrives unconditionally: harnesses with
+    // deferred tool loading (Claude Code's ToolSearch) show only
+    // tool NAMES up front and fetch schemas on demand, so this is
+    // what tells an agent we exist. It is resident in every
+    // session whether or not we are used — keep it short.
+    // tests/token_invariants.rs gates the size.
+    format!(
+        "Web access: fetch, search, crawl — one URL, many URLs, or a whole site.\
+        \n\n{tools}\n\n\
+        Output is the page's own markdown — full wording, code blocks and tables preserved."
+    )
+}
+
 /// tools/list payload — generated from the spec table.
 pub fn list() -> Value {
     json!({
