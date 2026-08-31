@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-717%20passed-00d4aa)](#)
+[![Tests](https://img.shields.io/badge/tests-729%20passed-00d4aa)](#)
 [![npm](https://img.shields.io/npm/v/donsetch?color=cb3837&logo=npm)](https://www.npmjs.com/package/donsetch)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
@@ -411,6 +411,7 @@ required:
 donsetch keys add tavily tvly-...       # Tavily
 donsetch keys add exa sk-exa-...        # Exa (stackable)
 donsetch keys add serper ...            # Serper.dev
+donsetch keys add serpapi ...           # SerpApi
 donsetch keys add tinyfish sk-...       # TinyFish (free tier)
 donsetch keys add parallel nKil3...     # Parallel AI (fast mode)
 donsetch keys add bd 576d013c...        # Bright Data SERP
@@ -561,7 +562,7 @@ Every layer in Rust. No dependency on existing OSS web tooling.
 | 📄 **DonSheet** | PDF extraction, PDFium FFI, pixel-truth fusion, OCR cascade, forms | `src/pdf/` |
 | 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, 3 tools, crash-only supervisor | `src/mcp/` |
 
-**717 tests. Zero clippy warnings.**
+ **727 tests. Zero clippy warnings.**
 `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law.
 
 ## 🔬 WRB: Web Research Benchmark

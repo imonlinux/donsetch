@@ -5,6 +5,85 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **SerpApi BYOK provider:** `donsetch keys add serpapi <key>` wires
+  up [SerpApi](https://serpapi.com) as a Google-SERP BYOK backend,
+  alongside the existing Serper.dev provider. Routes by intent like
+  the other providers: `google_scholar` engine for paper queries,
+  `tbm=nws` for news.
+- **Playwright-managed Chromium discovery (issue #84):** the browser
+  probe now finds every Playwright layout (chrome-linux64,
+  chrome-win64, chrome-mac-arm64 plus the legacy dirs), honors
+  `PLAYWRIGHT_BROWSERS_PATH` and `XDG_CACHE_HOME`, and does it via
+  one shared helper on all three platforms. The headless-shell
+  registry stays excluded on purpose (strictly weaker CDP target).
+
+### Fixed
+
+- **macOS build broken by the Playwright-discovery change above:**
+  `known_chrome_paths()` on macOS referenced an undefined `paths`
+  variable (`E0425`) — the hardcoded-app-bundle list's `.collect()`
+  was never bound to a `let`, so the build failed on every macOS
+  target. Also un-broke `playwright_discovers_chrome_linux64_layout`,
+  which wasn't OS-gated and failed on Windows/macOS CI runners since
+  it asserts against the Linux-only `chrome-linux64` layout.
+- **Xvfb install hint printed on macOS/Windows every session
+  (issue #81):** the "install xvfb" advice belongs to Linux-family
+  systems only; headful off-screen Chrome is the native mode on
+  macOS and Windows and the hint was pure noise on every daemon
+  start. The hint is a platform-gated pure function now, with a
+  regression test that runs on the Windows/macOS CI legs.
+- **fake-ip TUNs no longer trip the SSRF guard (issue #83):**
+  networks where a DNS rewriter maps every hostname into
+  198.18.0.0/15 (mihomo/Clash/Surge) saw every fetch blocked as a
+  false positive. The guard is now two-tiered: URL literals stay
+  strict, the DNS-resolved tier exempts the IETF-reserved
+  benchmarking block only, and every real private range stays
+  blocked. `DONSETCH_ALLOW_PRIVATE_EGRESS=1` now works end to end
+  (it was dead at the guard layer). Transport pinning agrees with
+  the guard so no layer re-blocks what another allowed.
+
+## [3.4.3] - 2026-08-30
+
+### Fixed
+
+- **must_contain probe regressions (issue #80):** regex probes with
+  a trailing flag like `/needle/i` were treated as literals and
+  returned a false NO MATCH; `must_contain` on non-HTML passthrough
+  bodies (text/plain, json, xml) silently returned the full document
+  instead of the probe; and `section=` was silently ignored on
+  adapter pages (both the extract fixture layer and the fetch-level
+  URL rewrite now defer to the generic pipeline when a section is
+  requested).
+- **Semantic reranking no longer starves async workers (PR #77):**
+  with the rerank feature on, concurrent searches ran synchronous
+  ONNX inference directly on Tokio workers while other workers
+  parked on the shared session mutex, starving timers and I/O.
+  Ranking now runs on the blocking pool (rerank builds only; the
+  inline path is unchanged otherwise). Measured with 8 concurrent
+  jobs on 2 CPUs: mean max executor stall 573.5ms to 3.5ms, no
+  latency regression, identical result digests.
+- **Same stall fixed on the fetch side:** focus extraction ran the
+  cross-encoder inline on the async worker. Scores now flow through
+  `block_in_place` on multi-thread runtimes (inline otherwise, since
+  `block_in_place` panics on current-thread runtimes), with a
+  single-worker timer regression test that fails on the old code.
+
+### Added
+
+- **Parallel query variants for `web_search` (PR #79):** a search
+  call can now carry up to two explicit `query_variants` alongside
+  the base query. All run concurrently under one shared deadline,
+  each keeps DonSeTch's existing ranking and returns as a clearly
+  separated result set, one global S-handle table covers every
+  result, and partial failures keep the successful searches.
+  DonSeTch never invents variants: the calling agent supplies
+  alternative formulations, the tool only fan-outs. Single-query
+  behavior, envelope, and cache keys are byte-for-byte unchanged.
+
 ## [3.4.2] - 2026-08-29
 
 ### Fixed

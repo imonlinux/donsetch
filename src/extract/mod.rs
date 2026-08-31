@@ -59,15 +59,26 @@ pub struct ExtractOptions {
 impl ExtractOptions {
     /// A regex probe: `must_contain` wrapped in slashes.
     pub fn probe_is_regex(&self) -> bool {
-        self.must_contain
-            .as_deref()
-            .is_some_and(|m| m.len() >= 2 && m.starts_with('/') && m.ends_with('/'))
+        self.must_contain.as_deref().is_some_and(|m| {
+            if !m.starts_with('/') || m.len() < 3 {
+                return false;
+            }
+            let inner = &m[1..];
+            match inner.rfind('/') {
+                Some(pos) if pos >= 1 => inner[pos + 1..].chars().all(char::is_alphabetic),
+                _ => false,
+            }
+        })
     }
 
-    /// The probe pattern with regex slashes stripped.
+    /// The probe pattern with regex slashes and trailing flags stripped.
     pub fn probe_pattern(&self) -> &str {
         match &self.must_contain {
-            Some(m) if self.probe_is_regex() => &m[1..m.len() - 1],
+            Some(m) if self.probe_is_regex() => {
+                let inner = &m[1..];
+                let at = inner.rfind('/').unwrap_or(inner.len());
+                &inner[..at]
+            }
             Some(m) => m,
             None => "",
         }
@@ -332,8 +343,37 @@ pub fn extract(
         !ct.is_empty() && !ct.contains("html") && !is_pdf && body_starts_with_html(body);
 
     if !ct.is_empty() && !ct.contains("html") && !is_pdf && !plain_is_html {
+        // Probe applies to non-HTML bodies too. A must_contain on a
+        // text/plain or json/xml response returns MATCH/NO-MATCH plus
+        // excerpts like the HTML path, never the full document.
         let text = String::from_utf8_lossy(body);
+        if let Some(pattern) = &opts.must_contain
+            && !pattern.trim().is_empty()
+        {
+            let md = probe_render(&text, opts.probe_pattern(), opts.probe_is_regex());
+            return Ok(Extracted {
+                tokens_est: md.len() / 4,
+                total_chars: text.len(),
+                markdown: md,
+                title: None,
+                byline: None,
+                published: None,
+                site: None,
+                next_offset: None,
+                thin: false,
+                content_kind: ContentKind::Page,
+                blocks_total: 1,
+                blocks_shown: 1,
+                lang: "unknown".to_string(),
+                quality: 1.0,
+                pdf_pages: None,
+                images: vec![],
+                fingerprint: None,
+                via: None,
+            });
+        }
         let (slice, next) = paginate(&text, opts.offset, max_chars);
+
         return Ok(Extracted {
             tokens_est: slice.len() / 4,
             total_chars: text.len(),

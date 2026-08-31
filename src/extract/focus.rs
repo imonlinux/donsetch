@@ -1020,6 +1020,25 @@ fn expand_breadcrumbs(blocks: &[Block], kept: &mut Vec<usize>, kept_set: &mut Ha
 /// The threshold for body-only matches is >0 (any keyword
 /// appearance), not max*0.15. This is intentional: never cut
 /// relevant info. Noise costs tokens; cut info is unrecoverable.
+/// Run CPU-heavy inference off the async worker when we are inside a
+/// multi-thread Tokio runtime (block_in_place), inline otherwise. This
+/// mirrors the search-side offload: concurrent focus-extractions must
+/// not park the worker pool on the shared ONNX session mutex.
+fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static) -> R {
+    use tokio::runtime::RuntimeFlavor;
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(work);
+    }
+    work()
+}
+
+fn xenc_scores(query: &str, docs: Vec<(String, String)>) -> Option<Vec<f64>> {
+    let q = query.to_string();
+    offload_inference(move || crate::search::rerank::cross_encoder_scores(&q, &docs))
+}
+
 pub fn filter_semantic<'a>(
     blocks: &'a [Block],
     query: &str,
@@ -1039,7 +1058,7 @@ pub fn filter_semantic<'a>(
         if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
             let docs: Vec<(String, String)> =
                 blocks.iter().map(|b| (b.text(), String::new())).collect();
-            if let Some(xenc_scores) = crate::search::rerank::cross_encoder_scores(query, &docs) {
+            if let Some(xenc_scores) = xenc_scores(query, docs) {
                 let xenc_max = xenc_scores.iter().cloned().fold(0.0f64, f64::max);
                 if xenc_max >= XENC_THRESHOLD {
                     let mut kept = select_sections_core(blocks, &xenc_scores, XENC_THRESHOLD);
@@ -1071,7 +1090,7 @@ pub fn filter_semantic<'a>(
     if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
         let docs: Vec<(String, String)> =
             blocks.iter().map(|b| (b.text(), String::new())).collect();
-        if let Some(xenc_scores) = crate::search::rerank::cross_encoder_scores(query, &docs) {
+        if let Some(xenc_scores) = xenc_scores(query, docs) {
             let sections = build_sections(blocks);
             for s in &sections {
                 let already = s
@@ -1823,5 +1842,73 @@ mod tests {
         ];
         let expanded = expand_code_blocks(blocks.clone());
         assert_eq!(expanded.len(), blocks.len());
+    }
+
+    #[test]
+    fn offload_inference_value_inline_outside_runtime() {
+        // Outside any Tokio runtime the work runs inline and passes through.
+        assert_eq!(offload_inference(|| 41u8), 41);
+    }
+
+    #[test]
+    fn offload_inference_ok_inside_multithread_worker() {
+        // block_in_place is the legal path here: it must run the work and
+        // never panic on a multi-thread worker.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            assert_eq!(offload_inference(|| 41u8), 41);
+        });
+    }
+
+    #[test]
+    fn offload_inference_inline_on_current_thread() {
+        // block_in_place panics on current-thread runtimes; the flavor guard
+        // must keep us inline there instead.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tid = std::thread::current().id();
+            let inner_tid = offload_inference(|| std::thread::current().id());
+            assert_eq!(inner_tid, tid, "current_thread must stay inline");
+        });
+    }
+
+    #[test]
+    fn offload_timer_survives_inference_on_single_worker() {
+        // The discriminating test: on a one-worker runtime, a sync "inference"
+        // burst must not starve a small timer. Without the offload the timer
+        // waits for the whole burst; with it the runtime supplies a
+        // replacement worker and the timer fires on time.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let started = std::time::Instant::now();
+            let timer = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                started.elapsed()
+            });
+            let burst = tokio::spawn(async move {
+                offload_inference(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    7u8
+                })
+            });
+            assert_eq!(burst.await.unwrap(), 7);
+            let timer_elapsed = timer.await.unwrap();
+            assert!(
+                timer_elapsed < std::time::Duration::from_millis(140),
+                "timer starved: {:?}",
+                timer_elapsed
+            );
+        });
     }
 }

@@ -69,6 +69,21 @@ impl Drop for GhostGuard {
     }
 }
 
+/// The Xvfb install hint belongs to Linux-family systems only.
+/// macOS and Windows run headful off-screen natively; printing
+/// apt/pacman advice there was noise on every session start
+/// (issue #81). A pure function so the platform gate is
+/// unit-testable on the CI platforms.
+fn xvfb_missing_hint() -> Option<&'static str> {
+    if cfg!(target_os = "linux") {
+        Some(
+            "[ghost] Xvfb not found — install with `apt install xvfb` or `pacman -S xorg-server-xvfb` (or your distro's equivalent) for invisible headful Chrome on Linux",
+        )
+    } else {
+        None
+    }
+}
+
 impl GhostManager {
     pub async fn new() -> Arc<Self> {
         // Termux (Android) has no X11 by default. Skip Xvfb entirely;
@@ -101,15 +116,19 @@ impl GhostManager {
                 eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
             }
             None
+        } else if let Some(hint) = xvfb_missing_hint() {
+            // Xvfb not installed on a Linux-family system: warn the
+            // user. Chrome will run headful off-screen
+            // (--window-position=-32000,-32000 + CDP minimize), but
+            // on Linux a minimized window may still flash on screen
+            // briefly. Xvfb is the clean solution for invisible
+            // headful Chrome there. macOS/Windows never see this
+            // hint: headful off-screen is their native mode and the
+            // apt/pacman advice does not apply (issue #81).
+            eprintln!("{hint}");
+            None
         } else {
-            // Xvfb not installed: warn the user. Chrome will run
-            // headful off-screen (--window-position=-32000,-32000 +
-            // CDP minimize), but on Linux a minimized window may
-            // still flash on screen briefly. Xvfb is the clean
-            // solution for invisible headful Chrome on Linux.
-            eprintln!(
-                "[ghost] Xvfb not found — install with `apt install xvfb` or `pacman -S xorg-server-xvfb` (or your distro's equivalent) for invisible headful Chrome on Linux"
-            );
+            // macOS/Windows/other: no Xvfb concept at all.
             None
         };
 
@@ -182,5 +201,19 @@ impl GhostManager {
     #[allow(dead_code)]
     pub fn is_headful(&self) -> bool {
         self.display.is_some()
+    }
+}
+
+#[cfg(test)]
+mod xvfb_hint_tests {
+    #[test]
+    fn hint_exists_only_on_linux() {
+        #[cfg(target_os = "linux")]
+        assert!(super::xvfb_missing_hint().is_some());
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            super::xvfb_missing_hint().is_none(),
+            "the Xvfb install hint must not exist off Linux (issue #81)"
+        );
     }
 }

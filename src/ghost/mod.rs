@@ -155,24 +155,11 @@ fn known_chrome_paths() -> Vec<PathBuf> {
         PathBuf::from("/snap/chromium/current/usr/lib/chromium-browser/chrome"),
         PathBuf::from("/snap/bin/chromium"),
     ];
-    // Playwright cache: ~/.cache/ms-playwright/chromium-*/chrome-linux/chrome
-    // Many devs have Chromium via `npx playwright install` but not as a
-    // system package. Auto-discover it so `donsetch doctor` just works.
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let base = home.join(".cache/ms-playwright");
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("chromium-") {
-                    let candidate = entry.path().join("chrome-linux/chrome");
-                    if candidate.is_file() {
-                        paths.push(candidate);
-                    }
-                }
-            }
-        }
-    }
+    // Playwright cache: ~/.cache/ms-playwright/chromium-*/,
+    // chrome-linux64 and chrome-linux layouts. Many devs have
+    // Chromium via `npx playwright install` but not as a system
+    // package. Auto-discover it so `donsetch doctor` just works.
+    paths.extend(playwright_candidates());
     // Termux: $PREFIX/bin/chromium-browser or chromium.
     // $PREFIX is /data/data/com.termux/files/usr.
     if let Some(prefix) = std::env::var_os("PREFIX") {
@@ -220,16 +207,114 @@ fn resolve_snap_chrome(_path: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
+/// Playwright keeps every historical Chromium layout; version
+/// bumps moved the binary between `chrome-linux`, `chrome-linux64`,
+/// `chrome-win64` and `chrome-mac-arm64` dirs. Probe each revision
+/// entry for every known layout. The headless-shell registry dirs
+/// (`chromium_headless_shell-*`) are deliberately excluded: legacy
+/// headless mode is a strictly weaker CDP/stealth target than the
+/// full browser, so accepting it would silently downgrade ghost.
+fn playwright_entry_suffixes() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+            "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    }
+    #[cfg(all(windows, not(target_os = "macos")))]
+    {
+        &["chrome-win64/chrome.exe", "chrome-win/chrome.exe"]
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        &["chrome-linux64/chrome", "chrome-linux/chrome"]
+    }
+}
+
+/// Playwright registry roots: the explicit override first, then the
+/// platform cache dir Playwright itself uses, then the XDG cache on
+/// Linux (Playwright honors XDG_CACHE_HOME when set).
+fn playwright_registry_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+        roots.push(PathBuf::from(ov));
+    }
+    #[cfg(not(windows))]
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        #[cfg(target_os = "macos")]
+        roots.push(home.join("Library/Caches/ms-playwright"));
+        #[cfg(not(target_os = "macos"))]
+        roots.push(home.join(".cache/ms-playwright"));
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
+        roots.push(xdg.join("ms-playwright"));
+    }
+    #[cfg(windows)]
+    if let Some(la) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        roots.push(la.join("ms-playwright"));
+    }
+    roots
+}
+
+/// All Playwright-managed Chromium binaries across registry roots.
+/// Shared by the macOS/Linux/Windows `known_chrome_paths` so every
+/// platform follows the same layout-evolution rules.
+fn playwright_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in playwright_registry_roots() {
+        out.extend(playwright_candidates_for_root(&root));
+    }
+    out
+}
+
+/// Chromium binaries inside one registry root. Exposed separately
+/// so the discovery rules are unit-testable against a synthetic
+/// cache dir without touching the real HOME.
+fn playwright_candidates_for_root(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    let mut names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    names.sort(); // deterministic across filesystem orderings
+    for entry in names {
+        let is_chromium_entry = entry
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("chromium-"))
+            .unwrap_or(false);
+        if !is_chromium_entry {
+            // firefox-*/webkit-* registries share the cache dir,
+            // and chromium_headless_shell-* is excluded on purpose
+            // (see playwright_entry_suffixes).
+            continue;
+        }
+        for suffix in playwright_entry_suffixes() {
+            let candidate = entry.join(suffix);
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "macos")]
 fn known_chrome_paths() -> Vec<PathBuf> {
-    [
+    let mut paths: Vec<PathBuf> = [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
     ]
     .into_iter()
     .map(PathBuf::from)
-    .collect()
+    .collect();
+    // Playwright cache: ~/Library/Caches/ms-playwright, including
+    // the Apple Silicon layout (chrome-mac-arm64). Auto-discovered
+    // so `npx playwright install` users need no DONGHOST_CHROME.
+    paths.extend(playwright_candidates());
+    paths
 }
 
 #[cfg(windows)]
@@ -245,20 +330,9 @@ fn known_chrome_paths() -> Vec<PathBuf> {
         let la = PathBuf::from(&la);
         paths.push(la.join("Google\\Chrome\\Application\\chrome.exe"));
         paths.push(la.join("Chromium\\Application\\chrome.exe"));
-        // Playwright cache (same layout as the Linux discovery):
-        // %LOCALAPPDATA%\\ms-playwright\\chromium-*\\chrome-win\\chrome.exe
-        let pw = la.join("ms-playwright");
-        if let Ok(entries) = std::fs::read_dir(&pw) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("chromium-") {
-                    let candidate = entry.path().join("chrome-win\\chrome.exe");
-                    if candidate.is_file() {
-                        paths.push(candidate);
-                    }
-                }
-            }
-        }
+        // Playwright cache (shared layouts: chrome-win64 first):
+        // %LOCALAPPDATA%\ms-playwright\chromium-*\chrome-win64\chrome.exe
+        paths.extend(playwright_candidates());
     }
     // Edge: Chromium-based and pre-installed on Windows — often the
     // ONLY CDP-capable browser on a stock box. Its directory is never
@@ -1434,6 +1508,69 @@ mod sandbox_tests {
             !args.iter().any(|a| a == "--disable-setuid-sandbox"),
             "default args must not contain --disable-setuid-sandbox"
         );
+    }
+
+    // Exercises the chrome-linux64/chrome-linux suffixes returned by
+    // playwright_entry_suffixes() on this cfg — see that function's
+    // own gate. Fails on macOS/Windows if run there since those
+    // platforms probe a different suffix set entirely.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn playwright_discovers_chrome_linux64_layout() {
+        // Regression for issue #84: Playwright moved Chromium into
+        // chrome-linux64/; the old discovery only probed the legacy
+        // chrome-linux/ layout and reported "Chromium not found".
+        let dir = std::env::temp_dir().join(format!("donsetch-pw-test-{}", std::process::id()));
+        let entry = dir.join("ms-playwright/chromium-1234/chrome-linux64");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("chrome"), b"fake").unwrap();
+        let root = dir.join("ms-playwright");
+        let found = playwright_candidates_for_root(&root);
+        assert!(
+            found.contains(&entry.join("chrome")),
+            "chrome-linux64 layout must be discovered, got: {found:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn playwright_skips_headless_shell_and_other_browsers() {
+        let dir = std::env::temp_dir().join(format!("donsetch-pw-skip-{}", std::process::id()));
+        let base = dir.join("ms-playwright");
+        for rel in [
+            "chromium_headless_shell-1234/chrome-linux/headless_shell",
+            "firefox-1234/firefox",
+            "webkit-1234/pw_run",
+        ] {
+            let f = base.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"fake").unwrap();
+        }
+        assert!(
+            playwright_candidates_for_root(&base).is_empty(),
+            "headless shell, firefox and webkit must never be discovered as Chrome"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn known_chrome_paths_includes_hardcoded_app_bundles() {
+        // Regression: known_chrome_paths() failed to compile on
+        // macOS (E0425: cannot find value `paths`) after the
+        // Playwright-discovery addition dropped the `let mut paths
+        // =` binding on the hardcoded-paths collect().
+        let paths = known_chrome_paths();
+        for expected in [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == std::path::Path::new(expected)),
+                "missing hardcoded path {expected}, got: {paths:?}"
+            );
+        }
     }
 
     #[test]

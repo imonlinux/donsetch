@@ -17,10 +17,28 @@
 # Pre-push gate: everything CI will flag.
 all: fmt-check lint test
 
-# Pre-tag gate: `all` + the exact tag-time payload gates of the
-# release workflow, mirrored locally so a late gate failure can
-# never cost a release round-trip. Run before pushing a tag.
-preflight: all gates
+# Pre-tag gate: `all` + the Cargo.lock gate (catches a version bump
+# with a stale lock in seconds, the failure that used to cost a full
+# release round-trip) + the tag-time payload gates mirrored against
+# the ci-profile binary. Fat LTO is NOT built locally: the release
+# workflow's own gates are the authoritative payload check, paying
+# for the fat-LTO build twice bought nothing.
+preflight: all lockgate ci-gates
+
+# Full fat-LTO + gates, for when the release workflow itself changed
+# and the payload gates must be proven locally first.
+preflight-full: all gates
+
+# Manifest/lock coherence: the bump-invalidates-lock failure must die
+# here in seconds, never in CI.
+lockgate:
+    cargo check --locked --profile ci --all-targets --features ocr,rerank,http
+
+# The tag-time gates (linux-x64 mirror of release.yml), against the
+# fast binary: sizes/version/dylib presence/ONNX probe/QEMU all hold
+# on the ci profile as well, so the slow fat-LTO pass is CI's job.
+ci-gates: bin
+    @sh scripts/gates.sh linux-x64 target/ci
 
 # The tag-time gates (linux-x64 mirror of release.yml).
 gates:

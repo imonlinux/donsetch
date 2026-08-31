@@ -31,7 +31,7 @@ pub async fn happy_connect(host: &str, port: u16) -> Result<TcpStream, FetchErro
     } else {
         let blocked: Vec<&SocketAddr> = addrs
             .iter()
-            .filter(|a| crate::fetch::guards::is_ssrf_ip(&a.ip()))
+            .filter(|a| crate::fetch::guards::is_ssrf_resolved_ip(&a.ip()))
             .collect();
         if blocked.len() == addrs.len() {
             return Err(FetchError::Http(format!(
@@ -40,7 +40,7 @@ pub async fn happy_connect(host: &str, port: u16) -> Result<TcpStream, FetchErro
         }
         addrs
             .into_iter()
-            .filter(|a| !crate::fetch::guards::is_ssrf_ip(&a.ip()))
+            .filter(|a| !crate::fetch::guards::is_ssrf_resolved_ip(&a.ip()))
             .collect()
     };
 

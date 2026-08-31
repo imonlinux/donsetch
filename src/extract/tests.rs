@@ -1995,6 +1995,51 @@ fn v3_probe_invalid_regex_is_honest_not_panic() {
     );
     assert!(r.markdown.contains("invalid regex"), "{}", r.markdown);
 }
+#[test]
+fn must_contain_regex_with_trailing_flags_is_still_regex() {
+    // A trailing flag like /i must not downgrade the probe to a
+    // literal search.
+    let hit = extract_html_opts(
+        "cve-2026-1234 hatchling",
+        &ExtractOptions {
+            must_contain: Some("/CVE-2026-\\d{4}/i".into()),
+            ..Default::default()
+        },
+    );
+    assert!(hit.markdown.contains("probe: MATCH"), "{}", hit.markdown);
+    let miss = extract_html_opts(
+        "nothing here",
+        &ExtractOptions {
+            must_contain: Some("/CVE-2026-\\d{4}/i".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        miss.markdown.contains("probe: NO MATCH"),
+        "{}",
+        miss.markdown
+    );
+}
+
+#[test]
+fn must_contain_probe_applies_to_plain_text_passthrough() {
+    let body = b"HTTP/1.1 Semantics and Content\r\nFielding, Ed.\r\n";
+    let out = extract(
+        body,
+        "text/plain",
+        "https://example.com/rfc",
+        &ExtractOptions {
+            must_contain: Some("Fielding".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(out.markdown.contains("probe: MATCH"), "{}", out.markdown);
+    // The probe must replace the body, not dump it: a probe block is
+    // a handful of lines, the raw passthrough would carry the full
+    // document text.
+    assert!(out.markdown.len() < 400, "len {}", out.markdown.len());
+}
 
 /// Issue #49: links and formatting nested inside em/strong were
 /// flattened away by `plain()`. Nested inline markup must survive:

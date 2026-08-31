@@ -43,6 +43,35 @@ pub fn is_ssrf_ip(ip: &IpAddr) -> bool {
     is_private_ip(ip)
 }
 
+/// IP-level SSRF check for DNS-resolved addresses (post-resolution
+/// pinning tier): same strictness as `is_ssrf_ip` EXCEPT the RFC
+/// 2544 benchmarking block 198.18.0.0/15. Fake-ip TUN networks
+/// (mihomo/Clash/Surge/etc.) map every hostname into that block and
+/// route the actual dial through the TUN device; treating it as
+/// private bricks the tool for those users while protecting nothing:
+/// the block is an IETF-reserved no-service range, not a reachable
+/// private network. Every real SSRF surface (RFC 1918, loopback,
+/// link-local, CGNAT, ULA, documentation ranges) stays blocked at
+/// the resolved tier. Literal 198.18.x in a URL stays blocked via
+/// `is_ssrf_ip`: a literal has no legitimate destination.
+pub fn is_ssrf_resolved_ip(ip: &IpAddr) -> bool {
+    if let IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+            return false;
+        }
+    }
+    is_private_ip(ip)
+}
+
+/// Escape hatch for deliberate private egress (CLI power users,
+/// local services): DONSETCH_ALLOW_PRIVATE_EGRESS set to anything
+/// disables the SSRF guard chain end to end, matching the
+/// transport layer's hatch. Default off.
+fn private_egress_allowed() -> bool {
+    std::env::var_os("DONSETCH_ALLOW_PRIVATE_EGRESS").is_some()
+}
+
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -121,9 +150,9 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
     let host = url
         .host_str()
         .ok_or_else(|| crate::error::FetchError::InvalidUrl(url_str.into()))?;
-    if is_ssrf_host(host) {
+    if is_ssrf_host(host) && !private_egress_allowed() {
         return Err(crate::error::FetchError::Http(format!(
-            "blocked: {host} is a private/loopback address — SSRF guard"
+            "blocked: {host} is a private/loopback address — SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)"
         )));
     }
     // Also check host_str for bracketed IPv6 that Url keeps brackets on? is_ssrf_host handles it.
@@ -158,6 +187,10 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
 /// (sync) and `ensure_url_safe` (async) where applicable.
 pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
     let url = validate_url_basic(url_str)?;
+    // Deliberate opt-out: skip the DNS resolution tier entirely.
+    if private_egress_allowed() {
+        return Ok(url);
+    }
     let host: String = url.host_str().unwrap_or("").to_owned();
     // Literal IP already blocked by validate_url_basic; only hostnames need DNS.
     // Fail closed on resolution errors for browser/network navigation.
@@ -172,9 +205,9 @@ pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::Fe
             let mut any = false;
             for addr in addrs {
                 any = true;
-                if is_ssrf_ip(&addr.ip()) {
+                if is_ssrf_resolved_ip(&addr.ip()) {
                     return Err(crate::error::FetchError::Http(format!(
-                        "blocked: {host} resolves to private/loopback address {} — SSRF guard",
+                        "blocked: {host} resolves to private/loopback address {} — SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)",
                         addr.ip()
                     )));
                 }
@@ -528,5 +561,87 @@ mod tests {
             msg.contains("dns") || msg.contains("fail-closed") || msg.contains("blocked"),
             "error must mention DNS/fail-closed, got: {msg}"
         );
+    }
+
+    // ---- fake-ip / RFC 2544 tiering (issue #83) ----
+
+    #[test]
+    fn rfc2544_resolved_tier_allows_fake_ip_block() {
+        // Fake-ip TUN networks (mihomo/Clash/Surge) resolve every
+        // hostname into 198.18.0.0/15. The resolved tier must pass
+        // those; the literal tier must keep blocking them.
+        for addr in [
+            "198.18.0.0",
+            "198.18.0.25",
+            "198.18.255.255",
+            "198.19.0.1",
+            "198.19.255.254",
+        ]
+        .iter()
+        .map(|a| a.parse::<IpAddr>().unwrap())
+        {
+            assert!(
+                !is_ssrf_resolved_ip(&addr),
+                "resolved tier must allow fake-ip fabric address {addr}"
+            );
+            assert!(is_ssrf_ip(&addr), "literal tier must still block {addr}");
+        }
+    }
+
+    #[test]
+    fn resolved_tier_still_blocks_real_private_ranges() {
+        for addr in [
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "192.88.99.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "2001:db8::1",
+        ]
+        .iter()
+        .map(|a| a.parse::<IpAddr>().unwrap())
+        {
+            assert!(
+                is_ssrf_resolved_ip(&addr),
+                "resolved tier must keep blocking {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_egress_hatch_disables_both_tiers() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        // Literal gate relaxed.
+        assert!(validate_url_basic("http://127.0.0.1/").is_ok());
+        assert!(validate_url_basic("http://198.18.0.25/").is_ok());
+        assert!(validate_url_basic("http://[::ffff:169.254.169.254]/").is_ok());
+        unsafe { std::env::remove_var("DONSETCH_ALLOW_PRIVATE_EGRESS") };
+        // Strict again.
+        assert!(validate_url_basic("http://127.0.0.1/").is_err());
+        assert!(validate_url_basic("http://198.18.0.25/").is_err());
+    }
+
+    #[tokio::test]
+    async fn hatch_also_relaxes_resolved_tier() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        // A genuinely private target would still be dialed here, so
+        // use a blocked literal to prove the whole async chain is
+        // skipped without performing a resolution at all.
+        assert!(ensure_url_safe("http://192.168.1.1/").await.is_ok());
+        unsafe { std::env::remove_var("DONSETCH_ALLOW_PRIVATE_EGRESS") };
+        assert!(ensure_url_safe("http://192.168.1.1/").await.is_err());
     }
 }

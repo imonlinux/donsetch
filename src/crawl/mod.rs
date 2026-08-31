@@ -445,7 +445,11 @@ impl Crawler {
             } else {
                 return Err(format!("resume token expired or unknown: {tok}"));
             }
-        } else {
+        }
+        // Site-wide IDF for BM25-lite frontier scoring: built from
+        // the sitemap inventory when one exists; None otherwise.
+        let mut focus_idf: Option<std::sync::Arc<score::FocusIdf>> = None;
+        if resume_token.is_none() {
             let _ = queue.push(seed_url.clone(), 10.0, 0);
             // Sitemap entries seed frontier at depth 1.
             // Dedup by locale-canonical path: don't queue
@@ -453,6 +457,19 @@ impl Crawler {
             // (de/, es/, fr/ copies waste crawl budget).
             let mut seeded_locales: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // Build the IDF table from the full inventory BEFORE
+            // scoring the seeds: document frequency is a corpus
+            // property, not a per-entry one.
+            if opts.focus.is_some() && !sitemap_entries.is_empty() {
+                focus_idf = Some(std::sync::Arc::new(score::FocusIdf::from_paths(
+                    sitemap_entries.iter().filter_map(|e| {
+                        Url::parse(&e.loc)
+                            .ok()
+                            .filter(|u| host_ok(u))
+                            .map(|u| u.path().to_string())
+                    }),
+                )));
+            }
             for e in &sitemap_entries {
                 if let Ok(u) = Url::parse(&e.loc)
                     && host_ok(&u)
@@ -470,8 +487,12 @@ impl Crawler {
                     if !seeded_locales.insert(lcanon) {
                         continue; // Another variant already queued
                     }
-                    let s = score::score_candidate("", u.path(), opts.focus.as_deref())
-                        + e.priority.unwrap_or(0.0) as f64 * 2.0;
+                    let s = score::score_candidate_with_idf(
+                        "",
+                        u.path(),
+                        opts.focus.as_deref(),
+                        focus_idf.as_deref(),
+                    ) + e.priority.unwrap_or(0.0) as f64 * 2.0;
                     queue.push(u, s, 1);
                 }
             }
@@ -527,6 +548,7 @@ impl Crawler {
             let total_fetched = Arc::clone(&total_fetched);
             let stop_flag = Arc::clone(&stop_flag);
             let focus = Arc::clone(&focus);
+            let focus_idf = focus_idf.clone();
             let fetch = self.fetch.clone();
             let governor = Arc::clone(&self.governor);
             let ghost_hook = self.ghost.clone();
@@ -1180,9 +1202,12 @@ impl Crawler {
                                         if any_focus_match || item.depth > 0 {
                                             continue;
                                         }
-                                        let s =
-                                            score::score_candidate("", nu.path(), focus.as_deref())
-                                                - 100.0;
+                                        let s = score::score_candidate_with_idf(
+                                            "",
+                                            nu.path(),
+                                            focus.as_deref(),
+                                            focus_idf.as_deref(),
+                                        ) - 100.0;
                                         q.push_with_parent(
                                             nu,
                                             s,
@@ -1195,7 +1220,12 @@ impl Crawler {
                                     if ls.contains(&lcanon) {
                                         continue;
                                     }
-                                    let s = score::score_candidate("", nu.path(), focus.as_deref());
+                                    let s = score::score_candidate_with_idf(
+                                        "",
+                                        nu.path(),
+                                        focus.as_deref(),
+                                        focus_idf.as_deref(),
+                                    );
                                     q.push_with_parent(nu, s, item.depth, Some(item.url.clone()));
                                 }
                             }
@@ -1279,10 +1309,11 @@ impl Crawler {
                                             if any_focus_match || item.depth > 0 {
                                                 continue;
                                             }
-                                            let s = score::score_candidate(
+                                            let s = score::score_candidate_with_idf(
                                                 "",
                                                 u.path(),
                                                 focus.as_deref(),
+                                                focus_idf.as_deref(),
                                             ) - 100.0;
                                             q.push_with_parent(
                                                 u,
@@ -1292,8 +1323,12 @@ impl Crawler {
                                             );
                                             continue;
                                         }
-                                        let s =
-                                            score::score_candidate("", u.path(), focus.as_deref());
+                                        let s = score::score_candidate_with_idf(
+                                            "",
+                                            u.path(),
+                                            focus.as_deref(),
+                                            focus_idf.as_deref(),
+                                        );
                                         q.push_with_parent(
                                             u,
                                             s,
@@ -1340,10 +1375,11 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    let s = score::score_candidate(
+                                    let s = score::score_candidate_with_idf(
                                         &anchor,
                                         cu.path(),
                                         focus.as_deref(),
+                                        focus_idf.as_deref(),
                                     );
                                     // Focus gate: when a focus query is set,
                                     // non-matching links are filtered.
