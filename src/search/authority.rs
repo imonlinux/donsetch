@@ -1,9 +1,9 @@
-//! authority.rs — the decisive top-placement layer.
+//! authority.rs : the decisive top-placement layer.
 //!
 //! History: v1 ranking had excellent top-5 recall (23/25 in the
 //! 50-case benchmark) but weak top-1/top-3 placement (6/25 top-1
-//! vs hound's 13/25). The recall machinery — cross-engine
-//! consensus, family-deduped RRF, BM25, coverage penalties —
+//! vs hound's 13/25). The recall machinery : cross-engine
+//! consensus, family-deduped RRF, BM25, coverage penalties :
 //! reliably puts the RIGHT result IN the list, but nothing made
 //! a decisive #1 choice: the domain prior was a flat +0.15 on
 //! the wrong scale, and the cross-encoder blend (60/40, min-max
@@ -14,8 +14,8 @@
 //! final blended score) and multiplies in three signals:
 //!
 //! 1. **Query-aware official domains.** A "rust ownership" query
-//!    maps to rust-lang.org/docs.rs — the OFFICIAL sources for
-//!    the thing the query names — via a curated registry of
+//!    maps to rust-lang.org/docs.rs : the OFFICIAL sources for
+//!    the thing the query names : via a curated registry of
 //!    tech-token → official-domain mappings. Generic
 //!    (non-query-aware) authority tables from `intent::domain_prior`
 //!    get a smaller lift.
@@ -222,7 +222,7 @@ const OFFICIAL: &[(&[&str], &[&str])] = &[
 ];
 
 /// Meta-words about the SEARCH ITSELF, never about the target
-/// entity — excluded from title-coverage requirements. "docs"
+/// entity : excluded from title-coverage requirements. "docs"
 /// and "news" describe what the agent wants, not what the page
 /// is about; requiring them in titles would punish the best
 /// results (official doc pages often don't say "docs" in the
@@ -281,7 +281,7 @@ const TITLE_STOPWORDS: &[&str] = &[
     "when",
 ];
 
-/// Docs-seeking queries amplify the official boost — when the
+/// Docs-seeking queries amplify the official boost : when the
 /// agent explicitly asks for documentation, official sources are
 /// near-certain to be the intended #1.
 const DOCS_WORDS: &[&str] = &[
@@ -341,7 +341,7 @@ fn query_tokens(query: &str) -> Vec<String> {
 }
 
 /// Official domains for THIS query: registry entries whose token
-/// set ⊆ query tokens. Empty when nothing matches — the layer
+/// set ⊆ query tokens. Empty when nothing matches : the layer
 /// then no-ops (non-tech queries are untouched).
 pub fn official_domains(query: &str) -> Vec<&'static str> {
     let toks = query_tokens(query);
@@ -371,7 +371,7 @@ fn host_matches(host: &str, domain: &str) -> bool {
 
 /// Fraction of query ENTITY terms present in the title.
 /// Meta-words (TITLE_STOPWORDS) are excluded from both sides of
-/// the ratio — the signal is entity match, not filler match.
+/// the ratio : the signal is entity match, not filler match.
 fn title_terms_ratio(query: &str, title: &str) -> f64 {
     let q = query.to_lowercase();
     let terms: Vec<&str> = q
@@ -436,7 +436,7 @@ fn iso_days_ago(iso: &str) -> Option<i64> {
     Some(now - then)
 }
 
-/// Howard Hinnant's days_from_civil — proleptic Gregorian.
+/// Howard Hinnant's days_from_civil : proleptic Gregorian.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -472,7 +472,7 @@ fn civil_from_days(z: i64) -> String {
 
 /// The decisive top-placement layer. Called from
 /// `rank::merge` AFTER rerank + coverage, BEFORE the final
-/// sort — the same slot the coverage penalty proved effective
+/// sort : the same slot the coverage penalty proved effective
 /// in (the layer the cross-encoder blend cannot wash out).
 pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
     let official = official_domains(query);
@@ -501,7 +501,7 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
             m *= PAPER_SEEK_MULT;
         }
 
-        // Title decisiveness — the placement signal the 60/40
+        // Title decisiveness : the placement signal the 60/40
         // blend dilutes. Applied to every result: it reorders
         // results by entity-title match, independent of domain.
         let ratio = title_terms_ratio(query, &r.title);
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn freshness_prefers_recent() {
-        // Relative check — no pinned "today".
+        // Relative check : no pinned "today".
         let now = epoch_days_now();
         let iso_now = civil_from_days(now);
         let iso_old = civil_from_days(now - 400);

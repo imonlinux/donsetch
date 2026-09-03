@@ -3,7 +3,7 @@
 //! Every fetch is both an action AND an observation. This store
 //! learns from each outcome and routes the next fetch more
 //! efficiently. The more you use DonSeTch, the less it escalates
-//! to tier 2 — domains it has already solved get warm tier-1
+//! to tier 2 : domains it has already solved get warm tier-1
 //! with their clearance cookies injected, and cookies are kept
 //! alive by write-back from successful warm fetches.
 //!
@@ -32,7 +32,15 @@ pub struct CookieRecord {
     pub value: String,
     pub domain: String,
     #[serde(default)]
+    pub path: String,
+    #[serde(default)]
     pub expires_at: Option<u64>, // unix seconds; None = session
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default)]
+    pub http_only: bool,
+    #[serde(default)]
+    pub same_site: String,
 }
 
 /// Per-domain intelligence. Evolves with every fetch outcome.
@@ -41,6 +49,14 @@ pub struct DomainProfile {
     // === Cookie vault (clearance cookies only) ===
     #[serde(default)]
     pub cookies: Vec<CookieRecord>,
+    /// Session vault: login/session cookies harvested from the
+    /// browser after every tier-2 run and replayed into the next
+    /// browser launch. Distinct from `cookies` (bot-wall clearance
+    /// only): this holds the user's own authenticated state so a
+    /// login survives daemon restarts, crashes and even the
+    /// browser's own kill-without-flush.
+    #[serde(default)]
+    pub session_cookies: Vec<CookieRecord>,
     /// When tier 2 last solved (unix seconds).
     #[serde(default)]
     pub last_solved: u64,
@@ -83,7 +99,7 @@ pub struct DomainProfile {
     pub warm_fail_streak: u32,
     /// Tier-1 replay of ghost-harvested cookies VERIFIED working
     /// (the post-solve tier-1 retry came back ContentOk). Warm
-    /// routing is only offered after a verified replay — cookies
+    /// routing is only offered after a verified replay : cookies
     /// that the vendor binds to the browser fingerprint never
     /// earn a doomed tier-1 roundtrip.
     #[serde(default)]
@@ -95,13 +111,13 @@ pub struct DomainProfile {
 pub enum RouteDecision {
     /// No profile (first visit) or easy domain. Tier 1 cold.
     Cold,
-    /// Known to need tier 2, cookies still fresh — inject them.
+    /// Known to need tier 2, cookies still fresh : inject them.
     Warm(Vec<CookieRecord>),
     /// Known to need tier 2, cookies stale, cold-check recent.
-    /// Skip the doomed tier-1 round-trip — go straight to solve.
+    /// Skip the doomed tier-1 round-trip : go straight to solve.
     SkipToSolve,
     /// Known to need tier 2, but hasn't been cold-checked in a
-    /// while — try tier 1 cold. The wall may have been removed.
+    /// while : try tier 1 cold. The wall may have been removed.
     RecheckCold,
 }
 
@@ -127,25 +143,25 @@ pub struct RenderCache {
 const TTL_CAP: u64 = 2 * 60 * 60; // 2 hours
 
 /// If a domain is known to need tier 2, periodically try tier 1
-/// cold anyway — the wall may have been removed.
+/// cold anyway : the wall may have been removed.
 const RECHECK_INTERVAL: u64 = 24 * 60 * 60; // 24 hours
 
 /// SPA renders stale after 5 min.
 const RENDER_TTL: u64 = 5 * 60;
 
-/// Max render cache entries. Each stores full HTML — cap to
+/// Max render cache entries. Each stores full HTML : cap to
 /// prevent unbounded growth. LRU eviction when full.
 /// 20 entries × ~200KB avg = ~4MB max contribution to state file.
 const RENDER_MAX: usize = 20;
 
 /// Max HTML size to cache per render (200KB). Larger pages are
-/// rendered but not persisted — they'd bloat the state file.
+/// rendered but not persisted : they'd bloat the state file.
 const RENDER_MAX_HTML: usize = 200_000;
 
 // ────────────────────────── cookie filtering ──────────────────────────
 
 /// Cookie name prefixes that bot-wall vendors use for clearance/
-/// verification cookies. We only persist these — tracking cookies
+/// verification cookies. We only persist these : tracking cookies
 /// (_ga, TDID, demdex, etc.) bloat the state file with no benefit.
 const CLEARANCE_PREFIXES: &[&str] = &[
     "cf_",         // Cloudflare: cf_clearance, cf_chl, cf_ob_setup
@@ -187,6 +203,221 @@ fn filter_clearance(cookies: &[CookieRecord]) -> Vec<CookieRecord> {
         .collect()
 }
 
+// ────────────────────────── session vault ──────────────────────────
+
+/// Cap on vaulted session cookies: keeps ghost-state.json bounded
+/// even after months of multi-site browsing.
+const SESSION_MAX: usize = 500;
+
+/// Max chars one vaulted cookie value may hold: jumbo tokens are
+/// either junk or per-request blobs, never reusable login state.
+const SESSION_VALUE_MAX: usize = 8_192;
+
+/// Cookie names that are analytics/ad junk, never login state.
+/// Prefix-matched, lowercase.
+const SESSION_JUNK_PREFIXES: &[&str] = &[
+    "_ga",
+    "_gid",
+    "_gat",
+    "_gcl",
+    "_gac",
+    "__utma",
+    "__utmb",
+    "__utmc",
+    "__utmz",
+    "__utmv",
+    "__utmt",
+    "__utm",
+    "_fbp",
+    "_fbc",
+    "tdid",
+    "demdex",
+    "dpm",
+    "dextp",
+    "adobemc",
+    "mbox",
+    "s_cc",
+    "s_sq",
+    "optimizely",
+    "pardot",
+    "visitor_id",
+    "hubspotutk",
+    "intercom-id-",
+    "intercom-session-",
+    "akaalb_",
+    "akacd_",
+    // Ad-mesh session junk from real harvests (DSP sync, exchange
+    // seat ids, media sync timestamps): never login state.
+    "_hj",
+    "dsp2f_",
+    "sspz",
+    "sspr_",
+    "stx_",
+    "cnx_",
+    "nm_",
+    "st_usi",
+    "ruds",
+    "_cc_cc",
+    "_twsid",
+    "wp-wpml",
+    "_cf",
+    "wrv",
+    "seedtag",
+];
+
+/// Exact-match junk names (lowercase) too risky to prefix-match.
+const SESSION_JUNK_EXACT: &[&str] = &[
+    "tz",
+    "cpu_bucket",
+    "preferred_color_mode",
+    "countries_availability_flash_seen",
+    "ingresscookie",
+];
+
+/// Long-lived cookies named like login state are vaulted even when
+/// they carry an expiry (remember-me tokens). Lowercase substrings.
+const SESSION_AUTH_HINTS: &[&str] = &[
+    "session",
+    "sess",
+    "sid",
+    "auth",
+    "token",
+    "jwt",
+    "bearer",
+    "login",
+    "connect.sid",
+    "phpsessid",
+    "laravel_session",
+    "cfid",
+    "cftoken",
+    "cookiesupport",
+    "identity",
+    "loggedin",
+    "logged_in",
+    "remember",
+    "user_id",
+    "userid",
+    "guest",
+    "member",
+    "api_key",
+    "apikey",
+    "csrf",
+    "sid",
+];
+
+/// Would replaying this cookie plausibly restore an authenticated
+/// session? Session cookies (no expiry) are the login signature;
+/// explicit auth-shaped names pass even with an expiry. Everything
+/// else (trackers, preferences, A/B buckets) is dropped so the
+/// vault stays small and meaningful.
+pub(crate) fn is_session_worthy(c: &CookieRecord) -> bool {
+    if c.domain.is_empty() || c.value.is_empty() {
+        return false;
+    }
+    if c.value.len() > SESSION_VALUE_MAX {
+        return false;
+    }
+    if is_clearance_cookie(&c.name) {
+        return false;
+    }
+    let n = c.name.to_ascii_lowercase();
+    if SESSION_JUNK_PREFIXES.iter().any(|p| n.starts_with(p))
+        || SESSION_JUNK_EXACT.contains(&n.as_str())
+    {
+        return false;
+    }
+    if c.expires_at.is_none() {
+        return true;
+    }
+    SESSION_AUTH_HINTS.iter().any(|k| n.contains(k))
+}
+
+/// Merge one harvest into the session vault: dedupe by
+/// (name, domain), per-domain cap for safety.
+pub(crate) fn merge_session_cookies(vault: &mut Vec<CookieRecord>, harvested: &[CookieRecord]) {
+    const PER_DOMAIN_MAX: usize = 50;
+    for c in harvested {
+        if !is_session_worthy(c) {
+            continue;
+        }
+        // Same (name, domain): refresh in place (value/expiry
+        // evolve as the site rotates its session).
+        if let Some(existing) = vault
+            .iter_mut()
+            .find(|e| e.name == c.name && e.domain == c.domain)
+        {
+            *existing = c.clone();
+            continue;
+        }
+        vault.insert(0, c.clone());
+    }
+    vault.truncate(PER_DOMAIN_MAX);
+}
+
+/// Persist a fresh cookie harvest into the session vault on disk.
+/// Load-modify-save with the same atomic tmp+rename write as the
+/// rest of the state file: a mid-write crash can never corrupt the
+/// vault it updates.
+pub(crate) fn store_session_cookies(cookies: &[CookieRecord]) {
+    if cookies.is_empty() {
+        return;
+    }
+    let mut state = GhostState::load();
+    for c in cookies {
+        if !is_session_worthy(c) {
+            continue;
+        }
+        let p = state
+            .profiles
+            .entry(c.domain.trim_start_matches('.').to_string())
+            .or_default();
+        merge_session_cookies(&mut p.session_cookies, std::slice::from_ref(c));
+    }
+    // Global cap: if the vault exceeds SESSION_MAX, drop the
+    // least-recently-solved domains' session vaults first
+    // (deterministic: last_solved is the recency signal).
+    let total: usize = state
+        .profiles
+        .values()
+        .map(|p| p.session_cookies.len())
+        .sum();
+    if total > SESSION_MAX {
+        let mut keys: Vec<(u64, String)> = state
+            .profiles
+            .iter()
+            .filter(|(_, p)| !p.session_cookies.is_empty())
+            .map(|(k, p)| (p.last_solved, k.clone()))
+            .collect();
+        keys.sort_by_key(|(last, _)| *last);
+        let mut excess = total - SESSION_MAX;
+        for (_, key) in keys {
+            if excess == 0 {
+                break;
+            }
+            let p = state.profiles.get_mut(&key).expect("key from iter");
+            let drop = p.session_cookies.len().min(excess);
+            p.session_cookies.truncate(p.session_cookies.len() - drop);
+            excess -= drop;
+        }
+    }
+    state.save();
+}
+
+/// Everything currently vaulted, across all domains, for replay
+/// into a fresh browser launch.
+pub(crate) fn load_session_cookies() -> Vec<CookieRecord> {
+    let state = GhostState::load();
+    let mut out = Vec::new();
+    for p in state.profiles.values() {
+        for c in &p.session_cookies {
+            if is_session_worthy(c) {
+                out.push(c.clone());
+            }
+        }
+    }
+    out
+}
+
 // ────────────────────────── helpers ──────────────────────────
 
 pub fn now() -> u64 {
@@ -208,7 +439,7 @@ pub fn cookies_fresh_at(profile: &DomainProfile, now: u64) -> bool {
     }
 
     // Server-set expiry: the earliest-expiring cookie is the
-    // weakest link — if it's past, the batch is stale.
+    // weakest link : if it's past, the batch is stale.
     if let Some(exp) = profile.cookies.iter().filter_map(|c| c.expires_at).min()
         && now >= exp
     {
@@ -241,7 +472,7 @@ impl GhostState {
             if let Ok(mut state) = serde_json::from_str::<Self>(&s) {
                 // One-time migration: prune tracking cookies from
                 // existing profiles. Pre-filter versions stored ALL
-                // cookies (_ga, TDID, demdex, etc.) — some domains
+                // cookies (_ga, TDID, demdex, etc.) : some domains
                 // had 1000+ cookies, making the state file 100MB+.
                 // After pruning, only clearance cookies remain.
                 let mut changed = false;
@@ -252,8 +483,18 @@ impl GhostState {
                         changed = true;
                     }
                 }
+                // The session vault's own migration: junk from
+                // earlier filter versions fades out of old state
+                // files on load instead of lingering forever.
+                for profile in state.profiles.values_mut() {
+                    let before = profile.session_cookies.len();
+                    profile.session_cookies.retain(is_session_worthy);
+                    if profile.session_cookies.len() != before {
+                        changed = true;
+                    }
+                }
                 // One-time un-poisoning (v2.2): pre-v2.2 code marked
-                // domains needs_tier2 on ANY non-content verdict —
+                // domains needs_tier2 on ANY non-content verdict :
                 // a single 404 or rate-limit forced ghost on every
                 // later fetch. Profiles that never recorded an
                 // actual solve carry no wall knowledge: reset them
@@ -267,7 +508,7 @@ impl GhostState {
                     }
                     // Pre-v2.2 warm-stale learning clamped lifetimes
                     // to as low as 1s (single-failure, unfloored).
-                    // Those observations are garbage — drop them.
+                    // Those observations are garbage : drop them.
                     if profile.observed_lifetime.is_some_and(|o| o < 120) {
                         profile.observed_lifetime = None;
                         changed = true;
@@ -313,7 +554,11 @@ impl GhostState {
                                         name: n,
                                         value: v,
                                         domain: d,
+                                        path: "/".to_string(),
                                         expires_at: None,
+                                        secure: false,
+                                        http_only: false,
+                                        same_site: "Lax".to_string(),
                                     })
                                     .collect::<Vec<_>>(),
                             ),
@@ -332,9 +577,9 @@ impl GhostState {
     }
 
     /// Atomic save: write to temp, rename. Survives crashes.
-    /// No-op in test builds — tests exercise the pure decision
+    /// No-op in test builds : tests exercise the pure decision
     /// and freshness logic without disk side effects.
-    /// No-op when DONSEEK_NO_DISK_STATE is set — keeps in-memory
+    /// No-op when DONSEEK_NO_DISK_STATE is set : keeps in-memory
     /// state for the session but doesn't persist to disk.
     pub fn save(&self) {
         #[cfg(not(test))]
@@ -375,7 +620,7 @@ impl GhostState {
                 };
                 if write_ok && let Err(e) = std::fs::rename(&tmp, &p) {
                     // e.g. antivirus lock on Windows: harvested
-                    // clearance cookies are lost this session — say
+                    // clearance cookies are lost this session : say
                     // so instead of silently re-burning ghost solves.
                     eprintln!("[ghost] cookie vault persist failed: {e}");
                 }
@@ -402,7 +647,7 @@ impl GhostState {
             // Warm only when cookies are fresh AND tier-1 replay has
             // actually been verified to work for this domain. Vendors
             // that bind clearance to the browser fingerprint reject
-            // tier-1 replay forever — serving Warm there just burns a
+            // tier-1 replay forever : serving Warm there just burns a
             // doomed roundtrip before every solve.
             if cookies_fresh_at(profile, n) && profile.replay_ok {
                 return RouteDecision::Warm(profile.cookies.clone());
@@ -411,10 +656,10 @@ impl GhostState {
             if n - profile.last_cold_check > RECHECK_INTERVAL {
                 return RouteDecision::RecheckCold;
             }
-            // Skip the doomed tier-1 attempt — go straight to solve.
+            // Skip the doomed tier-1 attempt : go straight to solve.
             return RouteDecision::SkipToSolve;
         }
-        // Easy domain — tier 1 cold.
+        // Easy domain : tier 1 cold.
         RouteDecision::Cold
     }
 
@@ -422,7 +667,7 @@ impl GhostState {
 
     /// A fetch completed with a non-challenge, non-content verdict
     /// (404, rate-limit, paywall, auth wall). These say nothing
-    /// about walls or cookies — they must not poison the route.
+    /// about walls or cookies : they must not poison the route.
     /// The counters move and the cold-check clock restarts (this
     /// WAS a tier-1 answer; the 24h recheck cadence follows it).
     pub fn record_fetch(&mut self, host: &str) {
@@ -434,7 +679,7 @@ impl GhostState {
     }
 
     /// Tier 1 cold succeeded. If the domain was previously known
-    /// to need tier 2, the wall is gone — clear the flag.
+    /// to need tier 2, the wall is gone : clear the flag.
     pub fn record_cold_ok(&mut self, host: &str) {
         let n = now();
         let p = self.profiles.entry(host.to_string()).or_default();
@@ -444,7 +689,7 @@ impl GhostState {
         if p.needs_tier2 {
             p.needs_tier2 = false;
             p.wall_vendor = None;
-            // Cookies from a previous solve are stale context — clear.
+            // Cookies from a previous solve are stale context : clear.
             p.cookies.clear();
             p.observed_lifetime = None;
             p.replay_ok = false;
@@ -452,9 +697,9 @@ impl GhostState {
         self.save();
     }
 
-    /// Tier 1 cold was walled — domain needs tier 2.
+    /// Tier 1 cold was walled : domain needs tier 2.
     /// (Callers: ONLY on an actual Challenge verdict. A 404 or a
-    /// rate-limit is not a wall — it must not force ghost mode.)
+    /// rate-limit is not a wall : it must not force ghost mode.)
     pub fn record_cold_walled(&mut self, host: &str, vendor: Option<&str>) {
         let n = now();
         let p = self.profiles.entry(host.to_string()).or_default();
@@ -468,10 +713,10 @@ impl GhostState {
         self.save();
     }
 
-    /// Tier 1 warm succeeded — cookies are still valid. Refresh
+    /// Tier 1 warm succeeded : cookies are still valid. Refresh
     /// the cookie vault from the response's Set-Cookie headers
     /// so the on-disk cookies stay as fresh as the server's latest
-    /// response. Only clearance cookies are merged — tracking
+    /// response. Only clearance cookies are merged : tracking
     /// cookies are filtered out to keep the state file compact.
     pub fn record_warm_ok(&mut self, host: &str, refreshed: &[CookieRecord]) {
         let n = now();
@@ -480,7 +725,7 @@ impl GhostState {
         p.warm_ok_count += 1;
         p.warm_fail_streak = 0;
         p.last_refreshed = n;
-        // Merge: replace by (name, domain), add new ones — but only
+        // Merge: replace by (name, domain), add new ones : but only
         // clearance cookies.
         for new in filter_clearance(refreshed) {
             if let Some(existing) = p
@@ -496,13 +741,13 @@ impl GhostState {
         self.save();
     }
 
-    /// Tier 1 warm was walled — cookies went stale. Learn the
+    /// Tier 1 warm was walled : cookies went stale. Learn the
     /// real lifetime: it's at most `now - last_solved`. Next
     /// time, trust the observation over the server's claim and
     /// re-solve before the cookies expire.
     ///
     /// Dampened: the FIRST warm failure keeps the cookies (vendor
-    /// challenges rotate; one wall is often transient — the next
+    /// challenges rotate; one wall is often transient : the next
     /// warm fetch gets to prove the cookies still live). Only a
     /// SECOND consecutive failure clears the vault and learns the
     /// lifetime. The learned lifetime is floored at 120s: a fluke
@@ -520,7 +765,7 @@ impl GhostState {
                 Some(prev) => prev.max(120).min(elapsed),
                 None => elapsed,
             });
-            // Cookies are dead — clear so route_for doesn't serve them.
+            // Cookies are dead : clear so route_for doesn't serve them.
             p.cookies.clear();
             p.last_refreshed = 0;
             p.replay_ok = false;
@@ -528,13 +773,13 @@ impl GhostState {
         self.save();
     }
 
-    /// Tier 2 solved the wall — store fresh cookies with real
-    /// expiry captured from CDP. Only clearance cookies are kept —
+    /// Tier 2 solved the wall : store fresh cookies with real
+    /// expiry captured from CDP. Only clearance cookies are kept :
     /// tracking cookies bloat the state file with no benefit.
     ///
     /// `replay_ok` records whether tier-1 replay of these cookies
     /// was VERIFIED (post-solve tier-1 fetch came back with real
-    /// content). Warm routing is gated on it — see route_for.
+    /// content). Warm routing is gated on it : see route_for.
     pub fn record_solved(
         &mut self,
         host: &str,
@@ -551,7 +796,7 @@ impl GhostState {
         p.needs_tier2 = true;
         p.warm_fail_streak = 0;
         p.replay_ok = replay_ok;
-        // A fresh solve restarts the lifetime observation window —
+        // A fresh solve restarts the lifetime observation window :
         // stale pre-fix lifetimes (the 1-second clamp bug) must
         // not outlive the solve that invalidated them.
         if p.observed_lifetime.is_some_and(|o| o < 120) {
@@ -566,7 +811,7 @@ impl GhostState {
     // ── Render cache (unchanged from v1) ──
 
     pub fn record_render(&mut self, url: &str, html: &str) {
-        // Skip oversized pages — caching 1MB+ HTML bloats the state
+        // Skip oversized pages : caching 1MB+ HTML bloats the state
         // file with no benefit (large pages are usually not SPAs
         // that need render caching).
         if html.len() > RENDER_MAX_HTML {
@@ -624,8 +869,80 @@ mod tests {
             name: name.into(),
             value: value.into(),
             domain: domain.into(),
+            path: "/".into(),
             expires_at: exp,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".into(),
         }
+    }
+
+    // ── session vault ──
+
+    #[test]
+    fn session_worthy_keeps_and_drops() {
+        // Session cookie (no expiry) = the login signature.
+        assert!(is_session_worthy(&cr("probe", "v", "a.com", None)));
+        // Auth-named with expiry = remember-me.
+        assert!(is_session_worthy(&cr(
+            "sessionid",
+            "v",
+            "a.com",
+            Some(9_999_999_999)
+        )));
+        assert!(is_session_worthy(&cr(
+            "connect.sid",
+            "v",
+            "a.com",
+            Some(9_999_999_999)
+        )));
+        // Trackers never vault regardless of expiry.
+        assert!(!is_session_worthy(&cr("_ga", "v", "a.com", None)));
+        assert!(!is_session_worthy(&cr("TDID", "v", "a.com", None)));
+        // Clearance cookies belong to the wall vault, not here.
+        assert!(!is_session_worthy(&cr("cf_clearance", "v", "a.com", None)));
+        // A preference cookie with expiry: junk.
+        assert!(!is_session_worthy(&cr(
+            "theme",
+            "dark",
+            "a.com",
+            Some(9_999_999_999)
+        )));
+        // Degenerate shapes.
+        assert!(!is_session_worthy(&cr("x", "", "a.com", None)));
+        assert!(!is_session_worthy(&cr("x", "v", "", None)));
+        // Oversized value: never a reusable session token.
+        assert!(!is_session_worthy(&cr(
+            "tok",
+            &"a".repeat(8193),
+            "a.com",
+            None
+        )));
+    }
+
+    #[test]
+    fn session_merge_dedupes_and_caps_per_domain() {
+        let mut vault = vec![cr("a", "1", "site.com", None)];
+        // Same (name, domain) refreshes in place.
+        merge_session_cookies(
+            &mut vault,
+            std::slice::from_ref(&cr("a", "2", "site.com", None)),
+        );
+        assert_eq!(vault.len(), 1);
+        assert_eq!(vault[0].value, "2");
+        // Fill past the per-domain cap: oldest entries drop.
+        let many: Vec<CookieRecord> = (0..60)
+            .map(|i| cr(&format!("c{i}"), "v", "site.com", None))
+            .collect();
+        merge_session_cookies(&mut vault, &many);
+        assert!(
+            vault.len() <= 50,
+            "per-domain cap breached: {}",
+            vault.len()
+        );
+        // Newest survive: c59 must be present, c0 must not.
+        assert!(vault.iter().any(|c| c.name == "c59"));
+        assert!(vault.iter().all(|c| c.name != "c0"));
     }
 
     // ── cookies_fresh_at ──
@@ -685,7 +1002,7 @@ mod tests {
 
     #[test]
     fn fresh_ttl_cap() {
-        // No server expiry, no observed lifetime — cap at 2h.
+        // No server expiry, no observed lifetime : cap at 2h.
         let p = DomainProfile {
             cookies: vec![cr("s", "x", ".a.com", None)],
             last_solved: 1000,
@@ -771,7 +1088,7 @@ mod tests {
                 needs_tier2: true,
                 cookies: vec![cr("cf", "x", ".hard.com", Some(100))],
                 last_solved: 100,
-                last_cold_check: 1, // very old — > RECHECK_INTERVAL
+                last_cold_check: 1, // very old : > RECHECK_INTERVAL
                 ..Default::default()
             },
         );
@@ -975,7 +1292,7 @@ mod tests {
         s.record_warm_stale("so.com");
         let p = &s.profiles["so.com"];
         let learned = p.observed_lifetime.expect("learned");
-        assert!(learned >= 120, "got {learned} — must be floored");
+        assert!(learned >= 120, "got {learned} : must be floored");
     }
 
     #[test]
@@ -1046,7 +1363,7 @@ mod tests {
 
     #[test]
     fn legacy_migration() {
-        // Verify LegacyState deserialization — the production
+        // Verify LegacyState deserialization : the production
         // load() uses this to migrate old state files.
         let legacy_json = serde_json::json!({
             "solved": {

@@ -10,7 +10,7 @@ const MAX_DEPTH: usize = 300;
 
 /// Inline phrasing elements: consumed by an ancestor's
 /// loose-text paragraph, NEVER walked as standalone blocks
-/// (that duplicates content). They still recurse — a card
+/// (that duplicates content). They still recurse : a card
 /// link <a><h2>…</h2><p>…</p></a> has block children that
 /// must be emitted.
 pub const INLINE_TAGS: &[&str] = &[
@@ -180,11 +180,11 @@ fn walk<'a>(
         }
         "table" => {
             // Prose tables (forum threads, HN comment trees, layout
-            // tables) must NOT go through the pipe-table renderer —
+            // tables) must NOT go through the pipe-table renderer :
             // it clamps cells to 120 chars and destroys the text.
             // Data tables keep the pipe rendering.
             if is_prose_table(el) {
-                // Walk children as containers — comment divs inside
+                // Walk children as containers : comment divs inside
                 // the cells become real paragraphs.
                 let loose = loose_text(el, base, opts);
                 if !loose.0.is_empty() {
@@ -213,7 +213,7 @@ fn walk<'a>(
         "math" => {
             // Formula as its own block: `$$LaTeX$$`. alttext (the
             // original LaTeX) when present, MathML serialization
-            // otherwise. Math elements must never vanish — that
+            // otherwise. Math elements must never vanish : that
             // guts technical pages.
             let l = super::math::latex(el);
             if !l.is_empty() {
@@ -283,7 +283,7 @@ fn walk<'a>(
         }
         "dl" => {
             // Definition list: dt (term) + dd (definition) pairs.
-            // Rendered as a list with "**term** — definition".
+            // Rendered as a list with "**term** : definition".
             let items = def_list_items(el, base, opts);
             if !items.is_empty() {
                 push_block(
@@ -297,7 +297,7 @@ fn walk<'a>(
                 );
             }
         }
-        // Media blocks are ALWAYS segmented (cheap) — the render
+        // Media blocks are ALWAYS segmented (cheap) : the render
         // layer drops them unless include_media. On-demand image
         // OCR (v3) needs the image list even when media lines are
         // not part of the output.
@@ -308,7 +308,7 @@ fn walk<'a>(
         _ => {
             // Container or unknown: emit direct loose text as a
             // paragraph (div-soup), then recurse into children.
-            // Inline elements emit nothing themselves — their
+            // Inline elements emit nothing themselves : their
             // text was captured by the nearest block ancestor.
             if !INLINE_TAGS.contains(&name) {
                 let loose = loose_text(el, base, opts);
@@ -335,7 +335,7 @@ fn walk<'a>(
                 // The gate in score.rs handles main-content
                 // detection; applying it again here nukes real
                 // content (Reddit/HN comments have class "comment"
-                // which is in NEGATIVE_SUBSTR — the gate was
+                // which is in NEGATIVE_SUBSTR : the gate was
                 // silently dropping all short comments).
                 walk(child_el, base, opts, headings, out, depth + 1);
             }
@@ -343,7 +343,7 @@ fn walk<'a>(
     }
 }
 
-/// Direct (non-element-wrapped) text of an element — the
+/// Direct (non-element-wrapped) text of an element : the
 /// div-soup paragraph case.
 fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (String, f32) {
     let mut buf = String::new();
@@ -366,7 +366,7 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
                     continue;
                 };
                 let n = c.value().name();
-                // Inline phrasing content belongs to the loose paragraph —
+                // Inline phrasing content belongs to the loose paragraph :
                 // but an inline element wrapping BLOCK children (card
                 // links: <a><h2>…</h2><p>…</p></a>) must not be
                 // swallowed here; the walk emits those blocks itself.
@@ -470,8 +470,8 @@ fn list_items(
     (items, ld)
 }
 
-/// Definition list (dl/dt/dd) — render as
-/// "**term** — definition" list items.
+/// Definition list (dl/dt/dd) : render as
+/// "**term** : definition" list items.
 fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> Vec<String> {
     let mut items = Vec::new();
     let mut current_term: Option<String> = None;
@@ -496,7 +496,7 @@ fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) 
                     continue;
                 }
                 if let Some(term) = &current_term {
-                    items.push(format!("**{term}** — {def}"));
+                    items.push(format!("**{term}** : {def}"));
                 } else {
                     items.push(def);
                 }
@@ -541,7 +541,7 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
         return true;
     }
     // Single-column table of short cells is still layout (indent
-    // spacers, vertical stacks) — but only when it has several rows
+    // spacers, vertical stacks) : but only when it has several rows
     // (a 1×1 data table is degenerate either way).
     max_cols <= 1 && rows >= 2
 }
@@ -669,7 +669,7 @@ pub fn floor_boundary(s: &str, mut i: usize) -> usize {
 }
 
 /// Collapse 3+ consecutive newlines to 2. Source code often
-/// has runs of blank lines between functions — each extra
+/// has runs of blank lines between functions : each extra
 /// blank line wastes a token for zero content value.
 fn collapse_blank_lines(code: &str) -> String {
     let mut out = String::with_capacity(code.len());

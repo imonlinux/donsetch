@@ -2,16 +2,16 @@
 //! actually use (v3 Pillar E).
 //!
 //! Two hooks, one registry:
-//! - [`rewrite`] — fetch-level: some pages have a *better* URL
+//! - [`rewrite`] : fetch-level: some pages have a *better* URL
 //!   (the site's own public JSON endpoint). Rewriting gets
 //!   structured truth in ONE cheap tier-1 request and often
 //!   skips the wall entirely (registry CDNs don't challenge).
-//! - [`extract_json`] / [`extract_html`] — extract-level: pages
+//! - [`extract_json`] / [`extract_html`] : extract-level: pages
 //!   whose HTML the generic pipeline mangles (GitHub issues,
 //!   Stack Exchange QA trees) restructured from the DOM.
 //!
 //! Discipline: every adapter is small, fixture-tested, and
-//! returns `None` on anything it doesn't confidently recognize —
+//! returns `None` on anything it doesn't confidently recognize :
 //! the generic DonSift path is always the fallback. A site
 //! redesign degrades one adapter, never the core.
 //! Kill switch: `DONSETCH_NO_ADAPTERS=1` disables the registry.
@@ -23,14 +23,14 @@ pub mod reddit_json;
 pub mod stackexchange;
 pub mod wiki_infobox;
 
-/// Kill switch — checked once, then cached.
+/// Kill switch : checked once, then cached.
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DONSETCH_NO_ADAPTERS").is_err())
 }
 
 /// Debug capture: `DONSETCH_ADAPTER_DUMP=<dir>` writes every body
-/// an adapter inspects — fixture capture for adapter development.
+/// an adapter inspects : fixture capture for adapter development.
 /// Best-effort, never a failure path.
 fn debug_dump(html: &str, url: &str) {
     let Ok(dir) = std::env::var("DONSETCH_ADAPTER_DUMP") else {
@@ -57,7 +57,7 @@ pub fn rewrite(u: &url::Url) -> Option<(String, &'static str)> {
 
     // ── Reddit: the .json endpoints on old.reddit. ──────────
     // Threads and subreddit listings become structured JSON in
-    // one plain-HTTP GET — no JS shell, no login overlay. Other
+    // one plain-HTTP GET : no JS shell, no login overlay. Other
     // reddit paths (user pages, search) still get the legacy-SSR
     // domain; the HTML extractor or generic path handles those.
     if host == "www.reddit.com" || host == "reddit.com" || host == "old.reddit.com" {
@@ -66,7 +66,7 @@ pub fn rewrite(u: &url::Url) -> Option<(String, &'static str)> {
         let is_thread = path.contains("/comments/");
         let is_listing = path == "/" || path.starts_with("/r/") || path.starts_with("/comments");
         if (is_thread || is_listing) && !path_part.ends_with(".json") {
-            // Keep query (?t=top sorts) — drop fragments only.
+            // Keep query (?t=top sorts) : drop fragments only.
             let mut u2 = u.clone();
             let _ = u2.set_host(Some("old.reddit.com"));
             u2.set_path(&format!("{path_part}.json"));
@@ -133,9 +133,9 @@ pub fn rewrite(u: &url::Url) -> Option<(String, &'static str)> {
     }
     if host == "pkg.go.dev" {
         // /<module path> → Go module proxy. Uppercase paths need
-        // !escaping on the proxy (rare) — skip those, generic
+        // !escaping on the proxy (rare) : skip those, generic
         // handles them. Stdlib paths (no dot in the first
-        // element: /fmt, /net/http) have no proxy module — skip.
+        // element: /fmt, /net/http) have no proxy module : skip.
         let rest = path.strip_prefix('/')?;
         if rest.is_empty() || rest.starts_with("std") {
             return None;

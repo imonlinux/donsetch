@@ -7,7 +7,7 @@ use super::metadata::Meta;
 pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOptions) -> String {
     let mut out = String::new();
 
-    // Frontmatter — compact, agent-first.
+    // Frontmatter : compact, agent-first.
     let first_is_title = kept.first().is_some_and(|b| {
         matches!(b, Block::Heading { level: 1, text, .. }
             if Some(text) == meta.title.as_ref())
@@ -33,7 +33,7 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
     }
     out.push_str(url);
     out.push('\n');
-    // Description as a one-line summary — agents use it to
+    // Description as a one-line summary : agents use it to
     // decide relevance before reading the body. Always surface it
     // (capped): for JS-rendered SPAs the meta description is often
     // the only real content in the initial HTML.
@@ -52,7 +52,7 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
     for block in kept {
         match block {
             Block::Heading { level, text, .. } => {
-                // Skip the H1 that repeats the frontmatter title —
+                // Skip the H1 that repeats the frontmatter title :
                 // but only if the frontmatter title was actually
                 // shown. If first_is_title, the frontmatter was
                 // skipped, so this H1 IS the title display.

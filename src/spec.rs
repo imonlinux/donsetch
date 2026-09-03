@@ -1,4 +1,4 @@
-//! Tool spec table — the single source of truth for the three
+//! Tool spec table : the single source of truth for the three
 //! agent tools (fetch, search, crawl).
 //!
 //! Both frontends are GENERATED from this table:
@@ -72,7 +72,7 @@ pub struct ParamSpec {
     pub kind: ParamKind,
     pub cli: CliKind,
     pub required: bool,
-    /// Description string — used verbatim as the MCP schema
+    /// Description string : used verbatim as the MCP schema
     /// description AND the clap help text. One string, both
     /// interfaces.
     pub help: &'static str,
@@ -83,10 +83,10 @@ pub struct ToolSpec {
     pub name: &'static str,
     /// CLI subcommand (`fetch`).
     pub cli_cmd: &'static str,
-    /// One-liner — `donsetch --help` listing AND the MCP
+    /// One-liner : `donsetch --help` listing AND the MCP
     /// `instructions` blurb sent at initialize.
     pub summary: &'static str,
-    /// Full description — MCP tool description AND CLI long help.
+    /// Full description : MCP tool description AND CLI long help.
     pub description: &'static str,
     pub params: &'static [ParamSpec],
     /// Copy-pasteable CLI examples, shown in `--help` epilog.
@@ -110,7 +110,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Batch mode (array url): total output token budget shared across all results (200-500k). DonSeTch allocates it across pages by size — small pages stay whole, big ones get sliced with a resume note. Without it each page uses max_chars independently.",
+        help: "Batch mode (array url): total output token budget shared across all results (200-500k). DonSeTch allocates it across pages by size : small pages stay whole, big ones get sliced with a resume note. Without it each page uses max_chars independently.",
     },
     ParamSpec {
         name: "focus",
@@ -118,7 +118,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Relevance query — returns ONLY blocks that score against it, cutting tokens 50-80% on long pages. Scoring is BM25 keyword matching; a cross-encoder pass also catches blocks that use different words, but only on pages of 80 blocks or fewer AND only when the rerank model is already cached from prior search use (plain BM25 otherwise, never a download mid-fetch). If nothing matches, returns the full page with a notice. ALWAYS set when you know what you're looking for — #1 token saver.",
+        help: "Relevance query : returns ONLY blocks that score against it, cutting tokens 50-80% on long pages. Scoring is BM25 keyword matching; a cross-encoder pass also catches blocks that use different words, but only on pages of 80 blocks or fewer AND only when the rerank model is already cached from prior search use (plain BM25 otherwise, never a download mid-fetch). If nothing matches, returns the full page with a notice. ALWAYS set when you know what you're looking for : #1 token saver.",
     },
     ParamSpec {
         name: "max_chars",
@@ -142,7 +142,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Heading name (substring, case-insensitive) — return only that section. Use after toc to target a specific part.",
+        help: "Heading name (substring, case-insensitive) : return only that section. Use after toc to target a specific part.",
     },
     ParamSpec {
         name: "toc",
@@ -158,7 +158,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action — never a silent hang. Batch mode: per-URL budget.",
+        help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang. Batch mode: per-URL budget.",
     },
     ParamSpec {
         name: "archive",
@@ -190,7 +190,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "OCR the page's content images (up to 4) and append an 'image text' section. For infographics/comics/screenshots whose meaning IS the image. Costs extra fetch+compute — only when image content matters.",
+        help: "OCR the page's content images (up to 4) and append an 'image text' section. For infographics/comics/screenshots whose meaning IS the image. Costs extra fetch+compute : only when image content matters.",
     },
     ParamSpec {
         name: "must_contain",
@@ -198,7 +198,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Probe mode: verify the page mentions a string/pattern WITHOUT loading it into context. Output = MATCH/NO-MATCH verdict + up to 3 short context excerpts. Case-insensitive substring, or /regex/ (e.g. \"/CVE-2026-\\d+/\"). Full fetch still happens (tiers, walls, PDFs) — only the output collapses. For verification questions, not reading.",
+        help: "Probe mode: verify the page mentions a string/pattern WITHOUT loading it into context. Output = MATCH/NO-MATCH verdict + up to 3 short context excerpts. Case-insensitive substring, or /regex/ (e.g. \"/CVE-2026-\\d+/\"). Full fetch still happens (tiers, walls, PDFs) : only the output collapses. For verification questions, not reading.",
     },
     ParamSpec {
         name: "selector",
@@ -206,7 +206,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "CSS selector — extract only from matching elements. Narrows scope precisely.",
+        help: "CSS selector : extract only from matching elements. Narrows scope precisely.",
     },
     ParamSpec {
         name: "tier",
@@ -214,7 +214,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Enum(&["auto", "1", "2"]),
         cli: CliKind::Flag,
         required: false,
-        help: "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser — fails on JS sites. \"2\" (testing): browser directly — slower, skips HTTP entirely.",
+        help: "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser : fails on JS sites. \"2\" (testing): browser directly : slower, skips HTTP entirely.",
     },
     ParamSpec {
         name: "links",
@@ -222,7 +222,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Include [text](url) link URLs. Default false — saves ~30% tokens. Enable only when you need the URLs.",
+        help: "Include [text](url) link URLs. Default false : saves ~30% tokens. Enable only when you need the URLs.",
     },
     ParamSpec {
         name: "media",
@@ -238,7 +238,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::JsonStr,
         cli: CliKind::Flag,
         required: false,
-        help: "Browser steps to run BEFORE extraction — page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in the headless browser (tier auto/2, never 1); after them the page is extracted normally — focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
+        help: "Browser steps to run BEFORE extraction : page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in the headless browser (tier auto/2, never 1); after them the page is extracted normally : focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
     },
     ParamSpec {
         name: "shot",
@@ -246,7 +246,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "File path — saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
+        help: "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
     },
 ];
 
@@ -320,7 +320,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Relevance query — ranks the frontier by BM25-lite keyword scoring over link text + URL path (site-wide IDF from the map inventory when one exists), then crawls only matching pages. No semantic matching before fetch; a link sharing no token with the query is never enqueued. Fetched pages are then focus-filtered as in web_fetch. Essential for large sites; without it the crawl burns budget on noise.",
+        help: "Relevance query : ranks the frontier by BM25-lite keyword scoring over link text + URL path (site-wide IDF from the map inventory when one exists), then crawls only matching pages. No semantic matching before fetch; a link sharing no token with the query is never enqueued. Fetched pages are then focus-filtered as in web_fetch. Essential for large sites; without it the crawl burns budget on noise.",
     },
     ParamSpec {
         name: "max_pages",
@@ -400,7 +400,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Delta crawl: skip pages you already fetched in the last 24h (fingerprint on file) — only new/changed pages are fetched and counted. Monitoring and re-crawls at a fraction of the cost.",
+        help: "Delta crawl: skip pages you already fetched in the last 24h (fingerprint on file) : only new/changed pages are fetched and counted. Monitoring and re-crawls at a fraction of the cost.",
     },
     ParamSpec {
         name: "resume",
@@ -419,7 +419,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_fetch",
         cli_cmd: "fetch",
         summary: "Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)",
-        description: "Fetch one URL (or a batch) as clean markdown — use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) — returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" — only relevant blocks, 50-80% cheaper.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). structuredContent.changed carries the verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true returns the whole article in one call (≤6 parts, *(part N)* markers).\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] — deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: structuredContent.next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source (labeled via=adapter:... in structuredContent) — no special params, it just returns clean structure.\n\nResponse: content[0].text = markdown; structuredContent = {status, tier, verdict, content_ok, thin, content_kind (Article|Listing|Forum|Docs|Table|Page), quality 0-1, lang, title, changed, fingerprint, via, stitched, prewarmed_by_search, next_offset, tokens_est, ms, escalation (per-step ms trace), url}. content_ok=false or thin=true = possible JS shell. Errors: isError=true with structuredContent {code (stable: wall.challenge, wall.paywall, guard.ssrf, deadline.hit, content.binary, archive.stale, ...), next_action, escalation} — next_action says exactly what to do next",
+        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : only relevant blocks, 50-80% cheaper.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). structuredContent.changed carries the verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true returns the whole article in one call (≤6 parts, *(part N)* markers).\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] : deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: structuredContent.next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source (labeled via=adapter:... in structuredContent) : no special params, it just returns clean structure.\n\nResponse: content[0].text = markdown; structuredContent = {status, tier, verdict, content_ok, thin, content_kind (Article|Listing|Forum|Docs|Table|Page), quality 0-1, lang, title, changed, fingerprint, via, stitched, prewarmed_by_search, next_offset, tokens_est, ms, escalation (per-step ms trace), url}. content_ok=false or thin=true = possible JS shell. Errors: isError=true with structuredContent {code (stable: wall.challenge, wall.paywall, guard.ssrf, deadline.hit, content.binary, archive.stale, ...), next_action, escalation} : next_action says exactly what to do next",
         params: FETCH_PARAMS,
         examples: &[
             "donsetch fetch https://example.com/article",
@@ -432,8 +432,8 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_search",
         cli_cmd: "search",
-        summary: "Web search — 5 keyless engines merged + reranked, or your API keys",
-        description: "Web search — returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint — pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed — silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nSingle-query response: numbered markdown list and structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[...], engines:[...]}. Multi-query response: one Search section per query and structuredContent = {query_count, ok, errors, elapsed_ms, searches:[{query, ...single-query fields}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle — enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
+        summary: "Web search : 5 keyless engines merged + reranked, or your API keys",
+        description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint : pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed : silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nSingle-query response: numbered markdown list and structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[...], engines:[...]}. Multi-query response: one Search section per query and structuredContent = {query_count, ok, errors, elapsed_ms, searches:[{query, ...single-query fields}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
         params: SEARCH_PARAMS,
         examples: &[
             "donsetch search rust async trait objects",
@@ -446,7 +446,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_crawl",
         cli_cmd: "crawl",
         summary: "Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)",
-        description: "Crawl a site from a seed — for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap — see what a site has before committing · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped.\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches — set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory — returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: map (if any) + pages as markdown. structuredContent = {seed, pages:[{url,title,kind,chars,quality}], map, queued, filtered_out, skipped:[{url,reason}], stop, elapsed_s, resume}. stop = FrontierEmpty (done) | MaxPages|CharBudget|DepthLimit|Deadline (budget — resume to continue) | ThrottledOut (site pushed back — wait, then resume) | Cancelled (resume token kept)",
+        description: "Crawl a site from a seed : for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap : see what a site has before committing · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped.\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches : set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory : returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: map (if any) + pages as markdown. structuredContent = {seed, pages:[{url,title,kind,chars,quality}], map, queued, filtered_out, skipped:[{url,reason}], stop, elapsed_s, resume}. stop = FrontierEmpty (done) | MaxPages|CharBudget|DepthLimit|Deadline (budget : resume to continue) | ThrottledOut (site pushed back : wait, then resume) | Cancelled (resume token kept)",
         params: CRAWL_PARAMS,
         examples: &[
             "donsetch crawl https://docs.site.com --topic \"authentication\"",
@@ -592,7 +592,7 @@ fn cli_arg(p: &ParamSpec) -> Arg {
 }
 
 /// Convert parsed CLI matches into the exact JSON args Value
-/// the MCP dispatcher receives. Unset flags are omitted — the
+/// the MCP dispatcher receives. Unset flags are omitted : the
 /// core applies its own defaults (single default source).
 pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
     let mut map = serde_json::Map::new();

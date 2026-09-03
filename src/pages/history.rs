@@ -1,12 +1,12 @@
 //! Page history (v3): fingerprints and diff for re-fetches.
 //!
-//! Every successful fetch records a knowledge fingerprint — the
+//! Every successful fetch records a knowledge fingerprint : the
 //! sha256 of the full pre-pagination markdown. Re-fetching a URL
 //! the agent has seen before answers "did this change?" honestly:
 //!
-//! - `unchanged` — same fingerprint; with `since_last=true` the
+//! - `unchanged` : same fingerprint; with `since_last=true` the
 //!   result collapses to a one-line verdict.
-//! - `changed`/`rewritten` — section-level delta report (added /
+//! - `changed`/`rewritten` : section-level delta report (added /
 //!   removed / changed sections) alongside (or, with since_last,
 //!   instead of) the fresh content.
 //!
@@ -72,7 +72,7 @@ impl PageHistory {
 
     /// Fingerprint of normalized full markdown: whitespace-tail
     /// trimmed (renderers differ on trailing newlines), sha256
-    /// first 12 hex chars — enough to be collision-honest for
+    /// first 12 hex chars : enough to be collision-honest for
     /// change detection, short enough to show agents.
     pub fn fingerprint(markdown: &str) -> String {
         use sha2::Digest;
@@ -258,7 +258,7 @@ pub fn classify_change(old: &str, new: &str) -> ChangeKind {
 }
 
 /// Human/agent-readable section-level delta: which sections were
-/// added, removed, or materially changed. Capped — the report must
+/// added, removed, or materially changed. Capped : the report must
 /// never outweigh the news it delivers.
 pub fn section_delta_report(old: &str, new: &str) -> String {
     let old_sec = split_sections(old);

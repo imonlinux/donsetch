@@ -106,7 +106,7 @@ fn render(
                             buf.push_str(&format!("`{}`", t.replace('`', "'")));
                         }
                     }
-                    // Inline math: recover the LaTeX (`$...$`) —
+                    // Inline math: recover the LaTeX (`$...$`) :
                     // math elements must never be flattened away.
                     "math" => {
                         let l = super::math::latex(c);
@@ -117,7 +117,7 @@ fn render(
                     }
                     // Superscript: keep the content (`^{...}`)
                     // unless it is a wiki-citation marker ([1],
-                    // bare digits) — those are pure token waste.
+                    // bare digits) : those are pure token waste.
                     "sup" => {
                         let t = plain(c);
                         if !t.is_empty() && !is_citation_marker(&t) {
@@ -125,7 +125,7 @@ fn render(
                             *total += t.len();
                         }
                     }
-                    // Subscript: keep the content (`_{...}`) —
+                    // Subscript: keep the content (`_{...}`) :
                     // W<d sub>k</d>, x<sub>0</sub> carry meaning.
                     "sub" => {
                         let t = plain(c);
@@ -143,7 +143,7 @@ fn render(
                     "br" => buf.push('\u{0}'),
                     // Block boundaries inside inline rendering
                     // (multi-paragraph comments, list items): at
-                    // least a space — the words must never fuse.
+                    // least a space : the words must never fuse.
                     "p" | "li" | "div" | "blockquote" => {
                         if !buf.is_empty() && !buf.ends_with(' ') {
                             buf.push(' ');
@@ -166,7 +166,7 @@ fn render(
 /// Render an element's children into a fresh markdown string,
 /// preserving nested inline formatting (links, bold, emphasis).
 /// Used where a formatted element contains other formatted
-/// elements inside it — e.g. `<em>A <strong><a>B</a></strong> C</em>`
+/// elements inside it : e.g. `<em>A <strong><a>B</a></strong> C</em>`
 /// must become `*A **[B](url)** C*`, not the flattened `A B C`.
 struct RenderInner;
 

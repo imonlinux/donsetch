@@ -1,4 +1,4 @@
-//! SERP parsers — one per engine, scraper-based, with
+//! SERP parsers : one per engine, scraper-based, with
 //! layered fallbacks. A parse that yields <3 hits counts
 //! as engine failure (the health system hears about it).
 
@@ -29,7 +29,7 @@ fn sel(css: &str) -> Selector {
 }
 
 /// DDG html endpoint wraps links in /l/?uddg= redirects.
-/// Decode to the real URL — consensus matching depends on
+/// Decode to the real URL : consensus matching depends on
 /// every engine reporting the SAME url.
 fn decode_ddg(href: &str) -> String {
     if let Some((_, q)) = href.split_once("uddg=") {
@@ -79,7 +79,7 @@ fn decode_bing(href: &str) -> String {
         }
     }
     // If this is a bing.com/ck/a stub we couldn't decode,
-    // return empty — the is_serp_url filter and the
+    // return empty : the is_serp_url filter and the
     // starts_with("http") check will drop it.
     if href.contains("bing.com/ck/a") {
         return String::new();
@@ -115,7 +115,7 @@ fn base64url_decode(s: &str) -> Option<String> {
 }
 
 /// Check if a URL is a search engine results page (SERP).
-/// These should never appear as search results — they leak
+/// These should never appear as search results : they leak
 /// through parsers when redirect decoding fails or when
 /// broad selectors match pagination/header links.
 fn is_serp_url(url: &str) -> bool {
@@ -151,7 +151,7 @@ pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
         "brave" => parse_brave(&doc),
         "google" => parse_google(&doc),
         "bing" => parse_bing(&doc),
-        // DDG primary is now lite — the html endpoint serves a
+        // DDG primary is now lite : the html endpoint serves a
         // CAPTCHA challenge to proxy IPs.  parse_ddg (html parser)
         // is kept for the ddg_html fallback engine.
         "ddg" => parse_ddg_lite(&doc),
@@ -178,7 +178,7 @@ pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
 }
 
 /// Google URL unwrapping: Google wraps result URLs in
-/// /url?q=REAL_URL&sa=U&ved=... — extract and decode the
+/// /url?q=REAL_URL&sa=U&ved=... : extract and decode the
 /// real URL. Direct http(s) links pass through unchanged.
 fn decode_google(href: &str) -> String {
     if let Some((_, q)) = href.split_once("/url?") {
@@ -355,16 +355,22 @@ fn parse_brave(doc: &Html) -> Vec<Hit> {
 
 fn parse_bing(doc: &Html) -> Vec<Hit> {
     let items = sel("li.b_algo");
-    // Primary: h2 a; fallback: h2 > a, a.tilk, a[data-h]
-    let link = sel("h2 a, h2 > a, a.tilk, a[data-h]");
+    // Keep the title link and the attribution link separate. A grouped
+    // selector returns matches in document order, not selector-preference
+    // order; Bing places `a.tilk` (site + breadcrumb) before `h2 a`, so the
+    // old grouped selector silently used the breadcrumb as both URL and
+    // title on every result.
+    let title_link = sel("h2 a");
+    let fallback_link = sel("a.tilk, a[data-h]");
     // Primary: .b_caption p; fallback: .b_lineclamp*, [data-text]
     let cap = sel(".b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp4, p[data-text]");
     let h2 = sel("h2");
     let mut hits = Vec::new();
     for (rank, li) in doc.select(&items).enumerate() {
         let Some(a) = li
-            .select(&link)
+            .select(&title_link)
             .next()
+            .or_else(|| li.select(&fallback_link).next())
             .or_else(|| li.select(&sel("a[href]")).next())
         else {
             continue;
@@ -418,7 +424,7 @@ fn parse_ddg(doc: &Html) -> Vec<Hit> {
 }
 
 fn parse_ddg_lite(doc: &Html) -> Vec<Hit> {
-    // Lite: a table — result-link anchors then snippet tds.
+    // Lite: a table : result-link anchors then snippet tds.
     let links = sel("a.result-link");
     let snippets = sel("td.result-snippet");
     let snippet_vec: Vec<String> = doc.select(&snippets).map(text).collect();
@@ -472,7 +478,7 @@ fn parse_mojeek(doc: &Html) -> Vec<Hit> {
 
 /// Yahoo redirect links: r.search.yahoo.com/...RU=REAL_URL
 /// or r.search.yahoo.com/..._url=REAL_URL. Decode to the
-/// real URL — consensus matching depends on every engine
+/// real URL : consensus matching depends on every engine
 /// reporting the SAME url.
 ///
 /// Yahoo embeds tracking parameters (/RK=, /RS=, /RV=) inside
@@ -501,7 +507,7 @@ fn decode_yahoo(href: &str) -> String {
             return strip_yahoo_tracking(&decoded);
         }
     }
-    // Can't decode — return empty so the parser's `starts_with("http")`
+    // Can't decode : return empty so the parser's `starts_with("http")`
     // check filters it out. Previously this returned the raw Yahoo
     // SERP URL, which leaked search.yahoo.com/search?p=... as a result.
     String::new()
@@ -539,12 +545,12 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
         if !url.starts_with("http") {
             continue;
         }
-        let title = text(a);
-        let title = if title.is_empty() {
-            item.select(&h3).next().map(text).unwrap_or_default()
-        } else {
-            title
-        };
+        // Yahoo nests the breadcrumb and the h3 inside the same outer link.
+        // `text(a)` therefore concatenates site name + URL + real title. Use
+        // the dedicated heading first and retain the outer text only as a
+        // fallback for older layouts without an h3.
+        let heading = item.select(&h3).next().map(text).unwrap_or_default();
+        let title = if heading.is_empty() { text(a) } else { heading };
         let snippet = item.select(&cap).next().map(text).unwrap_or_default();
         if !title.is_empty() {
             hits.push(Hit {
@@ -666,5 +672,46 @@ mod tests {
         assert_eq!(hits.len(), 1, "SERP URL should be filtered, got {hits:?}");
         assert_eq!(hits[0].url, "https://doc.rust-lang.org/book");
         assert_eq!(hits[0].title, "The Rust Book");
+    }
+
+    #[test]
+    fn bing_prefers_result_heading_over_earlier_attribution_link() {
+        let html = r#"
+        <html><body><ol>
+          <li class="b_algo">
+            <div class="b_tpcn">
+              <a class="tilk" href="https://www.bing.com/site-attribution">
+                <span>rust-lang.org</span><cite>https://doc.rust-lang.org › book</cite>
+              </a>
+            </div>
+            <h2><a href="https://doc.rust-lang.org/book/">The Rust Programming Language</a></h2>
+            <div class="b_caption"><p>Learn Rust ownership and borrowing.</p></div>
+          </li>
+        </ol></body></html>
+        "#;
+        let hits = parse("bing", html);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "The Rust Programming Language");
+        assert_eq!(hits[0].url, "https://doc.rust-lang.org/book/");
+        assert!(!hits[0].title.contains("https://"));
+    }
+
+    #[test]
+    fn yahoo_extracts_heading_instead_of_outer_link_breadcrumb() {
+        let html = r#"
+        <html><body>
+          <div class="compTitle options-toggle">
+            <a data-matarget="algo" href="https://example.com/ownership">
+              <div><span>Example</span>https://example.com › ownership</div>
+              <h3 class="title"><span>Understanding Ownership</span></h3>
+            </a>
+            <div class="compText"><p>A focused explanation.</p></div>
+          </div>
+        </body></html>
+        "#;
+        let hits = parse("yahoo", html);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Understanding Ownership");
+        assert!(!hits[0].title.contains("https://"));
     }
 }

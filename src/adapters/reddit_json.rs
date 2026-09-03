@@ -2,7 +2,7 @@
 //! structured markdown from the site's own keyless JSON API.
 //!
 //! One plain-HTTP GET replaces the ghost-prone HTML scrape:
-//! comment trees with scores/ages, listings with vote counts —
+//! comment trees with scores/ages, listings with vote counts :
 //! no JS shell, no login overlay. Anything unexpected returns
 //! `None` → the caller falls back to the old.reddit HTML
 //! extractor or generic DonSift.
@@ -204,7 +204,7 @@ fn render_comment(node: &Value, depth: usize, md: &mut String, rendered: &mut us
             if n > 0 {
                 let indent = "  ".repeat(depth.min(MAX_DEPTH));
                 md.push_str(&format!(
-                    "{indent}*(+{n} more replies — deeper thread)*\n\n"
+                    "{indent}*(+{n} more replies : deeper thread)*\n\n"
                 ));
             }
             return;
@@ -311,7 +311,7 @@ fn render_listing(children: &Value) -> String {
             md.push_str(&format!(
                 "{n}. {prefix}**{title}** ({domain}) · {score} pts · u/{author} · {age} · {comments} comments{flair}\n\n"
             ));
-            // Sticky announcements often carry the rules — first
+            // Sticky announcements often carry the rules : first
             // 200 chars of the self-text.
             if sticky
                 && let Some(st) = d.get("selftext").and_then(Value::as_str)

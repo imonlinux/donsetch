@@ -1,4 +1,4 @@
-//! `donsetch stop` — kill orphaned Chrome instances and clean up
+//! `donsetch stop` : kill orphaned Chrome instances and clean up
 //! stale lock files. Use after a crash or when Chrome processes
 //! from a previous session are still resident.
 

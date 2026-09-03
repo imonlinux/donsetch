@@ -1,6 +1,6 @@
-//! `donsetch -u` / `donsetch --update` — self-update from GitHub Releases.
+//! `donsetch -u` / `donsetch --update` : self-update from GitHub Releases.
 //!
-//! **No GitHub API** — uses the public releases.atom RSS feed for
+//! **No GitHub API** : uses the public releases.atom RSS feed for
 //! version detection (served as a regular web page, no rate limits)
 //! and direct release-asset URLs for the download. This keeps the
 //! update path rate-limit-free even for anonymous, unauthenticated
@@ -56,7 +56,7 @@ pub async fn run() {
         }
     };
 
-    // ── Latest version (atom feed — no API, no rate limits) ──
+    // ── Latest version (atom feed : no API, no rate limits) ──
 
     let spinner = cli::Spinner::new("checking for updates...");
     let latest = match fetch_latest_version(&fetcher).await {
@@ -90,7 +90,7 @@ pub async fn run() {
             println!("  No update needed.");
             return;
         }
-        _ => {} // Proceed — version is newer or unparseable.
+        _ => {} // Proceed : version is newer or unparseable.
     }
 
     // ── Platform asset ───────────────────────────────────────
@@ -253,7 +253,7 @@ fn platform_asset_name() -> Option<&'static str> {
 /// so it is NOT subject to the 60-req/hour API rate limit.
 ///
 /// Uses the `<id>` tag (not `<title>`) because release titles can
-/// contain extra text (e.g. "v1.0.0 — Stable Release") that breaks
+/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
 /// semver parsing. The `<id>` tag always ends with `/v<version>`.
 async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases.atom");
@@ -270,7 +270,7 @@ async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
         .find("<entry>")
         .ok_or_else(|| "no releases found in feed".to_string())?;
 
-    // The <id> tag always ends with /v<version> — clean, no extra text.
+    // The <id> tag always ends with /v<version> : clean, no extra text.
     let id_tag = body[entry_pos..]
         .find("<id>")
         .ok_or_else(|| "could not parse feed: no <id> in first entry".to_string())?
@@ -324,7 +324,7 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<Vec<String>, String> {
 /// Replace the running binary with the extracted one.
 ///
 /// **Unix**: copy the new binary to a temp file in the same
-/// directory, then `rename()` — an atomic replace. The running
+/// directory, then `rename()` : an atomic replace. The running
 /// process keeps the old inode open. A backup is saved as
 /// `donsetch.bak`.
 ///
@@ -353,7 +353,7 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "cannot determine binary directory".to_string())?;
 
-    // Borrow as &Path for fs operations — &Path is Copy, so it
+    // Borrow as &Path for fs operations : &Path is Copy, so it
     // won't move and won't trigger clippy::needless_borrows.
 
     #[cfg(unix)]
@@ -368,14 +368,14 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod: {e}"))?;
 
-        // Save backup (copy, not rename — keeps the original in place).
+        // Save backup (copy, not rename : keeps the original in place).
         let bak = exe_dir.join("donsetch.bak");
         if let Err(e) = std::fs::copy(&exe, &bak) {
             // The atomic replace below is still checked; but if the
             // backup copy failed, rollback will be impossible after
-            // the swap — the user must know BEFORE it happens.
+            // the swap : the user must know BEFORE it happens.
             println!(
-                "  {} Warning: backup copy failed ({e}) — rollback will not be possible for this update",
+                "  {} Warning: backup copy failed ({e}) : rollback will not be possible for this update",
                 cli::icon_warn()
             );
         }
@@ -421,7 +421,7 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
 }
 
 /// Remove temp files from a previous interrupted update.
-/// Does NOT remove .bak files — those are managed by replace_binary
+/// Does NOT remove .bak files : those are managed by replace_binary
 /// and needed for rollback. Only cleans up temp artifacts.
 fn cleanup_previous(exe: &Path) {
     let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));

@@ -5,6 +5,301 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **BYOK search plugins:** platforms without a native adapter can
+  now be hooked through any user-registered executable that
+  answers a tiny stdin/stdout JSON contract (format 1:
+  `{query, max_results, intent, deadline_ms}` in,
+  `{results:[{title,url,snippet?,score?}], degraded?}` out).
+  Register with `donsetch keys add plugin <name> --cmd '...'
+  [--timeout N] [--test]`; the plugin then joins the same default
+  provider / fallback chain as natively supported keys, with
+  attribution, dedup, and rerank handoff unchanged. Any language
+  works. Reliability is enforced on our side: direct exec (never
+  a shell, argv tokenized once at registration), hard per-plugin
+  timeout with SIGKILL + kill-on-drop (MCP cancellation can never
+  orphan a child), 8 MiB stdout / 64 KiB stderr caps, overflow
+  kill, concurrent stderr draining (no pipe deadlocks), one
+  attempt per call with honest errors, graceful fallback. Names
+  are validated against native providers, keyless engine ids and
+  "local". New doctor check reports registration state and warns
+  on missing program files; `keys list` renders the plugin
+  section; `keys default` accepts plugin names. Native support
+  for big/keyed providers keeps coming - plugins are the bridge
+  for everything else. (README BYOK plugins section documents the
+  contract.)
+
+## [3.5.1] - 2026-09-03
+
+### Added
+
+- **Bright Data connection UX and diagnostics:** `donsetch keys add
+  unlocker|brightdata` now validates the key and zone shape at add
+  time and prints the active zone; `donsetch doctor --deep` adds a
+  FREE live zone probe (the route_ips endpoint validates token +
+  zone before the first paid call) and the default doctor shows
+  the daily-cap usage, solve-cache state and kill-switch state for
+  the solver and the SERP key state.
+
+- **SerpBase as a BYOK search provider (PR #109, gefsikatsinelou):**
+  Google SERP via serpbase.dev with the X-API-Key auth their docs
+  specify, business-status envelope handling (1001 unauthorized
+  marks the key dead so rotation moves on), organic-result mapping
+  with position-derived relevance, and the same error
+  classification as the other providers. No dependency additions;
+  nothing changes when the key is absent. Closes #94.
+
+### Fixed
+
+- **Bright Data solver errors were bare status codes; the jar was
+  behind the current API contract:** every failure class the paid
+  tier can produce is now typed (api/network/config/solve/internal)
+  with a recovery hint attached to the fetch escalation trace.
+  `parse_response` reads the CURRENT contract (x-brd-status-code /
+  x-brd-error-code / x-brd-error response headers, legacy JSON
+  fields still accepted), zone-not-found is classified as a fixable
+  config problem instead of a generic API error, 403 policy blocks
+  no longer mark a healthy key dead, transient solve classes named
+  retry-friendly by the docs get one automatic retry (failures are
+  never billed twice), and the solve timeout default now sits
+  inside Bright Data's documented 30-150s unlock window. Solve-cache
+  v2 stores bodies byte-exact (v1's lossy UTF-8 round trip could
+  corrupt binary bodies on a cache hit), the parallel-gate map is
+  pruned so a long-lived daemon does not leak one mutex per URL,
+  and stale daily counters are cleaned up. BD SERP queries now
+  percent-encode UTF-8 correctly (non-ASCII queries were mangled
+  before). Proven end to end by a six-test live suite over a fake
+  Bright Data API (tests/bypass_live.rs).
+
+- **pi-extension: startup banner corrupted the viewport:** the
+  `[donsetch] N tools registered: ...` line printed on every
+  `session_start` via a raw `process.stderr.write`, which bypasses
+  pi's TUI paint cycle. Under parallel background agents each
+  process's banner interleaved with the others on the same screen,
+  producing garbled repeated lines above the status bar. Now gated
+  behind `DONSETCH_DEBUG`/`DEBUG`, matching the existing gate on the
+  daemon's forwarded stderr diagnostics (issue #95) so a normal
+  session prints nothing.
+
+- **Secure cookies could replay over plain HTTP (security):** the
+  tier-1 jar dropped the `Secure` attribute at both ingresses:
+  bare `Secure` tokens from `Set-Cookie` never matched the
+  key=value-only attribute parser, and the tier-2 harvest import
+  read the real flag from the browser record but discarded it.
+  A cookie set `Secure` on an HTTPS visit was replayed on later
+  plain-`http://` requests to the same host, exposing the session
+  to any passive network observer. Reported privately by mnaza
+  via the GitHub security advisory flow (own draft advisory, will
+  be published with the patched release). The jar now: stores the
+  `Secure`, `HttpOnly` and `SameSite` attributes including bare
+  tokens; rejects a Secure cookie arriving over plain HTTP;
+  refuses to attach Secure cookies to non-HTTPS requests (both
+  the fetch loop and the CDP-harvest import path); enforces the
+  `__Secure-`/`__Host-` prefix rules and `SameSite=None requires
+  Secure`; and round-trips the real flags through the snapshot
+  handoff. Proven by a live socket regression test that fails on
+  the old code (a setup server's Secure cookie got replayed in
+  cleartext) and passes now, plus unit coverage for every
+  ingress and gate.
+
+- **Windows rooted-without-drive archive paths passed the cloak
+  extraction guard (PR #98, mnaza):** `safe_member` used
+  `is_absolute()`, which Windows defines as root plus drive
+  prefix: an archive entry like `/tmp/...` or `\tmp\...` has a
+  root but no prefix, reported not-absolute, and could escape the
+  extraction root when joined. The guard now uses `has_root()`
+  (identical semantics on Unix), with the regression case pinned
+  in the traversal test. The screenshot path resolver got the same
+  `has_root()` treatment so its first line of defense matches
+  reality instead of relying on the canonical-frame check further
+  down.
+- **PathBuf import now gated by x86_64 flag (PR #104):** this import
+  was used only on x86_64 and caused clippy errors on other architectures.
+- **Bing result cards could expose attribution links as results (PR #99):**
+  grouped selectors followed document order and could choose the breadcrumb
+  anchor before the actual heading. Bing parsing now prefers the `h2` result
+  link while retaining the existing fallback selectors.
+- **Requested table-of-contents output could be replaced by page text
+  (PR #101):** content-rescue paths treated a compact outline as a failed
+  extraction on long pages. A completed TOC projection now returns directly
+  instead of falling through to body-oriented rescue.
+- **Short PDFs could be mislabeled as HTML application shells (PR #102):**
+  downstream shell heuristics could mark valid, compact PDF output as thin
+  and suggest browser rendering. Documents already identified through PDF
+  page metadata now bypass HTML-only shell classification.
+- **Tracking parameters split identical search results during URL
+  deduplication (PR #103):** normalized URL keys retained analytics
+  identifiers such as `utm_*`, `gclid`, `fbclid`, and `msclkid`, so the same
+  page could appear as distinct candidates. Deduplication now drops a
+  conservative set of known tracking keys while preserving meaningful query
+  parameters, ordering, and encoding. (changelog: document tracking-parameter deduplication)
+- **Yahoo result titles included breadcrumb and URL text (PR #100):**
+  result cards can wrap their breadcrumb and heading in one outer link, so
+  reading the whole anchor produced noisy titles. Yahoo parsing now extracts
+  the dedicated heading first and keeps the outer text as a fallback.
+- **PDF bookmark titles carried two trailing NUL characters:**
+  `FPDF_GetMetaText`/`FPDFBookmark_GetTitle` report their length in bytes
+  (including the UTF-16 NUL terminator), but the decode call was treating
+  that count as UTF-16 units, a mismatch that read past the real string
+  into the buffer's zero-initialized slack. `get_meta`'s output was
+  unaffected (it already strips all `'\0'` chars), but every extracted
+  outline/bookmark title picked up two invisible trailing NULs. Both call
+  sites now convert bytes to units first, matching the sibling
+  `field_string` helper in `forms.rs`, which already did this correctly.
+- **A stray HTTP/2 RST_STREAM could abort the wrong request on a
+  reused connection:** every other per-stream frame type (HEADERS,
+  CONTINUATION, DATA) in the h2 read loop is scoped to the current
+  stream id, but RST_STREAM matched any stream id. On a pooled,
+  reused connection, a late RST_STREAM for an already-finished prior
+  stream would abort a completely unrelated new request in flight.
+  Also: the RST_STREAM sent to refuse a PUSH_PROMISE (a spec
+  violation, since we advertise `ENABLE_PUSH=0`) carried the wrong
+  payload: the current request's own stream id instead of a 4-byte
+  HTTP/2 error code (RFC 7540 §6.4); it now sends `REFUSED_STREAM`.
+
+
+## [3.5.0] - 2026-09-01
+
+### Added
+
+- **Session vault: logins survive daemon restarts, crashes, and a
+  `kill -9`.** Every tier-2 run now harvests login/session cookies
+  (after actions/solve fetches, and again at reap time) into
+  `ghost-state.json`: junk-filtered, deduped, capped, atomic write
+  like the rest of the state file. Every browser launch replants
+  them before the first navigation, batch CDP call with a
+  per-cookie fallback for older builds. A session established today
+  is still there next week, even if the daemon died hard in
+  between. Live-verified three ways: cookie + Local Storage across
+  separate processes; a full freeze -> reap -> relaunch cycle in
+  one daemon; and with Chromium's Cookies DB file deleted outright
+  while the session still came back from the vault.
+
+### Fixed
+
+- **Xvfb startup race and misleading diagnostics (issue #95):**
+  concurrent sessions racing for the shared display could kill each
+  other's Xvfb via the stale-cleanup pkill, degrade to headful
+  off-screen, and blame the package manager. Startup is now
+  serialized through a create_new gate: one coordinator, everyone
+  else reuses the winner's display. A present binary that exits
+  early surfaces its own last stderr line, never an install hint;
+  the reporter's fake-Xvfb repro is a regression test. Stale gates
+  self-heal after 30s. `DONSETCH_XVFB_DISPLAY` overrides the display
+  number for multi-daemon hosts.
+- **Windows profile lock stealable from a live daemon (PR #97,
+  mnaza):** the lockfile mtime was set once at creation, so every
+  lock older than 10 minutes looked stale and could be deleted out
+  from under a still-running daemon: a second process would then
+  claim the same profile. The lock now heartbeats every 120s, and
+  the stale window has three heartbeats of margin; the heartbeat is
+  aborted before removal in Drop.
+- **pi extension stderr noise:** raw MCP stderr forwarding put every
+  non-fatal daemon warning into pi's TUI as a popup. Only crash or
+  fatal lines surface now; `DONSETCH_DEBUG`/`DEBUG` restores full
+  forwarding.
+
+### Changed
+
+- **Browser version reporting is the real build:** version probing
+  is cached (one spawn per binary per process, was one per ghost
+  launch), and the full dotted build now flows through resolution
+  into `doctor`, `status`, and backend descriptions instead of a
+  padded major.
+- **CloakBrowser launches keep the stealth that matters:** the
+  extension/plugin and default-app disabling flags are dropped for
+  the cloak backend only, so its C++-level plugin enumeration
+  patches stay effective; stock Chromium keeps the hardened flags.
+
+
+- **prebuilts refused to start on Ubuntu 22.04 LTS (issue #93):**
+  the release legs built on a glibc 2.39 runner, so both npm and
+  GitHub release binaries demanded `GLIBC_2.39` and every 22.04
+  host died at first launch. Linux legs now build on
+  ubuntu-22.04 (glibc 2.35 baseline), pinned to lld (bfd 2.38
+  chokes on rustc 1.98's `.crel` relocations), and a new hard CI
+  gate objdumps the built bytes and fails the release if any
+  symbol exceeds 2.35: a regressed glibc leak now dies in CI,
+  not on a user's VM. README carries the verified build recipe.
+- **Session vault discipline:** replay and reap-harvest ride ONLY
+  the shared profile, so a temp-profile divergence run can never
+  borrow or overwrite the canonical session (a vendor that binds
+  sessions to fingerprints would see one login on two profiles);
+  tier 1 boots with the vault at daemon start, so a JS-less domain
+  gets an authenticated plain-HTTP fetch on the first request
+  after a restart; plain renders harvest too, not just solve and
+  actions.
+- **Cookie harvests could stall a finished fetch:** solve and
+  actions harvested with the 20s generic CDP timeout, so a wedged
+  browser added a 20s tail to a completed response. All harvest
+  sites now carry explicit 3-5s bounds and degrade to no-vault
+  instead of stalling.
+- **Crawl renders kept their cookies to themselves:** a login set
+  during a crawl's JS-render now lands in the session vault and
+  the tier-1 jar like every other tier-2 flow.
+- **Windows daemon collision on the shared profile:** two
+  daemons fought Chromium's singleton and the loser died without a
+  DevTools line. A create_new profile lockfile now mirrors the
+  unix flock: the loser diverges to a temp profile, and a stale
+  lock left by a dead daemon recovers by age (10 min).
+- **Windows profile lockfile could be stolen out from under a live
+  daemon:** the lockfile's mtime was never refreshed after
+  creation. Windows kills the Ghost on every guard drop (unlike
+  Linux/Xvfb's warm-freeze path), so the lock is normally held for
+  one call's duration : but a single long `actions` script (up to
+  16 steps, each wait capped at 60s) can legitimately outlast the
+  10-minute staleness window while the Ghost is nowhere near dead.
+  A second daemon starting mid-call would see the un-refreshed
+  mtime, mistake the still-live holder for abandoned, and steal the
+  profile : the exact collision the lock exists to prevent. The
+  lockfile's mtime now gets refreshed every 2 minutes for as long
+  as a Ghost holds it, opened with FILE_SHARE_DELETE so the
+  refresh can never block cleanup on exit.
+- **CloakBrowser archive extraction didn't reject rooted paths on
+  Windows:** `safe_member()`'s traversal guard used `is_absolute()`,
+  which requires a drive prefix on Windows: a path like
+  `/tmp/chrome` has a root but no prefix, so `is_absolute()` is
+  false there even though joining it onto the extraction dir still
+  escapes it (Windows path-join semantics replace everything past
+  the prefix for any rooted push). Practical impact is narrow: the
+  archive's hash is checked against a manifest that is itself
+  Ed25519-signed and verified against a public key pinned in this
+  binary, before extraction ever starts: exploiting this needs a
+  compromise of that signing key or release process, not just an
+  untrusted archive. Switched the
+  guard to `has_root()`, which `is_absolute()` is itself defined as
+  on Unix (no behavior change there) and is the correct, broader
+  check on Windows.
+- **Browser fingerprint noise:** the ghost no longer runs Chrome
+  default apps or extensions, killing the surprise-component
+  detection class (enumerable extensions, default-app traffic)
+  without touching the browser surface sites actually check.
+- **Ghost reap used to discard the session's newest cookies (and
+  could eat a login).** The reap SIGKILLed the process group with
+  no shutdown handshake, so the cookie checkpoint Chromium only
+  makes on clean exit never hit disk. Reap now thaws, harvests the
+  session vault, sends `Browser.close`, waits a bounded 6s for the
+  clean exit, and only then falls back to the hard kill. Same CDP
+  path on all three platforms. A profile's Cookies DB that had
+  sat untouched since 2026-08-30 now checkpoints on every exit.
+- **selftest pages littered the persistent browser profile** when
+  a daemon died mid-check; they now live in the system temp dir.
+- **Seven std mutex lock sites still panicked the daemon if the
+  lock was poisoned** (panic = abort build): converted to the same
+  poison-safe pattern as the earlier sweep.
+- **`focus_match` compound-term check crossed word boundaries:** the
+  crawl frontier's hard focus gate matched a compound query term
+  (e.g. `auto-complete`) against any URL/anchor text containing it
+  as a raw substring, so `auto-completed` (a different word once
+  stemming strips `-ed`) falsely counted as a match. The full-form
+  check is now a contiguous token-subsequence match instead of a
+  string `contains`, closing the same word-boundary gap the
+  existing fragment-based check (added in v2.3.1) already guarded
+  against.
+
 ## [3.4.4] - 2026-08-31
 
 ### Added
@@ -22,7 +317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tbm=nws` for news.
 - **Brave Search API BYOK provider:** `donsetch keys add bravesearch <key>`
   wires up the official, keyed
-  [Brave Search API](https://api.search.brave.com) — distinct from
+  [Brave Search API](https://api.search.brave.com) : distinct from
   the existing keyless `brave` SERP scraper. Uses a dedicated news
   endpoint for news-intent queries.
 - **Playwright-managed Chromium discovery (issue #84):** the browser
@@ -31,6 +326,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PLAYWRIGHT_BROWSERS_PATH` and `XDG_CACHE_HOME`, and does it via
   one shared helper on all three platforms. The headless-shell
   registry stays excluded on purpose (strictly weaker CDP target).
+- **Selectable browser backend:** `DONSETCH_BROWSER_BACKEND` now supports
+  `chromium` for the original shipped behavior, `headless` to force the
+  original Chromium binary into `--headless=new`, and `cloakbrowser` for the
+  CloakBrowser backend. `auto` (the default) keeps the shipped Chromium
+  behavior; CloakBrowser runs only after explicit backend selection, and
+  downloads stay opt-in via `DONSETCH_CLOAK_AUTO_DOWNLOAD=1`.
+- **Explicit CloakBrowser backend:** DonGhost resolves Chromium versus
+  CloakBrowser explicitly, accepts `CLOAKBROWSER_BINARY_PATH` without network
+  access, and supports opt-in (`DONSETCH_CLOAK_AUTO_DOWNLOAD=1`) public binary
+  installation with signed-manifest, version, checksum, and archive-path
+  verification. Source/path/version and deep fingerprint status are visible in
+  `doctor` and `status`; CloakBrowser payloads remain outside releases and
+  Docker images.
 
 ### Fixed
 
@@ -50,7 +358,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before fetch, hard no-shared-token gate at enqueue.
 - **macOS build broken by the Playwright-discovery change above:**
   `known_chrome_paths()` on macOS referenced an undefined `paths`
-  variable (`E0425`) — the hardcoded-app-bundle list's `.collect()`
+  variable (`E0425`) : the hardcoded-app-bundle list's `.collect()`
   was never bound to a `let`, so the build failed on every macOS
   target. Also un-broke `playwright_discovers_chrome_linux64_layout`,
   which wasn't OS-gated and failed on Windows/macOS CI runners since
@@ -162,11 +470,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **First-ever model download aborted the process:** OCR and rerank models download lazily on first use, but the download used `reqwest::blocking` on the calling thread — which on first use is a tokio runtime thread (the async search path for rerank, async fetch paths for OCR). `reqwest::blocking` panics there by design, and release builds carry `panic = "abort"`, so a fresh install's first search or first scanned PDF killed the daemon instead of fetching the model. Invisible on any machine with a warm model cache, which is why it survived. Downloads now run on a dedicated plain thread joined by the caller; timeouts and verification are unchanged. (PR #72, @Mart-Bogdan)
+- **First-ever model download aborted the process:** OCR and rerank models download lazily on first use, but the download used `reqwest::blocking` on the calling thread : which on first use is a tokio runtime thread (the async search path for rerank, async fetch paths for OCR). `reqwest::blocking` panics there by design, and release builds carry `panic = "abort"`, so a fresh install's first search or first scanned PDF killed the daemon instead of fetching the model. Invisible on any machine with a warm model cache, which is why it survived. Downloads now run on a dedicated plain thread joined by the caller; timeouts and verification are unchanged. (PR #72, @Mart-Bogdan)
 
-- **OCR and rerank silently dead on Windows and macOS arm64 since 3.3.0:** 3.3.0 intended to confine `ort`'s `load-dynamic` to Linux and keep macOS/Windows on static linking, but declared `ort` in the shared `[dependencies]` table *and* in a `cfg(not(target_os = "linux"))` table. Cargo unions features across every target section whose cfg matches rather than choosing one, so `load-dynamic` reached macOS and Windows too, where it wins over static linking. It also implies `ort-sys/disable-linking`, whose build script returns before downloading anything and before `copy-dylibs` runs — so the binaries shipped with ONNX Runtime neither linked in nor present beside them, and no build-time error. Nothing failed loudly at runtime either: OCR reported scanned pages as `no text layer and OCR did not recover them` instead of reading them, and search dropped to RRF+BM25 after a 30s reranker init timeout, memoized for the process lifetime. Visible in the shipped artifacts — `donsetch-win32-x64`'s binary fell from 35.6MB to 16.3MB and `donsetch-darwin-arm64` from 14.2MB to 8.3MB, the missing ~19MB and ~6MB being the ONNX static archive. Fixed by declaring `ort` only in two mutually exclusive target sections, never in the shared one. Linux keeps `load-dynamic` and its AVX gate unchanged. Verified on Windows 11 and Windows 10 22H2: OCR restored to 98% mean confidence on the issue #26 PDF, reranker initializes, cold-start search back to ~3s. (PR #68, @Mart-Bogdan)
+- **OCR and rerank silently dead on Windows and macOS arm64 since 3.3.0:** 3.3.0 intended to confine `ort`'s `load-dynamic` to Linux and keep macOS/Windows on static linking, but declared `ort` in the shared `[dependencies]` table *and* in a `cfg(not(target_os = "linux"))` table. Cargo unions features across every target section whose cfg matches rather than choosing one, so `load-dynamic` reached macOS and Windows too, where it wins over static linking. It also implies `ort-sys/disable-linking`, whose build script returns before downloading anything and before `copy-dylibs` runs : so the binaries shipped with ONNX Runtime neither linked in nor present beside them, and no build-time error. Nothing failed loudly at runtime either: OCR reported scanned pages as `no text layer and OCR did not recover them` instead of reading them, and search dropped to RRF+BM25 after a 30s reranker init timeout, memoized for the process lifetime. Visible in the shipped artifacts : `donsetch-win32-x64`'s binary fell from 35.6MB to 16.3MB and `donsetch-darwin-arm64` from 14.2MB to 8.3MB, the missing ~19MB and ~6MB being the ONNX static archive. Fixed by declaring `ort` only in two mutually exclusive target sections, never in the shared one. Linux keeps `load-dynamic` and its AVX gate unchanged. Verified on Windows 11 and Windows 10 22H2: OCR restored to 98% mean confidence on the issue #26 PDF, reranker initializes, cold-start search back to ~3s. (PR #68, @Mart-Bogdan)
 
-- **Loud failure for `--http` without the feature.** In a binary built without the `http` cargo feature (the linux-arm64 and macOS-x64 prebuilts, and any plain `cargo build`), `donsetch mcp --http` and `DONSETCH_TRANSPORT=http` silently fell through to stdio — a client configured for HTTP would hang waiting on a listener that never came up. Both paths now exit immediately with an error naming the missing cargo feature and how to get a binary that includes it. (PR #71, @imonlinux; issue #67)
+- **Loud failure for `--http` without the feature.** In a binary built without the `http` cargo feature (the linux-arm64 and macOS-x64 prebuilts, and any plain `cargo build`), `donsetch mcp --http` and `DONSETCH_TRANSPORT=http` silently fell through to stdio : a client configured for HTTP would hang waiting on a listener that never came up. Both paths now exit immediately with an error naming the missing cargo feature and how to get a binary that includes it. (PR #71, @imonlinux; issue #67)
 
 - **Docs: HTTP transport interface.** The README documented flags and env vars that do not exist (`--bind`, `--token`, `DONSETCH_HTTP_BIND`, `DONSETCH_HTTP_CORS=*`). Replaced with the real interface (`--host`/`--port`, `DONSETCH_HTTP_HOST`/`_PORT`/`_TOKEN`/`_TIMEOUT_SECS`, `DONSETCH_HTTP_CORS=1`), a build-requirement note (`http` is an optional cargo feature; the linux-arm64/macOS-x64 prebuilts are core-only), corrected feature-flag notes, and a Gotchas row for requesting `--http` when the build lacks the feature. (PR #69, @imonlinux; issue #66)
 
@@ -176,7 +484,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`src/onnx.rs` module docs rewritten:** a per-target map and the rule that `ort` must stay in per-target tables now lead; below them, reference sections on how ONNX is acquired and linked on each platform, a postmortem of how the 3.3.0 feature leak stayed silent, and why Windows links `DirectML.dll` without ever calling it. (PR #68, @Mart-Bogdan)
 
-- **README gotchas:** documented that Windows needs `DirectML.dll` present at startup (in-box since Windows 10 1903, version irrelevant, `0xC0000135` and no output when missing — and never harvest a copy from another machine's `System32`, which fails just as silently with `0xC0000142`), and that OCR/rerank models are downloaded on first use rather than bundled, with their cache locations and how to pre-seed an offline machine. (PR #68, @Mart-Bogdan)
+- **README gotchas:** documented that Windows needs `DirectML.dll` present at startup (in-box since Windows 10 1903, version irrelevant, `0xC0000135` and no output when missing : and never harvest a copy from another machine's `System32`, which fails just as silently with `0xC0000142`), and that OCR/rerank models are downloaded on first use rather than bundled, with their cache locations and how to pre-seed an offline machine. (PR #68, @Mart-Bogdan)
 
 - **Dev/test loop redesign:** new `ci` cargo profile (release optimizations, no fat LTO, `panic = "abort"` inherited) makes the 111-binary test suite link in seconds instead of minutes; switched to cargo-nextest (parallel, fail-fast locally, full failure set in CI); added `Justfile` recipes (`just check`/`test`/`lint`/`all`/`bin`/`smoke`) that collapse the previous multi-command grind into a ~4-second warm pre-push gate. Warm local iteration after a code edit: ~1m45s full gate, ~57s binary (was 8-15 min). The shipped binary keeps full fat LTO via `--release` at release time.
 
@@ -185,7 +493,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **HTTP transport in the Docker image.** The image now builds `--features ocr,rerank,http` (matching the linux-x64/macOS-arm64/Windows-x64 release binaries), `EXPOSE`s 8765, and the bundled compose file gains an opt-in `http` profile: `docker compose --profile http up -d donsetch-http` serves MCP at `http://localhost:8765/mcp` with a listener-based healthcheck. The profiled service carries its own `build:` block (it builds the image if it isn't there yet) and `restart: unless-stopped` (Docker-level crash recovery — the HTTP transport has no in-process supervisor). The port is published on `127.0.0.1` by default so an unset `DONSETCH_HTTP_TOKEN` never exposes unauthenticated MCP to the LAN. The stdio service is unchanged. (PR #70, @imonlinux)
+- **HTTP transport in the Docker image.** The image now builds `--features ocr,rerank,http` (matching the linux-x64/macOS-arm64/Windows-x64 release binaries), `EXPOSE`s 8765, and the bundled compose file gains an opt-in `http` profile: `docker compose --profile http up -d donsetch-http` serves MCP at `http://localhost:8765/mcp` with a listener-based healthcheck. The profiled service carries its own `build:` block (it builds the image if it isn't there yet) and `restart: unless-stopped` (Docker-level crash recovery : the HTTP transport has no in-process supervisor). The port is published on `127.0.0.1` by default so an unset `DONSETCH_HTTP_TOKEN` never exposes unauthenticated MCP to the LAN. The stdio service is unchanged. (PR #70, @imonlinux)
 
 - **`--links`/`--media` flags for `dev extract`:** expose `include_links` and `include_media` on the local-file extraction command, matching the `links`/`media` parameters of the `fetch` tool. Both default off (token savers), so link/media rendering issues could not be reproduced offline before. The usage line now also documents the existing `--url` flag. (PR #75, @Mart-Bogdan)
 
@@ -316,14 +624,14 @@ The search-legibility release: signals the merge already computed now reach the 
 
 ### Changed
 
-- **Snippets are 200 chars, cut on a word boundary.** 120 ended mid-word almost every time — `sequence transduc`, `All You Nee`, `the attention ` on a live query. The cost was not lost context but a wasted `web_fetch` to learn what the snippet nearly said. The cut trims back rather than extending, so output stays bounded by the budget; if the character past the window is whitespace the window already ends cleanly and is kept whole; backing off is abandoned when it would cost more than a fifth of the budget, since a long URL or an unbroken CJK run would otherwise strip the snippet to nothing. The ellipsis is appended only when text was actually dropped, so it never promises content that does not exist. Trailing marks that join clauses (`, ; : 、 ， 「 《 【`) are removed before it; sentence terminators (`. ! ? 。！？`, shared codepoints across Chinese and Japanese) stay, because a cut landing after one means the snippet ended on a complete sentence. (#40, @Mart-Bogdan)
-- **Each result names the engines behind it**, with its blended score: `engines: bing, ddg · score: 0.83`. Which indexes agreed is what separates two equally plausible results — independent engines converging usually means canonical, a lone vertical hit often means tangential — and it was previously visible only in `structuredContent`. Names rather than a count: `consensus` there is `sources.len()`, which double-counts an engine that returned the URL at two ranks, while ranking counts index families. Deduped names are the honest version, and say *which* source. (#40, @Mart-Bogdan)
+- **Snippets are 200 chars, cut on a word boundary.** 120 ended mid-word almost every time : `sequence transduc`, `All You Nee`, `the attention ` on a live query. The cost was not lost context but a wasted `web_fetch` to learn what the snippet nearly said. The cut trims back rather than extending, so output stays bounded by the budget; if the character past the window is whitespace the window already ends cleanly and is kept whole; backing off is abandoned when it would cost more than a fifth of the budget, since a long URL or an unbroken CJK run would otherwise strip the snippet to nothing. The ellipsis is appended only when text was actually dropped, so it never promises content that does not exist. Trailing marks that join clauses (`, ; : 、 ， 「 《 【`) are removed before it; sentence terminators (`. ! ? 。！？`, shared codepoints across Chinese and Japanese) stay, because a cut landing after one means the snippet ended on a complete sentence. (#40, @Mart-Bogdan)
+- **Each result names the engines behind it**, with its blended score: `engines: bing, ddg · score: 0.83`. Which indexes agreed is what separates two equally plausible results : independent engines converging usually means canonical, a lone vertical hit often means tangential : and it was previously visible only in `structuredContent`. Names rather than a count: `consensus` there is `sources.len()`, which double-counts an engine that returned the URL at two ranks, while ranking counts index families. Deduped names are the honest version, and say *which* source. (#40, @Mart-Bogdan)
 
 ### Fixed
 
-- **Whitespace in titles and snippets is collapsed at merge.** HTML-scraped engines normalized already; JSON-sourced hits did not — MDN summaries, BYOK provider snippets (Exa returns raw page text) and GitHub descriptions arrived with embedded newlines, breaking the three-space indent of the markdown list. Normalizing once in `rank::merge`, the single point every source flows through, also fixes the "longest snippet wins" and "shortest clean title wins" comparisons, which previously ranked on whitespace count: a newline-padded short snippet could beat a genuinely longer one. (#40, @Mart-Bogdan)
-- **Clippy only ever linted Linux, and only lib and bins.** The ~32 `#[cfg(windows)]` sites — all of `ghost/proc.rs` — were never compiled by the lint pass, and neither were the 50 `#[cfg(test)]` modules or `tests/*.rs`, which the default lib+bins pass skips. Clippy now runs on Windows as well, with `--all-targets`. macOS stays out deliberately: its only exclusive site is one `target_os = "macos"` block, everything else being `unix` (shared with Linux) or `not(linux_like)` (shared with Windows), so Linux+Windows already covers it.
-- **`rust-toolchain.toml` pins the local toolchain to 1.98**, matching the CI/release pin. v3.0.0 pinned the CI side to end local-vs-CI clippy drift, but nothing pinned the contributor's side, so a local clippy of a different version reports a different lint set — findings that CI does not have, and misses that it does.
+- **Whitespace in titles and snippets is collapsed at merge.** HTML-scraped engines normalized already; JSON-sourced hits did not : MDN summaries, BYOK provider snippets (Exa returns raw page text) and GitHub descriptions arrived with embedded newlines, breaking the three-space indent of the markdown list. Normalizing once in `rank::merge`, the single point every source flows through, also fixes the "longest snippet wins" and "shortest clean title wins" comparisons, which previously ranked on whitespace count: a newline-padded short snippet could beat a genuinely longer one. (#40, @Mart-Bogdan)
+- **Clippy only ever linted Linux, and only lib and bins.** The ~32 `#[cfg(windows)]` sites : all of `ghost/proc.rs` : were never compiled by the lint pass, and neither were the 50 `#[cfg(test)]` modules or `tests/*.rs`, which the default lib+bins pass skips. Clippy now runs on Windows as well, with `--all-targets`. macOS stays out deliberately: its only exclusive site is one `target_os = "macos"` block, everything else being `unix` (shared with Linux) or `not(linux_like)` (shared with Windows), so Linux+Windows already covers it.
+- **`rust-toolchain.toml` pins the local toolchain to 1.98**, matching the CI/release pin. v3.0.0 pinned the CI side to end local-vs-CI clippy drift, but nothing pinned the contributor's side, so a local clippy of a different version reports a different lint set : findings that CI does not have, and misses that it does.
 
 ## [3.1.0] - 2026-08-23
 
@@ -345,87 +653,87 @@ The focus release: the `focus` parameter rebuilt from flat BM25 block scoring to
 
 ## [3.0.0] - 2026-08-23
 
-The context-warfare release: six milestones — reference handles, budgets, probe and structure-first reading (M1); deadlines, real cancellation and ms-precision costs (M2); page fingerprints, deltas, Wayback resurrection and anti-cloak (M3); keyless domain adapters for reddit/npm/PyPI/crates/Go/RubyGems/GitHub/StackExchange/Wikipedia/docs frameworks (M4); search→fetch warm handoff, stitching and Chrome-parity TLS (M5); stable error codes, CI token/memory gates, a crash-only supervisor and the pi-agent v3 extension (M6). Plus a community fix for a Windows tier-1 boot hang (#36, @problaems).
+The context-warfare release: six milestones : reference handles, budgets, probe and structure-first reading (M1); deadlines, real cancellation and ms-precision costs (M2); page fingerprints, deltas, Wayback resurrection and anti-cloak (M3); keyless domain adapters for reddit/npm/PyPI/crates/Go/RubyGems/GitHub/StackExchange/Wikipedia/docs frameworks (M4); search→fetch warm handoff, stitching and Chrome-parity TLS (M5); stable error codes, CI token/memory gates, a crash-only supervisor and the pi-agent v3 extension (M6). Plus a community fix for a Windows tier-1 boot hang (#36, @problaems).
 
 The context-warfare milestone (v3 M1): every tool now respects the agent's context window as the scarce resource it is.
 
 ### Added
 
 - **Reference handles (`L1`, `S1`)**: fetched-page links render as `[text](L12)` instead of raw URLs, and search results list `S1`-`Sn` instead of 80-token URLs. `fetch` accepts a handle anywhere it accepts a URL (`fetch S3` = result 3 of your last search). Handles are stable per URL (L) or per search position (S), persisted at `~/.cache/donsetch/handles.json` with a 24h TTL and 2048-entry cap. Raw URLs remain in `structuredContent` for citation.
-- **Batch fetch with global token budget**: `url` now accepts an array (up to 12) — one parallel call instead of N round-trips. `budget_tokens` shares one output budget across all results, allocated by size (small pages stay whole, big ones slice with a resume note). Composed output carries per-URL status; only all-failed is an error.
+- **Batch fetch with global token budget**: `url` now accepts an array (up to 12) : one parallel call instead of N round-trips. `budget_tokens` shares one output budget across all results, allocated by size (small pages stay whole, big ones slice with a resume note). Composed output carries per-URL status; only all-failed is an error.
 - **Probe mode (`must_contain`)**: verification questions ("does the changelog mention CVE-2026-XXXX?") resolve the page fully but collapse the output to MATCH/NO-MATCH plus up to three short context excerpts (~60 tokens instead of 4k). Case-insensitive substring or `/regex/`.
-- **TOC section IDs + sizes**: `toc=true` now renders `- [s3] Heading . 1.2k` — a stable per-section ID and content-size label. `section="s3"` targets by ID (heading-name matching still works). Read structure and cost before reading content.
-- **Dropped-content manifest**: when `focus` removes blocks, the output gains one accounting line (`dropped by focus: 256 blocks (~12.1k words) — History, Early years, ...`). Omission is audited, never silent.
-- **On-demand image OCR (`image_text=true`)**: fetches and OCRs the page's content images (up to 4, 5MB each, SSRF-guarded) and appends an `image text` section — infographics, comics and screenshot-locked pages become readable (the OCR engine ships with `--features ocr` builds; core builds say so honestly).
-- Fuzz targets (`fuzz/`): `extract`, `charset`, `paginate`, `sitemap`, `feed` — the five panic-surface parsers, wired as CI smoke jobs with crash-artifact upload. The crate grew a library target (`src/lib.rs`) to support this; the binary is unchanged behavior.
+- **TOC section IDs + sizes**: `toc=true` now renders `- [s3] Heading . 1.2k` : a stable per-section ID and content-size label. `section="s3"` targets by ID (heading-name matching still works). Read structure and cost before reading content.
+- **Dropped-content manifest**: when `focus` removes blocks, the output gains one accounting line (`dropped by focus: 256 blocks (~12.1k words) : History, Early years, ...`). Omission is audited, never silent.
+- **On-demand image OCR (`image_text=true`)**: fetches and OCRs the page's content images (up to 4, 5MB each, SSRF-guarded) and appends an `image text` section : infographics, comics and screenshot-locked pages become readable (the OCR engine ships with `--features ocr` builds; core builds say so honestly).
+- Fuzz targets (`fuzz/`): `extract`, `charset`, `paginate`, `sitemap`, `feed` : the five panic-surface parsers, wired as CI smoke jobs with crash-artifact upload. The crate grew a library target (`src/lib.rs`) to support this; the binary is unchanged behavior.
 - Supply-chain gate: `deny.toml` + cargo-deny CI job (advisories, licenses, bans, sources).
 - `bench/tokens.py`: token-efficiency bench asserting the invariants (focus >=40% savings, probe <=400 chars, no raw-URL leaks past handle rewriting).
 
 ### Changed
 
 - **Main-content scoring**: link density now discounts punctuation/paragraph mass too (a sidebar of link lists could outrank the real article on punctuation inside link labels), image `alt` text counts as content text, and structural region IDs (`footer`, `bottom`, `sidebar`, `nav`, ...) are excluded from main-content candidacy at any size. xkcd scoped to its sidebar before this; it now scopes to the comic.
-- Media (`<img>`) elements are always segmented (cheap) and dropped at render time unless `media=true` — the image list must exist even when media lines are not rendered, so on-demand OCR works on any page.
+- Media (`<img>`) elements are always segmented (cheap) and dropped at render time unless `media=true` : the image list must exist even when media lines are not rendered, so on-demand OCR works on any page.
 
 ### Fixed
 
-- Comic/gallery pages (text-thin, image-rich) lost their content images when extraction fell back to raw text — fallbacks now carry the scoped image list through.
+- Comic/gallery pages (text-thin, image-rich) lost their content images when extraction fell back to raw text : fallbacks now carry the scoped image list through.
 - CI and release workflows pin rustc 1.98 (was floating `stable`), ending local-vs-CI clippy drift.
-### Added (M2 — the clock)
+### Added (M2 : the clock)
 
-- **Deadline contracts (`deadline_ms`)**: fetch (single and batch, per-URL) and search accept a hard time budget (500ms–600s). On expiry: honest `deadline` error with a next_action that names the usual eater (browser escalation) — never a silent hang.
-- **Real MCP cancellation**: `notifications/cancelled` now aborts in-flight work. Fetch/search drop via select (all persistent state was already written atomically); the crawl stops its workers gracefully through the existing stop-flag and persists its resume token — partial progress is never lost. Cancelled requests get no response, per spec.
-- **Progress notifications**: requests carrying `_meta.progressToken` get `notifications/progress` beats — per-page during crawls ("12 pages, 34 queued", throttled to 2s) and per-URL during batch fetches.
-- **Cost footer**: every fetch result's `[meta]` line and structuredContent carries `ms` — the agent sees what latency cost.
+- **Deadline contracts (`deadline_ms`)**: fetch (single and batch, per-URL) and search accept a hard time budget (500ms-600s). On expiry: honest `deadline` error with a next_action that names the usual eater (browser escalation) : never a silent hang.
+- **Real MCP cancellation**: `notifications/cancelled` now aborts in-flight work. Fetch/search drop via select (all persistent state was already written atomically); the crawl stops its workers gracefully through the existing stop-flag and persists its resume token : partial progress is never lost. Cancelled requests get no response, per spec.
+- **Progress notifications**: requests carrying `_meta.progressToken` get `notifications/progress` beats : per-page during crawls ("12 pages, 34 queued", throttled to 2s) and per-URL during batch fetches.
+- **Cost footer**: every fetch result's `[meta]` line and structuredContent carries `ms` : the agent sees what latency cost.
 - Crawl stop reason `Cancelled` with its own next_action ("resume with the token above").
 
-### Added (M3 — trust & memory)
+### Added (M3 : trust & memory)
 
-- **Page fingerprints + change verdicts**: every completed fetch is fingerprinted (sha256 of the normalized full markdown, first 12 hex) and recorded in a persistent page history (`~/.cache/donsetch/page-history.json`, capped: 64KB text per URL, 4MB total, 512 URLs). The next fetch of the same URL stamps its verdict in `[meta]` — `changed (minor|changed|rewritten)` with an ago-seconds label — so a re-read after a hot edit is an informed decision, not a guess.
-- **`since_last=true`**: collapses the fetch output to the verdict. Unchanged pages become one line ("unchanged since last fetch (300s ago) — fingerprint …"); changed pages return a section-level delta report (headings added/removed/changed, capped at 8) plus "refetch without since_last for full content". Re-watching a page costs ~30 tokens instead of 4k.
-- **Archive resurrection (`archive=auto|only|off`)**: on a dead link (404/410/gone), `auto` transparently checks the Wayback Machine and, if a snapshot exists, returns it stamped `ARCHIVED COPY of <url> — snapshot <date> (<age> old)` with an honest age warning when the snapshot is stale. `only` goes to the archive directly; `off` preserves the raw error. Dead links stop being dead ends.
-- **Anti-cloak equivalence check**: on domains known to serve decoy content to plain-HTTP clients (the wall registry), DonShadow's response is cross-checked against a headless render — text-similarity below the threshold appends a `decoy suspected` warning instead of confidently returning cloaked junk.
-- **Freshness truth**: `structuredContent.server_modified` surfaces the server's own `Last-Modified` on successful fetches — cache-lie detection for the agent ("the page says 2024, the server says 2019").
-- **Loud engine degradation**: search results from degraded engines carry a `*degraded: 3/5 engines ok (duckduckgo: timeout)*` line — silent quality collapse is visible in-band.
-- **Delta crawl (`since_last=true`)**: crawl skips pages whose recorded fingerprint is still fresh (24h window), reporting each as `unchanged (since_last)` in the skipped list — re-crawling a site after an edit returns just what moved.
+- **Page fingerprints + change verdicts**: every completed fetch is fingerprinted (sha256 of the normalized full markdown, first 12 hex) and recorded in a persistent page history (`~/.cache/donsetch/page-history.json`, capped: 64KB text per URL, 4MB total, 512 URLs). The next fetch of the same URL stamps its verdict in `[meta]` : `changed (minor|changed|rewritten)` with an ago-seconds label : so a re-read after a hot edit is an informed decision, not a guess.
+- **`since_last=true`**: collapses the fetch output to the verdict. Unchanged pages become one line ("unchanged since last fetch (300s ago) : fingerprint …"); changed pages return a section-level delta report (headings added/removed/changed, capped at 8) plus "refetch without since_last for full content". Re-watching a page costs ~30 tokens instead of 4k.
+- **Archive resurrection (`archive=auto|only|off`)**: on a dead link (404/410/gone), `auto` transparently checks the Wayback Machine and, if a snapshot exists, returns it stamped `ARCHIVED COPY of <url> : snapshot <date> (<age> old)` with an honest age warning when the snapshot is stale. `only` goes to the archive directly; `off` preserves the raw error. Dead links stop being dead ends.
+- **Anti-cloak equivalence check**: on domains known to serve decoy content to plain-HTTP clients (the wall registry), DonShadow's response is cross-checked against a headless render : text-similarity below the threshold appends a `decoy suspected` warning instead of confidently returning cloaked junk.
+- **Freshness truth**: `structuredContent.server_modified` surfaces the server's own `Last-Modified` on successful fetches : cache-lie detection for the agent ("the page says 2024, the server says 2019").
+- **Loud engine degradation**: search results from degraded engines carry a `*degraded: 3/5 engines ok (duckduckgo: timeout)*` line : silent quality collapse is visible in-band.
+- **Delta crawl (`since_last=true`)**: crawl skips pages whose recorded fingerprint is still fresh (24h window), reporting each as `unchanged (since_last)` in the skipped list : re-crawling a site after an edit returns just what moved.
 
-### Added (M4 — domain intelligence)
+### Added (M4 : domain intelligence)
 
-A keyless adapter registry for the sites agents actually hit. Fetch-level rewrites route page URLs to the site's own public JSON APIs (one plain-HTTP request for structured truth — often skipping the wall entirely); extract-level adapters restructure HTML the generic pipeline mangles. Every result is honestly labeled `via=adapter:…` in `[meta]` and structuredContent; any adapter miss falls back to the generic path, and an adapter failure (rate limit, login wall, non-JSON 200) transparently retries the ORIGINAL url through the full pipeline. Kill switch: `DONSETCH_NO_ADAPTERS=1`.
+A keyless adapter registry for the sites agents actually hit. Fetch-level rewrites route page URLs to the site's own public JSON APIs (one plain-HTTP request for structured truth : often skipping the wall entirely); extract-level adapters restructure HTML the generic pipeline mangles. Every result is honestly labeled `via=adapter:…` in `[meta]` and structuredContent; any adapter miss falls back to the generic path, and an adapter failure (rate limit, login wall, non-JSON 200) transparently retries the ORIGINAL url through the full pipeline. Kill switch: `DONSETCH_NO_ADAPTERS=1`.
 
 - **Reddit `.json`**: threads and subreddit listings fetched from the site's keyless JSON endpoints and rendered as comment trees with scores, ages, OP/sticky/NSFW flags and collapsed-reply counts; nested replies indented. Replaces the HTML scrape when available (an IP under Reddit's logged-out limit still gets the old.reddit/generic/ghost cascade).
-- **Package registries**: npm, PyPI, crates.io, Go module proxy and RubyGems page URLs (e.g. `npmjs.com/package/react`) resolve to their JSON APIs and render one unified package card — description, current version, publish/update dates, license, repo, download counts, dependencies, deprecation/`DEPRECATED` warnings, yanked markers, and a recent-versions list that prefers stable releases over canaries. Version-specific URLs fetch the version manifest (crates.io version pages carry the dependency tree).
-- **GitHub**: issue/PR lists, individual issues/PRs, releases and commits restructured from the server-rendered DOM (both the current React markup via stable `data-testid` hooks and the legacy markup). Issue lists: title, number, open/closed, author, date, labels. Issue threads: state, author, date, full body — plus an honest note that comments stream via JS (re-fetch with `tier=2` to read the discussion). No auth, no API rate jail.
+- **Package registries**: npm, PyPI, crates.io, Go module proxy and RubyGems page URLs (e.g. `npmjs.com/package/react`) resolve to their JSON APIs and render one unified package card : description, current version, publish/update dates, license, repo, download counts, dependencies, deprecation/`DEPRECATED` warnings, yanked markers, and a recent-versions list that prefers stable releases over canaries. Version-specific URLs fetch the version manifest (crates.io version pages carry the dependency tree).
+- **GitHub**: issue/PR lists, individual issues/PRs, releases and commits restructured from the server-rendered DOM (both the current React markup via stable `data-testid` hooks and the legacy markup). Issue lists: title, number, open/closed, author, date, labels. Issue threads: state, author, date, full body : plus an honest note that comments stream via JS (re-fetch with `tier=2` to read the discussion). No auth, no API rate jail.
 - **Stack Exchange**: question + answers as a QA tree with per-post scores (from `data-score`), accepted-answer ✓ marking, asker/answerer authorship and asked-dates.
-- **Wikipedia infoboxes**: the summary table (born/died/founded/license/versions…) becomes a clean `field | value` table at the top of the output, with the full article body (headings, paragraphs, data tables, lists) below — navbox/infobox duplication and citation markers stripped.
-- **Docs frameworks**: mkdocs / Docusaurus / Sphinx / Antora sites (detected via generator meta or framework markers) prepend a compact `Site outline` built from the nav — the site map with cheap L-handle links — before the page content. Version-switcher noise filtered.
+- **Wikipedia infoboxes**: the summary table (born/died/founded/license/versions…) becomes a clean `field | value` table at the top of the output, with the full article body (headings, paragraphs, data tables, lists) below : navbox/infobox duplication and citation markers stripped.
+- **Docs frameworks**: mkdocs / Docusaurus / Sphinx / Antora sites (detected via generator meta or framework markers) prepend a compact `Site outline` built from the nav : the site map with cheap L-handle links : before the page content. Version-switcher noise filtered.
 - `donsetch dev extract --url <url> --input <file>`: run the extraction pipeline on a saved HTML file against a URL (adapter development, fixture capture). `DONSETCH_ADAPTER_DUMP=<dir>` captures every body the adapters inspect.
 
-### Added (M5 — speed & stealth)
+### Added (M5 : speed & stealth)
 
-- **Search→fetch warm handoff**: search enrichment already fetches the top results — that content is now cached (bounded: 10 bodies, 1.5MB each, 10min TTL) and the subsequent `web_fetch` of a result serves it instantly. `structuredContent.prewarmed_by_search: true`, tier reads `prewarmed` (the search→fetch second hop measured at ~3ms). One-shot: a second fetch goes to the wire for freshness; extraction, thin→ghost escalation and page history run unchanged on the cached body.
-- **Route hints on search results**: domains the self-improving store knows need the browser are annotated in the results (`⚠ needs browser (~+6s)`) — the agent can pick a faster source or budget time before spending the fetch.
-- **Article stitching (`stitch=true`)**: multi-page articles with rel=next pagination are walked (up to 6 parts, 48k budget, same-host only) and returned as ONE article with `*(part N)*` markers — an 8-part spread costs one call, not eight. `structuredContent.stitched` reports the part count.
-- **h2 fingerprint parity gate**: DonShadow's h2 preface (SETTINGS values+order, connection WINDOW_UPDATE, pseudo-header order, no PRIORITY frames) is now asserted byte-identical to the Chromium capture in a CI test — any future divergence is a red build, not a silent detectability regression.
-- **Locale-coherent Accept-Language**: the header now follows the target's locale (host TLD map + percent-encoded script in the path) — an en-US header on a .ru page gets the English stub on some sites and is a mild incoherence signal; localized sites now serve their real content. Default remains Chrome's en-US.
+- **Search→fetch warm handoff**: search enrichment already fetches the top results : that content is now cached (bounded: 10 bodies, 1.5MB each, 10min TTL) and the subsequent `web_fetch` of a result serves it instantly. `structuredContent.prewarmed_by_search: true`, tier reads `prewarmed` (the search→fetch second hop measured at ~3ms). One-shot: a second fetch goes to the wire for freshness; extraction, thin→ghost escalation and page history run unchanged on the cached body.
+- **Route hints on search results**: domains the self-improving store knows need the browser are annotated in the results (`⚠ needs browser (~+6s)`) : the agent can pick a faster source or budget time before spending the fetch.
+- **Article stitching (`stitch=true`)**: multi-page articles with rel=next pagination are walked (up to 6 parts, 48k budget, same-host only) and returned as ONE article with `*(part N)*` markers : an 8-part spread costs one call, not eight. `structuredContent.stitched` reports the part count.
+- **h2 fingerprint parity gate**: DonShadow's h2 preface (SETTINGS values+order, connection WINDOW_UPDATE, pseudo-header order, no PRIORITY frames) is now asserted byte-identical to the Chromium capture in a CI test : any future divergence is a red build, not a silent detectability regression.
+- **Locale-coherent Accept-Language**: the header now follows the target's locale (host TLD map + percent-encoded script in the path) : an en-US header on a .ru page gets the English stub on some sites and is a mild incoherence signal; localized sites now serve their real content. Default remains Chrome's en-US.
 
 ### Fixed
 
-- **Daemon-abort panic in jsdata blob discovery (fuzzer find, CI fuzz gate)**: a known-global assignment (`__NUXT__ = `) matching at the very end of a page whose preceding byte was invalid UTF-8 (decoded to a 3-byte replacement char) advanced the scan cursor past the string / mid-character — `html[from..]` panicked. The cursor now floors to the next char boundary, clamped to the string length. Found by the new CI fuzz gate on its first green-config run; regression-tested with the crash input.
-- **Windows tier-1 boot hang in the browser version probe (#36, @problaems)**: startup spawned a real browser (`--version --headless=new`) with no timeout to learn its version — on Chrome 129 the spawn hangs (crash-looping GPU/network services) and blocks every command at boot, leaving an orphaned process tree. The probe now reads the version from the browser's own registry key (`HKCU\Software\<Browser>\BLBeacon\version` — zero spawns, honours `DONGHOST_CHROME` families incl. Thorium/Edge) and hard-caps any spawned fallback at 3s with a whole-tree kill. Review follow-ups: non-Windows build stub, child cleanup on an early-out path, unit tests for the version parser.
+- **Daemon-abort panic in jsdata blob discovery (fuzzer find, CI fuzz gate)**: a known-global assignment (`__NUXT__ = `) matching at the very end of a page whose preceding byte was invalid UTF-8 (decoded to a 3-byte replacement char) advanced the scan cursor past the string / mid-character : `html[from..]` panicked. The cursor now floors to the next char boundary, clamped to the string length. Found by the new CI fuzz gate on its first green-config run; regression-tested with the crash input.
+- **Windows tier-1 boot hang in the browser version probe (#36, @problaems)**: startup spawned a real browser (`--version --headless=new`) with no timeout to learn its version : on Chrome 129 the spawn hangs (crash-looping GPU/network services) and blocks every command at boot, leaving an orphaned process tree. The probe now reads the version from the browser's own registry key (`HKCU\Software\<Browser>\BLBeacon\version` : zero spawns, honours `DONGHOST_CHROME` families incl. Thorium/Edge) and hard-caps any spawned fallback at 3s with a whole-tree kill. Review follow-ups: non-Windows build stub, child cleanup on an early-out path, unit tests for the version parser.
 
-### Added (M6 — foundation)
+### Added (M6 : foundation)
 
-- **Stable error codes**: every error on all three tools carries a machine-readable `code` (`guard.ssrf`, `deadline.hit`, `network.dns`, `wall.challenge`, `wall.paywall`, `content.binary`, `crawl.resume`, `archive.stale`, `cloak.suspected`, …) alongside the prose and `next_action` — agents branch on codes, not string matching.
+- **Stable error codes**: every error on all three tools carries a machine-readable `code` (`guard.ssrf`, `deadline.hit`, `network.dns`, `wall.challenge`, `wall.paywall`, `content.binary`, `crawl.resume`, `archive.stale`, `cloak.suspected`, …) alongside the prose and `next_action` : agents branch on codes, not string matching.
 - **Token-efficiency CI gate**: the live claims (focus ≥40% savings, toc ≤5%, probe ≤2% of page, link rendering) are now asserted offline against saved real-page corpora on every build (`tests/token_invariants.rs`).
-- **Memory soak gate**: 200 full-pipeline extractions + 10k handle churn + 800 page-history records with RSS growth asserted bounded (`tests/soak.rs`) — a creeping daemon is a build failure, not a surprise.
-- **Crash-only supervisor**: `donsetch mcp --supervised` proxies stdio over a supervised child daemon — a panic-abort (or a SIGKILL) restarts the daemon (500ms backoff, 5-crash give-up), held requests are replayed, idle deaths are caught within 500ms, and the MCP session survives. Live-verified: SIGKILL mid-session, all requests answered after restart.
+- **Memory soak gate**: 200 full-pipeline extractions + 10k handle churn + 800 page-history records with RSS growth asserted bounded (`tests/soak.rs`) : a creeping daemon is a build failure, not a surprise.
+- **Crash-only supervisor**: `donsetch mcp --supervised` proxies stdio over a supervised child daemon : a panic-abort (or a SIGKILL) restarts the daemon (500ms backoff, 5-crash give-up), held requests are replayed, idle deaths are caught within 500ms, and the MCP session survives. Live-verified: SIGKILL mid-session, all requests answered after restart.
 - **Homebrew tap**: `brew tap dondai44423/donsetch && brew install donsetch` (formula staged, published with the release).
-- **Release workflow hardening**: release builds are `--locked` (deps can't drift mid-release); every platform binary must *report the tagged version* before packaging — a missed `Cargo.toml` bump fails the release job, not the user's `--version`; GitHub release notes are generated from `CHANGELOG.md` (curated) with commit-log notes appended, not the bare commit log.
-- **pi agent extension v3**: tools now run under the crash-only supervisor (`mcp --supervised` — a SIGKILLed daemon no longer kills the pi session); pi's Esc/cancel forwards real MCP cancellation so server-side fetch/crawl work actually stops; tool cards surface v3 stable error codes (`[deadline.hit] …`) and `stitched ×N` pagination. Tool definitions are discovered live from the binary, so `pi update --extensions` picks up all of v3 with no extension-side pinning.
+- **Release workflow hardening**: release builds are `--locked` (deps can't drift mid-release); every platform binary must *report the tagged version* before packaging : a missed `Cargo.toml` bump fails the release job, not the user's `--version`; GitHub release notes are generated from `CHANGELOG.md` (curated) with commit-log notes appended, not the bare commit log.
+- **pi agent extension v3**: tools now run under the crash-only supervisor (`mcp --supervised` : a SIGKILLed daemon no longer kills the pi session); pi's Esc/cancel forwards real MCP cancellation so server-side fetch/crawl work actually stops; tool cards surface v3 stable error codes (`[deadline.hit] …`) and `stitched ×N` pagination. Tool definitions are discovered live from the binary, so `pi update --extensions` picks up all of v3 with no extension-side pinning.
 
 ### Decision
 
-- **HTTP/3: not in 3.0.0** (timeboxed spike concluded — see design notes): h3 fingerprinting is not yet a vendor signal, h2 fallback is first-class everywhere, and a second transport stack (quiche + duplicate BoringSSL) pre-3.0 trades proven reliability for an unmeasured signal. The bar to ship post-3.0 is documented.
+- **HTTP/3: not in 3.0.0** (timeboxed spike concluded : see design notes): h3 fingerprinting is not yet a vendor signal, h2 fallback is first-class everywhere, and a second transport stack (quiche + duplicate BoringSSL) pre-3.0 trades proven reliability for an unmeasured signal. The bar to ship post-3.0 is documented.
 
 
 ## [2.5.0] - 2026-08-22
@@ -434,15 +742,15 @@ The polish & reliability release: one daemon-crashing charset bug fixed (#35), f
 
 ### Fixed
 
-- **ghost-dom double-decoded browser text as GB18030 mojibake (#35)**: the headless-browser tier reads UTF-8 text from the live DOM via CDP — the browser already decoded the page. But the rendered DOM keeps the page's original `<meta charset=gb18030>` declaration, so the charset sniffer honored it and "decoded" the already-UTF-8 bytes a second time (末日乐园 → 鏈棩涔愐涯 on 69shuba). Browser-provided text is now pinned as UTF-8 (`GHOST_TEXT_CT`) at every extraction site (fetch ghost paths, actions, render cache, crawl ghost escalation). Raw HTTP bytes keep full detection — the v2.3.8 GBK/Big5/Shift-JIS fixes are untouched.
+- **ghost-dom double-decoded browser text as GB18030 mojibake (#35)**: the headless-browser tier reads UTF-8 text from the live DOM via CDP : the browser already decoded the page. But the rendered DOM keeps the page's original `<meta charset=gb18030>` declaration, so the charset sniffer honored it and "decoded" the already-UTF-8 bytes a second time (末日乐园 → 鏈棩涔愐涯 on 69shuba). Browser-provided text is now pinned as UTF-8 (`GHOST_TEXT_CT`) at every extraction site (fetch ghost paths, actions, render cache, crawl ghost escalation). Raw HTTP bytes keep full detection : the v2.3.8 GBK/Big5/Shift-JIS fixes are untouched.
 
-- **Daemon-abort panics (release builds run `panic=abort` — each of these was a one-request kill)**:
+- **Daemon-abort panics (release builds run `panic=abort` : each of these was a one-request kill)**:
   - `js_unescape`: a literal backslash before a multi-byte UTF-8 character (hostile or sloppy page in a Next.js flight frame) advanced the cursor mid-character; the next string slice panicked. Copy the full character instead.
   - Pagination: unclamped `max_chars`/`offset` tool args wrapped `start + max_chars` below `start` (integer overflow) → slice panic. Now saturating arithmetic plus server-side clamps (`max_chars` 200..=1 MiB, `offset` ≤ 1e9).
   - Pagination resume: the 500-byte block-boundary search window could split a multi-byte character on CJK pages → slice panic. Window end is floored to a char boundary.
   - Ghost debug HTML dump could slice a multi-byte character at byte 1200.
 
-- **Infinite hang**: `Cdp::connect` — the only unguarded network primitive in the ghost stack — could hang a tool call forever if the browser accepted TCP but stalled the WebSocket handshake. 10-second cap.
+- **Infinite hang**: `Cdp::connect` : the only unguarded network primitive in the ghost stack : could hang a tool call forever if the browser accepted TCP but stalled the WebSocket handshake. 10-second cap.
 
 - **Unclamped action waits**: a `wait` step with `ms: 3600000` stalled the tool call for an hour with no cancellation path. Per-step waits cap at 30s, selector/text polls at 60s.
 
@@ -450,13 +758,13 @@ The polish & reliability release: one daemon-crashing charset bug fixed (#35), f
 
 ### Changed
 
-- **Windows browser discovery** now probes Microsoft Edge install directories (often the only CDP-capable browser on a stock Windows box — its directory is never on PATH), per-user Chromium, and the Playwright cache. Ghost escalation, browser actions, and `doctor` work on default Windows installs.
+- **Windows browser discovery** now probes Microsoft Edge install directories (often the only CDP-capable browser on a stock Windows box : its directory is never on PATH), per-user Chromium, and the Playwright cache. Ghost escalation, browser actions, and `doctor` work on default Windows installs.
 
-- **macOS Intel (darwin-x64) supported end-to-end**: prebuilt binaries now build in CI (native `macos-15-intel` runner), `npm install` accepts the platform, and self-update maps it correctly. Core build (no OCR/rerank — `ort-sys` ships no prebuilt ONNX Runtime for Intel macOS; same trade-off as Linux ARM64).
+- **macOS Intel (darwin-x64) supported end-to-end**: prebuilt binaries now build in CI (native `macos-15-intel` runner), `npm install` accepts the platform, and self-update maps it correctly. Core build (no OCR/rerank : `ort-sys` ships no prebuilt ONNX Runtime for Intel macOS; same trade-off as Linux ARM64).
 
 - **npm install.js hardened**: musl (Alpine) systems are detected up front with an honest "glibc-linked binary will not run" error instead of a deferred cryptic spawn failure; `tar` presence is checked on Windows before downloading; stale/truncated leftover binaries (< 1 MiB) are re-fetched instead of shadowing a fresh install; extraction is verified before chmod.
 
-- **Error contract extended to every tool**: `web_crawl` and `web_search` failures now return structured errors with escalation trace + `next_action` (crawl failures classified permanent vs transient — bad seed/expired token no longer masquerade as retryable); crawl ghost-escalation failures surface their reason (launch error, captcha, timeouts) in `skipped[]` instead of vanishing; SSRF / binary-content / extraction-failure errors carry `next_action`; zero-result searches suggest the available levers.
+- **Error contract extended to every tool**: `web_crawl` and `web_search` failures now return structured errors with escalation trace + `next_action` (crawl failures classified permanent vs transient : bad seed/expired token no longer masquerade as retryable); crawl ghost-escalation failures surface their reason (launch error, captcha, timeouts) in `skipped[]` instead of vanishing; SSRF / binary-content / extraction-failure errors carry `next_action`; zero-result searches suggest the available levers.
 
 - **CLI exit codes honest**: `update`, `doctor`, and `rollback` exit 1 on failure (scripts gate on `$?`); bulk-fetch JSON mode no longer collapses walled/transient failures to the permanent exit code; signal exit code matches the received signal.
 
@@ -464,13 +772,13 @@ The polish & reliability release: one daemon-crashing charset bug fixed (#35), f
 
 ### Security / Reliability
 
-- **Sitemap decompression bomb capped**: gzip sitemaps decompress through the same 64 MiB cap as every other path — a malicious `.xml.gz` could previously OOM the daemon via unbounded allocation.
+- **Sitemap decompression bomb capped**: gzip sitemaps decompress through the same 64 MiB cap as every other path : a malicious `.xml.gz` could previously OOM the daemon via unbounded allocation.
 - **HPACK hostile index 0**: `checked_sub` instead of unsigned wrap (protocol-violation byte from a hostile server).
 - **MCP stdout write failures** now log and shut down instead of silently serving into a broken pipe while the client waits forever.
 - **Update flow**: backup-copy failure warns before the atomic swap (rollback would otherwise be silently impossible); cookie-vault persist failure logs instead of silently dropping warm clearance state.
 - **Key masking** (`donsetch keys list`) is char-boundary-safe for keys containing multi-byte characters.
-- `fetch` validates URL parse up front — an unparseable URL can no longer flow through the pipeline with an empty host, poisoning domain profiles.
-- `/tmp` literals replaced with `std::env::temp_dir()` (ghost screenshots, search debug dumps) — Windows-safe.
+- `fetch` validates URL parse up front : an unparseable URL can no longer flow through the pipeline with an empty host, poisoning domain profiles.
+- `/tmp` literals replaced with `std::env::temp_dir()` (ghost screenshots, search debug dumps) : Windows-safe.
 - `doctor`'s browser-timeout remedy is platform-appropriate (no `pkill`/`/tmp` advice on Windows/macOS).
 
 ## [2.4.1] - 2026-08-20
@@ -594,64 +902,64 @@ The polish & reliability release: one daemon-crashing charset bug fixed (#35), f
 
 ### Fixed
 
-- **Crawl: auto-scope drift on multi-tenant hosts** — seeding a crawl at `docs.rs/tokio` (single-segment path) returned `None` from `auto_scope`, causing the crawler to explore the entire `docs.rs` sitemap instead of staying within `/tokio/`. Fixed: single-segment paths now scope to `/{segment}/*`. Before: 383 off-topic pages fetched (async-blocking-bridger, asm_block, etc.). After: 5 pages, all within `/tokio/`.
+- **Crawl: auto-scope drift on multi-tenant hosts** : seeding a crawl at `docs.rs/tokio` (single-segment path) returned `None` from `auto_scope`, causing the crawler to explore the entire `docs.rs` sitemap instead of staying within `/tokio/`. Fixed: single-segment paths now scope to `/{segment}/*`. Before: 383 off-topic pages fetched (async-blocking-bridger, asm_block, etc.). After: 5 pages, all within `/tokio/`.
 
-- **Crawl: focus filter false positives from compound terms** — `focus_match` tokenized `spawn_blocking` into `spawn` + `block`, then matched `block` against unrelated paths like `/ant-libp2p-allow-block-list/`. Fixed: compound terms (containing `_` or `-`) are matched as full substrings OR require ALL fragments to match. `spawn_blocking` must appear as `spawn_blocking` in the path, or both `spawn` AND `block` must be present.
+- **Crawl: focus filter false positives from compound terms** : `focus_match` tokenized `spawn_blocking` into `spawn` + `block`, then matched `block` against unrelated paths like `/ant-libp2p-allow-block-list/`. Fixed: compound terms (containing `_` or `-`) are matched as full substrings OR require ALL fragments to match. `spawn_blocking` must appear as `spawn_blocking` in the path, or both `spawn` AND `block` must be present.
 
-- **Fetch: content density threshold too high** — lowered from 50KB to 20KB raw and 5000 to 3000 chars extracted. Sites like artstation (91KB raw, 866 chars, 0.9% density) now correctly escalate to tier 2. Sites like bilibili (24KB raw, 1476 chars, 6% density) are not flagged.
+- **Fetch: content density threshold too high** : lowered from 50KB to 20KB raw and 5000 to 3000 chars extracted. Sites like artstation (91KB raw, 866 chars, 0.9% density) now correctly escalate to tier 2. Sites like bilibili (24KB raw, 1476 chars, 6% density) are not flagged.
 
-- **Fetch: ghost settle time increased to 4s** — 3s was not enough for some SPAs (crates.io occasionally settled at 8KB before hydration). 4s gives SvelteKit/React enough time to download, parse, and execute JS bundles.
+- **Fetch: ghost settle time increased to 4s** : 3s was not enough for some SPAs (crates.io occasionally settled at 8KB before hydration). 4s gives SvelteKit/React enough time to download, parse, and execute JS bundles.
 
-- **Doctor: TLS fingerprint false warning** — `tls.peet.ws` being unreachable showed a warning in `donsetch doctor`. Changed to Pass: the TLS stack is active (used for every fetch); the external fingerprint service being down is not a DonSeTch issue.
+- **Doctor: TLS fingerprint false warning** : `tls.peet.ws` being unreachable showed a warning in `donsetch doctor`. Changed to Pass: the TLS stack is active (used for every fetch); the external fingerprint service being down is not a DonSeTch issue.
 
-- **Tests: crawl_cycles_terminate with root seed** — test was seeded at `/a` which auto-scoped to `/a/*`, preventing the root page from being fetched. Fixed: seed at `/` (root) so auto-scope returns `None` and all paths are in scope.
+- **Tests: crawl_cycles_terminate with root seed** : test was seeded at `/a` which auto-scoped to `/a/*`, preventing the root page from being fetched. Fixed: seed at `/` (root) so auto-scope returns `None` and all paths are in scope.
 
 ## [2.3.0] - 2026-08-17
 
 ### Fixed
 
-- **False positive ContentOk on SPA shells** — pages that server-render their layout (navigation, sidebar, footer) but client-render the main content produced enough boilerplate text (> 800 chars) to pass the thin check. The tool returned this boilerplate as content without escalating to tier 2. Added content density check: if raw HTML is > 50KB and extracted text is < 5% of raw with < 5000 chars, the page is classified as a JS shell and triggers tier-2 escalation. Measured false positives: artstation (0.9% density), all caught. Real pages: 15-40%+ density, never triggered.
+- **False positive ContentOk on SPA shells** : pages that server-render their layout (navigation, sidebar, footer) but client-render the main content produced enough boilerplate text (> 800 chars) to pass the thin check. The tool returned this boilerplate as content without escalating to tier 2. Added content density check: if raw HTML is > 50KB and extracted text is < 5% of raw with < 5000 chars, the page is classified as a JS shell and triggers tier-2 escalation. Measured false positives: artstation (0.9% density), all caught. Real pages: 15-40%+ density, never triggered.
 
-- **Ghost (tier 2) settles too early on SPA shells** — the ghost_fetch content-quality oracle settled after 2 stability polls (~400ms), before SPAs had time to hydrate and render their content. A stable 8KB DOM at 400ms is a SvelteKit/React shell, not a complete page. Added a minimum settle time of 3 seconds for DOMs < 50KB, giving SPAs time to download, parse, and execute their JS bundles. Large DOMs (>= 50KB) settle fast as before. Fixed: crates.io (SvelteKit, was 8KB shell, now 47KB full render), users.rust-lang.org (Discourse, was intermittent 30KB shell, now consistent 397KB full render).
+- **Ghost (tier 2) settles too early on SPA shells** : the ghost_fetch content-quality oracle settled after 2 stability polls (~400ms), before SPAs had time to hydrate and render their content. A stable 8KB DOM at 400ms is a SvelteKit/React shell, not a complete page. Added a minimum settle time of 3 seconds for DOMs < 50KB, giving SPAs time to download, parse, and execute their JS bundles. Large DOMs (>= 50KB) settle fast as before. Fixed: crates.io (SvelteKit, was 8KB shell, now 47KB full render), users.rust-lang.org (Discourse, was intermittent 30KB shell, now consistent 397KB full render).
 
-- **Pi extension TUI: truncateToWidth ANSI leak** — pi-tui's `truncateToWidth` function injects `\x1b[0m` RESET codes around the ellipsis even when the input is plain text. These RESET codes broke pi's green/red tool-call overlay mid-line, causing text to fall outside the highlight. Replaced all `truncateToWidth` calls with a local `truncate()` function that adds zero ANSI codes.
+- **Pi extension TUI: truncateToWidth ANSI leak** : pi-tui's `truncateToWidth` function injects `\x1b[0m` RESET codes around the ellipsis even when the input is plain text. These RESET codes broke pi's green/red tool-call overlay mid-line, causing text to fall outside the highlight. Replaced all `truncateToWidth` calls with a local `truncate()` function that adds zero ANSI codes.
 
 ## [2.2.4] - 2026-08-17
 
 ### Fixed
 
-- **Pi extension TUI: visual glitch fixed** — stripped ALL ANSI color codes from renderCall and renderResult. Plain text only. Pi wraps tool calls in its own green (success) / red (failure) highlight; our ANSI RESET codes were breaking pi's overlay mid-line, causing text to fall outside the highlight and show with the TUI background color.
+- **Pi extension TUI: visual glitch fixed** : stripped ALL ANSI color codes from renderCall and renderResult. Plain text only. Pi wraps tool calls in its own green (success) / red (failure) highlight; our ANSI RESET codes were breaking pi's overlay mid-line, causing text to fall outside the highlight and show with the TUI background color.
 
 ## [2.2.3] - 2026-08-17
 
 ### Fixed
 
-- **Pi extension TUI: removed all green/red ANSI from renderResult** — pi handles success (green) and failure (red) coloring itself. Our own green/red codes bled into pi's highlight causing a visual glitch. renderResult now outputs only amber (tool name) and dim (metadata).
+- **Pi extension TUI: removed all green/red ANSI from renderResult** : pi handles success (green) and failure (red) coloring itself. Our own green/red codes bled into pi's highlight causing a visual glitch. renderResult now outputs only amber (tool name) and dim (metadata).
 
 ## [2.2.2] - 2026-08-17
 
 ### Changed
 
-- **Pi extension TUI: provider + cache display** — search results now show the provider (`via local`, `via exa`, `via tavily`), so the agent and user can see which engine was used. Fetch results show `via cache` when warm cookies were used (not a fresh fetch) and `via ghost` when the browser escalated.
-- **Pi extension TUI: success/fail coloring fix** — removed all green and red ANSI codes from renderResult. Pi's TUI already wraps successful tool calls in green and failures in red; our own green/red codes bled into pi's highlight causing a visual glitch. renderResult now outputs only amber (tool name) and dim (metadata) — pi handles the success/fail coloring.
+- **Pi extension TUI: provider + cache display** : search results now show the provider (`via local`, `via exa`, `via tavily`), so the agent and user can see which engine was used. Fetch results show `via cache` when warm cookies were used (not a fresh fetch) and `via ghost` when the browser escalated.
+- **Pi extension TUI: success/fail coloring fix** : removed all green and red ANSI codes from renderResult. Pi's TUI already wraps successful tool calls in green and failures in red; our own green/red codes bled into pi's highlight causing a visual glitch. renderResult now outputs only amber (tool name) and dim (metadata) : pi handles the success/fail coloring.
 
 ## [2.2.1] - 2026-08-17
 
 ### Changed
 
-- **Crawl auto-scope** — when `include_paths` is empty, the crawl now auto-derives a path scope from the seed URL's path. `docs.rs/tokio/latest/tokio/` stays within `/tokio/latest/tokio/*`; `github.com/tokio-rs/tokio/wiki` stays within `/tokio-rs/tokio/*`. Multi-tenant sites (docs.rs, github.com) and multi-section sites (stripe.com, nextjs.org) no longer escape the seed's section. The user no longer needs to manually set `include_paths` for the common case.
-- **Focus filtering on all link discovery paths** — when a `focus` query is set, links with zero focus-token matches are now filtered from BFS outlinks, pagination `<link rel="next">`, RSS/Atom feed entries, and sitemap frontier seeding. Previously only the sitemap map display was focus-filtered; all discovered links were enqueued regardless of relevance. The filter uses a smart soft/hard approach: if the current page has any matching links, non-matching links are hard-filtered (only relevant pages crawled). If no links match (e.g., a homepage linking to a tutorial that links to the target content), non-matching links are soft-filtered (enqueued at low priority) to enable multi-hop discovery.
-- **Junk path filtering** — common non-content paths (`/login*`, `/signin*`, `/signup*`, `/register*`, `/auth*`, `/oauth*`, `/account*`, `/settings*`, `/cart*`, `/checkout*`, `/favicon*`) are now excluded by default, merged with user-specified `exclude_paths`.
-- **Faster crawl pacing** — base inter-request delay reduced from 300ms to 200ms; skim dwell cap reduced from 300ms to 100ms. Roughly 2x faster crawls with zero observed throttling on test sites.
+- **Crawl auto-scope** : when `include_paths` is empty, the crawl now auto-derives a path scope from the seed URL's path. `docs.rs/tokio/latest/tokio/` stays within `/tokio/latest/tokio/*`; `github.com/tokio-rs/tokio/wiki` stays within `/tokio-rs/tokio/*`. Multi-tenant sites (docs.rs, github.com) and multi-section sites (stripe.com, nextjs.org) no longer escape the seed's section. The user no longer needs to manually set `include_paths` for the common case.
+- **Focus filtering on all link discovery paths** : when a `focus` query is set, links with zero focus-token matches are now filtered from BFS outlinks, pagination `<link rel="next">`, RSS/Atom feed entries, and sitemap frontier seeding. Previously only the sitemap map display was focus-filtered; all discovered links were enqueued regardless of relevance. The filter uses a smart soft/hard approach: if the current page has any matching links, non-matching links are hard-filtered (only relevant pages crawled). If no links match (e.g., a homepage linking to a tutorial that links to the target content), non-matching links are soft-filtered (enqueued at low priority) to enable multi-hop discovery.
+- **Junk path filtering** : common non-content paths (`/login*`, `/signin*`, `/signup*`, `/register*`, `/auth*`, `/oauth*`, `/account*`, `/settings*`, `/cart*`, `/checkout*`, `/favicon*`) are now excluded by default, merged with user-specified `exclude_paths`.
+- **Faster crawl pacing** : base inter-request delay reduced from 300ms to 200ms; skim dwell cap reduced from 300ms to 100ms. Roughly 2x faster crawls with zero observed throttling on test sites.
 
 ### Fixed
 
-- **Sitemap focus filter bug** — the sitemap filter used `score <= 0.0` which incorrectly filtered deep but relevant pages (depth_prior made the total score negative even with a focus token match). Replaced with `focus_match()` which checks for any token match regardless of depth.
-- **Sitemap seeding not focus-filtered** — sitemap entries were seeded into the frontier without focus filtering (only the map display was filtered). Now all sitemap-seeded entries pass the focus gate.
+- **Sitemap focus filter bug** : the sitemap filter used `score <= 0.0` which incorrectly filtered deep but relevant pages (depth_prior made the total score negative even with a focus token match). Replaced with `focus_match()` which checks for any token match regardless of depth.
+- **Sitemap seeding not focus-filtered** : sitemap entries were seeded into the frontier without focus filtering (only the map display was filtered). Now all sitemap-seeded entries pass the focus gate.
 
 ### Added
 
-- **`next_action` in crawl output** — when the crawl returns 0 pages or stops early, the structured output now includes a `next_action` field with actionable guidance: "use mode=content", "try broader include_paths", "the site blocked the crawler", "resume={token} to continue", etc.
+- **`next_action` in crawl output** : when the crawl returns 0 pages or stops early, the structured output now includes a `next_action` field with actionable guidance: "use mode=content", "try broader include_paths", "the site blocked the crawler", "resume={token} to continue", etc.
 
 ## [2.2.0] - 2026-08-17
 
@@ -659,89 +967,89 @@ The polish & reliability release: one daemon-crashing charset bug fixed (#35), f
 
 **Reliability: the self-improving fetch loop actually self-improves now.** Four compounding bugs made ghost-solved domains re-need the ghost forever and occasionally served bot-wall pages as content:
 
-- **Fake solves** — the tier-2 oracle settled on modern Cloudflare interstitials ("Performing security verification", ~344 visible chars of vendor boilerplate) and recorded them as solved, then replay-served the wall page as `ContentOk`. New interstitial detection layer (title/H1 boilerplate + near-empty-DOM-with-challenge-markers shapes) runs before the visible-text override in `detect_dom_smart` and `detect`. The ghost now waits for real clears.
-- **Learning was gated off on re-solves** — a `skip-to-solve` re-fetch (cookies past their TTL) never called `record_solved` because `learn` required a fresh tier-1 challenge, so expired domains went ghost-first forever. Learning now fires on every wall-driven escalation. Live-verified: solve once → next fetch rides warm tier 1 in ~0.4s.
-- **State poisoning** — ANY non-content verdict (404, 429, paywall, auth wall) marked domains `needs_tier2`, forcing a 20s ghost launch on every later fetch of that domain. Only real `Challenge` verdicts set the flag now; terminal verdicts move counters only. One-time migration un-poisons existing profiles that never recorded a solve (144 → 15 in the dev state file).
-- **Warm-stale over-learning** — a single walled warm fetch (often transient challenge rotation) cleared the cookie vault and clamped `observed_lifetime` to as low as 1 second (the live stackoverflow case), killing warm routing permanently. Two consecutive failures are now required, and the learned lifetime is floored at 120s.
-- **`replay_ok` gating** — warm routing now requires the post-solve tier-1 retry to have VERIFIED that these cookies actually work on tier 1 (some vendors bind clearance to the browser fingerprint; replay is impossible there). Unverifiable cookies never earn a doomed warm roundtrip again.
-- **Ghost 404 laundering** — on skip-to-solve routes the ghost happily rendered 404 pages (browsers do) and the pipeline served them as `ContentOk`. The post-solve tier-1 retry is now the oracle of record for terminal verdicts (404/paywall/auth): dead URLs return honest errors.
-- **Version coherence** — tier 1 claimed Chrome 150 headers while the ghost ran the installed Chromium 151 (client hints advertise the real version even under `--user-agent`). The installed browser's major version is now probed at startup and both tiers advertise the same coherent identity — clearance cookies bind to it.
+- **Fake solves** : the tier-2 oracle settled on modern Cloudflare interstitials ("Performing security verification", ~344 visible chars of vendor boilerplate) and recorded them as solved, then replay-served the wall page as `ContentOk`. New interstitial detection layer (title/H1 boilerplate + near-empty-DOM-with-challenge-markers shapes) runs before the visible-text override in `detect_dom_smart` and `detect`. The ghost now waits for real clears.
+- **Learning was gated off on re-solves** : a `skip-to-solve` re-fetch (cookies past their TTL) never called `record_solved` because `learn` required a fresh tier-1 challenge, so expired domains went ghost-first forever. Learning now fires on every wall-driven escalation. Live-verified: solve once → next fetch rides warm tier 1 in ~0.4s.
+- **State poisoning** : ANY non-content verdict (404, 429, paywall, auth wall) marked domains `needs_tier2`, forcing a 20s ghost launch on every later fetch of that domain. Only real `Challenge` verdicts set the flag now; terminal verdicts move counters only. One-time migration un-poisons existing profiles that never recorded a solve (144 → 15 in the dev state file).
+- **Warm-stale over-learning** : a single walled warm fetch (often transient challenge rotation) cleared the cookie vault and clamped `observed_lifetime` to as low as 1 second (the live stackoverflow case), killing warm routing permanently. Two consecutive failures are now required, and the learned lifetime is floored at 120s.
+- **`replay_ok` gating** : warm routing now requires the post-solve tier-1 retry to have VERIFIED that these cookies actually work on tier 1 (some vendors bind clearance to the browser fingerprint; replay is impossible there). Unverifiable cookies never earn a doomed warm roundtrip again.
+- **Ghost 404 laundering** : on skip-to-solve routes the ghost happily rendered 404 pages (browsers do) and the pipeline served them as `ContentOk`. The post-solve tier-1 retry is now the oracle of record for terminal verdicts (404/paywall/auth): dead URLs return honest errors.
+- **Version coherence** : tier 1 claimed Chrome 150 headers while the ghost ran the installed Chromium 151 (client hints advertise the real version even under `--user-agent`). The installed browser's major version is now probed at startup and both tiers advertise the same coherent identity : clearance cookies bind to it.
 
 **DonSift content fidelity** (the agent-reported gaps):
 
-- **Math is no longer destroyed.** `<math>` elements are recovered as LaTeX: MediaWiki `alttext` first (with the `{\displaystyle}` wrapper stripped), then `<annotation encoding="application/x-tex">`, then a compact MathML serialization (`W_{Q}^{T}`, `(QK^{T})/(sqrt(d_{k}))`, matrices as `(a, b; c, d)`). Hidden-math exception: `display:none`/`aria-hidden` wrappers around `<math>` (the a11y twin of rendered formula images — MediaWiki, MathJax, KaTeX shape) are extracted instead of skipped. Live-verified on the attention-paper Wikipedia page: every formula and matrix variable renders. `<sup>`/`<sub>` content is preserved as `^{...}`/`_{...}` (only citation markers like `[1]` are dropped).
+- **Math is no longer destroyed.** `<math>` elements are recovered as LaTeX: MediaWiki `alttext` first (with the `{\displaystyle}` wrapper stripped), then `<annotation encoding="application/x-tex">`, then a compact MathML serialization (`W_{Q}^{T}`, `(QK^{T})/(sqrt(d_{k}))`, matrices as `(a, b; c, d)`). Hidden-math exception: `display:none`/`aria-hidden` wrappers around `<math>` (the a11y twin of rendered formula images : MediaWiki, MathJax, KaTeX shape) are extracted instead of skipped. Live-verified on the attention-paper Wikipedia page: every formula and matrix variable renders. `<sup>`/`<sub>` content is preserved as `^{...}`/`_{...}` (only citation markers like `[1]` are dropped).
 - **Discussion threads are no longer lossy.** Hacker News gets a dedicated extractor (threads AND the 2026 comment-permalink layout): full comment text (was: table cells truncated at 120 chars / entire subtrees dropped), authors, ages, reply depth via indentation, story header with points. Generic fix for other forums: layout/prose tables (any cell ≥300 chars, single-column tables, `role="presentation"`) are walked as containers instead of rendered as pipe tables; `class="comment"` is no longer treated as boilerplate (it silently removed whole comment sections from scoring).
 - **Feeds render as feeds, not raw XML.** RSS 2.0 / Atom / JSON Feed → structured markdown: channel header, items with linked titles, dates, HTML-stripped summaries (was: 25KB CDATA blob). Handles lying Content-Types (`text/xml`, `text/plain`) by payload sniffing, and the HTML-parser traps (`<link>` void-element mangling, CDATA leakage) via preprocessing.
-- **Thin-hole closed** — a 27KB page extracting 250 chars over 3+ boilerplate blocks was classified non-thin (how challenge pages leaked through). Any page over 5KB yielding <800 chars is thin now.
+- **Thin-hole closed** : a 27KB page extracting 250 chars over 3+ boilerplate blocks was classified non-thin (how challenge pages leaked through). Any page over 5KB yielding <800 chars is thin now.
 - **HTML served as `text/plain`** is parsed as HTML instead of passing through as angle-bracket soup.
-- **`tokens_est` is honest** — dedicated extractors reported full-document token counts instead of the returned slice's.
+- **`tokens_est` is honest** : dedicated extractors reported full-document token counts instead of the returned slice's.
 
 **Fetch and escalation:**
 
-- **`/pdf/` path convention honored everywhere** — `arxiv.org/pdf/1706.03762` previously skipped PDF early-detection (only `.pdf` suffix counted), escalating to a 23s ghost roundtrip; now routed straight to DonSheet (0.7s, tier 1).
-- **Walls never enter the revalidation cache** — a challenge interstitial carrying an ETag was re-served fresh as content on later fetches; fresh-cache hits also get honest verdicts now instead of hardcoded `ContentOk`.
-- **Warm cookies are no longer killed by extraction gaps** — a warm `ContentOk` that extracts thin is only treated as a shell when the body is big with almost no visible text (real shell evidence); rich-visible-text pages with thin extraction keep their valid cookies.
-- **Turnstile clicks retry** — the checkbox iframe renders late and repositions; the old one-shot click usually fired before it attached. Up to 3 attempts, re-finding geometry each time. (Interactive captchas remain an honest dead end by design.)
-- **Section slices no longer trigger ghost escalation** — a small `section=` result on a huge page computed as "thin" (shell) and escalated to the browser, which returned the FULL page instead of the requested section. A matched section is intentionally small; shell detection is skipped for it.
-- **Math brace fidelity** — the `\displaystyle` wrapper strip removed exactly one closing brace per formula (`W_{Q}` stayed intact; the previous `trim_end_matches` ate inner braces).
-- **HN threads honor `focus`** — relevant comments surface on 700-comment threads (with the standard no-match notice); previously the dedicated extractor ignored the query and returned the first N comments.
-- **Legacy lifetime de-poisoning** — pre-fix `observed_lifetime` values below the 120s floor are dropped at load AND on each new solve; stackoverflow (clamped to 1s by the old bug) rides warm tier 1 again.
+- **`/pdf/` path convention honored everywhere** : `arxiv.org/pdf/1706.03762` previously skipped PDF early-detection (only `.pdf` suffix counted), escalating to a 23s ghost roundtrip; now routed straight to DonSheet (0.7s, tier 1).
+- **Walls never enter the revalidation cache** : a challenge interstitial carrying an ETag was re-served fresh as content on later fetches; fresh-cache hits also get honest verdicts now instead of hardcoded `ContentOk`.
+- **Warm cookies are no longer killed by extraction gaps** : a warm `ContentOk` that extracts thin is only treated as a shell when the body is big with almost no visible text (real shell evidence); rich-visible-text pages with thin extraction keep their valid cookies.
+- **Turnstile clicks retry** : the checkbox iframe renders late and repositions; the old one-shot click usually fired before it attached. Up to 3 attempts, re-finding geometry each time. (Interactive captchas remain an honest dead end by design.)
+- **Section slices no longer trigger ghost escalation** : a small `section=` result on a huge page computed as "thin" (shell) and escalated to the browser, which returned the FULL page instead of the requested section. A matched section is intentionally small; shell detection is skipped for it.
+- **Math brace fidelity** : the `\displaystyle` wrapper strip removed exactly one closing brace per formula (`W_{Q}` stayed intact; the previous `trim_end_matches` ate inner braces).
+- **HN threads honor `focus`** : relevant comments surface on 700-comment threads (with the standard no-match notice); previously the dedicated extractor ignored the query and returned the first N comments.
+- **Legacy lifetime de-poisoning** : pre-fix `observed_lifetime` values below the 120s floor are dropped at load AND on each new solve; stackoverflow (clamped to 1s by the old bug) rides warm tier 1 again.
 
 ### Added
 
-- **Crawl explains its pace** — when a site's robots.txt declares `Crawl-delay` and it's honored, the crawl output says so (`robots crawl-delay: 30s between requests (site-declared; pass respect_robots=false to override)`) plus `crawl_delay` in structuredContent. A slow crawl is no longer a mystery.
-- **Feed extraction surface** — feed URLs return `content_kind: Listing` with item counts in `blocks_total`/`blocks_shown`.
+- **Crawl explains its pace** : when a site's robots.txt declares `Crawl-delay` and it's honored, the crawl output says so (`robots crawl-delay: 30s between requests (site-declared; pass respect_robots=false to override)`) plus `crawl_delay` in structuredContent. A slow crawl is no longer a mystery.
+- **Feed extraction surface** : feed URLs return `content_kind: Listing` with item counts in `blocks_total`/`blocks_shown`.
 
 ## [2.1.2] - 2026-08-16
 
 ### Added
 
-- **Pi agent TUI rendering** — custom `renderCall` and `renderResult` for all 3 tools in the pi extension. Tool calls show a clean amber icon + tool name + key arg (URL or query). Results show a compact status line (✓/✗ glyph, tool name, metadata) plus a one-line preview. No more raw content dumps in the TUI — the LLM still gets full content, the user sees a clean summary card. Amber theme matching DonSeTch's identity (#ffb200).
+- **Pi agent TUI rendering** : custom `renderCall` and `renderResult` for all 3 tools in the pi extension. Tool calls show a clean amber icon + tool name + key arg (URL or query). Results show a compact status line (✓/✗ glyph, tool name, metadata) plus a one-line preview. No more raw content dumps in the TUI : the LLM still gets full content, the user sees a clean summary card. Amber theme matching DonSeTch's identity (#ffb200).
 
 ## [2.1.1] - 2026-08-16
 
 ### Added
 
-- **Pi agent support** — `pi install npm:donsetch` now works natively. The npm package ships a pi extension that spawns the donsetch MCP binary at session start, discovers tools dynamically via `tools/list`, and registers them as native pi tools. Zero configuration, zero maintenance — tool definitions are fetched from the binary, so they stay in sync automatically. If the binary is missing (e.g. npm blocked postinstall), the extension auto-downloads it from GitHub Releases.
-- **Tool-def token optimization** — cut 203 tokens of duplicated/redundant text from MCP tool descriptions (2,566 → 2,363 tokens, measured with tiktoken/GPT-4o). No quality loss — all behavior guidance preserved.
+- **Pi agent support** : `pi install npm:donsetch` now works natively. The npm package ships a pi extension that spawns the donsetch MCP binary at session start, discovers tools dynamically via `tools/list`, and registers them as native pi tools. Zero configuration, zero maintenance : tool definitions are fetched from the binary, so they stay in sync automatically. If the binary is missing (e.g. npm blocked postinstall), the extension auto-downloads it from GitHub Releases.
+- **Tool-def token optimization** : cut 203 tokens of duplicated/redundant text from MCP tool descriptions (2,566 → 2,363 tokens, measured with tiktoken/GPT-4o). No quality loss : all behavior guidance preserved.
 
 ## [2.1.0] - 2026-08-16
 
 ### Added
 
-- **`donsetch status`** — one-glance overview: version + update check, search config (providers, keys, default mode), proxies count, cache size, and health hint. No probes, no browser launch — fast. The "I just installed it, what's the state?" command.
-- **`donsetch help <command>`** — route to any command's help: `donsetch help keys`, `donsetch help proxy`, `donsetch help fetch`, etc. Falls back to top-level help for unknown commands.
-- **`donsetch keys default local`** — set the local keyless search engine as the default search method, even when BYOK provider keys are configured. When local is the default, the local 5-engine search is tried first and BYOK keys are only used as fallback if local search fails. This lets users test or use the local engine without removing their keys. `donsetch keys default <provider>` switches back to BYOK-first mode.
-- **`donsetch keys export [path|-]`** — export all BYOK keys and config to a file (with 0600 permissions) or stdout (with `-`). Useful for backup, transfer between machines, or dotfiles repos.
-- **`donsetch keys import <path>`** — import a config from a file previously exported by `keys export`. Replaces the current config entirely. Validates structure (provider names, key states, default) before saving.
-- **`donsetch keys clear`** — remove all keys and reset to a clean state. The nuclear option for starting fresh.
+- **`donsetch status`** : one-glance overview: version + update check, search config (providers, keys, default mode), proxies count, cache size, and health hint. No probes, no browser launch : fast. The "I just installed it, what's the state?" command.
+- **`donsetch help <command>`** : route to any command's help: `donsetch help keys`, `donsetch help proxy`, `donsetch help fetch`, etc. Falls back to top-level help for unknown commands.
+- **`donsetch keys default local`** : set the local keyless search engine as the default search method, even when BYOK provider keys are configured. When local is the default, the local 5-engine search is tried first and BYOK keys are only used as fallback if local search fails. This lets users test or use the local engine without removing their keys. `donsetch keys default <provider>` switches back to BYOK-first mode.
+- **`donsetch keys export [path|-]`** : export all BYOK keys and config to a file (with 0600 permissions) or stdout (with `-`). Useful for backup, transfer between machines, or dotfiles repos.
+- **`donsetch keys import <path>`** : import a config from a file previously exported by `keys export`. Replaces the current config entirely. Validates structure (provider names, key states, default) before saving.
+- **`donsetch keys clear`** : remove all keys and reset to a clean state. The nuclear option for starting fresh.
 
 ### Fixed
 
-- **Proxy missing from top-level help** — `proxy` command was not listed in `donsetch --help`, making it undiscoverable. Now shown in the MANAGEMENT section alongside `keys`, `doctor`, `update`, etc.
-- **`proxy remove` now accepts numeric indices** — `proxy list` displays proxies as `1, 2, 3, ...` but `proxy remove` only accepted `host:port` or full URLs. Now `donsetch proxy remove 1` works. Handles multiple indices (`remove 1 3 5`) with correct order-of-operations (collects all first, removes in reverse to avoid index shifting). Backward compatible with `host:port` and full URL arguments.
+- **Proxy missing from top-level help** : `proxy` command was not listed in `donsetch --help`, making it undiscoverable. Now shown in the MANAGEMENT section alongside `keys`, `doctor`, `update`, etc.
+- **`proxy remove` now accepts numeric indices** : `proxy list` displays proxies as `1, 2, 3, ...` but `proxy remove` only accepted `host:port` or full URLs. Now `donsetch proxy remove 1` works. Handles multiple indices (`remove 1 3 5`) with correct order-of-operations (collects all first, removes in reverse to avoid index shifting). Backward compatible with `host:port` and full URL arguments.
 
 ## [2.0.0] - 2026-08-16
 
-The v2 quality jump — a direct response to the 50-case
+The v2 quality jump : a direct response to the 50-case
 DonSeTch-vs-Hound comparison. Search top-1 decisiveness, browser
 actions inside fetch, honest telemetry on every result, crawl
 elastic pacing, and a browser path that's boring to install.
 
 ### Added
 
-- **Browser actions in `web_fetch`** — page control inside fetch: `actions=[{...}]` runs click / type / press / scroll / hover / wait steps in the headless browser BEFORE extraction. Deterministic waits (`wait_selector`, `wait_text`), element addressing by CSS selector or visible text, human-cadence typing (log-normal key gaps, think-pauses), trusted CDP input events with bezier mouse paths. Up to 16 steps, validated before any browser time is spent. After the script, the normal extraction pipeline runs (focus/section/toc apply to the interacted page). Per-step results in `structuredContent.actions`; the first failing step aborts honestly with everything that succeeded. Form submits, search flows, load-more, lazy-load scrolls — one call, no separate browser tool.
-- **Authority-aware search ranking** — the decisive top-placement layer. v1 had top-5 recall (23/25) but weak top-1 placement (6/25 vs hound's 13/25); v2 measures **29/30 top-1, 30/30 top-3** on the 30-query regression suite (`bench/regression.py`). Query-aware official-domain registry (~130 tech entries), title entity-term coverage with exact-phrase bonus, docs-seeking amplification, paper-repository authority for research queries, and news freshness ranking (the `published` field was dead data in v1 — it ranks now).
-- **Escalation trace** — every fetch result (success AND error) carries `structuredContent.escalation`: the ordered steps actually taken (route decision → HTTP fetch → browser launch → ghost render → cookie retry → fallbacks) with per-step latency. A 3-second fetch is no longer opaque.
-- **Structured error contract** — errors now carry `structuredContent {url, status, verdict, next_action, escalation}`. `next_action` is a one-line instruction derived from the failure kind (retry with tier=2, wait 30-60s, needs credentials, use an interactive browser). The CLI JSON envelope surfaces it too.
-- **New success fields** — `content_ok` (true content, not a JS shell), `quality` (0-1 content trust, previously computed but never surfaced), `lang`.
-- **PDF per-page stats** — `structuredContent.pdf = {pages, per_page: [{page, chars, ocr, confidence}]}`: per-page extraction confidence (glyph trust for text pages, OCR mean confidence for scanned pages), page boundaries preserved where block merging deliberately flows text across pages.
-- **Doctor browser proof** — doctor now checks Xvfb (with :99 reuse detection), performs a REAL browser launch through the exact tier-2 code path with the fingerprint selftest (webdriver=false verified, 40s bound), verifies ghost-state.json permissions (auto-tightens to 0600), and reports the rerank model cache. 13 checks total (was 9). All new paths are platform-neutral (macOS/Windows report Xvfb as not-needed and use off-screen headful).
-- **Search regression suite** — `bench/regression.py`: 30 queries with canonical domains defined upfront, measuring hit@1/3/5. The report's bar (official/primary in top-3 for ≥80% of tech-doc queries) passes at 100%.
+- **Browser actions in `web_fetch`** : page control inside fetch: `actions=[{...}]` runs click / type / press / scroll / hover / wait steps in the headless browser BEFORE extraction. Deterministic waits (`wait_selector`, `wait_text`), element addressing by CSS selector or visible text, human-cadence typing (log-normal key gaps, think-pauses), trusted CDP input events with bezier mouse paths. Up to 16 steps, validated before any browser time is spent. After the script, the normal extraction pipeline runs (focus/section/toc apply to the interacted page). Per-step results in `structuredContent.actions`; the first failing step aborts honestly with everything that succeeded. Form submits, search flows, load-more, lazy-load scrolls : one call, no separate browser tool.
+- **Authority-aware search ranking** : the decisive top-placement layer. v1 had top-5 recall (23/25) but weak top-1 placement (6/25 vs hound's 13/25); v2 measures **29/30 top-1, 30/30 top-3** on the 30-query regression suite (`bench/regression.py`). Query-aware official-domain registry (~130 tech entries), title entity-term coverage with exact-phrase bonus, docs-seeking amplification, paper-repository authority for research queries, and news freshness ranking (the `published` field was dead data in v1 : it ranks now).
+- **Escalation trace** : every fetch result (success AND error) carries `structuredContent.escalation`: the ordered steps actually taken (route decision → HTTP fetch → browser launch → ghost render → cookie retry → fallbacks) with per-step latency. A 3-second fetch is no longer opaque.
+- **Structured error contract** : errors now carry `structuredContent {url, status, verdict, next_action, escalation}`. `next_action` is a one-line instruction derived from the failure kind (retry with tier=2, wait 30-60s, needs credentials, use an interactive browser). The CLI JSON envelope surfaces it too.
+- **New success fields** : `content_ok` (true content, not a JS shell), `quality` (0-1 content trust, previously computed but never surfaced), `lang`.
+- **PDF per-page stats** : `structuredContent.pdf = {pages, per_page: [{page, chars, ocr, confidence}]}`: per-page extraction confidence (glyph trust for text pages, OCR mean confidence for scanned pages), page boundaries preserved where block merging deliberately flows text across pages.
+- **Doctor browser proof** : doctor now checks Xvfb (with :99 reuse detection), performs a REAL browser launch through the exact tier-2 code path with the fingerprint selftest (webdriver=false verified, 40s bound), verifies ghost-state.json permissions (auto-tightens to 0600), and reports the rerank model cache. 13 checks total (was 9). All new paths are platform-neutral (macOS/Windows report Xvfb as not-needed and use off-screen headful).
+- **Search regression suite** : `bench/regression.py`: 30 queries with canonical domains defined upfront, measuring hit@1/3/5. The report's bar (official/primary in top-3 for ≥80% of tech-doc queries) passes at 100%.
 
 ### Fixed
 
-- **arXiv PDF false "blocked"** (from the 50-case report): wall detection marker-scanned PDF bytes as lossy text — a Cloudflare-fronted paper containing "attention required" plus a cf-ray header produced a Blocked verdict at HTTP 200. Binary bodies (PDFs, images, archives) are now exempt from HTML marker scanning on 2xx; bot walls speak HTML. Non-2xx still classifies normally.
+- **arXiv PDF false "blocked"** (from the 50-case report): wall detection marker-scanned PDF bytes as lossy text : a Cloudflare-fronted paper containing "attention required" plus a cf-ray header produced a Blocked verdict at HTTP 200. Binary bodies (PDFs, images, archives) are now exempt from HTML marker scanning on 2xx; bot walls speak HTML. Non-2xx still classifies normally.
 - **Cloudflare "Enable JavaScript and cookies to continue" shells** (report: "do not call a response successful when it only contains…") are now Challenge, never success.
 - **Crawl latency** (report: 6.29s median vs 0.45s): v1 slept ~2.7s/page (700ms pace + up to 2s anti-metronome dwell) plus serial sitemap probes. v2 elastic pacing: 300ms base pace, skim-model dwell (≤300ms), sitemap candidates probed in one parallel wave on miss, reactive escalation ladder unchanged (throttle/latency signals still back off aggressively). 5-page docs crawl now ~3.5s wall including extraction.
 - **Domain-profile poisoning from browser fetches**: cookie write-back in the actions path no longer marks never-walled domains as needs_tier2 (the v1.1 reddit-poisoning bug class, caught in live testing).
@@ -749,28 +1057,28 @@ elastic pacing, and a browser path that's boring to install.
 
 ### Changed
 
-- Search enrichment now prefetches the top 5 results (was 3) — parallel with a 4s cap each, so real page titles/descriptions feed the final ordering at no wall-clock cost.
+- Search enrichment now prefetches the top 5 results (was 3) : parallel with a 4s cap each, so real page titles/descriptions feed the final ordering at no wall-clock cost.
 - Crawl sitemap child-index recursion is wave-parallel (bounds of 8) instead of serial.
 
 ## [1.2.0] - 2026-08-16
 
-Security hardening — full audit by GLM 5.3 found 8 live-proven
+Security hardening : full audit by GLM 5.3 found 8 live-proven
 vulnerabilities. All patched, PoC-verified against the release binary.
 
 ### Security
 
-- **SSRF: DNS pinning** — hostnames resolving to private/loopback addresses are now blocked at the transport layer (post-resolution IP check, TOCTOU-safe). Previously only literal IPs were checked, so `127-0-0-1.nip.io` or any rebinding DNS reached loopback and cloud metadata endpoints. Escape hatch: `DONSETCH_ALLOW_PRIVATE_EGRESS=1`.
-- **SSRF: redirect re-check** — every redirect hop is now checked with the SSRF guard before following. Previously the guard ran once on the initial URL; a public URL redirecting into a private network bypassed it.
-- **SSRF: crawl guard** — `web_crawl` now checks the seed URL with the SSRF guard (same as `web_fetch`). Previously crawl had no guard at all.
-- **Decompression bomb** — all decompression codecs (br/gzip/deflate/zstd) and identity bodies are now capped at 64 MiB. A 500 KB gzip body expanding to 512 MB previously caused unbounded memory growth; now returns a clean error.
-- **h2 memory DoS** — three amplifiers fixed in the custom HTTP/2 stack: CONTINUATION flood capped at 256 KiB header blocks, frame size cap reduced from 16 MiB to 1 MiB, HPACK dynamic-table size updates rejected above 64 KiB (Chrome's advertised max). Response bodies capped at 64 MiB.
-- **Cookie tossing** — `Domain=` attribute now validated per RFC 6265 §5.3.6: accepted only when it equals the request host or is a parent suffix. Previously any origin could pin cookies on any victim domain.
-- **Expired cookie replay** — `header_for` and `snapshot_for` now filter expired cookies; `purge_expired()` runs after every store. Previously expired cookies were replayed indefinitely.
-- **CRLF request splitting** — h2 header values with CR/LF/NUL are now rejected at decode time (RFC 9113 §8.2.2). The cookie jar rejects control characters at store time. Outgoing headers are validated in both `fetch_once_via` and `h1::get` before any wire write. Previously a crafted h2 `set-cookie` with embedded CRLF could inject arbitrary headers into later h1 requests.
+- **SSRF: DNS pinning** : hostnames resolving to private/loopback addresses are now blocked at the transport layer (post-resolution IP check, TOCTOU-safe). Previously only literal IPs were checked, so `127-0-0-1.nip.io` or any rebinding DNS reached loopback and cloud metadata endpoints. Escape hatch: `DONSETCH_ALLOW_PRIVATE_EGRESS=1`.
+- **SSRF: redirect re-check** : every redirect hop is now checked with the SSRF guard before following. Previously the guard ran once on the initial URL; a public URL redirecting into a private network bypassed it.
+- **SSRF: crawl guard** : `web_crawl` now checks the seed URL with the SSRF guard (same as `web_fetch`). Previously crawl had no guard at all.
+- **Decompression bomb** : all decompression codecs (br/gzip/deflate/zstd) and identity bodies are now capped at 64 MiB. A 500 KB gzip body expanding to 512 MB previously caused unbounded memory growth; now returns a clean error.
+- **h2 memory DoS** : three amplifiers fixed in the custom HTTP/2 stack: CONTINUATION flood capped at 256 KiB header blocks, frame size cap reduced from 16 MiB to 1 MiB, HPACK dynamic-table size updates rejected above 64 KiB (Chrome's advertised max). Response bodies capped at 64 MiB.
+- **Cookie tossing** : `Domain=` attribute now validated per RFC 6265 §5.3.6: accepted only when it equals the request host or is a parent suffix. Previously any origin could pin cookies on any victim domain.
+- **Expired cookie replay** : `header_for` and `snapshot_for` now filter expired cookies; `purge_expired()` runs after every store. Previously expired cookies were replayed indefinitely.
+- **CRLF request splitting** : h2 header values with CR/LF/NUL are now rejected at decode time (RFC 9113 §8.2.2). The cookie jar rejects control characters at store time. Outgoing headers are validated in both `fetch_once_via` and `h1::get` before any wire write. Previously a crafted h2 `set-cookie` with embedded CRLF could inject arbitrary headers into later h1 requests.
 
 ### Fixed
 
-- h1 response bodies now capped (content-length, chunked, read-to-close) — a lying Content-Length or an endless chunked stream previously caused unbounded allocation. Chunk-size arithmetic overflow also capped.
+- h1 response bodies now capped (content-length, chunked, read-to-close) : a lying Content-Length or an endless chunked stream previously caused unbounded allocation. Chunk-size arithmetic overflow also capped.
 - `ghost-state.json` and BYOK key tmp files now created with 0600 permissions before content is written. Previously the tmp file was 0644 until the atomic rename, leaving harvested cookies and API keys world-readable on crash.
 - IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`) now detected as their v4 self in the SSRF guard. Previously they bypassed all v6 rules.
 - IPv6 literals in brackets (`[::1]`) now correctly parsed by the SSRF guard. Previously brackets prevented the IP parser from running.
@@ -788,13 +1096,13 @@ Hybrid semantic focus filter + tool definition updates.
 
 ### Added
 
-- Hybrid BM25 + cross-encoder semantic focus filter for `web_fetch`. The `focus` parameter now uses keyword matching (BM25) as the base, then if the cross-encoder model is already cached (from search reranking), runs a second pass and adds semantically relevant blocks that BM25 missed. Catches blocks where the query uses different vocabulary than the page (e.g. query "how gradients flow through layers" matches "backpropagation" and "chain rule"). No model download is triggered during fetch — only uses the model if already cached.
+- Hybrid BM25 + cross-encoder semantic focus filter for `web_fetch`. The `focus` parameter now uses keyword matching (BM25) as the base, then if the cross-encoder model is already cached (from search reranking), runs a second pass and adds semantically relevant blocks that BM25 missed. Catches blocks where the query uses different vocabulary than the page (e.g. query "how gradients flow through layers" matches "backpropagation" and "chain rule"). No model download is triggered during fetch : only uses the model if already cached.
 - `cross_encoder_scores` and `is_model_cached` exposed from the rerank module for reuse by the focus filter.
 
 ### Changed
 
 - `focus` parameter description strengthened to drive agent adoption: explains the 50-80% token reduction, hybrid matching, concrete example, and ends with a directive to always set focus when you know what you're looking for.
-- `web_fetch` tool description updated with a prominent "Token efficiency — use focus" section.
+- `web_fetch` tool description updated with a prominent "Token efficiency : use focus" section.
 - `web_crawl` `focus` (topic) param and description updated similarly.
 - 401 tests (was 395).
 
@@ -828,7 +1136,7 @@ First stable release. Feature-complete MCP server + CLI for web fetch, search, a
 
 ### Added
 
-- **CLI**: full command-line interface — `fetch`, `search`, `crawl` with same engine as MCP.
+- **CLI**: full command-line interface : `fetch`, `search`, `crawl` with same engine as MCP.
   - `--json` for machine-readable output, `-q` for quiet mode, `--tier` for manual escalation control.
   - `keys` subcommand: manage BYOK search provider keys (`add`, `remove`, `list`, `default`, `reset`).
   - `doctor`: 9-check health diagnostics with auto-fix.
@@ -839,7 +1147,7 @@ First stable release. Feature-complete MCP server + CLI for web fetch, search, a
 
 - **BYOK search providers**: external search providers (TinyFish, Tavily, Serper, Exa) bypass the local engine entirely. Key stacking, rotation, rate-limit cooldown (60s auto-recovery), credit-depletion detection, local fallback. Config: `~/.cache/donsetch/byok-keys.json`.
 
-- **Query-entity coverage penalty**: anchor entities (hyphenated compounds like "B-tree") and specifiers (version numbers, years) checked against results. Wrong entity = 0.3× score penalty. Fixes BM25 splitting "B-tree" → "b" + "tree" where "binary tree" matches. Universal — no-op for queries without entities.
+- **Query-entity coverage penalty**: anchor entities (hyphenated compounds like "B-tree") and specifiers (version numbers, years) checked against results. Wrong entity = 0.3× score penalty. Fixes BM25 splitting "B-tree" → "b" + "tree" where "binary tree" matches. Universal : no-op for queries without entities.
 
 - **Crawl v2**: transient retry (max 2), canonical URL resolution, pagination (`<link rel="next">`), RSS/Atom feed discovery, `<base href>` resolution, binary content-type guard, referer + sec-fetch-site chaining, parent metadata, score-sorted output, sitemap `<priority>` + `<lastmod>`, ghost escalation (capped 3/crawl). Seed URL always in scope.
 
@@ -914,7 +1222,7 @@ Initial public beta. Feature-complete MCP server for web fetch, search, and craw
 
 ### Known limitations
 
-- Interactive captchas (hCaptcha, reCAPTCHA, Turnstile checkbox) are not solved — no solving service by design.
+- Interactive captchas (hCaptcha, reCAPTCHA, Turnstile checkbox) are not solved : no solving service by design.
 - ML-DSA post-quantum signatures not yet supported (BoringSSL 5.1.0 lacks them).
 - `outerWidth/Height` in headless: protocol-level override only.
 - Windows/macOS PDF subsystem compiled but CI verification pending.

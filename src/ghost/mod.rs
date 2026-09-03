@@ -1,11 +1,11 @@
-//! DonGhost — the tier-2 ghost browser.
+//! DonGhost : the tier-2 ghost browser.
 //!
 //! A real Chromium, driven over raw CDP with zero
 //! automation flags and zero script injection. Exists for
 //! exactly two jobs DonShadow can't do:
-//!   SOLVE  — pass a JS challenge, harvest clearance
+//!   SOLVE  : pass a JS challenge, harvest clearance
 //!            cookies, hand them to tier 1.
-//!   RENDER — execute a JS-rendered page, hand the DOM
+//!   RENDER : execute a JS-rendered page, hand the DOM
 //!            HTML to DonSift.
 //!
 //! Lifecycle: lazy launch → freeze (SIGSTOP the process
@@ -16,6 +16,7 @@
 pub mod actions;
 pub mod cache;
 pub mod cdp;
+pub mod cloak;
 pub mod manager;
 pub mod ops;
 pub mod proc;
@@ -35,10 +36,33 @@ use crate::error::FetchError;
 use crate::profile::BrowserProfile;
 
 /// Idle this long → SIGSTOP the process group.
-/// (Daemon lifecycle — used by the MCP idle reaper.)
+/// (Daemon lifecycle : used by the MCP idle reaper.)
 pub const FREEZE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
 /// Frozen this long → reap entirely.
 pub const REAP_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Windows profile lockfile: age past which an unheld lockfile is
+/// treated as orphaned by a dead daemon and recovered.
+#[cfg(windows)]
+pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+/// Windows profile lockfile: how often a held lockfile's mtime is
+/// refreshed. Must stay comfortably below WINLOCK_STALE_AFTER.
+///
+/// FREEZE_AFTER/REAP_AFTER don't apply here: GhostGuard::drop kills
+/// the Ghost outright on every guard drop on Windows (see
+/// manager.rs), so the lock is normally held only for a single
+/// call's duration. The real trigger is one long-running call: an
+/// `actions` script allows up to MAX_STEPS steps with individual
+/// wait_selector/wait_text polls capped at 60s each (see
+/// actions.rs), so a single guarded call can legitimately run well
+/// past WINLOCK_STALE_AFTER without the Ghost being anywhere near
+/// dead. Without a heartbeat, a second daemon starting mid-call
+/// would see the lockfile's un-refreshed creation-time mtime,
+/// mistake the still-live holder for an abandoned one, and steal
+/// the profile out from under it : exactly the collision this lock
+/// exists to prevent.
+#[cfg(windows)]
+pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub struct Ghost {
     child: Child,
@@ -64,6 +88,18 @@ pub struct Ghost {
     /// `fetch::guards::ensure_url_safe` before it hits the network.
     /// Aborted in Drop so it cannot leak after Chrome is reaped.
     fetch_guard: Option<tokio::task::JoinHandle<()>>,
+
+    /// Windows profile-exclusion lockfile path (unix uses flock
+    /// instead). Removed in Drop so the next daemon can take the
+    /// shared profile.
+    #[cfg(windows)]
+    winlock: Option<std::path::PathBuf>,
+    /// Refreshes `winlock`'s mtime on an interval so a Ghost held
+    /// through one long-running call never looks abandoned to
+    /// another daemon's staleness check (see WINLOCK_HEARTBEAT).
+    /// Aborted in Drop, same as fetch_guard.
+    #[cfg(windows)]
+    winlock_heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Persistent profile dir: aged state passes challenges
@@ -93,10 +129,23 @@ pub fn default_chrome_args(
         "--disable-component-update".into(),
         "--disable-sync".into(),
         "--disable-translate".into(),
+        // Vanilla-browser surface: no surprise extension set
+        // (extensions are enumerable fingerprints), no default
+        // apps phoning home behind the page being fetched.
+        "--disable-default-apps".into(),
+        "--disable-extensions".into(),
         "--mute-audio".into(),
         "--disk-cache-size=1".into(),
         "--disable-gpu-shader-disk-cache".into(),
         "--disable-features=SiteEngagementService".into(),
+        // Software WebGL: a GPU-less box (Xvfb, VM, container)
+        // must still expose a renderer string. WebGL=null is a
+        // headless-only signature real desktops never produce;
+        // SwiftShader always initialises, so the page reads
+        // "Google SwiftShader" exactly like real Chrome on a
+        // machine without dedicated graphics.
+        "--use-gl=swiftshader".into(),
+        "--enable-unsafe-swiftshader".into(),
     ]
 }
 
@@ -106,26 +155,48 @@ pub fn sandbox_opt_in_enabled() -> bool {
     std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1")
 }
 
-/// Locate a Chrome-family binary. Env override first, then
-/// platform-specific known paths, then PATH search. No `which`
-/// subprocess — works on Linux, macOS, and Windows.
+/// Resolve the Chromium-family binary used by DonGhost.
+///
+/// `DONSETCH_BROWSER_BACKEND=chromium|headless|cloakbrowser|auto` selects the
+/// backend. `chromium` preserves the original headful/off-screen behavior;
+/// `headless` uses the same original binary with `--headless=new` forced.
+/// `auto` (default) is plain Chromium discovery. CloakBrowser runs only
+/// after explicit selection; downloading is additionally opt-in via
+/// `DONSETCH_CLOAK_AUTO_DOWNLOAD=1`.
+pub fn resolve_browser() -> Result<cloak::BrowserResolution, FetchError> {
+    cloak::resolve_browser().map_err(FetchError::ghost)
+}
+
+/// Resolve the configured browser without downloading a public binary.
+pub fn resolve_browser_without_download() -> Result<cloak::BrowserResolution, FetchError> {
+    cloak::resolve_browser_without_download().map_err(FetchError::ghost)
+}
+
+/// Locate the selected browser binary. Kept as the narrow compatibility API
+/// for existing profile/version probing and status callers.
 pub fn chrome_binary() -> Result<String, FetchError> {
+    Ok(resolve_browser()?.path.to_string_lossy().into_owned())
+}
+
+fn chromium_binary() -> Result<String, String> {
     if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        return Ok(p.to_string_lossy().into_owned());
+        let path = PathBuf::from(p);
+        if !is_executable(&path) {
+            return Err(format!(
+                "DONGHOST_CHROME is not an executable: {}",
+                path.display()
+            ));
+        }
+        return Ok(path.to_string_lossy().into_owned());
     }
-    // Known install locations (most reliable, no PATH needed).
     for path in known_chrome_paths() {
         if is_executable(&path) {
-            // Snap wrappers (/snap/bin/chromium → /usr/bin/snap) are
-            // executable but don't reliably pass CDP flags through
-            // Snap's confinement. Resolve to the real binary.
             if let Some(real) = resolve_snap_chrome(&path) {
                 return Ok(real.to_string_lossy().into_owned());
             }
             return Ok(path.to_string_lossy().into_owned());
         }
     }
-    // PATH search.
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             for name in chrome_names() {
@@ -136,9 +207,7 @@ pub fn chrome_binary() -> Result<String, FetchError> {
             }
         }
     }
-    Err(FetchError::ghost(
-        "no chromium/chrome binary found (set DONGHOST_CHROME)",
-    ))
+    Err("no chromium/chrome binary found (set DONGHOST_CHROME)".into())
 }
 
 #[cfg(linux_like)]
@@ -334,7 +403,7 @@ fn known_chrome_paths() -> Vec<PathBuf> {
         // %LOCALAPPDATA%\ms-playwright\chromium-*\chrome-win64\chrome.exe
         paths.extend(playwright_candidates());
     }
-    // Edge: Chromium-based and pre-installed on Windows — often the
+    // Edge: Chromium-based and pre-installed on Windows : often the
     // ONLY CDP-capable browser on a stock box. Its directory is never
     // on PATH, so it must be probed explicitly.
     if let Some(pfx86) = std::env::var_os("ProgramFiles(x86)") {
@@ -348,7 +417,7 @@ fn known_chrome_paths() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn chrome_names() -> &'static [&'static str] {
-    // Edge is Chromium-based, pre-installed on Windows — often
+    // Edge is Chromium-based, pre-installed on Windows : often
     // the only available CDP-capable browser.
     &["chrome.exe", "msedge.exe", "chromium.exe"]
 }
@@ -378,24 +447,27 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 impl Ghost {
-    /// Launch cold. Headful Chrome on Xvfb (Linux) — the real
+    /// Launch cold. Headful Chrome on Xvfb (Linux) : the real
     /// stealth mode. Headful has real WebGL, real window.chrome,
     /// real screen geometry. Headless is detectable; headful on
     /// a virtual display is not. Falls back to `--headless=new`
     /// on macOS/Windows where Xvfb is unavailable.
     ///
     /// Clean by construction: no automation flags, UA pinned to
-    /// the DonShadow profile so harvested cookies stay valid
-    /// when tier 1 reuses them (cf_clearance binds IP+UA).
+    /// the DonShadow profile so harvested cookies stay valid when
+    /// tier 1 reuses them (cf_clearance binds IP+UA).
     pub async fn launch(
         profile: &BrowserProfile,
         display: Option<&str>,
     ) -> Result<Self, FetchError> {
-        // Unused on macOS/Windows (Xvfb is Linux-only) — clippy -Dwarnings errors on it.
+        // Unused on macOS/Windows (Xvfb is Linux-only) : clippy -Dwarnings errors on it.
         #[cfg(not(linux_like))]
         let _ = display;
 
-        let bin = chrome_binary()?;
+        let browser = tokio::task::spawn_blocking(resolve_browser)
+            .await
+            .map_err(|e| FetchError::ghost(format!("browser resolution task failed: {e}")))??;
+        let bin = browser.path.to_string_lossy().into_owned();
 
         // ── Profile lock: prevent cross-process collision ──
         // Multiple donsetch processes (CLI + MCP daemon, parallel
@@ -419,36 +491,121 @@ impl Ghost {
             .open(&lockfile)
             .ok();
 
-        let (dir, temp_profile) = match profile_lock.as_ref() {
-            Some(f) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::io::AsRawFd;
-                    let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                    if got == 0 {
-                        (profile_dir(), None)
-                    } else {
-                        let t = std::env::temp_dir()
-                            .join(format!("donsetch-ghost-{}", std::process::id()));
-                        (t.clone(), Some(t))
+        let (dir, temp_profile, _winlock_opt) = {
+            let (dir_s, temp_s, _wl) = match profile_lock.as_ref() {
+                Some(f) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let got =
+                            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                        if got == 0 {
+                            (profile_dir(), None, None::<std::path::PathBuf>)
+                        } else {
+                            let t = std::env::temp_dir()
+                                .join(format!("donsetch-ghost-{}", std::process::id()));
+                            (t.clone(), Some(t), None::<std::path::PathBuf>)
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
+                        // Windows flock(2) doppelgänger: an exclusive
+                        // create_new lockfile. Two daemons on the shared
+                        // profile fight Chromium's own singleton, and
+                        // the loser gets no DevTools line at all; the
+                        // lockfile loser diverges to a temp profile
+                        // exactly like the unix flock path. A stale
+                        // file (dead daemon left it) is recovered by
+                        // age: >10min old is taken as orphaned.
+                        let _ = f;
+                        let lock_path = crate::paths::cache_dir().join("ghost-profile.winlock");
+                        // FILE_SHARE_DELETE (0x4, alongside the usual
+                        // READ|WRITE) explicitly, not relied on as a
+                        // default: without it, Drop's remove_file could
+                        // hit a sharing violation if it races the
+                        // heartbeat's own brief open() on another
+                        // thread, leaving the lockfile behind after a
+                        // clean exit.
+                        let take_lock = |p: &std::path::Path| {
+                            use std::os::windows::fs::OpenOptionsExt;
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .share_mode(0x1 | 0x2 | 0x4)
+                                .open(p)
+                        };
+                        match take_lock(&lock_path) {
+                            Ok(_f) => (profile_dir(), None, Some(lock_path)),
+                            Err(_) => {
+                                // Sub-second precision (a full Duration
+                                // compare, not `.as_secs() > 600` as
+                                // before) : the boundary shifts by
+                                // under a second either way, moot at a
+                                // 10-minute threshold.
+                                let stale = std::fs::metadata(&lock_path)
+                                    .and_then(|m| m.modified())
+                                    .ok()
+                                    .and_then(|t| t.elapsed().ok())
+                                    .is_some_and(|e| e > WINLOCK_STALE_AFTER);
+                                if stale {
+                                    let _ = std::fs::remove_file(&lock_path);
+                                    if take_lock(&lock_path).is_ok() {
+                                        (profile_dir(), None, Some(lock_path))
+                                    } else {
+                                        let t = std::env::temp_dir()
+                                            .join(format!("donsetch-ghost-{}", std::process::id()));
+                                        (t.clone(), Some(t), None::<std::path::PathBuf>)
+                                    }
+                                } else {
+                                    let t = std::env::temp_dir()
+                                        .join(format!("donsetch-ghost-{}", std::process::id()));
+                                    (t.clone(), Some(t), None::<std::path::PathBuf>)
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        let _ = f;
+                        (profile_dir(), None, None::<std::path::PathBuf>)
                     }
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = f;
-                    (profile_dir(), None)
+                None => {
+                    let t =
+                        std::env::temp_dir().join(format!("donsetch-ghost-{}", std::process::id()));
+                    (t.clone(), Some(t), None::<std::path::PathBuf>)
                 }
-            }
-            None => {
-                let t = std::env::temp_dir().join(format!("donsetch-ghost-{}", std::process::id()));
-                (t.clone(), Some(t))
-            }
+            };
+            let dir = dir_s;
+            let temp_profile = temp_s;
+            (dir, temp_profile, _wl)
         };
+        #[cfg(windows)]
+        let winlock: Option<std::path::PathBuf> = _winlock_opt;
+        // Keep the winlock's mtime fresh for as long as this Ghost
+        // holds it : see WINLOCK_HEARTBEAT's doc comment for why
+        // this can't just rely on WINLOCK_STALE_AFTER alone.
+        #[cfg(windows)]
+        let winlock_heartbeat = winlock.clone().map(|p| {
+            tokio::spawn(async move {
+                use std::os::windows::fs::OpenOptionsExt;
+                loop {
+                    tokio::time::sleep(WINLOCK_HEARTBEAT).await;
+                    // FILE_SHARE_DELETE so this brief handle never
+                    // blocks Drop's remove_file on another thread.
+                    if let Ok(f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .share_mode(0x1 | 0x2 | 0x4)
+                        .open(&p)
+                    {
+                        let _ = f.set_modified(std::time::SystemTime::now());
+                    }
+                }
+            })
+        });
 
         std::fs::create_dir_all(&dir)
             .map_err(|e| FetchError::ghost(format!("profile dir: {e}")))?;
-        // Only clear stale SingletonLock files when we hold the
-        // profile lock. If we are on a temp profile the shared
         // dir's lock belongs to a LIVE Chrome; removing its
         // SingletonLock corrupts that instance's session and
         // triggers the "Something went wrong" dialog.
@@ -459,13 +616,31 @@ impl Ghost {
         }
         let mut cmd = Command::new(bin);
         let mut chrome_args: Vec<String> = default_chrome_args(&dir, profile);
+        let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;
+        if browser.backend == cloak::BrowserBackend::CloakBrowser {
+            // Cloak's C++ patches own the extension/plugin and
+            // default-app surfaces: its real plugin list and app
+            // behavior are the stealth guarantee. The vanilla
+            // surface flags added above delete exactly that value.
+            // Drop them for this backend only (stock chromium keeps
+            // them: enumerable-extension fingerprint class).
+            chrome_args.retain(|a| {
+                !a.starts_with("--disable-default-apps") && !a.starts_with("--disable-extensions")
+            });
+            let platform = match profile.platform {
+                crate::profile::Platform::Linux => "linux",
+                crate::profile::Platform::Windows => "windows",
+                crate::profile::Platform::MacOs => "macos",
+            };
+            chrome_args.push(format!("--fingerprint-platform={platform}"));
+        }
         // Opt-in escape hatch for environments where sandbox is
         // unavailable (e.g. containers without user-namespace support
-        // or AppArmor restrictions). Never enabled by default —
+        // or AppArmor restrictions). Never enabled by default :
         // requires explicit env var and prints a loud warning.
         if std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1") {
             eprintln!(
-                "[ghost] WARNING: DONGHOST_NO_SANDBOX=1 — launching Chrome with --no-sandbox and --disable-setuid-sandbox. This disables the Chromium sandbox and is UNSAFE. Only use in isolated containers."
+                "[ghost] WARNING: DONGHOST_NO_SANDBOX=1 : launching Chrome with --no-sandbox and --disable-setuid-sandbox. This disables the Chromium sandbox and is UNSAFE. Only use in isolated containers."
             );
             chrome_args.push("--no-sandbox".into());
             chrome_args.push("--disable-setuid-sandbox".into());
@@ -490,7 +665,7 @@ impl Ghost {
         //
         // macOS / Windows: no Xvfb, but headful Chrome with the
         //   window positioned at -32000,-32000 (far off-screen).
-        //   The window exists, has real GPU, real WebGL — but the
+        //   The window exists, has real GPU, real WebGL : but the
         //   user never sees it. This is strictly better than
         //   --headless=new, which uses SwiftShader (detectable).
         //
@@ -498,7 +673,9 @@ impl Ghost {
 
         #[cfg(linux_like)]
         {
-            if let Some(disp) = display {
+            if force_headless {
+                chrome_args.push("--headless=new".into());
+            } else if let Some(disp) = display {
                 // Linux + Xvfb: headful on virtual display.
                 cmd.env("DISPLAY", disp);
                 chrome_args.push("--ozone-platform=x11".into());
@@ -510,6 +687,11 @@ impl Ghost {
                 // the only option without a display.
                 chrome_args.push("--headless=new".into());
             }
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if force_headless {
+            chrome_args.push("--headless=new".into());
         }
 
         // Unknown platforms (not Linux/Android/macOS/Windows): headless
@@ -562,6 +744,16 @@ impl Ghost {
         .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
 
         let cdp = cdp::Cdp::connect(&ws_url).await?;
+        // Replant the session vault: login/session cookies harvested
+        // from earlier browser runs. Best-effort by design: a walled
+        // or hostile cookie shape can never fail a launch. Only the
+        // SHARED profile gets the replay: a temp-profile ghost (a
+        // concurrent divergence run) must not borrow the canonical
+        // session, or a vendor that binds sessions to fingerprints
+        // sees the same login riding two profiles.
+        if temp_profile.is_none() {
+            Self::restore_session_cookies(&cdp).await;
+        }
 
         // One page target, attached flat.
         let target = cdp
@@ -615,27 +807,30 @@ impl Ghost {
         }
         cdp.call(Some(&session), "Page.enable", json!({})).await?;
 
-        // Stealth JS injection — runs before any page script.
-        // Patches the most common automation detection vectors:
-        // - navigator.webdriver: belt-and-suspenders alongside
-        //   --disable-blink-features=AutomationControlled
+        // Stealth JS injection : runs before any page script.
+        // Patches only what real Chrome guarantees and our launch
+        // does NOT:
         // - navigator.languages: ensure it's set (some Xvfb setups
         //   don't inherit the system locale)
         // - window.chrome: ensure it exists (some headful setups
         //   on Linux miss the chrome.runtime object)
         // - navigator.permissions.query: patch notifications to
         //   return 'denied' (real Chrome default, automation
-        //   returns 'prompt' — a known detection vector)
+        //   returns 'prompt' : a known detection vector)
         // - navigator.plugins: ensure length > 0 (headful Chrome
         //   should have plugins, but some setups don't)
-        // Minimal patches — over-patching is itself detectable.
+        // navigator.webdriver is DELIBERATELY not patched:
+        // defining it, even with get() => false, is itself the
+        // detection vector fpscanner flags (real Chrome leaves
+        // the property undefined); --disable-blink-features=
+        // AutomationControlled on the launch args handles the
+        // headless-mode case without defining anything.
         let _ = cdp
             .call(
                 Some(&session),
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({
                     "source": "\
-                        Object.defineProperty(navigator, 'webdriver', { get: () => false });\
                         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });\
                         if (!window.chrome) { window.chrome = {}; }\
                         if (!window.chrome.runtime) { window.chrome.runtime = {}; }\
@@ -691,7 +886,7 @@ impl Ghost {
             .await?;
         }
 
-        // Session warmup — Debian 12 chromium 151 (observed): the
+        // Session warmup : Debian 12 chromium 151 (observed): the
         // FIRST session-scoped navigation's CDP response is deferred
         // until a one-time ~26s barrier after browser start (the
         // DevTools-visible face of this build's slow first-paint
@@ -704,7 +899,7 @@ impl Ghost {
         // HTTPS URL: about:blank and data: URLs do not trip (and so
         // do not absorb) the barrier. It flows through the same
         // Fetch request guard as any other navigation, so the SSRF
-        // posture is unchanged. Failures are tolerated — healthy
+        // posture is unchanged. Failures are tolerated : healthy
         // Chrome answers instantly and pays only a trivial page load.
         {
             let _ = cdp
@@ -728,6 +923,10 @@ impl Ghost {
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
+            #[cfg(windows)]
+            winlock,
+            #[cfg(windows)]
+            winlock_heartbeat,
         })
     }
 
@@ -767,11 +966,62 @@ impl Ghost {
         self.frozen
     }
 
-    /// Reap the browser entirely — the whole process tree,
+    /// Reap the browser entirely : the whole process tree,
     /// plus crashpad handlers on Unix (they daemonize into
     /// their own groups and escape the group kill; on Windows
     /// the Job Object already owns them).
+    ///
+    /// Graceful first, hard kill only as the fallback. Chromium
+    /// checkpoints the cookie DB, Local Storage, session files and
+    /// preferences only on a clean exit; a bare SIGKILL discards
+    /// every write since the last checkpoint, so a login or
+    /// storage token set during the session this daemon just ran
+    /// would silently vanish at reap. The close handshake is
+    /// send-once best-effort (a dead CDP link fails it instantly),
+    /// and the whole path is time-bounded so a hung browser can
+    /// never stall the caller. Cross-platform: Browser.close is
+    /// CDP, same on Linux/macOS/Windows.
     pub async fn kill(&mut self) {
+        if self.frozen {
+            // A SIGSTOPped tree cannot answer CDP: thaw before the
+            // handshake so it can receive it (reaper kills frozen
+            // ghosts after REAP_AFTER).
+            self.proc.thaw();
+            self.frozen = false;
+        }
+        // Vault the authenticated state before the browser can
+        // take it with it: session cookies gathered now survive
+        // whatever exit shape this reap ends up being, including
+        // the hard-kill fallback below. Bounded: a wedged CDP
+        // must not stretch the reap budget. Only the shared
+        // profile feeds the vault: a temp-profile run is a
+        // concurrent divergence and must not stamp its cookies
+        // into the canonical session.
+        if self.temp_profile.is_none()
+            && let Ok(Ok(list)) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), self.cookies()).await
+        {
+            cache::store_session_cookies(&list);
+        }
+        let cdp = self.cdp.clone();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            cdp.call(None, "Browser.close", json!({})),
+        )
+        .await;
+        // Bounded wait for the clean exit. Resolves fast in every
+        // real shape: close processed (Chromium flushes then exits),
+        // CDP already dead but the child still shutting down, or an
+        // already-exited child (thaw showed a corpse). Only a truly
+        // wedged browser spends the whole budget here.
+        if tokio::time::timeout(std::time::Duration::from_secs(6), self.child.wait())
+            .await
+            .is_ok()
+        {
+            sweep_crashpad();
+            return;
+        }
+        // Hard fallback: hung browser. Last-resort only.
         self.proc.kill_group();
         sweep_crashpad();
         let _ = self.child.wait().await;
@@ -790,7 +1040,7 @@ impl Ghost {
     /// until the generic 20s CDP timeout, blocking tier-2 entirely.
     ///
     /// Fix: dispatch `Page.navigate` but do NOT block on its
-    /// response. Poll `current_url()` instead — it uses the
+    /// response. Poll `current_url()` instead : it uses the
     /// browser-level `Target.getTargetInfo`, which is routed
     /// separately from the page session and still returns the
     /// advancing URL. This succeeds on both healthy Chrome (fast
@@ -815,7 +1065,7 @@ impl Ghost {
         //
         // Debian 12 chromium 151 (observed in testing): session-
         // scoped CDP responses queue behind a settling navigation
-        // — Page.navigate's response can lag tens of seconds on
+        // : Page.navigate's response can lag tens of seconds on
         // trivial pages while the URL advance itself is <1s
         // (browser-level Target.getTargetInfo answers in ms), and
         // every subsequent session-scoped call shares that queue.
@@ -863,7 +1113,7 @@ impl Ghost {
         }
     }
 
-    /// Current document HTML. DOM domain only — no Runtime,
+    /// Current document HTML. DOM domain only : no Runtime,
     /// no script execution.
     ///
     /// Both calls are bounded to 3s per leg: session-scoped CDP
@@ -895,7 +1145,7 @@ impl Ghost {
             .to_string())
     }
 
-    /// Current page URL (targetInfo — no Runtime).
+    /// Current page URL (targetInfo : no Runtime).
     pub async fn current_url(&self) -> Result<String, FetchError> {
         Ok(self
             .cdp
@@ -933,12 +1183,92 @@ impl Ghost {
                         name: name.to_string(),
                         value: value.to_string(),
                         domain: domain.to_string(),
+                        path: c
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                         expires_at: expires,
+                        secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+                        http_only: c.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+                        same_site: c
+                            .get("sameSite")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Lax")
+                            .to_string(),
                     });
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Replant the session vault into a fresh browser. Best-effort:
+    /// a hostile bucket or a vendor that rejects replanted cookies
+    /// must never fail a launch. Batch CDP call first, then the
+    /// per-cookie stable path as fallback (older/different builds
+    /// ship Storage.setCookies behind different rpc versions).
+    async fn restore_session_cookies(cdp: &cdp::Cdp) {
+        let list = crate::ghost::cache::load_session_cookies();
+        if list.is_empty() {
+            return;
+        }
+        let batch: Vec<serde_json::Value> = list
+            .iter()
+            .filter_map(|c| {
+                if c.domain.is_empty() {
+                    return None;
+                }
+                let mut v = serde_json::json!({
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": if c.path.is_empty() { "/".to_string() } else { c.path.clone() },
+                    "secure": c.secure,
+                    "httpOnly": c.http_only,
+                    "sameSite": if c.same_site.is_empty() { "Lax".to_string() } else { c.same_site.clone() },
+                });
+                if let Some(e) = c.expires_at {
+                    v["expires"] = serde_json::json!(e);
+                }
+                Some(v)
+            })
+            .collect();
+        if !batch.is_empty() {
+            let ok = cdp
+                .call(
+                    None,
+                    "Storage.setCookies",
+                    serde_json::json!({ "cookies": batch }),
+                )
+                .await
+                .is_ok();
+            if ok {
+                return;
+            }
+            for c in &list {
+                if c.domain.is_empty() {
+                    continue;
+                }
+                let mut params = serde_json::json!({
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": if c.path.is_empty() { "/" } else { &c.path },
+                    "secure": c.secure,
+                    "httpOnly": c.http_only,
+                    "sameSite": if c.same_site.is_empty() { "Lax" } else { &c.same_site },
+                });
+                if let Some(e) = c.expires_at {
+                    params["expires"] = serde_json::json!(e);
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    cdp.call(None, "Network.setCookie", params),
+                )
+                .await;
+            }
+        }
     }
 
     /// PNG screenshot → path (D16 byproduct).
@@ -1018,7 +1348,7 @@ impl Ghost {
     }
 
     /// Move the mouse to (x, y) along the human path WITHOUT
-    /// pressing — hover. Reuses the click pre-move geometry.
+    /// pressing : hover. Reuses the click pre-move geometry.
     pub async fn hover(&self, x: f64, y: f64) -> Result<(), FetchError> {
         let mut rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1052,7 +1382,7 @@ impl Ghost {
     }
 
     /// Evaluate a JS expression and return the decoded JSON
-    /// result. Caller-invoked Runtime — the same discipline as
+    /// result. Caller-invoked Runtime : the same discipline as
     /// the Turnstile geometry lookups in ops.rs: Runtime.enable
     /// is NEVER called, so the DataDome console trap stays
     /// defused. Expression must be an arrow-IIFE returning a
@@ -1151,7 +1481,7 @@ impl Ghost {
         Ok(v.as_bool().unwrap_or(false))
     }
 
-    /// Type text into the focused element with a human cadence —
+    /// Type text into the focused element with a human cadence :
     /// log-normal-ish inter-key gaps with rare think-pauses.
     /// CDP key events are isTrusted=true; the cadence is the
     /// behavioral cover (a metronome of exactly-50ms keys is the
@@ -1215,7 +1545,7 @@ impl Ghost {
     pub async fn press_key(&self, key: &str) -> Result<(), FetchError> {
         let Some((code, vk)) = named_key(key) else {
             return Err(FetchError::ghost(format!(
-                "unknown key {key:?} — supported: Enter, Tab, Escape, Backspace, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, PageUp, PageDown, Home, End"
+                "unknown key {key:?} : supported: Enter, Tab, Escape, Backspace, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, PageUp, PageDown, Home, End"
             )));
         };
         for ty in ["rawKeyDown", "keyUp"] {
@@ -1238,7 +1568,7 @@ impl Ghost {
     }
 
     /// Scroll with trusted mouse-wheel events at the viewport
-    /// center. `to`: "top" | "bottom" | "down" — or a pixel
+    /// center. `to`: "top" | "bottom" | "down" : or a pixel
     /// amount via scroll_px. Bottom keeps scrolling until the
     /// page stops growing (lazy-load friendly), bounded.
     pub async fn scroll(&self, to: &str, px: i64) -> Result<(), FetchError> {
@@ -1258,7 +1588,7 @@ impl Ghost {
                     if y == last_y {
                         stall += 1;
                         if stall >= 2 {
-                            break; // page stopped moving — done
+                            break; // page stopped moving : done
                         }
                     } else {
                         stall = 0;
@@ -1325,6 +1655,18 @@ impl Drop for Ghost {
         // Child was dropped without killing Chrome.
         self.proc.kill_group();
         sweep_crashpad();
+        // Stop refreshing the winlock's mtime before removing it :
+        // same abort-then-cleanup order as fetch_guard above.
+        #[cfg(windows)]
+        if let Some(handle) = self.winlock_heartbeat.take() {
+            handle.abort();
+        }
+        // Release the Windows profile-exclusion lockfile (unix
+        // flock releases itself when this handle closes).
+        #[cfg(windows)]
+        if let Some(p) = &self.winlock {
+            let _ = std::fs::remove_file(p);
+        }
         // Clean up temp profile if we used one.
         if let Some(temp) = &self.temp_profile {
             let _ = std::fs::remove_dir_all(temp);
@@ -1511,7 +1853,7 @@ mod sandbox_tests {
     }
 
     // Exercises the chrome-linux64/chrome-linux suffixes returned by
-    // playwright_entry_suffixes() on this cfg — see that function's
+    // playwright_entry_suffixes() on this cfg : see that function's
     // own gate. Fails on macOS/Windows if run there since those
     // platforms probe a different suffix set entirely.
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -1571,6 +1913,22 @@ mod sandbox_tests {
                 "missing hardcoded path {expected}, got: {paths:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn winlock_heartbeat_has_safety_margin_under_stale_threshold() {
+        // A single long-running actions call (up to MAX_STEPS steps,
+        // each wait_selector/wait_text capped at 60s) can hold the
+        // winlock file far longer than WINLOCK_STALE_AFTER while the
+        // Ghost is nowhere near dead. Without a heartbeat comfortably
+        // faster than the staleness window, a second daemon starting
+        // mid-call would mistake the still-live holder for an
+        // abandoned one and steal the profile out from under it.
+        assert!(
+            WINLOCK_HEARTBEAT.as_secs() * 3 < WINLOCK_STALE_AFTER.as_secs(),
+            "heartbeat interval must stay comfortably below the staleness window"
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use url::Url;
+
 use crate::detect::walls::{self, Verdict};
 use crate::error::FetchError;
 use crate::ghost::cache::CookieRecord;
@@ -80,7 +82,7 @@ impl Fetcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for c in cookies {
-            jar.store_raw(&c.name, &c.value, &c.domain, c.expires_at);
+            jar.store_raw(c);
         }
     }
 
@@ -101,7 +103,7 @@ impl Fetcher {
     }
 
     /// Fetch through a specific egress lane (proxy). Redirects,
-    /// cookies, revalidation all follow the lane — pool keys are
+    /// cookies, revalidation all follow the lane : pool keys are
     /// proxy-scoped so egress IPs never share conns.
     pub async fn fetch_via(
         &self,
@@ -112,7 +114,7 @@ impl Fetcher {
     }
 
     /// Full lane control: `use_jar=false` keeps the shared cookie
-    /// jar OUT of the request. Proxy lanes stay unlinked — the
+    /// jar OUT of the request. Proxy lanes stay unlinked : the
     /// direct lane's session cookies must never transit a third
     /// egress IP.
     pub async fn fetch_via_jar(
@@ -212,7 +214,9 @@ impl Fetcher {
                     .jar
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                jar.store_from_headers(&host, &out.headers);
+                let current_is_https =
+                    Url::parse(&current).is_ok_and(|u| u.scheme().eq_ignore_ascii_case("https"));
+                jar.store_from_headers(&host, &out.headers, current_is_https);
             }
 
             // 304: merge body from cache.
@@ -228,7 +232,7 @@ impl Fetcher {
                 out.body = body;
                 out.cache = CacheState::Revalidated;
                 // fetch_once_via already scored the bare 304, where
-                // detect() sees an empty body and has no 3xx arm — it
+                // detect() sees an empty body and has no 3xx arm : it
                 // returns Blocked. Re-score the merged body, as the
                 // CacheCheck::Fresh arm does for its cached body;
                 // otherwise every revalidated page comes back as
@@ -253,7 +257,7 @@ impl Fetcher {
                     };
                     let base = url::Url::parse(&current)
                         .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
-                    // Centralized redirect SSRF guard — validates scheme,
+                    // Centralized redirect SSRF guard : validates scheme,
                     // credentials and host, and rejects private literals.
                     // Non-http(s) redirects are returned honestly, not followed.
                     // Every redirect hop also passes through the async DNS-aware
@@ -305,7 +309,9 @@ impl Fetcher {
                                 .jar
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            jar.store_from_headers(&host, &retry.headers);
+                            let current_is_https = Url::parse(&current)
+                                .is_ok_and(|u| u.scheme().eq_ignore_ascii_case("https"));
+                            jar.store_from_headers(&host, &retry.headers, current_is_https);
                         }
                         retry.verdict = walls::detect(retry.status, &retry.headers, &retry.body);
                         if matches!(retry.verdict, Verdict::ContentOk) {
@@ -328,7 +334,7 @@ impl Fetcher {
 
     /// Same, optionally through a CONNECT proxy. Pool keys
     /// are proxy-scoped so egress IPs never share conns.
-    /// `use_jar=false` keeps cookies out entirely — search
+    /// `use_jar=false` keeps cookies out entirely : search
     /// engines get cookie-less requests so egress lanes
     /// stay unlinked and the fetch-tool jar stays clean.
     pub async fn fetch_once_via(
@@ -341,7 +347,7 @@ impl Fetcher {
     ) -> Result<FetchOutcome, FetchError> {
         // Centralized gate ensures credentials/host checks even for
         // direct fetch_once calls (e.g. tests, internal callers).
-        // Includes DNS resolution — every target, including proxy
+        // Includes DNS resolution : every target, including proxy
         // lanes, is checked before any TCP connect.
         crate::fetch::guards::ensure_url_safe(url_str).await?;
         let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
@@ -379,7 +385,7 @@ impl Fetcher {
                 .jar
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cookie) = jar.header_for(host, &path) {
+            if let Some(cookie) = jar.header_for(host, &path, is_https) {
                 let pos = req_headers
                     .iter()
                     .position(|(n, _)| n == "priority")
@@ -409,7 +415,7 @@ impl Fetcher {
 
         // Referer + sec-fetch-site: when following a link, a real
         // browser sends `Referer` and sets `sec-fetch-site` to
-        // `same-origin` or `cross-site` (never `none` — that's
+        // `same-origin` or `cross-site` (never `none` : that's
         // for typed URLs only). Without this, every crawl request
         // looks like a fresh typed navigation, which is a bot
         // fingerprint.
@@ -436,7 +442,7 @@ impl Fetcher {
                 || !crate::fetch::guards::valid_header_value(v)
         }) {
             return Err(FetchError::Http(
-                "invalid header value (CR/LF/NUL) — refused to send".into(),
+                "invalid header value (CR/LF/NUL) : refused to send".into(),
             ));
         }
 
@@ -656,7 +662,7 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 
 /// Compute `sec-fetch-site` from the referer's origin vs the
 /// target's origin. `same-origin` = same scheme+host+port;
-/// everything else = `cross-site` (conservative — we don't
+/// everything else = `cross-site` (conservative : we don't
 /// compute the registrable domain for `same-site`).
 fn sec_fetch_site(referer: &str, target: &str) -> &'static str {
     let ref_origin = url::Url::parse(referer).ok().map(|u| {

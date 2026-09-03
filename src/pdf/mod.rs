@@ -1,4 +1,4 @@
-//! DonSheet — the PDF extraction engine.
+//! DonSheet : the PDF extraction engine.
 //!
 //! Bytes in, DonSift blocks out. See `design/pdf.md` for the full
 //! architecture. This module owns: the PDFium FFI boundary (`sys` +
@@ -72,7 +72,7 @@ pub struct ParsedPdf {
     pub fonts: Vec<String>,
     /// Per-page extraction stats. Block merging deliberately
     /// flows paragraphs across page breaks for reading
-    /// continuity — this is where page boundaries (and
+    /// continuity : this is where page boundaries (and
     /// per-page text trust) are preserved instead.
     pub pages_meta: Vec<PageMeta>,
 }
@@ -168,7 +168,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                 f
             })
             .or_else(|| {
-                // No pixels (text-rich page) — still track glyph trust
+                // No pixels (text-rich page) : still track glyph trust
                 // for garbage detection (PUA glyph soup pages).
                 Some(fusion::FusionData {
                     garbage_ratio: trust,
@@ -366,7 +366,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
             0.0
         };
         notes.push(format!(
-            "{ocr_pages} page(s) were OCR'd (no usable text layer); mean recognition confidence {:.0}% — read numbers and proper nouns with care",
+            "{ocr_pages} page(s) were OCR'd (no usable text layer); mean recognition confidence {:.0}% : read numbers and proper nouns with care",
             mean * 100.0
         ));
     } else if ocr_failed && !needs_ocr.is_empty() {
@@ -454,7 +454,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
             _ => reading::page_order(p.lines.clone()),
         };
         // Splice form widgets at their visual position (they render as
-        // list items — the markdown_line() already starts with "- ").
+        // list items : the markdown_line() already starts with "- ").
         let pw = p.height;
         for (wi, w) in all_widgets.iter().enumerate() {
             if w.0 != p.index {
@@ -493,7 +493,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     }
     if vertical_pages > 0 {
         notes.push(format!(
-            "{vertical_pages} of {} page(s) contain vertical or rotated text — vertical text extraction is best-effort and may be out of order",
+            "{vertical_pages} of {} page(s) contain vertical or rotated text : vertical text extraction is best-effort and may be out of order",
             raw.page_count
         ));
     }
@@ -534,7 +534,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     // Per-page stats from the FINAL text state (post-OCR):
     // chars, ocr flag, and the trust of whichever engine
     // produced the text. Glyph pages without fusion data are
-    // ordinary text pages — trust 1.0.
+    // ordinary text pages : trust 1.0.
     let pages_meta = pages
         .iter()
         .map(|p| {

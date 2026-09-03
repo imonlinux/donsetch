@@ -1,8 +1,8 @@
-//! `donsetch status` — one-glance overview of everything.
+//! `donsetch status` : one-glance overview of everything.
 //!
 //! Shows: version + update check, keys (count + default mode),
 //! proxies (count), cache size, quick health hint. This is the
-//! "I just installed it, what's the state?" command — fast, no
+//! "I just installed it, what's the state?" command : fast, no
 //! network probes, no browser launch.
 
 use crate::cli;
@@ -16,7 +16,7 @@ const REPO: &str = "dondai44423/donsetch";
 pub async fn run() {
     cli::init();
     let current = env!("CARGO_PKG_VERSION");
-    cli::print_title(&format!("DonSeTch {current} — Status"));
+    cli::print_title(&format!("DonSeTch {current} : Status"));
     println!();
 
     // ── Version + update ────────────────────────────────────
@@ -106,9 +106,24 @@ pub async fn run() {
     };
     cli::print_kv("cache", &cache_size);
 
-    // ── Health hint ──────────────────────────────────────────
+    // Resolution may probe a browser; keep that blocking operation off the
+    // async executor. Status never triggers a public binary download.
+    let browser = tokio::task::spawn_blocking(crate::ghost::resolve_browser_without_download)
+        .await
+        .unwrap_or_else(|e| {
+            Err(crate::error::FetchError::ghost(format!(
+                "browser resolution task failed: {e}"
+            )))
+        });
+    match &browser {
+        Ok(info) => {
+            cli::print_kv("browser", &info.describe());
+        }
+        Err(error) => {
+            cli::print_kv("browser", &format!("unavailable: {error}"));
+        }
+    }
 
-    let chrome_ok = crate::ghost::chrome_binary().is_ok();
     let ghost_state = cache.join("ghost-state.json");
     let has_state = ghost_state.exists();
     let domains = if has_state {
@@ -117,21 +132,25 @@ pub async fn run() {
         0
     };
 
-    let health = if chrome_ok && domains > 0 {
+    let health = if browser.is_ok() && domains > 0 {
         format!(
             "{} browser ready, {} domain profile(s)",
             cli::green("good"),
             domains
         )
-    } else if chrome_ok {
+    } else if browser.is_ok() {
         format!("{} browser ready, no profiles yet", cli::green("good"))
     } else {
         format!(
-            "{} browser not found — tier 2 unavailable",
+            "{} browser unavailable: tier 2 unavailable",
             cli::red("warn")
         )
     };
     cli::print_kv("health", &health);
+    cli::print_kv(
+        "deep fingerprint",
+        "not probed (run `donsetch doctor --deep`)",
+    );
 
     println!();
     println!(
@@ -178,7 +197,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Fetch the latest version from the GitHub releases.atom feed.
-/// Same logic as version.rs — no API, no rate limits.
+/// Same logic as version.rs : no API, no rate limits.
 async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases.atom");
     let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;

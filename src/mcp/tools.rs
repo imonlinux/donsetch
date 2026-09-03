@@ -5,7 +5,7 @@
 //! (never our source) should know exactly when to call,
 //! which params to set, and how to interpret the response.
 //!
-//! Schemas are GENERATED from `crate::spec::TOOLS` — the
+//! Schemas are GENERATED from `crate::spec::TOOLS` : the
 //! single source of truth shared with the CLI. Never edit
 //! schemas here; edit the spec table.
 
@@ -25,10 +25,10 @@ pub const SERVER_NAME: &str = "donsetch";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The `instructions` string sent at initialize. Generated from
-/// the spec table — a new tool appears here with no prose edit.
+/// the spec table : a new tool appears here with no prose edit.
 pub fn instructions() -> String {
     // Name + summary, one per line. Summaries are already
-    // one-liners — they double as the `--help` subcommand listing.
+    // one-liners : they double as the `--help` subcommand listing.
     let tools = crate::spec::TOOLS
         .iter()
         .map(|t| format!("- {0}: {1}", t.name, t.summary))
@@ -39,16 +39,16 @@ pub fn instructions() -> String {
     // deferred tool loading (Claude Code's ToolSearch) show only
     // tool NAMES up front and fetch schemas on demand, so this is
     // what tells an agent we exist. It is resident in every
-    // session whether or not we are used — keep it short.
+    // session whether or not we are used : keep it short.
     // tests/token_invariants.rs gates the size.
     format!(
-        "Web access: fetch, search, crawl — one URL, many URLs, or a whole site.\
+        "Web access: fetch, search, crawl : one URL, many URLs, or a whole site.\
         \n\n{tools}\n\n\
-        Output is the page's own markdown — full wording, code blocks and tables preserved."
+        Output is the page's own markdown : full wording, code blocks and tables preserved."
     )
 }
 
-/// tools/list payload — generated from the spec table.
+/// tools/list payload : generated from the spec table.
 pub fn list() -> Value {
     json!({
         "tools": crate::spec::TOOLS.iter().map(crate::spec::mcp_schema).collect::<Vec<_>>()

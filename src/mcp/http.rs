@@ -9,7 +9,7 @@
 //! GET /mcp opens the server-initiated SSE stream that streamable-HTTP
 //! clients expect after initialize (OpenCode among them fails the whole
 //! connection on a bare 405 here). DonSeTch never pushes unsolicited
-//! messages — no server tools, no sampling requests — so the stream
+//! messages : no server tools, no sampling requests : so the stream
 //! carries keep-alive comments only. It self-terminates just inside
 //! SESSION_TTL: graceful shutdown is never blocked by an idle stream,
 //! clients simply reconnect per SSE convention, and each reconnect
@@ -20,7 +20,7 @@
 //! `initialize`. Clients that echo it back get a dedicated cancellation
 //! registry, so a `notifications/cancelled` posted while a tool call is
 //! in flight reaches it (mirroring stdio's shared registry). Clients
-//! that ignore sessions — curl, simple integrators — share one default
+//! that ignore sessions : curl, simple integrators : share one default
 //! registry; cancellation still works, they just share a request-id
 //! namespace with other session-less clients. Unknown or expired
 //! session ids get a 404, per the MCP streamable-HTTP convention.
@@ -67,7 +67,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// The GET /mcp SSE stream closes itself after this long (just inside
 /// SESSION_TTL): an unbounded idle stream would hold graceful shutdown
 /// open forever, and a closed stream is a routine reconnect for SSE
-/// clients — one that usefully refreshes the session idle timer.
+/// clients : one that usefully refreshes the session idle timer.
 const SSE_MAX_LIFETIME: Duration = Duration::from_secs(25 * 60);
 
 struct Session {
@@ -233,8 +233,8 @@ fn silent_stream(max: Duration) -> impl Stream<Item = Result<Event, Infallible>>
 ///
 /// DonSeTch has nothing server-initiated to say, so this exists purely
 /// so clients that open the stream after initialize (per spec they MAY)
-/// get a live SSE connection instead of a 405 that some clients —
-/// OpenCode notably — treat as fatal. See the module docs for the
+/// get a live SSE connection instead of a 405 that some clients :
+/// OpenCode notably : treat as fatal. See the module docs for the
 /// lifetime/reconnect reasoning.
 async fn sse_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if !authorized(&state, &headers) {
@@ -406,7 +406,7 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    // Cancellation notifications are handled inline — they must reach
+    // Cancellation notifications are handled inline : they must reach
     // the running tool NOW, not after a full dispatch round-trip.
     // Mirrors the stdio transport's inline handling.
     if is_notification && method == "notifications/cancelled" {
@@ -486,7 +486,7 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
             // Notification: no body, 202 Accepted per the streamable-HTTP
             // spec (204 would also be "no content", but the spec names
             // 202 for notification-only POSTs). The sender MUST be
-            // dropped before draining — recv() only returns None once
+            // dropped before draining : recv() only returns None once
             // every sender is gone, and progress_tx is still in scope
             // here, so draining first would wait forever. (This exact
             // deadlock hung the notifications/initialized POST and with

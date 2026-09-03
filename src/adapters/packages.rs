@@ -152,7 +152,7 @@ fn render(registry: &str, c: &PkgCard) -> String {
         md.push_str("## Recent versions\n");
         for (num, date, yanked) in c.versions.iter().take(MAX_VERSIONS) {
             let flag = if *yanked { " *(yanked)*" } else { "" };
-            md.push_str(&format!("- {num} — {date}{flag}\n"));
+            md.push_str(&format!("- {num} : {date}{flag}\n"));
         }
         md.push('\n');
     }
@@ -421,7 +421,7 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
             .unwrap_or_default()
             .to_string();
         let deps_hint = format!(
-            "deps live per version — fetch crates.io/crates/{}/{version} for the tree",
+            "deps live per version : fetch crates.io/crates/{}/{version} for the tree",
             c.get("name").and_then(Value::as_str).unwrap_or("?")
         );
         Some(PkgCard {
@@ -457,7 +457,7 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
             versions: sorted,
         })
     } else if v.get("version").is_some() {
-        // Version endpoint (/api/v1/crates/<n>/<v>) — carries deps.
+        // Version endpoint (/api/v1/crates/<n>/<v>) : carries deps.
         let ver = v.get("version")?;
         let deps: Vec<String> = ver
             .get("dependencies")
@@ -526,7 +526,7 @@ fn crates_card(v: &Value) -> Option<PkgCard> {
 
 fn go_card(v: &Value, url: &str) -> Option<PkgCard> {
     let version = v.get("Version").and_then(Value::as_str)?.to_string();
-    // The proxy payload carries no name — the module path IS the
+    // The proxy payload carries no name : the module path IS the
     // name; recover it from the URL (.../<module>/@latest).
     let name = url::Url::parse(url)
         .ok()

@@ -6,7 +6,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/dondai44423/donsetch/ci.yml?label=CI&style=flat-square)](https://github.com/dondai44423/donsetch/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-00d4aa?style=flat-square)](https://github.com/dondai44423/donsetch/blob/master/LICENSE)
 
-DonSeTch gives AI agents web research from a single local process — fetch any URL, search across 10+ engines, and crawl multi-page docs. Chrome-true TLS fingerprinting, bot-wall bypass, PDF extraction with OCR, semantic reranking. Zero API keys.
+DonSeTch gives AI agents web research from a single local process : fetch any URL, search across 10+ engines, and crawl multi-page docs. Chrome-true TLS fingerprinting, bot-wall bypass, PDF extraction with OCR, semantic reranking. Zero API keys.
 
 ## Install
 
@@ -60,6 +60,6 @@ donsetch update
 
 ## License
 
-AGPL-3.0 — Copyright (c) 2026 Bishesh Bhandari
+AGPL-3.0 : Copyright (c) 2026 Bishesh Bhandari
 
 Full documentation: [github.com/dondai44423/donsetch](https://github.com/dondai44423/donsetch)

@@ -47,7 +47,7 @@ pub fn screenshots_dir() -> PathBuf {
 pub fn resolve_screenshot_path(input: &str) -> Result<PathBuf, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Err("screenshot path is empty — provide a filename".into());
+        return Err("screenshot path is empty : provide a filename".into());
     }
     let p = PathBuf::from(trimmed);
 
@@ -65,9 +65,16 @@ pub fn resolve_screenshot_path(input: &str) -> Result<PathBuf, String> {
         return Err("screenshot path contains NUL".into());
     }
 
-    // Resolve to absolute destination.
+    // Resolve to absolute destination. has_root(), not
+    // is_absolute(): a Windows path rooted without a drive prefix
+    // (e.g. `/tmp/x.png` as entered, or `\tmp\x.png`) is not
+    // "absolute" by is_absolute(), yet PathBuf::join replaces the
+    // base entirely for any rooted path: without has_root() such an
+    // input skips the early under-root rejection below. The
+    // canonical-frame check catches it anyway today; this makes the
+    // first line of defense honest instead of accidental.
     let screenshots = screenshots_dir();
-    let is_absolute = p.is_absolute();
+    let is_absolute = p.has_root();
     let dest = if is_absolute { p } else { screenshots.join(&p) };
 
     // Ensure screenshots root exists so we have a canonical base.

@@ -1,4 +1,4 @@
-//! `donsetch -v` / `donsetch --version` — build identity + update check.
+//! `donsetch -v` / `donsetch --version` : build identity + update check.
 //!
 //! Shows build info (binary, target, profile, features, pdfium, git).
 //! Then fetches the latest release tag from the GitHub releases.atom
@@ -37,10 +37,10 @@ pub async fn run() {
     );
     cli::print_kv("git", option_env!("DONSHEET_GIT_HASH").unwrap_or("unknown"));
 
-    // ── Update check (atom feed — no API, no rate limits) ─────
+    // ── Update check (atom feed : no API, no rate limits) ─────
     //
     // Fetches the GitHub releases.atom feed (a regular web page,
-    // not the API — no 60-req/hour limit). Parses the first
+    // not the API : no 60-req/hour limit). Parses the first
     // <entry><title> for the latest tag. Compares semver.
 
     let fetcher = Fetcher::new(BrowserProfile::host_default());
@@ -84,12 +84,12 @@ pub async fn run() {
 }
 
 /// Fetch the releases.atom feed and parse the latest release tag.
-/// Same logic as `cli::update::fetch_latest_version` — duplicated
+/// Same logic as `cli::update::fetch_latest_version` : duplicated
 /// here to keep `version` independent of `update` (no cross-module
 /// dependency for a one-off atom parse).
 ///
 /// Uses the `<id>` tag (not `<title>`) because release titles can
-/// contain extra text (e.g. "v1.0.0 — Stable Release") that breaks
+/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
 /// semver parsing. The `<id>` tag always ends with `/v<version>`.
 async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases.atom");
@@ -105,7 +105,7 @@ async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
         .find("<entry>")
         .ok_or_else(|| "no releases found in feed".to_string())?;
 
-    // The <id> tag always ends with /v<version> — clean, no extra text.
+    // The <id> tag always ends with /v<version> : clean, no extra text.
     let id_tag = body[entry_pos..]
         .find("<id>")
         .ok_or_else(|| "could not parse feed: no <id> in first entry".to_string())?

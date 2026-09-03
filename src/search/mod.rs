@@ -1,4 +1,4 @@
-//! DonSeek — keyless multi-engine search.
+//! DonSeek : keyless multi-engine search.
 //!
 //! Intent → fan-out (engines across egresses + verticals
 //! direct) → weighted RRF merge → ranked results with
@@ -33,10 +33,10 @@ use scraper::Selector;
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Intent + recency-aware cache TTL. Every cached query
-/// is a query that never touches an egress — the #1 rate
+/// is a query that never touches an egress : the #1 rate
 /// reducer. But a cached answer presented as fresh is
 /// WORSE than honest latency when the world moved:
-/// time-sensitive queries (even outside news intent —
+/// time-sensitive queries (even outside news intent :
 /// "X release date", "inflation 2026") get news-grade
 /// TTLs regardless of detected intent.
 fn cache_ttl(intent: Intent, query: &str) -> Duration {
@@ -100,7 +100,7 @@ pub struct Searcher {
     /// engine stops wasting a fan-out slot every query.
     failures: Mutex<HashMap<String, (u32, Instant)>>,
     /// Single-flight: two identical in-flight queries spend
-    /// egress budget ONCE — the follower awaits the
+    /// egress budget ONCE : the follower awaits the
     /// leader's result. Stampedes are an agent reality
     /// (parallel tool calls love the same query).
     inflight: Mutex<std::collections::HashSet<String>>,
@@ -173,7 +173,7 @@ impl PrewarmCache {
         );
     }
 
-    /// One-shot: a served prewarm is consumed — the second
+    /// One-shot: a served prewarm is consumed : the second
     /// fetch of the same URL goes to the network for freshness.
     pub fn take(&mut self, url: &str) -> Option<PrewarmEntry> {
         let e = self.entries.remove(url)?;
@@ -220,7 +220,7 @@ impl Searcher {
         }
     }
 
-    /// v3 F1: warm-handoff store — filled by enrichment, drained
+    /// v3 F1: warm-handoff store : filled by enrichment, drained
     /// by the fetch tool.
     pub fn prewarms(&self) -> &std::sync::Arc<std::sync::Mutex<PrewarmCache>> {
         &self.prewarms
@@ -257,7 +257,7 @@ impl Searcher {
                 }
             }
             // ALL proxies failing means the PROBE endpoint
-            // died, not the pool — clear the marks rather
+            // died, not the pool : clear the marks rather
             // than bench every lane over our own bug.
             if total > 0 && dead == total {
                 this.pool.revive_all();
@@ -335,7 +335,7 @@ impl Searcher {
                     });
                 }
             }
-            // Leader died or timed out — compute ourselves.
+            // Leader died or timed out : compute ourselves.
         }
         let _inflight_guard = InflightGuard {
             map: &self.inflight,
@@ -415,7 +415,7 @@ impl Searcher {
         }
         // ── Adaptive fan-out width: the governor. Under
         // stress the system shrinks its appetite instead of
-        // burning lanes — consensus survives at width 2 by
+        // burning lanes : consensus survives at width 2 by
         // construction (two independent index families).
         let width = width_for_stress(self.pool.stress(), live.len());
         live.truncate(width);
@@ -423,7 +423,7 @@ impl Searcher {
             .iter()
             .map(|e| (e.to_string(), query.to_string()))
             .collect();
-        // Recall variants spend lanes — only when the
+        // Recall variants spend lanes : only when the
         // governor did NOT cut the roster (healthy pool).
         if queries.len() > 1 && self.pool.stress() < 0.15 {
             for e in live.iter().take(2) {
@@ -438,7 +438,7 @@ impl Searcher {
         // proxy-averse engines can share direct (with pacing).
         // Non-averse engines spread across proxies.
         //
-        // We only exclude proxy egresses from reuse — direct
+        // We only exclude proxy egresses from reuse : direct
         // is shared, not exclusive.
         let has_proxies = self.pool.has_proxies();
         for (engine, q) in assignments {
@@ -474,7 +474,7 @@ impl Searcher {
         let outcomes = futures_util::future::join_all(futures).await;
 
         // ── Retry wave: failed engines get one more shot
-        // through a fresh egress — but ONLY when the first
+        // through a fresh egress : but ONLY when the first
         // wave left the merge thin. A healthy merge never
         // pays retry latency; a degraded one recovers.
         let ok_engines = outcomes.iter().filter(|(_, r)| r.is_ok()).count();
@@ -569,7 +569,7 @@ impl Searcher {
                 Err((status, egress_id, was_engine)) => {
                     let base = engine.split('_').next().unwrap_or(&engine);
                     // Dead proxies are egress failures, not
-                    // engine failures — don't quarantine.
+                    // engine failures : don't quarantine.
                     if !status.starts_with("dead")
                         && status != "auth-fail"
                         && status != "no-results"
@@ -599,7 +599,7 @@ impl Searcher {
 
         if per_engine.is_empty() {
             return Err(FetchError::Http(format!(
-                "search: all engines failed — {}",
+                "search: all engines failed : {}",
                 report
                     .iter()
                     .map(|r| format!("{}:{}", r.engine, r.status))
@@ -638,12 +638,12 @@ impl Searcher {
         self.enrich_results(&mut results).await;
 
         // ── site: operator enforcement: engines don't strictly
-        // respect `site:domain.com` — some results leak through
+        // respect `site:domain.com` : some results leak through
         // from other domains. Filter them out post-merge so the
         // agent only gets results from the requested domain.
         site_filter(query, &mut results);
         // Poisoning guard: a merge built while engines
-        // were down must NOT persist for 30 minutes —
+        // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
         let cacheable = ok_engines >= 2 && total >= 8;
         if cacheable {
@@ -696,7 +696,7 @@ impl Searcher {
     /// Enrich top results by prefetching destination pages.
     ///
     /// Extracts real <title> and <meta name="description">
-    /// from the actual page HTML — richer than any SERP
+    /// from the actual page HTML : richer than any SERP
     /// snippet. Dead links (404/timeout) get demoted 50%.
     /// Pages behind bot walls are left untouched (still
     /// valid results, agent fetches via tier 2).
@@ -775,11 +775,11 @@ impl Searcher {
             let r = &mut results[i];
             match (&title, &desc) {
                 (None, None) => {
-                    // Dead link — demote 50%.
+                    // Dead link : demote 50%.
                     r.score *= 0.5;
                 }
                 (None, Some(d)) if d.is_empty() => {
-                    // Bot wall — leave untouched.
+                    // Bot wall : leave untouched.
                 }
                 _ => {
                     if let Some(t) = title {
@@ -858,7 +858,7 @@ async fn engine_task(
     );
     let hits = engines::parse(&engine, &html);
     if hits.len() < 3 {
-        // Honest "no results" is NOT an engine failure —
+        // Honest "no results" is NOT an engine failure :
         // don't burn trust/lanes for a dry query.
         let lower = html.to_lowercase();
         let dry = lower.contains("no results")
@@ -905,7 +905,7 @@ fn dirs_cache() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// On disk: (key, age_secs, results, total) — age lets us
+/// On disk: (key, age_secs, results, total) : age lets us
 /// re-base Instant across process restarts.
 fn save_cache_disk(cache: &HashMap<String, (Instant, Vec<Merged>, usize)>) {
     let Some(path) = cache_path() else { return };
@@ -979,7 +979,7 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
 
 /// Enforce `site:domain.com` operator: extract the target domain
 /// from the query and remove results whose host doesn't match.
-/// Engines (especially Bing/DDG) don't strictly respect `site:` —
+/// Engines (especially Bing/DDG) don't strictly respect `site:` :
 /// they often inject related results from other domains. This
 /// post-merge filter ensures the agent only sees results from the
 /// requested domain.
@@ -1014,7 +1014,7 @@ fn site_filter(query: &str, results: &mut Vec<Merged>) {
 }
 
 /// Snippet budget for the markdown list. 120 cut mid-phrase far
-/// too often — the detail that distinguishes two results sat just
+/// too often : the detail that distinguishes two results sat just
 /// past the cut, and the agent paid a whole fetch to learn what the
 /// snippet nearly said. 200 is where a snippet reliably carries one
 /// complete claim; the 300 the JSON keeps is past diminishing
@@ -1022,7 +1022,7 @@ fn site_filter(query: &str, results: &mut Vec<Merged>) {
 const SNIPPET_CHARS: usize = 200;
 
 /// Below this fraction (4/5) of the budget, a word-boundary cut
-/// throws away more than it saves — see `clip_snippet`.
+/// throws away more than it saves : see `clip_snippet`.
 const CLIP_FLOOR_NUM: usize = 4;
 const CLIP_FLOOR_DEN: usize = 5;
 
@@ -1035,9 +1035,9 @@ const CLIP_FLOOR_DEN: usize = 5;
 /// them would make a clean ending look like a severed one.
 /// CJK marks are the same codepoints in Chinese and Japanese, so
 /// one list serves both: 、and ，join clauses, 《》【】「」（ open
-/// spans. 。！？ are absent on purpose — they end sentences.
+/// spans. 。！？ are absent on purpose : they end sentences.
 const CLIP_TRIM: &[char] = &[
-    ',', ';', ':', '-', '–', '—', '(', '[', '{', '/', '|', '…', '、', '，', '；', '：', '（', '「',
+    ',', ';', ':', '-', '-', ':', '(', '[', '{', '/', '|', '…', '、', '，', '；', '：', '（', '「',
     '『', '《', '〈', '【', '〔', '［', '｛', '·', '／', '｜', '〜',
 ];
 
@@ -1058,21 +1058,21 @@ fn clip_snippet(s: &str, max: usize) -> String {
     // three ways: indexed (chars[max]), scanned BACKWARDS for the
     // last space, and sliced for the head. `Chars` cannot be
     // rewound, so an iterator version re-decodes UTF-8 from the
-    // start once per pass — and `rposition` is not even available
+    // start once per pass : and `rposition` is not even available
     // on it (it needs ExactSizeIterator, which `Chars` is not),
     // leaving manual position bookkeeping. Decode once, index
     // freely.
     //
     // Char positions, not &str byte offsets, for the same reason:
     // the budget and the floor are counted in chars, so `rfind`'s
-    // byte index would need converting before every comparison —
+    // byte index would need converting before every comparison :
     // and mixing the two on multi-byte text is where UTF-8 bugs
     // breed.
     //
     // max + 1 and no further: the only index past the window we
     // inspect is chars[max], the "does the next char end a word?"
     // test. Collecting the whole string would allocate 4 bytes a
-    // char for input we discard — BYOK snippets carry raw page
+    // char for input we discard : BYOK snippets carry raw page
     // text and run to thousands of chars.
     let chars: Vec<char> = s.chars().take(max + 1).collect();
     if chars.len() <= max {
@@ -1090,7 +1090,7 @@ fn clip_snippet(s: &str, max: usize) -> String {
         }
     };
     let mut head: String = chars[..cut].iter().collect();
-    // trim_end_matches only slices — it is the `.to_string()` that
+    // trim_end_matches only slices : it is the `.to_string()` that
     // would copy. Truncating to the trimmed length shortens in
     // place instead, leaving one allocation for the whole function.
     let keep = head
@@ -1117,12 +1117,12 @@ pub fn render_markdown(
     hints: &[Option<String>],
 ) -> String {
     // Search answers ONE question: "what should I fetch?"
-    // Snippets carry just enough to decide — content is
+    // Snippets carry just enough to decide : content is
     // the fetch tool's job.
     let mut md = format!("# Search: {query}\n\n");
     for (i, r) in out.results.iter().enumerate() {
         let host = rank::host_of(&r.url);
-        md.push_str(&format!("{}. **{}** — {}\n", i + 1, r.title, host));
+        md.push_str(&format!("{}. **{}** : {}\n", i + 1, r.title, host));
         if !r.snippet.is_empty() {
             let snip = clip_snippet(&r.snippet, SNIPPET_CHARS);
             md.push_str(&format!("   {snip}\n"));
@@ -1132,7 +1132,7 @@ pub fn render_markdown(
         match handles {
             Some(hs) if let Some(h) = hs.get(i) => {
                 // v3 F2: a known-walled domain carries its route
-                // cost — pick a faster source or budget time
+                // cost : pick a faster source or budget time
                 // BEFORE spending the fetch.
                 match hints.get(i).and_then(|h| h.as_deref()) {
                     Some(hint) => md.push_str(&format!("   {h} {hint}\n")),
@@ -1155,7 +1155,7 @@ pub fn render_markdown(
         // the URL at two ranks (live: ddg, yahoo, yahoo, brave = 4
         // for 3 engines). Ranking counts index FAMILIES instead, so
         // deduped names are both cheaper to read and more honest
-        // than the number — and they say WHICH source, which a count
+        // than the number : and they say WHICH source, which a count
         // never can.
         let mut engines: Vec<&str> = Vec::new();
         for (engine, _) in &r.sources {
@@ -1174,14 +1174,14 @@ pub fn render_markdown(
         }
     }
     if out.weak {
-        md.push_str("\n*weak results: low cross-engine consensus — treat with care*\n");
+        md.push_str("\n*weak results: low cross-engine consensus : treat with care*\n");
     }
-    // Zero hits is a success-shaped answer with nothing in it —
+    // Zero hits is a success-shaped answer with nothing in it :
     // tell the agent which levers exist instead of leaving it
     // staring at an empty list.
     if out.results.is_empty() {
         md.push_str(
-            "\n*0 results — try a simpler query, a different intent (news/code/paper), \
+            "\n*0 results : try a simpler query, a different intent (news/code/paper), \
 or add an API-key provider (`donsetch keys add`)*\n",
         );
     }
@@ -1202,7 +1202,7 @@ or add an API-key provider (`donsetch keys add`)*\n",
         .collect();
     if !failed.is_empty() {
         md.push_str(&format!(
-            "*degraded: {}/{} engines ok ({}) — results may skew*\n",
+            "*degraded: {}/{} engines ok ({}) : results may skew*\n",
             out.report.len() - failed.len(),
             out.report.len(),
             failed.join(", ")
@@ -1368,7 +1368,7 @@ mod tests {
 
     #[test]
     fn clip_backs_off_to_word_boundary() {
-        // Straddling word, last space at 16 of 20 — exactly the
+        // Straddling word, last space at 16 of 20 : exactly the
         // 4/5 floor, so the partial word goes.
         assert_eq!(
             clip_snippet("aaaaaaaaaaaaaaaa bbbbbbbbbb", 20),
@@ -1419,7 +1419,7 @@ mod tests {
     #[test]
     fn clip_keeps_a_sentence_terminator() {
         // A cut landing after '.' means the snippet ended on a
-        // COMPLETE sentence — stripping it would make a clean
+        // COMPLETE sentence : stripping it would make a clean
         // ending look severed.
         assert_eq!(
             clip_snippet("Tokio is a runtime. Axum builds on it.", 20),
@@ -1427,7 +1427,7 @@ mod tests {
         );
     }
 
-    /// Sōseki's opening line — 3-byte chars, and no spaces at
+    /// Sōseki's opening line : 3-byte chars, and no spaces at
     /// all, which is the real reason Japanese is the right test:
     /// there is no word boundary to back off to, so every cut is
     /// a hard cut and byte slicing would panic outright.
@@ -1443,19 +1443,19 @@ mod tests {
 
     #[test]
     fn clip_keeps_a_cjk_sentence_terminator() {
-        // Cut lands right after 。 (U+3002) — the same codepoint
+        // Cut lands right after 。 (U+3002) : the same codepoint
         // in Chinese and Japanese. It ends a sentence, so it stays.
         assert_eq!(clip_snippet(JA, 17), "「吾輩は猫である。名前はまだ無い。…");
     }
 
     #[test]
     fn clip_keeps_chinese_terminators_and_strips_chinese_separators() {
-        // ！ (U+FF01) ends a sentence — kept.
+        // ！ (U+FF01) ends a sentence : kept.
         assert_eq!(
             clip_snippet("这是一个测试。第二句话！第三句", 12),
             "这是一个测试。第二句话！…"
         );
-        // 、 (U+3001) is the enumeration comma — it joins, so it
+        // 、 (U+3001) is the enumeration comma : it joins, so it
         // goes rather than dangling before the ellipsis.
         assert_eq!(clip_snippet("第一项、第二项、第三项", 8), "第一项、第二项…");
     }
@@ -1488,7 +1488,7 @@ mod tests {
     #[test]
     fn markdown_dedupes_repeated_engines() {
         // One engine returning the same URL at two ranks must not
-        // read as extra consensus — the JSON's `consensus` count
+        // read as extra consensus : the JSON's `consensus` count
         // does exactly that.
         let mut r = merged("https://tokio.rs/");
         r.sources = vec![

@@ -1,5 +1,5 @@
 //! The skip predicate: functional pruning. Junk is skipped during
-//! traversal — the tree is never mutated, never re-parsed.
+//! traversal : the tree is never mutated, never re-parsed.
 
 use scraper::ElementRef;
 
@@ -13,7 +13,7 @@ fn math_sel() -> &'static scraper::Selector {
 /// of a rendered formula image (MediaWiki, MathJax, KaTeX all ship
 /// this shape: visible SVG/PNG + hidden MathML with the LaTeX).
 /// The hidden math is the ONLY machine-readable form of the
-/// formula — skipping it as "hidden content" guts every technical
+/// formula : skipping it as "hidden content" guts every technical
 /// page. Skip the wrapper visually, never the math inside it.
 fn has_math_descendant(el: ElementRef<'_>) -> bool {
     el.select(math_sel()).next().is_some()
@@ -28,7 +28,7 @@ const SKIP_TAGS: &[&str] = &[
     // <form> nukes all comment text. The form's interactive
     // children (input, button, select, textarea) are already
     // skipped above, so only text content inside forms is
-    // extracted — exactly what we want.
+    // extracted : exactly what we want.
 ];
 
 const SKIP_ROLES: &[&str] = &[
@@ -43,7 +43,7 @@ const SKIP_ROLES: &[&str] = &[
 
 /// Class/id fragments that mark boilerplate. Long fragments use
 /// substring matching on tokens; SHORT fragments (nav, menu)
-/// require exact token match — "flex-nav-upsell" must not kill
+/// require exact token match : "flex-nav-upsell" must not kill
 /// a whole page wrapper.
 ///
 /// NOTE: "comment" is deliberately NOT here. Discussion threads
@@ -51,7 +51,7 @@ const SKIP_ROLES: &[&str] = &[
 /// treating the class name as boilerplate silently dropped whole
 /// comment sections from main-content scoring. Comment-section
 /// noise on article pages is handled by the score competition
-/// (the article container wins) — not by nuking "comment" nodes.
+/// (the article container wins) : not by nuking "comment" nodes.
 const NEGATIVE_SUBSTR: &[&str] = &[
     "sidebar",
     "widget",
@@ -137,7 +137,7 @@ fn is_negative(el: &scraper::node::Element) -> bool {
 }
 
 /// Hard skip: semantic junk only (tags, hidden, roles).
-/// Class-name heuristics are NOT here — they're too fragile
+/// Class-name heuristics are NOT here : they're too fragile
 /// for hard skips (a "fixed-sidebar" class can sit on the
 /// main container). Use `is_negative` as a score penalty or
 /// a size-gated skip instead.
@@ -146,7 +146,7 @@ pub fn skip(el: ElementRef<'_>) -> bool {
     let name = e.name();
     if SKIP_TAGS.contains(&name) {
         // <svg> can embed MathML-adjacent content, but <math>
-        // itself is never junk — the formula is content.
+        // itself is never junk : the formula is content.
         return true;
     }
     if name == "math" {
@@ -168,7 +168,7 @@ pub fn skip(el: ElementRef<'_>) -> bool {
         return true;
     }
     // Screen-reader-only text duplicates visible content
-    // (Ars/BBC badge dupes) — same class as display:none.
+    // (Ars/BBC badge dupes) : same class as display:none.
     if e.attr("class").is_some_and(|c| {
         c.split_whitespace().any(|t| {
             t.eq_ignore_ascii_case("sr-only")
@@ -199,8 +199,8 @@ pub fn negative(el: ElementRef<'_>) -> bool {
 }
 
 /// Hard structural negative: the element's ID is a layout-region
-/// name (footer, sidebar, nav...). Unlike classes — where
-/// "fixed-sidebar" may style the main wrapper — an id IS the
+/// name (footer, sidebar, nav...). Unlike classes : where
+/// "fixed-sidebar" may style the main wrapper : an id IS the
 /// region. Such containers are never the main article, at any
 /// size (xkcd's 1000-char id="bottom" link farm outranked the
 /// comic itself).

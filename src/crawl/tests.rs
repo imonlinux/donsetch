@@ -210,7 +210,7 @@ async fn map_mode_reads_sitemap_cheap() {
     assert_eq!(r.map.len(), 3);
     // Cost: robots + sitemap discovery fetches, never the pages.
     // Multiple sitemap locations are tried (6 fallbacks), but only
-    // /sitemap.xml returns 200 — the others 404.
+    // /sitemap.xml returns 200 : the others 404.
     let hits = hits
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -454,7 +454,7 @@ async fn crawl_walls_marked_skipped_honestly() {
     o.max_pages = 10;
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     // The wall page has no wall verdict in this mock (the mock
-    // returns ContentOk) — real walls handled by walls::detect
+    // returns ContentOk) : real walls handled by walls::detect
     // in the real bridge. What we CAN assert: /ok got crawled.
     assert!(r.pages.iter().any(|p| p.url.ends_with("/ok")));
 }
@@ -569,7 +569,7 @@ async fn crawl_focus_ranks_relevant_first() {
     let mut o = opts();
     o.mode = CrawlMode::Content;
     o.focus = Some("migration".into());
-    o.max_pages = 2; // seed + ONE more — focus decides which
+    o.max_pages = 2; // seed + ONE more : focus decides which
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     let hits = hits
         .lock()
@@ -855,7 +855,7 @@ async fn v2_sitemap_priority_seeds_frontier() {
     let crawler = Crawler::new(fetch, gov());
     let mut o = opts();
     o.mode = CrawlMode::Full;
-    o.max_pages = 2; // seed + 1 — priority decides which
+    o.max_pages = 2; // seed + 1 : priority decides which
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     // The high-priority page should be fetched before the low one.
     assert!(
@@ -883,7 +883,7 @@ async fn v2_referer_passed_to_fetcher() {
     let _ = r;
     // The mock captures referers. Check that /child was fetched
     // with the seed URL as referer.
-    // (We can't access referers from here — it's inside the
+    // (We can't access referers from here : it's inside the
     // mock's Arc. But we can verify the crawl succeeded.)
     // This test serves as a compile-time check that the
     // PageFetcher signature accepts referer.
@@ -1045,7 +1045,7 @@ async fn seed_always_in_scope_with_include() {
     // it doesn't match --include globs. Scope filters apply to
     // discovered links, not the seed the user explicitly asked for.
     // Regression test for docs.rs: crawling /tokio with
-    // --include /tokio/* — seed /tokio doesn't match /tokio/*
+    // --include /tokio/* : seed /tokio doesn't match /tokio/*
     // but must still be in results.
     let seed = "<html><body><article><h1>Tokio</h1><p>content words for extractor threshold pass yes yes yes</p><a href=\"/tokio/v0.1/api\">api</a></article></body></html>";
     let api = "<html><body><article><h1>Tokio API</h1><p>API docs content words for extractor threshold pass yes yes yes</p></article></body></html>";

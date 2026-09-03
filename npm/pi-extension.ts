@@ -1,5 +1,5 @@
 /**
- * DonSeTch pi extension — bridges the donsetch MCP binary into pi.
+ * DonSeTch pi extension : bridges the donsetch MCP binary into pi.
  *
  * `pi install npm:donsetch` installs this package. At session_start the
  * extension spawns `donsetch mcp`, performs the MCP handshake, discovers
@@ -8,14 +8,14 @@
  *
  * Zero maintenance: tool definitions are fetched dynamically from the
  * binary. When donsetch adds or changes tools, this extension picks
- * them up automatically — no code changes needed here.
+ * them up automatically : no code changes needed here.
  *
  * Auto-download: if the binary is missing (e.g. postinstall was
  * blocked by npm 10+), the extension runs install.js at session_start
  * to fetch it from GitHub Releases.
  *
  * Custom TUI: each tool has clean renderCall/renderResult showing
- * a compact summary card — not the full raw output. The LLM still
+ * a compact summary card : not the full raw output. The LLM still
  * receives complete content; the user sees a minimal status line +
  * one-line preview. Amber theme matching DonSeTch's identity.
  */
@@ -31,14 +31,20 @@ const INIT_TIMEOUT_MS = 10_000;
 const CALL_TIMEOUT_MS = 120_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 
+// A raw process.stderr.write bypasses pi's TUI paint cycle and
+// corrupts the viewport (worse across parallel agents). Gate it here.
+const DEBUG_MODE =
+  (process.env.DONSETCH_DEBUG ?? "").length > 0 ||
+  (process.env.DEBUG ?? "").length > 0;
+
 // ── TUI rendering note ──
 // Pi's TUI wraps tool calls in its own green (success) / red (failure)
-// highlight. We output PLAIN TEXT only — no ANSI codes at all.
+// highlight. We output PLAIN TEXT only : no ANSI codes at all.
 // pi-tui's truncateToWidth injects \x1b[0m RESET around the ellipsis,
 // which breaks pi's overlay mid-line. We use our own truncate()
 // that adds zero ANSI codes.
 
-/** Plain text truncation — no ANSI codes. */
+/** Plain text truncation : no ANSI codes. */
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   if (maxLen <= 3) return text.slice(0, maxLen);
@@ -120,7 +126,7 @@ function startServer(): Promise<void> {
     try {
       // --supervised: crash-only daemon. If the MCP server is SIGKILLed
       // (OOM, crash), the supervisor respawns it and replays in-flight
-      // requests — pi users never see a dead tool until the process
+      // requests : pi users never see a dead tool until the process
       // itself dies.
       proc = spawn(binaryPath, ["mcp", "--supervised"], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -158,8 +164,29 @@ function startServer(): Promise<void> {
       }
     });
 
+    // The daemon writes diagnostics to stderr (Xvfb warnings,
+    // fallback notices, ghost telemetry). Pi's TUI surfaces stderr
+    // as user-facing output: raw forwarding used to pop non-fatal
+    // warnings up (issue #95). Gate it:
+    // - DONSETCH_DEBUG / DEBUG set: forward everything (dev mode)
+    // - otherwise only crash/fatal lines survive; the rest is
+    //   tool-level information the caller already has
+    const FATAL_RE = /fatal|panic|crash|SIGSEGV|abort|OOM|out of memory/i;
+    let stderrTail = "";
     proc.stderr?.on("data", (chunk: Buffer) => {
-      process.stderr.write(chunk);
+      if (DEBUG_MODE) {
+        process.stderr.write(chunk);
+        return;
+      }
+      stderrTail = (stderrTail + chunk.toString()).slice(-2048);
+      const lines = stderrTail.split("\n");
+      stderrTail = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed && FATAL_RE.test(trimmed)) {
+          process.stderr.write(`[donsetch] ${trimmed}\n`);
+        }
+      }
     });
 
     proc.on("error", (err) => {
@@ -518,7 +545,7 @@ export default function (pi: ExtensionAPI) {
           } else if (args?.query) {
             key = truncate(`"${args.query}"`, 50);
           }
-          // Plain text only — no ANSI codes. Pi wraps tool calls
+          // Plain text only : no ANSI codes. Pi wraps tool calls
           // in its own green (success) / red (failure) highlight.
           // Any ANSI we emit breaks pi's overlay mid-line.
           return new Text(
@@ -567,7 +594,7 @@ export default function (pi: ExtensionAPI) {
             line2 = d.preview;
           }
 
-          // Plain text only — no ANSI. Pi handles all coloring.
+          // Plain text only : no ANSI. Pi handles all coloring.
           const line1 = `${toolName} \u00B7 ${meta}`;
           const output = line2
             ? `${line1}\n  ${line2}`
@@ -578,7 +605,11 @@ export default function (pi: ExtensionAPI) {
       });
     }
 
-    process.stderr.write(`[donsetch] ${mcpTools.length} tools registered: ${toolNames.join(", ")}\n`);
+    // Fires every session_start (unlike the failure paths above), so
+    // this one corrupted the viewport on every normal run.
+    if (DEBUG_MODE) {
+      process.stderr.write(`[donsetch] ${mcpTools.length} tools registered: ${toolNames.join(", ")}\n`);
+    }
   });
 
   pi.on("session_shutdown", () => {

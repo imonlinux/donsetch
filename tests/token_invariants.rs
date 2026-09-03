@@ -1,6 +1,6 @@
 //! Token-efficiency invariants as a CI gate (v3 foundation #3).
 //! Offline: real saved pages (tests/fixtures/corpus/), full DonSift
-//! pipeline — the same claims bench/tokens.py makes live, asserted
+//! pipeline : the same claims bench/tokens.py makes live, asserted
 //! deterministically on every build.
 
 use donsetch::extract::{self, ExtractOptions};
@@ -72,7 +72,7 @@ fn toc_costs_under_5_percent_of_the_full_page() {
     // The toc-only view (section=TOC) must be a small fraction.
     assert!(
         toc.markdown.len() as f64 / full.markdown.len() as f64 <= 0.05,
-        "toc output {} chars vs full {} — >5%",
+        "toc output {} chars vs full {} : >5%",
         toc.markdown.len(),
         full.markdown.len()
     );
@@ -110,18 +110,18 @@ fn probe_output_stays_tiny() {
 #[test]
 fn mcp_instructions_stay_cheap() {
     // The handshake blurb is the one string an agent pays for in
-    // every session, whether or not it ever calls us — so it is a
+    // every session, whether or not it ever calls us : so it is a
     // token invariant like any response size. Generated live, not
     // read from the fixture: a fixture is only as fresh as its
     // last blessing, so measuring it would pass on stale text and
     // report the bloat one run too late.
     let text = donsetch::mcp::tools::instructions();
 
-    // chars/4 — the estimator the rest of the codebase uses.
+    // chars/4 : the estimator the rest of the codebase uses.
     let tokens = text.len() / 4;
     assert!(
         tokens <= 150,
-        "instructions cost ~{tokens} tokens (>150) — resident in every session"
+        "instructions cost ~{tokens} tokens (>150) : resident in every session"
     );
 }
 

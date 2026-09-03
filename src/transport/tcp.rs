@@ -23,7 +23,7 @@ pub async fn happy_connect(host: &str, port: u16) -> Result<TcpStream, FetchErro
     // DNS pinning (SSRF): a hostname that resolves to a
     // private/loopback address is treated exactly like a
     // literal one. Checking the addresses we are about to
-    // dial — not the name — also closes rebinding TOCTOU.
+    // dial : not the name : also closes rebinding TOCTOU.
     // Escape hatch for deliberate local-egress use (CLI
     // power users, tests): DONSETCH_ALLOW_PRIVATE_EGRESS=1.
     let addrs: Vec<SocketAddr> = if std::env::var_os("DONSETCH_ALLOW_PRIVATE_EGRESS").is_some() {
@@ -35,7 +35,7 @@ pub async fn happy_connect(host: &str, port: u16) -> Result<TcpStream, FetchErro
             .collect();
         if blocked.len() == addrs.len() {
             return Err(FetchError::Http(format!(
-                "dns: {host} resolves to a private/loopback address — SSRF guard"
+                "dns: {host} resolves to a private/loopback address : SSRF guard"
             )));
         }
         addrs

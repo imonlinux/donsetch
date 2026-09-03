@@ -14,7 +14,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
-    // *.wikipedia.org only — the REST/mobile mirrors differ.
+    // *.wikipedia.org only : the REST/mobile mirrors differ.
     if !host.ends_with(".wikipedia.org") {
         return None;
     }
@@ -66,7 +66,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
 
     // Hand the rest to the generic pipeline, then prepend the
     // infobox. Reuse extract by calling the generic path with the
-    // infobox REMOVED from the html — simplest correct approach:
+    // infobox REMOVED from the html : simplest correct approach:
     // re-serialize is heavy; instead extract the article body
     // directly from #mw-content-text via inline rendering of
     // block children.
@@ -176,7 +176,7 @@ fn is_furniture(el: ElementRef) -> bool {
 }
 
 /// Minimal block walk over the article body: headings, paragraphs,
-/// lists, tables, code — furniture skipped at the element level.
+/// lists, tables, code : furniture skipped at the element level.
 fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
     let mut out = String::new();
     let mut opts = opts.clone();

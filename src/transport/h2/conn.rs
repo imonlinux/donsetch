@@ -178,12 +178,12 @@ impl H2Conn {
                         for (n, v) in decoded {
                             // RFC 9113 §8.2.2: CR/LF in field values is
                             // malformed. Such a value must never reach the
-                            // cookie jar — it would split later h1 requests.
+                            // cookie jar : it would split later h1 requests.
                             if !crate::fetch::guards::valid_header_value(&n)
                                 || !crate::fetch::guards::valid_header_value(&v)
                             {
                                 return Err(FetchError::Http(
-                                    "h2: header name/value contains CR/LF/NUL — malformed".into(),
+                                    "h2: header name/value contains CR/LF/NUL : malformed".into(),
                                 ));
                             }
                             if n == ":status" {
@@ -236,19 +236,32 @@ impl H2Conn {
                         break;
                     }
                 }
-                RST_STREAM => {
+                // Scoped like HEADERS/CONTINUATION/DATA above: on a
+                // pooled, reused connection, a late RST_STREAM for a
+                // PRIOR (already-finished) stream must not abort the
+                // new request currently in flight. Unmatched
+                // RST_STREAM falls through to the `_` arm below and
+                // is correctly ignored.
+                RST_STREAM if hdr.stream_id == stream_id => {
                     return Err(FetchError::Http(format!("h2 rst_stream on {stream_id}")));
                 }
                 GOAWAY => {
                     return Err(FetchError::Http("h2 goaway".into()));
                 }
                 PUSH_PROMISE => {
+                    // RFC 7540 §6.4: RST_STREAM's payload is a 4-byte
+                    // error code, not a stream id (this used to send
+                    // `stream_id`'s own bytes. We advertise
+                    // ENABLE_PUSH=0 in SETTINGS, so a conforming
+                    // server never pushes; REFUSED_STREAM tells a
+                    // non-conforming one plainly why this is refused.
+                    const REFUSED_STREAM: u32 = 0x7;
                     write_frame(
                         &mut self.stream,
                         RST_STREAM,
                         0,
                         hdr.stream_id,
-                        &stream_id.to_be_bytes(),
+                        &REFUSED_STREAM.to_be_bytes(),
                     )
                     .await
                     .ok();
@@ -276,7 +289,7 @@ mod parity_tests {
     /// to Chromium's (Akamai-style fingerprint
     /// `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`).
     /// Ground truth: Chromium 150 capture (2026-07-30). Any change
-    /// here is a fingerprint regression — update ONLY with a new
+    /// here is a fingerprint regression : update ONLY with a new
     /// capture, never by hand.
     #[test]
     fn settings_match_chromium() {
@@ -305,7 +318,7 @@ mod parity_tests {
         );
     }
 
-    /// Pseudo-header order: m,a,s,p — Chromium's header order.
+    /// Pseudo-header order: m,a,s,p : Chromium's header order.
     #[test]
     fn pseudo_header_order_is_chrome() {
         // Mirrors the order in H2Conn::get; keep both in lockstep.

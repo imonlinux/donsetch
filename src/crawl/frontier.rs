@@ -77,7 +77,7 @@ fn web_scheme(url: &Url) -> bool {
 /// Known locale codes that appear as the first path segment on
 /// multi-language sites (MDN, Wikipedia, React docs, etc.).
 /// When two URLs differ ONLY in this prefix, they are translations
-/// of the same content — fetching both wastes crawl budget.
+/// of the same content : fetching both wastes crawl budget.
 const LOCALE_PREFIXES: &[&str] = &[
     // ISO 639-1 two-letter codes
     "en", "de", "es", "fr", "ja", "ko", "ru", "it", "nl", "pl", "tr", "ar", "hi", "th", "vi", "id",
@@ -293,7 +293,7 @@ impl FrontierQueue {
     }
 
     /// Requeue a popped item (e.g. host boxed, try later).
-    /// NOT dedup'd — the seen-set already knows it.
+    /// NOT dedup'd : the seen-set already knows it.
     pub fn requeue(&mut self, f: Frontier) {
         self.heap.push(f);
     }
@@ -334,7 +334,7 @@ impl FrontierQueue {
     }
 
     /// Snapshot all queued entries (url, score, depth, retries,
-    /// parent) for a resume token. Does not drain — the seen-set
+    /// parent) for a resume token. Does not drain : the seen-set
     /// survives.
     pub fn snapshot_entries(&self) -> Vec<(String, f64, u32, u8, Option<String>)> {
         self.heap
@@ -371,7 +371,7 @@ impl FrontierQueue {
 /// - Path not ending with `/` (page): use parent directory.
 ///   `/tokio-rs/tokio/wiki` -> `/tokio-rs/tokio/*`
 /// - Single-segment path (e.g. `/tokio`): scope to that segment.
-///   `/tokio` -> `/tokio/*` (NOT None — multi-tenant hosts like
+///   `/tokio` -> `/tokio/*` (NOT None : multi-tenant hosts like
 ///   docs.rs, crates.io, npmjs.com have each crate/package as
 ///   a top-level segment; returning None crawls the entire site).
 /// - Root path `/`: no scope (crawl the whole host).
@@ -397,7 +397,7 @@ pub fn auto_scope(seed_path: &str) -> Option<String> {
     // Page path: use parent directory.
     let prefix = match path.rfind('/') {
         Some(0) => {
-            // Single-segment path like `/tokio` — scope to
+            // Single-segment path like `/tokio` : scope to
             // `/tokio/*` instead of returning None. This is
             // critical for multi-tenant hosts (docs.rs,
             // crates.io, npmjs.com) where each top-level segment
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn auto_scope_single_segment_is_scope() {
-        // /tokio on docs.rs -> /tokio/* (NOT None — multi-tenant host)
+        // /tokio on docs.rs -> /tokio/* (NOT None : multi-tenant host)
         assert_eq!(auto_scope("/tokio"), Some("/tokio/*".into()));
         assert_eq!(auto_scope("/learn"), Some("/learn/*".into()));
         assert_eq!(auto_scope("/blog"), Some("/blog/*".into()));

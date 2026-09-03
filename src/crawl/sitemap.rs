@@ -3,13 +3,13 @@
 //! Phase-1 of the two-phase crawl surface: read the site's
 //! published URL inventory BEFORE crawling. A 10K-page site
 //! costs 2 requests here (robots.txt + sitemap index) instead of
-//! 10K. Streaming byte-scanners — no DOM, tolerant of the
+//! 10K. Streaming byte-scanners : no DOM, tolerant of the
 //! malformed XML sitemaps actually ship.
 
 use super::PageFetcher;
 
 /// robots.txt: sitemap directives + `*` Disallow rules.
-/// We obey robots by default — it is both polite AND the
+/// We obey robots by default : it is both polite AND the
 /// fastest signal of what the site WANTS crawled (`Allow`
 /// paths + sitemap lists).
 #[derive(Default, Debug, Clone)]
@@ -106,7 +106,7 @@ impl Robots {
 pub struct SitemapEntry {
     pub loc: String,
     pub lastmod: Option<String>,
-    /// Sitemap-declared priority (0.0–1.0). Used to seed
+    /// Sitemap-declared priority (0.0-1.0). Used to seed
     /// the frontier relevance score.
     pub priority: Option<f32>,
     /// True when the entry came from a `<sitemap>` index block
@@ -143,7 +143,7 @@ pub fn parse_sitemap(xml: &str, out: &mut Vec<SitemapEntry>, cap: usize) {
     }
 }
 
-/// Find the next `<url>` or `<sitemap>` open tag — skipping the
+/// Find the next `<url>` or `<sitemap>` open tag : skipping the
 /// `<urlset>`/`<sitemapindex>` containers. Returns
 /// (content_offset, close_tag). Tag-name based: immune to
 /// prefix collisions like `<urlset>` matching `<url`.
@@ -198,7 +198,7 @@ fn extract_tag(block: &str, tag: &str) -> Option<String> {
 pub fn maybe_gunzip(body: &[u8]) -> Vec<u8> {
     if body.len() > 2 && body[0] == 0x1f && body[1] == 0x8b {
         use std::io::Read;
-        // Same 64 MiB cap as the fetch decompressor — a malicious
+        // Same 64 MiB cap as the fetch decompressor : a malicious
         // .xml.gz sitemap must not OOM the daemon via unbounded
         // decompression.
         const MAX_SITEMAP_DECOMPRESSED: usize = 64 << 20;
@@ -232,7 +232,7 @@ pub async fn discover(fetch: &PageFetcher, host: &str, cap: usize) -> (Robots, V
     // Sitemap candidates: robots directives first.
     let mut queue: Vec<String> = robots.sitemaps.clone();
     if queue.is_empty() {
-        // Multiple conventional locations — many sites use non-standard
+        // Multiple conventional locations : many sites use non-standard
         // sitemap paths (WordPress /wp-sitemap.xml, Yoast /sitemap_index.xml).
         queue.extend([
             format!("https://{host}/sitemap.xml"),
@@ -251,7 +251,7 @@ pub async fn discover(fetch: &PageFetcher, host: &str, cap: usize) -> (Robots, V
         if first {
             // Wave 1: the highest-confidence candidate alone.
             // Robots-declared sitemaps and /sitemap.xml cover the
-            // large majority of sites — one request, exactly like
+            // large majority of sites : one request, exactly like
             // the serial v1 loop's best case.
             first = false;
             let loc = queue.remove(0);
@@ -265,7 +265,7 @@ pub async fn discover(fetch: &PageFetcher, host: &str, cap: usize) -> (Robots, V
         // Sitemap-less sites used to pay every candidate as a
         // serial 404 round-trip (~1-3s of pure latency); now the
         // whole miss-set resolves in one round. Child sitemap
-        // indexes discovered later are also waved — they are
+        // indexes discovered later are also waved : they are
         // metadata probes, not page fetches, and the governor's
         // page-fetch pacing is untouched.
         let wave: Vec<String> = queue.drain(..queue.len().min(8)).collect();

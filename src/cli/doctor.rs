@@ -1,4 +1,4 @@
-//! `donsetch --doctor` — health check with auto-fix.
+//! `donsetch --doctor` : health check with auto-fix.
 //!
 //! Checks, each with a clean pass/warn/fail icon and a dim
 //! detail string. Auto-fixes what it can (creates missing dirs,
@@ -85,14 +85,14 @@ pub async fn run() {
             cli::check_fail(
                 "Fetcher init",
                 &e.to_string(),
-                "TLS initialization failed — check system CA certificates",
+                "TLS initialization failed : check system CA certificates",
             );
             f += 1;
             collected.push((
                 "Fetcher init".into(),
                 "fail".into(),
                 e.to_string(),
-                "TLS initialization failed — check system CA certificates".into(),
+                "TLS initialization failed : check system CA certificates".into(),
             ));
             None
         }
@@ -114,7 +114,7 @@ pub async fn run() {
     }
 
     // 4. Chrome/Chromium.
-    report!("Chrome/Chromium", check_chrome());
+    report!("Chrome/Chromium", check_chrome().await);
 
     // 5. Xvfb (Linux headful stealth prerequisite).
     report!("Xvfb", check_xvfb());
@@ -151,8 +151,15 @@ pub async fn run() {
     // 14. Ghost state.
     report!("Ghost state", check_ghost_state());
 
-    // 15. Bypass unlocker key.
-    report!("Bypass unlocker", check_bypass());
+    // 15. Bright Data account keys (SERP + unlocker): the paid
+    // layer gets more than a y/n. Default mode validates locally
+    // (presence, shape, cap + cache state, kill switches); --deep
+    // adds a free live zone probe (route_ips costs nothing).
+    report!("Bright Data SERP", check_brightdata());
+    report!("Bypass unlocker", check_bypass(deep));
+
+    // 15.5 BYOK plugins (user-registered executable adapters).
+    report!("Search plugins", check_plugins());
 
     // 16. MCP client registration (detect + print blocks).
     print_mcp_section();
@@ -253,55 +260,72 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
             CheckResult::Pass("TLS connection successful".into())
         }
         Ok(_) => {
-            // External service returned non-200 — skip silently.
+            // External service returned non-200 : skip silently.
             // The TLS stack works (we connected); the fingerprint
             // check service is just unavailable. Don't alarm users.
             CheckResult::Pass("TLS connected (fingerprint service unavailable)".into())
         }
         Err(_) => {
             // Can't reach the fingerprint service at all. Still
-            // don't warn — the service may be down or blocked,
+            // don't warn : the service may be down or blocked,
             // and the TLS stack is fine (we use it for every fetch).
             CheckResult::Pass("TLS stack active (fingerprint service unreachable)".into())
         }
     }
 }
 
-fn check_chrome() -> CheckResult {
-    match crate::ghost::chrome_binary() {
-        Ok(path) => {
-            // Browser version via the shared probe — registry first
-            // (zero spawn), then a hard-capped `--version` spawn that
-            // kills the whole tree on timeout. Never opens a window,
-            // never hangs, never leaves an orphaned browser behind.
-            let version = match crate::profile::probe_installed_major() {
-                Some(major) => format!("{major}.0.0.0 (probed)"),
-                None => "unknown version".into(),
-            };
-            CheckResult::Pass(format!("{version} at {path}"))
+async fn check_chrome() -> CheckResult {
+    let result = tokio::task::spawn_blocking(crate::ghost::resolve_browser).await;
+    match result {
+        Ok(Ok(browser)) => {
+            // Full dotted build, not just the major: probing the
+            // exact binary we resolved (backed identical for
+            // chromium and cloak) costs one spawn and is the only
+            // number that matters for debugging detection issues.
+            // A padded "151.0.0.0" was honest but vague.
+            let version =
+                crate::profile::probe_version_string_at_path(&browser.path.to_string_lossy())
+                    .or_else(|| browser.version.clone())
+                    .unwrap_or_else(|| "unknown version".into());
+            CheckResult::Pass(format!(
+                "{} at {} ({}; {})",
+                version,
+                browser.path.display(),
+                browser.backend.as_str(),
+                browser.source
+            ))
         }
-        Err(_) => CheckResult::Fail(
-            "not found".into(),
-            "Install Chrome/Chromium, or set DONGHOST_CHROME to a browser path".into(),
+        Ok(Err(error)) => CheckResult::Fail(
+            error.to_string(),
+            "Install Chromium, set DONGHOST_CHROME, or set CLOAKBROWSER_BINARY_PATH. ".to_string()
+                + "Set DONSETCH_CLOAK_AUTO_DOWNLOAD=1 to fetch the signed CloakBrowser binary.",
+        ),
+        Err(error) => CheckResult::Fail(
+            format!("browser resolution task failed: {error}"),
+            "Retry the check; browser resolution could not be started.".into(),
         ),
     }
 }
 
 /// Xvfb: the Linux headful-stealth prerequisite. Missing Xvfb
-/// does NOT disable tier 2 — ghost falls back to off-screen
+/// does NOT disable tier 2 : ghost falls back to off-screen
 /// headful on the real display (a window may flash briefly) or
 /// headless on Wayland-only sessions (more detectable). Warn,
-/// not fail — but the user deserves to know.
+/// not fail : but the user deserves to know.
 fn check_xvfb() -> CheckResult {
     #[cfg(linux_like)]
     {
+        // A forced headless backend deliberately does not need Xvfb.
+        if crate::ghost::cloak::headless_mode_requested() {
+            return CheckResult::Pass("not needed (headless backend)".into());
+        }
         // Termux (Android) has no X11 by default. Xvfb is not
-        // needed — Ghost uses --headless=new mode.
+        // needed : Ghost uses --headless=new mode.
         if std::env::var_os("PREFIX")
             .map(|p| p.to_string_lossy().contains("com.termux"))
             .unwrap_or(false)
         {
-            return CheckResult::Pass("not needed (Termux — headless mode)".into());
+            return CheckResult::Pass("not needed (Termux : headless mode)".into());
         }
         if crate::ghost::xvfb::is_available() {
             // :99 socket alive = daemon's Xvfb will be reused.
@@ -313,7 +337,7 @@ fn check_xvfb() -> CheckResult {
             })
         } else {
             CheckResult::Warn(
-                "not installed — tier 2 falls back to headless/off-screen (less stealthy)".into(),
+                "not installed : tier 2 falls back to headless/off-screen (less stealthy)".into(),
             )
         }
     }
@@ -322,17 +346,19 @@ fn check_xvfb() -> CheckResult {
         CheckResult::Pass("not needed on this platform".into())
     }
 }
-
 /// The REAL browser test: launch Chromium exactly as tier 2
 /// would (same flags, same Xvfb dance), run the fingerprint
 /// selftest page, kill. Bounded to 40s. This is what turns
-/// "Chromium found" into "tier 2 proven on this machine" —
 /// the 50-case report's "a feature that works only when the
 /// user guesses the hidden prerequisite is not finished".
 async fn check_browser_launch() -> CheckResult {
     let inner = async {
         // Same Xvfb handling as GhostManager: start/reuse :99.
-        let xvfb = crate::ghost::xvfb::Xvfb::start().await.ok();
+        let xvfb = if crate::ghost::cloak::headless_mode_requested() {
+            None
+        } else {
+            crate::ghost::xvfb::Xvfb::start().await.ok()
+        };
         let display = xvfb.as_ref().map(|x| x.display_env());
         let profile = BrowserProfile::host_default();
         let t0 = std::time::Instant::now();
@@ -344,14 +370,12 @@ async fn check_browser_launch() -> CheckResult {
                 }
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Tier 2 (browser fallback) will not work. Install Chromium + Xvfb, or set DONGHOST_CHROME".into(),
+                    "Tier 2 browser fallback will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
                 );
             }
         };
         let launch_ms = t0.elapsed().as_millis();
 
-        // Fingerprint selftest: local page reads back
-        // navigator.webdriver and friends from the live browser.
         let fp = crate::ghost::ops::selftest(&mut ghost).await;
         ghost.kill().await;
         if let Some(x) = xvfb {
@@ -360,19 +384,65 @@ async fn check_browser_launch() -> CheckResult {
         match fp {
             Ok(json_str) => {
                 let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+                // Real-Chrome parity: webdriver must be false VIA THE
+                // NATIVE ACCESSOR with no own property on the
+                // navigator instance (an injected own property is a
+                // tell). undefined was pre-Chrome-89 behavior.
                 let webdriver = v.get("webdriver").and_then(|w| w.as_bool());
-                match webdriver {
-                    Some(false) => CheckResult::Pass(format!(
-                        "launched in {launch_ms}ms, fingerprint clean (webdriver=false)"
-                    )),
-                    Some(true) => CheckResult::Warn(
-                        "launched, but webdriver=true — stealth patches not applied".into(),
-                    ),
-                    None => CheckResult::Pass(format!("launched in {launch_ms}ms, selftest ok")),
+                let no_own_prop =
+                    v.get("webdriverOwnProp").and_then(|w| w.as_bool()) == Some(false);
+                // WebGL null is a headless-only signature: it fires
+                // when the host cannot provide any GL (common on
+                // GPU-less Linux + a Chromium build without a
+                // working software rasterizer). Windows/macOS and
+                // GPU Linux report a real renderer and clear this.
+                // Warn, do not fail: the browser still works, and
+                // the SwiftShader launch flags enable it whenever
+                // the host can.
+                let gl_ok = v
+                    .get("webglRenderer")
+                    .and_then(|w| w.as_str())
+                    .is_some_and(|r| !r.is_empty() && r != "?" && r != "err" && r != "undefined");
+                let deep_clean = webdriver == Some(false)
+                    && no_own_prop
+                    && v.get("hasChrome").and_then(|x| x.as_bool()) == Some(true)
+                    && v.get("plugins")
+                        .and_then(|x| x.as_u64())
+                        .is_some_and(|n| n > 0)
+                    && v.get("ua")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|ua| !ua.contains("HeadlessChrome"));
+                let gl_note = if gl_ok {
+                    format!(
+                        "webgl={}",
+                        v.get("webglRenderer")
+                            .and_then(|w| w.as_str())
+                            .unwrap_or("ok")
+                    )
+                } else {
+                    "webgl=null (host provides no GL; software renderer unavailable in this Chromium build)"
+                        .to_string()
+                };
+                if deep_clean && gl_ok {
+                    CheckResult::Pass(format!(
+                        "launched in {launch_ms}ms, deep fingerprint clean (webdriver=false native, no own prop, {gl_note})"
+                    ))
+                } else if deep_clean {
+                    CheckResult::Warn(format!(
+                        "launched in {launch_ms}ms, fingerprint clean EXCEPT {gl_note}"
+                    ))
+                } else {
+                    CheckResult::Warn(format!(
+                        "launched in {launch_ms}ms, deep fingerprint incomplete: webdriver={webdriver:?} ownProp={:?}, gl={:?}, chrome={:?}, plugins={:?}",
+                        v.get("webdriverOwnProp"),
+                        v.get("webglRenderer"),
+                        v.get("hasChrome"),
+                        v.get("plugins")
+                    ))
                 }
             }
             Err(e) => CheckResult::Warn(format!(
-                "launched in {launch_ms}ms, but selftest failed: {e}"
+                "launched in {launch_ms}ms, deep fingerprint selftest failed: {e}"
             )),
         }
     };
@@ -390,7 +460,7 @@ async fn check_browser_launch() -> CheckResult {
     }
 }
 
-/// ghost-state.json holds cookies — it must not be
+/// ghost-state.json holds cookies : it must not be
 /// world-readable.
 fn check_state_permissions() -> CheckResult {
     #[cfg(unix)]
@@ -513,7 +583,7 @@ fn check_cache_dir() -> CheckResult {
             let _ = std::fs::remove_file(&test);
             let total = dir_size(&dir);
 
-            // Breakdown by component — helps users understand what's
+            // Breakdown by component : helps users understand what's
             // using space. The ghost-profile (Chrome's own cache) is
             // typically the largest; ghost-state.json (self-improvement)
             // should be < 1MB after cookie filtering.
@@ -559,7 +629,17 @@ fn check_cache_dir() -> CheckResult {
                 ),
             ];
 
-            let breakdown: String = parts
+            let mut parts_vec: Vec<(&str, u64)> = parts.to_vec();
+            let known: u64 = parts_vec.iter().map(|(_, s)| *s).sum();
+            let other = total.saturating_sub(known);
+            // 'other' = vendored engine bits (PDFium static lib,
+            // ONNX runtime) staged in the cache dir: name them so
+            // nobody wonders where the bytes went.
+            if other >= 1_000_000 {
+                parts_vec.push(("engine-runtime", other));
+            }
+
+            let breakdown: String = parts_vec
                 .iter()
                 .filter(|(_, s)| *s > 0)
                 .map(|(name, size)| format!("{name}={}", format_size(*size)))
@@ -659,7 +739,7 @@ fn check_onnx() -> CheckResult {
             let has_avx = crate::cpu::has_avx();
             if !has_avx {
                 return CheckResult::Warn(
-                    "CPU lacks AVX — OCR and rerank disabled (all other features work)".into(),
+                    "CPU lacks AVX : OCR and rerank disabled (all other features work)".into(),
                 );
             }
             // Check shared library presence.
@@ -676,7 +756,7 @@ fn check_onnx() -> CheckResult {
                 CheckResult::Pass("AVX detected, shared library present".into())
             } else {
                 CheckResult::Warn(
-                    "AVX detected but shared library missing — reinstall donsetch".into(),
+                    "AVX detected but shared library missing : reinstall donsetch".into(),
                 )
             }
         }
@@ -690,17 +770,210 @@ fn check_ghost_state() -> CheckResult {
     CheckResult::Pass(format!("{domains} domains, {renders} renders cached"))
 }
 
-fn check_bypass() -> CheckResult {
-    let cfg = crate::search::byok::store::ByokConfig::load();
-    let has = crate::fetch::bypass::active_unlocker_key(&cfg).is_some();
-    if has {
-        CheckResult::Pass("unlocker key configured".to_string())
+/// BYOK plugins: registration state only. Never probes the
+/// adapter from doctor (a probe is a real query through user
+/// code; it stays behind the explicit `--test` flag).
+fn check_plugins() -> CheckResult {
+    let cfg = crate::search::byok::plugin::PluginConfig::load();
+    if !cfg.is_configured() {
+        return CheckResult::Pass(
+            "none registered (optional: `donsetch keys add plugin <name> --cmd '...' --test`)"
+                .to_string(),
+        );
+    }
+    let names: Vec<String> = cfg.names().cloned().collect();
+    // Path-form program checks only: PATH lookups are resolved
+    // by the exec at run time, and absence there already yields
+    // a clear error on the first search.
+    let mut missing: Vec<String> = Vec::new();
+    for n in &names {
+        let prog = &cfg.plugins[n].cmd[0];
+        let is_path_form = prog.contains('/') || prog.contains('\\') || prog.starts_with('.');
+        if is_path_form && !std::path::Path::new(prog).exists() {
+            missing.push(format!("{n}: {prog}"));
+        }
+    }
+    let detail = format!(
+        "{} registered ({}), runs at search time",
+        names.len(),
+        names.join(", ")
+    );
+    if missing.is_empty() {
+        CheckResult::Pass(detail)
     } else {
-        CheckResult::Warn(
+        CheckResult::Warn(format!(
+            "{detail}; program not found: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn mask_key(k: &str) -> String {
+    let start = k.split_once("::").map(|(t, _)| t).unwrap_or(k);
+    let b = start.as_bytes();
+    if b.len() <= 8 {
+        return format!("{}***", &start[..start.len().saturating_sub(1)]);
+    }
+    let head = std::str::from_utf8(&b[..6]).unwrap_or("");
+    let tail = std::str::from_utf8(&b[b.len() - 4..]).unwrap_or("");
+    format!("{head}...{tail}")
+}
+
+/// Bright Data SERP key: local validation + a free live zone probe
+/// in --deep mode (route_ips costs nothing, so the check can
+/// confirm token + zone without spending a cent).
+fn check_brightdata() -> CheckResult {
+    let cfg = crate::search::byok::store::ByokConfig::load();
+    let Some(entry) = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == "brightdata")
+        .and_then(|p| p.keys.first())
+    else {
+        return CheckResult::Warn(
+            "not configured : keyless search still works, but SERP costs nothing to add via `donsetch keys add brightdata <token>[::zone]`"
+                .to_string(),
+        );
+    };
+    let (_, zone) = crate::search::byok::brightdata_key_parts(&entry.key)
+        .unwrap_or_else(|_| (String::new(), String::new()));
+    let masked = mask_key(&entry.key);
+    let state = match entry.state {
+        crate::search::byok::store::KeyState::Active => "active",
+        crate::search::byok::store::KeyState::Invalid => "rejected by Bright Data (fix the token)",
+        crate::search::byok::store::KeyState::CreditDepleted => "out of credits",
+        crate::search::byok::store::KeyState::RateLimited => "rate limited",
+    };
+    if entry.state != crate::search::byok::store::KeyState::Active {
+        return CheckResult::Fail(
+            format!("{masked} on {zone} : {state}"),
+            "`donsetch keys reset brightdata` re-activates the key after you fix the problem on Bright Data's side.".to_string(),
+        );
+    }
+    CheckResult::Pass(format!("{masked} on zone {zone}, {state}"))
+}
+
+fn check_bypass(deep: bool) -> CheckResult {
+    let cfg = crate::search::byok::store::ByokConfig::load();
+    let bc = crate::fetch::bypass::BypassConfig::from_env();
+    if !bc.enabled {
+        return CheckResult::Warn(
+            "integration disabled by DONSETCH_BYPASS=0 : walled sites will end on the tier-2 path instead of the solver"
+                .to_string(),
+        );
+    }
+    let Some(key) = crate::fetch::bypass::active_unlocker_key(&cfg) else {
+        return CheckResult::Warn(
             "not configured (optional, opt-in: donsetch keys add unlocker <key>[::zone])"
                 .to_string(),
-        )
+        );
+    };
+    let parsed = crate::fetch::bypass::parse_key(&key, crate::fetch::bypass::DEFAULT_ZONE);
+    let (_, zone) = match &parsed {
+        Ok((t, z)) => (t.clone(), z.clone()),
+        Err(_) => (String::new(), String::new()),
+    };
+    let masked = mask_key(&key);
+    if let Err(e) = &parsed {
+        return CheckResult::Fail(
+            format!("{masked} looks broken : {e}"),
+            "`donsetch keys add unlocker <token>[::zone]` replaces the key with a valid one."
+                .to_string(),
+        );
     }
+    // Daily cap state: how close are we to the ceiling today?
+    let count_path = crate::fetch::bypass::bypass_count_path(&crate::paths::cache_dir());
+    let used: u32 = std::fs::read_to_string(&count_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let cap_note = if used >= bc.max_daily {
+        ", daily cap reached (raise DONSETCH_BYPASS_MAX_DAILY to keep unlocking)".to_string()
+    } else {
+        format!(", {used}/{} daily unlocks used", bc.max_daily)
+    };
+    // Solve-cache state.
+    let cache_dir = crate::fetch::bypass::bypass_cache_dir(&crate::paths::cache_dir());
+    let cache_n: usize = std::fs::read_dir(&cache_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    let cache_note = if bc.cache_ttl.is_zero() {
+        ", solve-cache disabled via DONSETCH_BYPASS_CACHE=0".to_string()
+    } else {
+        format!(", {cache_n} pages cached")
+    };
+    let base = format!(
+        "{masked} on zone {zone}{cap_note}{cache_note}, render-on-solve {}",
+        if bc.render { "on" } else { "off" }
+    );
+    // --deep: live, free zone validation (route_ips endpoint).
+    if deep {
+        let zone_for_probe = zone.clone();
+        let token_for_probe = key
+            .split_once("::")
+            .map(|(t, _)| t.to_string())
+            .unwrap_or_else(|| key.clone());
+        match std::thread::Builder::new()
+            .name("bd-probe".into())
+            .spawn(move || bright_zone_probe(&token_for_probe, &zone_for_probe))
+        {
+            Ok(handle) => match handle.join() {
+                Ok(Ok(n)) => {
+                    CheckResult::Pass(format!("{base} ; live zone probe OK ({n} IPs routed)"))
+                }
+                Ok(Err(e)) => CheckResult::Warn(format!(
+                    "{base} ; live zone probe failed: {e} (free check, nothing billed)"
+                )),
+                Err(_) => CheckResult::Pass(base),
+            },
+            Err(_) => CheckResult::Pass(base),
+        }
+    } else {
+        CheckResult::Pass(base)
+    }
+}
+
+/// Free Bright Data validation: the zone route_ips endpoint lists
+/// the zone's IP pool without making a request, so a dead token or
+/// wrong zone name shows up here before the first paid unlock.
+fn bright_zone_probe(token: &str, zone: &str) -> Result<usize, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let resp = client
+            .get(format!(
+                "https://api.brightdata.com/zone/route_ips?zone={zone}"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| format!("request: {e}"))?;
+        let status = resp.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err("the token or zone name was rejected (401/403) : verify both in the Bright Data dashboard, or the zone type does not expose its route IPs".to_string());
+        }
+        if status != 200 {
+            return Err(format!("HTTP {status}"));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        if let Some(n) = v.get("ip_count").and_then(|x| x.as_u64()) {
+            return Ok(n as usize);
+        }
+        if let Some(ips) = v.get("ips").and_then(|x| x.as_array()) {
+            return Ok(ips.len());
+        }
+        Ok(0)
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────────

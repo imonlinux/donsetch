@@ -1,4 +1,4 @@
-//! DonSift — the extraction engine of DonSeTch.
+//! DonSift : the extraction engine of DonSeTch.
 //!
 //! HTML bytes in → agent-native markdown out. Block model, not
 //! article text: typed blocks with heading breadcrumbs power BM25
@@ -48,7 +48,7 @@ pub struct ExtractOptions {
     /// Scope to one heading section (substring, case-
     /// insensitive). Pairs with toc.
     pub section: Option<String>,
-    /// Probe (v3): verification query — when set, the extraction
+    /// Probe (v3): verification query : when set, the extraction
     /// runs in full but the output is reduced to hit/no-hit plus
     /// short context excerpts around matches. The page never
     /// enters the agent's context wholesale. Case-insensitive
@@ -104,7 +104,7 @@ pub struct Extracted {
     /// Rough token estimate (chars / 4) of the returned markdown.
     pub tokens_est: usize,
     /// True when the page was large but almost no content
-    /// extracted — a JS shell. Tier 2's job.
+    /// extracted : a JS shell. Tier 2's job.
     pub thin: bool,
     /// Best-guess content kind from block composition.
     /// Conservative: only non-Page when confident.
@@ -112,22 +112,22 @@ pub struct Extracted {
     /// Detected language (BCP-47 code: "en", "zh", "ja", etc.).
     #[allow(dead_code)]
     pub lang: String,
-    /// Quality score 0.0..1.0 — content density, metadata
+    /// Quality score 0.0..1.0 : content density, metadata
     /// completeness, structure diversity. Helps agents
     /// decide if content is trustworthy.
     #[allow(dead_code)]
     pub quality: f32,
     /// PDF only: per-page extraction stats (chars, ocr flag,
     /// confidence). Block merging intentionally flows paragraphs
-    /// across page breaks for reading continuity — page
+    /// across page breaks for reading continuity : page
     /// boundaries are preserved HERE instead.
     pub pdf_pages: Option<Vec<crate::pdf::PageMeta>>,
-    /// Content-area images (alt, src) capped at 12 — collected
+    /// Content-area images (alt, src) capped at 12 : collected
     /// whether or not media lines are rendered, so image-text OCR
     /// (v3) can run on demand.
     pub images: Vec<(String, String)>,
     /// Knowledge fingerprint (v3): sha256 of the FULL pre-
-    /// pagination markdown. Stable across max_chars settings —
+    /// pagination markdown. Stable across max_chars settings :
     /// re-fetches compare apples to apples.
     pub fingerprint: Option<String>,
     /// Domain-intelligence adapter that produced this result
@@ -159,7 +159,7 @@ impl std::fmt::Display for ExtractError {
     }
 }
 
-/// Quality score 0.0..1.0 — content density, metadata
+/// Quality score 0.0..1.0 : content density, metadata
 /// completeness, structure diversity, and language
 /// coherence. Helps agents decide if the extracted
 /// content is trustworthy enough to quote.
@@ -249,7 +249,7 @@ fn quality_score(
 }
 
 /// Classify content from block composition.
-/// Conservative — Page when nothing is dominant.
+/// Conservative : Page when nothing is dominant.
 fn classify(blocks: &[&blocks::Block]) -> ContentKind {
     let mut code = 0usize;
     let mut tables = 0usize;
@@ -319,7 +319,7 @@ pub fn extract(
     let is_pdf = body.len() >= 5 && body.starts_with(b"%PDF-") || ct.contains("pdf");
 
     // Feeds (RSS/Atom/JSON Feed): structured rendering, never a
-    // raw XML blob. Checked BEFORE passthrough — feed content
+    // raw XML blob. Checked BEFORE passthrough : feed content
     // types (text/xml, application/rss+xml…) never say "html".
     if !is_pdf
         && feed::is_feed(&ct, body)
@@ -330,7 +330,7 @@ pub fn extract(
 
     // Domain-intelligence adapters (v3): JSON payloads from the
     // registry's URL rewrites (reddit .json, package APIs) render
-    // structured — BEFORE the non-HTML passthrough so adapter JSON
+    // structured : BEFORE the non-HTML passthrough so adapter JSON
     // never dumps raw.
     if !is_pdf && let Some(ex) = crate::adapters::extract_json(body, &ct, url, opts) {
         return Ok(ex);
@@ -417,7 +417,7 @@ pub fn extract(
             Err(crate::pdf::PdfFailure::Encrypted) => {
                 return Ok(empty_pdf(
                     url,
-                    "encrypted document — a password is required; could not extract text",
+                    "encrypted document : a password is required; could not extract text",
                 ));
             }
             Err(crate::pdf::PdfFailure::Corrupt(msg)) => {
@@ -471,10 +471,10 @@ pub fn extract(
     let lang_info = language::detect(&doc);
 
     // A large page that yields almost nothing is a JS
-    // shell (Medium, SPAs) — flag it for tier 2 routing.
+    // shell (Medium, SPAs) : flag it for tier 2 routing.
     let thin_flag = raw_len > 50_000;
 
-    // Skeleton/SPA loading detection. Only use aria-busy —
+    // Skeleton/SPA loading detection. Only use aria-busy :
     // the word "skeleton" appears in CSS class names on
     // fully-hydrated pages (Amazon, React apps), making it
     // a false-positive. aria-busy is a reliable loading
@@ -511,10 +511,17 @@ pub fn extract(
         max_chars,
     )?;
 
+    // A TOC is a complete projection, not a failed short extraction. Once
+    // downstream has built the outline, content-oriented rescue paths must
+    // not replace it with the page body.
+    if opts.toc {
+        return Ok(extracted);
+    }
+
     // JSON-in-script rescue: SPAs (Next.js/React/YouTube) embed
     // their content as a JS-assigned JSON blob. DonSift sees an
     // empty shell, but the data is sitting in the HTML. When
-    // DonSift came up thin, mine the embedded JSON — if it's
+    // DonSift came up thin, mine the embedded JSON : if it's
     // richer, it wins. This is the tier-1 unlock for the SPA
     // class of sites.
     // When focus is active, short content is intentional
@@ -573,7 +580,7 @@ fn body_starts_with_html(body: &[u8]) -> bool {
 /// structure (h1-h6 → # ## ###) and paragraph breaks. Skips
 /// script/style/nav/footer/header/aside/form elements.
 ///
-/// Returns None when there's < 200 chars of visible text — the
+/// Returns None when there's < 200 chars of visible text : the
 /// page is genuinely empty (JS shell or block page).
 pub fn text_fallback(
     html_text: &str,
@@ -619,7 +626,7 @@ pub fn text_fallback(
     // visible text (script filenames, noscript messages, meta
     // descriptions) is NOT real content. The MCP layer must
     // escalate to ghost. Only pages with >= 800 chars of real
-    // visible text are non-thin — those are genuinely complex
+    // visible text are non-thin : those are genuinely complex
     // DOMs where block extraction failed but text is real.
     Some(Extracted {
         markdown: slice,
@@ -795,7 +802,7 @@ fn downstream(
             }
         }
         if shown == 0 {
-            md.push_str("*(no headings — flat page)*\n");
+            md.push_str("*(no headings : flat page)*\n");
         } else {
             md.push_str("\n*fetch with section=\"sN\" (or a heading name) to read that part*\n");
         }
@@ -883,7 +890,7 @@ fn downstream(
 
     let blocks_total = all_blocks.len();
 
-    // Content images for on-demand OCR (v3) — capped, order kept.
+    // Content images for on-demand OCR (v3) : capped, order kept.
     let images: Vec<(String, String)> = all_blocks
         .iter()
         .filter_map(|b| match b {
@@ -915,7 +922,7 @@ fn downstream(
     // Render markdown (frontmatter + blocks) then paginate.
     let mut full = render::render(meta, url, &kept, opts);
 
-    // Engine notes first (PDF scan flags etc.) — they frame any
+    // Engine notes first (PDF scan flags etc.) : they frame any
     // other trust signal that follows.
     for note in &notes {
         full = format!("*[pdf: {note}]*\n\n{full}");
@@ -926,11 +933,11 @@ fn downstream(
     // - empty page → silence looks like a bug
     if focus_fell_back {
         if let Some(q) = &opts.focus {
-            full = format!("*[focus \"{q}\": no matches — showing full content]*\n\n{full}");
+            full = format!("*[focus \"{q}\": no matches : showing full content]*\n\n{full}");
         }
     } else if section_missed {
         if let Some(s) = &opts.section {
-            full = format!("*[section \"{s}\": not found — showing full content]*\n\n{full}");
+            full = format!("*[section \"{s}\": not found : showing full content]*\n\n{full}");
         }
     } else if full.trim().is_empty() || (blocks_total == 0 && meta.title.is_none()) {
         full = format!("{url}\n\n*(no extractable content)*\n");
@@ -944,12 +951,12 @@ fn downstream(
 
     // JS-shell warning: agent must know the content
     // below is likely incomplete. On tier=auto the MCP
-    // fetch escalates to the browser itself — this note
+    // fetch escalates to the browser itself : this note
     // only surfaces on an explicit tier=1 request.
     //
     // Thinness: the extraction yield is the truth. Any page over
     // 5KB that yields < 800 chars is a shell (the 27KB-challenge-
-    // page-with-250-chars class — three boilerplate blocks used
+    // page-with-250-chars class : three boilerplate blocks used
     // to pass as non-thin). Zero blocks or a >50KB page with
     // almost nothing are shells at any size. Skeleton markers
     // stay a secondary signal for borderline yields.
@@ -964,7 +971,7 @@ fn downstream(
     // is NOT flagged (above the 5% density threshold, and above
     // 3000 chars is not required because density already says
     // it's real content).
-    // A matched section is intentionally small — the agent asked for
+    // A matched section is intentionally small : the agent asked for
     // exactly this slice. Shell detection must not fire on it (a
     // small section on a 400KB page used to escalate to ghost and
     // return the full page instead of the section).
@@ -974,13 +981,18 @@ fn downstream(
         1.0
     };
     let is_shell = raw_len > 20_000 && density < 0.05 && full.len() < 3_000;
-    let thin = !section_hit
+    // A PDF can legitimately contain only a few words. It is already parsed
+    // from a complete binary document, so HTML shell heuristics must never
+    // label a short PDF as a JS-rendered page.
+    let is_pdf = pdf_pages.is_some();
+    let thin = !is_pdf
+        && !section_hit
         && ((full.len() < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
             || (thin_flag && has_skeletons && full.len() < 4000)
             || is_shell);
     if thin {
         full = format!(
-            "*[note: large page rendered almost no content — likely JS-rendered (SPA). Content below may be a shell; use tier=auto to render with a real browser.]*\n\n{full}"
+            "*[note: large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell; use tier=auto to render with a real browser.]*\n\n{full}"
         );
     }
     let (slice, next) = paginate(&full, opts.offset, max_chars);
@@ -991,7 +1003,7 @@ fn downstream(
 
     // Probe mode (v3): the page resolved fully (tiers, walls and
     // all) but the agent only asked a verification question. The
-    // output collapses to a verdict + short context excerpts —
+    // output collapses to a verdict + short context excerpts :
     // the page itself never enters the agent's context.
     if let Some(pattern) = &opts.must_contain
         && !pattern.trim().is_empty()
@@ -1049,13 +1061,13 @@ pub fn probe_render(text: &str, pattern: &str, is_regex: bool) -> String {
     let total = text.chars().count();
     let report = |hits: Option<Vec<(usize, usize)>>| -> String {
         match hits {
-            None => format!("probe: invalid regex /{pattern}/ — use a plain substring instead"),
+            None => format!("probe: invalid regex /{pattern}/ : use a plain substring instead"),
             Some(v) if v.is_empty() => {
                 format!("probe: NO MATCH for {pattern:?} in {total} chars of content")
             }
             Some(v) => {
                 let mut out = format!(
-                    "probe: MATCH — {} hit{} for {pattern:?}\n",
+                    "probe: MATCH : {} hit{} for {pattern:?}\n",
                     v.len(),
                     if v.len() == 1 { "" } else { "s" }
                 );
@@ -1130,7 +1142,7 @@ fn char_to_byte(text: &str, char_idx: usize) -> usize {
 
 /// One-line accounting of what the focus filter dropped: block
 /// count, word estimate, and up to four section names the dropped
-/// content lived under. Omission must be audited, never silent —
+/// content lived under. Omission must be audited, never silent :
 /// but the audit itself must never cost more than one line.
 fn dropped_manifest(all: &[blocks::Block], kept: &[&blocks::Block]) -> Option<String> {
     let kept_ptrs: std::collections::HashSet<usize> = kept
@@ -1166,7 +1178,7 @@ fn dropped_manifest(all: &[blocks::Block], kept: &[&blocks::Block]) -> Option<St
     let mut line = format!("dropped by focus: {dropped_blocks} blocks (~{words_fmt} words)");
     if !sections.is_empty() {
         let names: Vec<&str> = sections.iter().take(4).copied().collect();
-        line.push_str(&format!(" — {}", names.join(", ")));
+        line.push_str(&format!(" : {}", names.join(", ")));
     }
     // Hard cap: the audit line must never outweigh what it audits.
     if line.chars().count() > 160 {
@@ -1187,7 +1199,7 @@ fn size_label(chars: usize) -> String {
 /// Per-heading content size, in heading order: the heading's own
 /// chars plus every following block until the next heading of
 /// same-or-higher level (subsections included). Powers the toc's
-/// size labels — the agent's fetch-cost signal before it reads.
+/// size labels : the agent's fetch-cost signal before it reads.
 fn section_sizes(all: &[blocks::Block]) -> Vec<usize> {
     let mut sizes = Vec::new();
     let mut i = 0;
@@ -1222,7 +1234,7 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     // resuming. Agents who resume at offset=N should start at a
     // clean paragraph/heading boundary, not mid-sentence.
     if offset > 0 {
-        // Floor the window end to a char boundary — a mid-char
+        // Floor the window end to a char boundary : a mid-char
         // offset into CJK text makes start+500 mid-character and
         // the slice below would panic.
         let mut search_end = start.saturating_add(500).min(text.len());
@@ -1249,10 +1261,10 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     let next = if end < text.len() { Some(end) } else { None };
     let mut slice = text[start..end].to_string();
     // In-content truncation marker: agents read content,
-    // not metadata — the resume instruction must be IN
+    // not metadata : the resume instruction must be IN
     // the markdown.
     if let Some(n) = next {
-        slice.push_str(&format!("\n\n*[truncated — continue with offset={n}]*"));
+        slice.push_str(&format!("\n\n*[truncated : continue with offset={n}]*"));
     }
     (slice, next)
 }

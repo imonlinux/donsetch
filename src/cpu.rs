@@ -11,6 +11,7 @@
 //! start. With `load-dynamic`, ONNX is dlopen'd at runtime, but only
 //! after this check confirms AVX support.
 
+#[cfg(target_arch = "x86_64")]
 use std::path::PathBuf;
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;

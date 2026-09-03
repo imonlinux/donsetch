@@ -8,6 +8,7 @@
 //! "fast" mode: high quality within a 1-second latency budget.
 //! Best mix of quality and speed per the user's request.
 
+use super::ProviderOutcome;
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -136,5 +137,9 @@ pub async fn search(
         .unwrap_or_default();
 
     let ms = started.elapsed().as_millis() as u64;
-    Ok((results, ms))
+    Ok(ProviderOutcome {
+        hits: results,
+        ms,
+        degraded: false,
+    })
 }

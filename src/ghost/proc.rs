@@ -3,23 +3,23 @@
 //! **Unix (Linux + macOS):** process groups + SIGSTOP/SIGCONT/SIGKILL.
 //! The whole browser tree (browser + renderers + GPU) shares one
 //! process group, so a single signal suspends/resumes/kills it all.
-//! Linux additionally gets `PR_SET_PDEATHSIG` — the kernel reaps the
+//! Linux additionally gets `PR_SET_PDEATHSIG` : the kernel reaps the
 //! child if donsetch dies hard. macOS has no `prctl` equivalent; the
 //! Ghost Drop + kill path cover normal exit, only a hard parent crash
 //! could orphan (documented limitation).
 //!
 //! **Windows:** a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-//! owns the browser tree — the kernel kills every process in the job
+//! owns the browser tree : the kernel kills every process in the job
 //! when the last handle closes (including if donsetch crashes).
 //! Freeze/thaw enumerates ALL processes in the Job Object (not just
 //! the main browser) and suspends/resumes each one via
 //! `NtSuspendProcess`/`NtResumeProcess` (ntdll; the atomic
-//! whole-process pause, stable since XP — Sysinternals Process
+//! whole-process pause, stable since XP : Sysinternals Process
 //! Explorer, WinDbg, and Chrome's own crash handling all use it).
-//! Linked directly to ntdll via `#[link(name = "ntdll")]` — no
+//! Linked directly to ntdll via `#[link(name = "ntdll")]` : no
 //! `GetProcAddress` dance, no FARPROC type ambiguity.
 //! Without enumerating all PIDs, only the main Chrome process would
-//! be suspended — the renderer/GPU/utility processes keep running,
+//! be suspended : the renderer/GPU/utility processes keep running,
 //! burning CPU and RAM.
 
 use crate::error::FetchError;
@@ -45,7 +45,7 @@ pub struct Proc {
     job: fnd::HANDLE,
 }
 
-// ntdll process suspend/resume — always loaded, linked directly.
+// ntdll process suspend/resume : always loaded, linked directly.
 #[cfg(windows)]
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -56,7 +56,7 @@ unsafe extern "system" {
 impl Proc {
     /// Configure a `Command` BEFORE spawn.
     /// Unix: own process group (freeze/thaw signal the whole tree).
-    /// Windows: nothing — the Job Object is attached post-spawn.
+    /// Windows: nothing : the Job Object is attached post-spawn.
     pub fn prepare_cmd(cmd: &mut tokio::process::Command) {
         #[cfg(unix)]
         cmd.process_group(0);
@@ -89,16 +89,16 @@ impl Proc {
 
         // SAFETY: all FFI calls in this function target well-documented
         // Windows kernel/ntdll APIs with correct parameter types. The
-        // `unsafe` block wraps the entire body — every call is audited.
+        // `unsafe` block wraps the entire body : every call is audited.
         unsafe {
             // Process handle with the access rights we need:
-            //   PROCESS_SUSPEND_RESUME  — NtSuspendProcess / NtResumeProcess
-            //   PROCESS_SET_QUOTA       — AssignProcessToJobObject
-            //   PROCESS_TERMINATE       — AssignProcessToJobObject also requires
+            //   PROCESS_SUSPEND_RESUME  : NtSuspendProcess / NtResumeProcess
+            //   PROCESS_SET_QUOTA       : AssignProcessToJobObject
+            //   PROCESS_TERMINATE       : AssignProcessToJobObject also requires
             //                             this; without it the call fails with
             //                             ERROR_ACCESS_DENIED and the job stays
             //                             empty, so KILL_ON_JOB_CLOSE kills nothing
-            //   PROCESS_QUERY_LIMITED_INFORMATION — status checks
+            //   PROCESS_QUERY_LIMITED_INFORMATION : status checks
             let proc_handle = thr::OpenProcess(
                 thr::PROCESS_SUSPEND_RESUME
                     | thr::PROCESS_SET_QUOTA
@@ -141,16 +141,16 @@ impl Proc {
             }
             // Assign the child to the job. On Win8+ nested jobs are
             // allowed, so this succeeds even if the process is already
-            // in a job. If it fails we don't abort — freeze/thaw/kill
+            // in a job. If it fails we don't abort : freeze/thaw/kill
             // still work via the process handle; only the death-reap
             // safety net is lost.
             if job::AssignProcessToJobObject(job_h, proc_handle) == 0 {
                 // Non-fatal for the fetch itself, but the job is now empty:
                 // KILL_ON_JOB_CLOSE has nothing to kill, so the browser tree
                 // outlives donsetch and orphaned Chrome processes pile up.
-                // Warn unconditionally — silent degradation is what hid this.
+                // Warn unconditionally : silent degradation is what hid this.
                 eprintln!(
-                    "[ghost] AssignProcessToJobObject failed: {} — browser tree will not be reaped on exit, leaving orphaned Chrome processes",
+                    "[ghost] AssignProcessToJobObject failed: {} : browser tree will not be reaped on exit, leaving orphaned Chrome processes",
                     fnd::GetLastError()
                 );
             }
@@ -203,14 +203,14 @@ impl Proc {
         }
         #[cfg(windows)]
         unsafe {
-            // Kills every process in the job — the whole tree.
+            // Kills every process in the job : the whole tree.
             job::TerminateJobObject(self.job, 1);
         }
     }
 
     /// Enumerate all PIDs in the Job Object (Windows only).
     /// Chrome spawns renderer, GPU, and utility processes as
-    /// separate processes in the Job — the main process handle
+    /// separate processes in the Job : the main process handle
     /// only controls the browser process. To freeze/thaw the
     /// whole tree, we query the Job Object for all member PIDs.
     #[cfg(windows)]
@@ -236,7 +236,7 @@ impl Proc {
             )
         };
         if ok == 0 {
-            // Query failed — fall back to just the main PID.
+            // Query failed : fall back to just the main PID.
             // The main process is still controlled by proc_handle.
             return Vec::new();
         }
@@ -255,7 +255,7 @@ impl Proc {
     }
 }
 
-/// `PR_SET_PDEATHSIG` — kernel kills the child if donsetch dies.
+/// `PR_SET_PDEATHSIG` : kernel kills the child if donsetch dies.
 /// Called in `pre_exec` (child context). Linux-only; macOS has no
 /// `prctl` equivalent.
 #[cfg(linux_like)]
@@ -270,7 +270,7 @@ pub fn pdeath_pre_exec() -> std::io::Result<()> {
 
 /// Open a process handle for suspend/resume (Windows only).
 /// Returns Err if the process has already exited (race condition
-/// during freeze — child crashed between enumeration and open).
+/// during freeze : child crashed between enumeration and open).
 #[cfg(windows)]
 fn open_for_suspend(pid: u32) -> Result<fnd::HANDLE, ()> {
     unsafe {

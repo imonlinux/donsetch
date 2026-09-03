@@ -1,4 +1,4 @@
-//! `donsetch --rollback` — revert to the previous binary version.
+//! `donsetch --rollback` : revert to the previous binary version.
 //!
 //! Swaps the current binary with the `.bak` backup saved by
 //! `--update`. The current binary becomes the new `.bak` (so
@@ -35,7 +35,7 @@ pub fn run() {
 
     let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
 
-    // Borrow as &Path for fs operations — &Path is Copy, so it
+    // Borrow as &Path for fs operations : &Path is Copy, so it
     // won't move and won't trigger clippy::needless_borrows.
 
     // ── Locate backup ────────────────────────────────────────
@@ -183,7 +183,7 @@ pub fn run() {
 
         // Rename old current to .bak (new backup for roll-forward).
         if let Err(e) = std::fs::rename(&tmp, &bak_path).map_err(|e| e.to_string()) {
-            // Not fatal — the rollback succeeded, we just couldn't
+            // Not fatal : the rollback succeeded, we just couldn't
             // save the roll-forward backup.
             println!(
                 "  {} Rollback OK, but could not save roll-forward backup: {e}",

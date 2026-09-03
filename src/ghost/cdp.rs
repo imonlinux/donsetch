@@ -1,7 +1,7 @@
 //! Minimal CDP (Chrome DevTools Protocol) client.
 //!
 //! Browser-level + page-session JSON-RPC over the DevTools ws
-//! endpoint. No Runtime/Console/Debugger domains — DOM and Page
+//! endpoint. No Runtime/Console/Debugger domains : DOM and Page
 //! only. Message framing per RFC 6455 via tokio-tungstenite.
 //!
 //! Upstream (master) made `Cdp` cloneable by wrapping every field
@@ -9,7 +9,7 @@
 //! so the ghost hot path can bound each response wait. On Debian 12
 //! chromium 151, session-scoped CDP responses queue behind a
 //! settling navigation and can lag the URL advance by tens of
-//! seconds — unbounded waits there turn a recoverable stall into a
+//! seconds : unbounded waits there turn a recoverable stall into a
 //! failed fetch (see ghost::navigate docs).
 
 use crate::error::FetchError;
@@ -29,7 +29,7 @@ pub struct Cdp {
     write: Arc<Mutex<futures_util::stream::SplitSink<Ws, Message>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     /// Event stream (targetInfoChanged = title/url
-    /// changes — challenge progression without Runtime).
+    /// changes : challenge progression without Runtime).
     /// Consumed by the daemon's smarter wait loop.
     #[allow(dead_code)]
     events: broadcast::Sender<Value>,
@@ -51,7 +51,7 @@ impl Cdp {
     /// Connect to a browser-level ws endpoint and spawn the
     /// demux reader task.
     pub async fn connect(ws_url: &str) -> Result<Self, FetchError> {
-        // The only unguarded network primitive in the ghost stack —
+        // The only unguarded network primitive in the ghost stack :
         // a browser that accepts TCP but stalls the WS handshake
         // would hang the tool call forever.
         let (ws, _) =

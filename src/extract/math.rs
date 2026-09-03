@@ -2,7 +2,7 @@
 //! inline text. Technical pages (Wikipedia ML/physics/math, papers,
 //! docs) carry their formulas as MathML with the ORIGINAL LaTeX in
 //! `alttext` (MediaWiki) or `<annotation encoding="application/x-tex">`.
-//! Dropping these elements guts the page's core information — the
+//! Dropping these elements guts the page's core information : the
 //! v2.1 behavior. This module recovers the formula, preferring the
 //! true LaTeX and falling back to a compact MathML serialization.
 
@@ -49,12 +49,12 @@ pub fn latex(el: ElementRef<'_>) -> String {
 }
 
 /// MediaWiki alttext wraps content as `{\displaystyle ...}` (or
-/// `\displaystyle ...`) — rendering boilerplate, not math. Strip
+/// `\displaystyle ...`) : rendering boilerplate, not math. Strip
 /// to the clean formula the agent actually wants to read.
 fn strip_displaystyle(s: &str) -> String {
     let mut t = s.trim();
     if let Some(rest) = t.strip_prefix("{\\displaystyle ") {
-        // Strip exactly ONE closing brace — trim_end_matches would
+        // Strip exactly ONE closing brace : trim_end_matches would
         // eat inner braces too ("W_{Q}}" → "W_{Q").
         t = rest.strip_suffix('}').unwrap_or(rest).trim();
     } else if let Some(rest) = t.strip_prefix("\\displaystyle ") {
@@ -79,7 +79,7 @@ fn tex_annotation(el: ElementRef<'_>) -> Option<String> {
 }
 
 /// Compact linear serialization of a MathML subtree. Not full
-/// LaTeX — a token-efficient linearization an LLM reads natively:
+/// LaTeX : a token-efficient linearization an LLM reads natively:
 /// `W_Q^T`, `(Q K^T)/(sqrt(d_k))`, matrices as `(a, b; c, d)`.
 fn serialize(el: ElementRef<'_>) -> String {
     let name = el.value().name();
@@ -130,7 +130,7 @@ fn serialize(el: ElementRef<'_>) -> String {
         }
         "annotation" | "annotation-xml" => String::new(), // handled by latex(); never leak as prose
         "mspace" => " ".into(),
-        // Containers and tokens: concatenate serialized children —
+        // Containers and tokens: concatenate serialized children :
         // `mrow(mi W, mo _, mi Q)` → "W_Q" via the sub/sup rules.
         _ => {
             let mut out = String::new();
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn displaystyle_wrapper_strips_exactly_one_brace() {
-        // "{\displaystyle W_{Q}}" → "W_{Q}" — never "W_{Q" (the
+        // "{\displaystyle W_{Q}}" → "W_{Q}" : never "W_{Q" (the
         // trim_end_matches bug ate inner braces).
         let el = math_el(r#"<math alttext="{\displaystyle W_{Q}}"><mi>x</mi></math>"#);
         assert_eq!(latex(el), "W_{Q}");

@@ -1,6 +1,6 @@
 //! Stack Exchange adapter: question + answers as a structured QA
 //! tree with accepted-answer marking, scores, and authorship.
-//! Stack Exchange HTML is server-rendered — this restructures
+//! Stack Exchange HTML is server-rendered : this restructures
 //! what the generic pipeline flattens (vote columns, sidebars).
 
 use scraper::{ElementRef, Html, Selector};
@@ -166,7 +166,7 @@ fn post_parts(post: &ElementRef) -> Option<(i64, String, String, String)> {
         .filter(|a| !a.is_empty())
         .unwrap_or_default();
     // "asked <span title='2014-04-25 12:45:54Z' class='relativetime'>"
-    // — the title attr is ISO; fall back to visible text.
+    // : the title attr is ISO; fall back to visible text.
     let date = owner
         .and_then(|o| {
             o.select(&Selector::parse("span[title], span.relativetime").unwrap())

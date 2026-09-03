@@ -4,7 +4,7 @@
 //! render client-side, but they embed their full content as a JSON
 //! blob assigned to a JS global or inside a
 //! `<script type="application/json">`/ld+json tag. Tier 1 can't run
-//! the JS, but it CAN parse that blob — turning an empty SPA shell
+//! the JS, but it CAN parse that blob : turning an empty SPA shell
 //! into real content without a browser. This is the single biggest
 //! tier-1 unlock: YouTube, GitHub, and every Next.js site drops
 //! its data in the HTML.
@@ -234,7 +234,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         return None;
     }
 
-    // Score each candidate; generous lower bound — prose with any
+    // Score each candidate; generous lower bound : prose with any
     // content key already earned points. Config noise is penalized
     // below the threshold.
     let mut kept: Vec<Item> = items
@@ -333,10 +333,10 @@ fn find_blobs(html: &str) -> Vec<Blob> {
 
     // 4. Modern Next.js (>=13): `self.__next_f.push([k,"..."])`
     // streaming-RSC flight frames. These carry the FULL rendered
-    // page (paragraphs under `children`) — the single biggest
+    // page (paragraphs under `children`) : the single biggest
     // modern-SPA unlock.
     for frame in find_next_f(html) {
-        // Frame is `[k]:"value"` — strip the key prefix so the
+        // Frame is `[k]:"value"` : strip the key prefix so the
         // remainder is a standalone JSON array/object.
         let json = strip_frame_key(&frame);
         if !json.is_empty()
@@ -361,7 +361,7 @@ fn find_next_f(html: &str) -> Vec<String> {
         };
         let body_start = from + rel + needle.len();
         let rest = &html[body_start..];
-        // `[k,"` — skip to the opening quote.
+        // `[k,"` : skip to the opening quote.
         let Some(q) = rest.find('"') else { break };
         // Scan the JS string literal (\" and \\ are escapes).
         let bytes = rest.as_bytes();
@@ -465,7 +465,7 @@ fn js_unescape(s: &str) -> String {
                 // a multi-byte UTF-8 lead, advancing to j+1 would land
                 // mid-character and the next `&s[i..end]` slice would
                 // panic on a hostile page (`\é` inside a flight
-                // frame) — copy the full char instead.
+                // frame) : copy the full char instead.
                 let ch_len = utf8_len(b[j]);
                 let end = (j + ch_len).min(b.len());
                 if ch_len == 1 {
@@ -702,7 +702,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         return (0.0, false);
     }
     let len = t.chars().count();
-    // Long single-token blobs (base64, opaque IDs, tracking tokens) —
+    // Long single-token blobs (base64, opaque IDs, tracking tokens) :
     // reject unless the path is a real content key AND it reads
     // as prose (has spaces).
     if !t.contains(' ') && len >= 40 {
@@ -736,7 +736,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         }
     }
 
-    // Shape signals (secondary — only matter with a key hit).
+    // Shape signals (secondary : only matter with a key hit).
     if t.contains(' ') {
         score += 1.0;
     }
@@ -756,7 +756,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     }
 
     // Without a real content-key hit, only very long prose-shaped
-    // strings survive — short buttons/aria labels stay out.
+    // strings survive : short buttons/aria labels stay out.
     if !key_hit {
         // Requires an actual sentence-shaped string: >= 60 chars,
         // words separated by spaces, with sentence punctuation.
@@ -771,7 +771,7 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
 }
 
 /// `key=value[_]key=value` attribute fragments (viewports, meta
-/// charset) — no prose. Only fires when before the first space the
+/// charset) : no prose. Only fires when before the first space the
 /// token is a bare `key=value` pair.
 fn looks_like_attr(t: &str) -> bool {
     let first = t
@@ -887,7 +887,7 @@ fn strip_html(s: &str) -> String {
 
 /// HTML-entity-unescape the raw JSON (DOM encodes it).
 fn unescape(raw: &str) -> String {
-    // The blob may contain &quot; &amp; &lt; &gt; &#39; — decode the
+    // The blob may contain &quot; &amp; &lt; &gt; &#39; : decode the
     // common ones (serde_json decodes the rest).
     let mut s = raw.to_string();
     for (from, to) in [
@@ -942,7 +942,7 @@ fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
 mod tests {
     /// Fuzzer find (CI, 2026-08-22): a global-assignment match at
     /// the END of input advanced `from` past the string and/or
-    /// mid-replacement-char — `html[from..]` panicked. The advance
+    /// mid-replacement-char : `html[from..]` panicked. The advance
     /// now floors to the next char boundary, clamped to len.
     #[test]
     fn global_match_at_end_of_input_no_panic() {
@@ -1090,14 +1090,14 @@ mod tests {
 
     #[test]
     fn extract_none_on_pure_shell_without_json() {
-        // A plain static HTML body — jsdata must not claim it.
+        // A plain static HTML body : jsdata must not claim it.
         let html = "<html><body><p>Just a normal server-side page, no embedded JSON anywhere in this document.</p></body></html>";
         assert!(extract(html, "https://example.com/x", &opts()).is_none());
     }
 
     #[test]
     fn extract_none_when_only_config_noise() {
-        // Embedded JSON with only ids/urls — must not produce
+        // Embedded JSON with only ids/urls : must not produce
         // "content". Ensure we don't fabricate prose from config.
         let html = r#"<script type="application/json">{"sessionId":"abc123","tracking":{"url":"/api/t","nonce":"deadbeefdecafbad"}}</script>"#;
         assert!(extract(html, "https://example.com/a", &opts()).is_none());

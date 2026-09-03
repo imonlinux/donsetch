@@ -4,7 +4,7 @@
 // donsetch postinstall: download the prebuilt binary for this platform
 // from GitHub Releases, verify SHA256, and extract to ./binaries/.
 //
-// The binary is NOT bundled in the npm package — it's fetched at
+// The binary is NOT bundled in the npm package : it's fetched at
 // install time from the GitHub release matching this package version.
 // This keeps the npm registry clean (no 35 MB binary tarballs) and
 // uses the same release artifacts that manual users download.
@@ -40,8 +40,8 @@ const plat = PLATFORMS[platKey];
 
 if (!plat) {
   const known = {
-    'darwin-x64': 'prebuilt binaries exist — update donsetch to a version that ships one',
-    'win32-arm64': 'no prebuilt binary yet — build from source (see below)',
+    'darwin-x64': 'prebuilt binaries exist : update donsetch to a version that ships one',
+    'win32-arm64': 'no prebuilt binary yet : build from source (see below)',
   }[platKey];
   console.error(`donsetch: unsupported platform ${platKey}${known ? ` (${known})` : ''}`);
   console.error('');
@@ -58,7 +58,7 @@ if (!plat) {
 
 // ── musl detection (Alpine etc.) ────────────────────────────────
 // The Linux binaries are glibc-linked. On musl systems they install
-// fine but can never exec (missing ld-linux loader) — fail HERE with
+// fine but can never exec (missing ld-linux loader) : fail HERE with
 // the actual cause instead of a cryptic spawn error on first run.
 //
 // Checking for /lib/ld-musl-*.so.1 existence is a false positive on
@@ -143,7 +143,7 @@ if (fs.existsSync(binaryPath)) {
     console.log(`donsetch: binary already present (${plat.binary})`);
     process.exit(0);
   }
-  console.log(`donsetch: leftover ${plat.binary} is ${size} bytes — re-downloading`);
+  console.log(`donsetch: leftover ${plat.binary} is ${size} bytes : re-downloading`);
   try { fs.unlinkSync(binaryPath); } catch (_) {}
 }
 
@@ -236,7 +236,7 @@ async function main() {
 
   // 4. Extract (tar is built into Linux, macOS, and Windows 10+)
   console.log('donsetch: extracting...');
-  // execFileSync: no shell, no string interpolation — the install
+  // execFileSync: no shell, no string interpolation : the install
   // path (which can contain quotes/spaces) is passed as argv.
   execFileSync('tar', ['xzf', tarball, '-C', binDir], { stdio: 'inherit' });
 
@@ -244,7 +244,7 @@ async function main() {
   try { fs.unlinkSync(tarball); } catch (_) {}
   try { fs.unlinkSync(checksumFile); } catch (_) {}
 
-  // 6. Verify the binary exists after extraction (BEFORE chmod —
+  // 6. Verify the binary exists after extraction (BEFORE chmod :
   //    chmod on a missing file throws an opaque error).
   if (!fs.existsSync(binaryPath)) {
     console.error(`donsetch: expected ${plat.binary} not found after extraction`);

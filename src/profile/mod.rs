@@ -84,7 +84,7 @@ impl BrowserProfile {
     /// Chrome `major` on the given platform. The TLS/H2 tables are
     /// the Chrome 150 capture (stable across adjacent versions);
     /// the UA and client hints carry the real version so the ghost
-    /// browser and tier 1 advertise the SAME identity — clearance
+    /// browser and tier 1 advertise the SAME identity : clearance
     /// cookies are bound to it, and a ghost solving on Chromium 151
     /// while tier 1 claims 150 gets its replays rejected.
     pub fn chrome(major: u32, platform: Platform) -> Self {
@@ -155,7 +155,7 @@ impl BrowserProfile {
 }
 
 /// v3 F5: Accept-Language coherent with the target's locale.
-/// Many sites gate localized content on this header — an en-US
+/// Many sites gate localized content on this header : an en-US
 /// header on a .ru page is served the English stub (and is a mild
 /// incoherence signal). Derived from the host TLD and non-Latin
 /// script in the path; everything else stays Chrome-default en-US.
@@ -204,12 +204,12 @@ pub fn accept_language_for(host: &str, path: &str) -> &'static str {
 /// 1. **Registry read (Windows).** Chromium-family browsers persist
 ///    their own version under `HKCU\Software\<Name>\BLBeacon\version`
 ///    (Google Chrome, Chromium, Microsoft Edge, Thorium, …). Reading
-///    it costs zero browser launches — no window, no hang, no orphaned
+///    it costs zero browser launches : no window, no hang, no orphaned
 ///    processes. This is the tier-1-friendly path: tier 1 never needs
 ///    to spawn a real browser just to know what version to claim.
 /// 2. **Spawned `--version` probe, hard timeboxed.** Only reached
 ///    when the registry has nothing (custom forks with no BLBeacon
-///    entry). The child is killed — whole tree on Windows — if it
+///    entry). The child is killed : whole tree on Windows : if it
 ///    does not answer within `PROBE_SPAWN_TIMEOUT`, so a wedged
 ///    browser can never block tier 1 startup or leave processes behind.
 ///
@@ -241,7 +241,7 @@ fn probe_registry_major() -> Option<u32> {
     use windows_sys::Win32::System::Registry as reg;
 
     // Candidate registry paths, in preference order. `DONGHOST_CHROME`
-    // names one binary — probe its family first so a Thorium fork is
+    // names one binary : probe its family first so a Thorium fork is
     // read from the Thorium key, not from whichever Chrome is installed.
     let mut keys: Vec<&str> = vec![
         "Software\\Google\\Chrome\\BLBeacon",
@@ -250,7 +250,7 @@ fn probe_registry_major() -> Option<u32> {
         "Software\\Thorium\\BLBeacon",
     ];
     // Sort DONGHOST_CHROME's family to the front if it doesn't already
-    // lead — cheap, and makes the explicit choice authoritative.
+    // lead : cheap, and makes the explicit choice authoritative.
     if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
         let p = p.to_string_lossy().to_lowercase();
         for (family, key) in [
@@ -279,7 +279,7 @@ fn probe_registry_major() -> Option<u32> {
     None
 }
 
-/// Non-Windows: there is no registry to consult — fall through to
+/// Non-Windows: there is no registry to consult : fall through to
 /// the spawned probe directly. (Stub keeps `probe_installed_major`
 /// platform-symmetric.)
 #[cfg(not(windows))]
@@ -310,7 +310,7 @@ fn registry_string(
 
     let mut hkey = std::ptr::null_mut();
     // SAFETY: RegOpenKeyExW with a nul-terminated wide path and a
-    // valid out-param. KEY_READ only — no write access requested.
+    // valid out-param. KEY_READ only : no write access requested.
     let rc = unsafe { reg::RegOpenKeyExW(hive, path.as_ptr(), 0, reg::KEY_READ, &mut hkey) };
     if rc != 0 || hkey.is_null() {
         return None;
@@ -337,7 +337,7 @@ fn registry_string(
         return None;
     }
     // REG_SZ is stored as UTF-16LE (one NUL-terminated wchar per
-    // char). Treat the bytes as UTF-16, not UTF-8 — reading them raw
+    // char). Treat the bytes as UTF-16, not UTF-8 : reading them raw
     // yields interleaved NULs that break version parsing.
     let sz = (size as usize).min(buf.len());
     let units: Vec<u16> = buf[..sz]
@@ -351,17 +351,59 @@ fn registry_string(
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Spawned `--version` probe, hard-capped by `PROBE_SPAWN_TIMEOUT`.
-/// On timeout the whole process tree is killed so no orphaned browser
-/// processes survive.
-pub(crate) fn probe_spawned_major() -> Option<u32> {
-    let bin = crate::ghost::chrome_binary().ok()?;
-    let mut cmd = std::process::Command::new(&bin);
+/// Probe a specific Chromium-family executable without changing the selected
+/// backend. Used by the browser resolver for Chromium and CloakBrowser alike.
+pub(crate) fn probe_version_at_path(path: &str) -> Option<u32> {
+    probe_version_string_at_path(path).and_then(|v| parse_version_major(&v))
+}
+
+/// Probe a specific executable and return its full dotted Chromium version.
+pub(crate) fn probe_version_string_at_path(path: &str) -> Option<String> {
+    probe_version_string_at_path_result(path).ok()
+}
+
+pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, String> {
+    // One spawn per binary per process. Ghost launches, doctor,
+    // status, and cloak resolution all walk through here, and each
+    // call used to pay a chrome --version spawn (~100-200ms plus a
+    // fork on some platforms). The daemon launches ghosts often
+    // enough that caching is a real win; Ok results never change
+    // for a given on-disk path, and Err results stay recalculated
+    // so a transient startup hiccup is not sticky.
+    static PROBE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    let cache = PROBE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = guard.get(path) {
+            return entry
+                .clone()
+                .ok_or_else(|| format!("browser version probe failed for {path}"));
+        }
+    }
+    let result = probe_version_string_at_path_uncached(path);
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if result.is_ok() {
+        guard.insert(path.to_string(), result.clone().ok());
+        // Small cache: this map holds one entry per distinct binary
+        // path (system chromium, a playwright build, a cloak binary,
+        // an edge install). Never grows unbounded in practice; the
+        // paths are bounded by discoverable binaries on the host.
+        if guard.len() > 16 {
+            guard.clear();
+        }
+    }
+    result
+}
+
+fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(path);
     cmd.arg("--version");
-    // On Windows and macOS, `--version` without `--headless` opens a
-    // real GUI window. Pass `--headless=new` + a scratch profile so any
-    // spawn that does happen stays invisible. Harmless on Linux (the
-    // flag is ignored alongside `--version`).
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let tmp = std::env::temp_dir().join("donsetch-chrome-probe");
@@ -376,13 +418,15 @@ pub(crate) fn probe_spawned_major() -> Option<u32> {
     spawn_probe_with_timeout(cmd)
 }
 
-/// Run the built `--version` command, read its stdout, and return the
-/// first plausible major version. Never runs longer than
-/// `PROBE_SPAWN_TIMEOUT`; on timeout, kills the whole process tree.
-fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
+/// Run the built `--version` command, read its stdout, and return it.
+/// Never runs longer than `PROBE_SPAWN_TIMEOUT`; on timeout, kills the
+/// whole process tree.
+fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Result<String, String> {
     use std::io::Read;
 
-    let mut child = cmd.spawn().ok()?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn browser version probe: {e}"))?;
 
     // Read stdout on a side thread so we can still enforce the timeout
     // if the browser never exits (the read would otherwise block us).
@@ -394,7 +438,7 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
             // leave a spawned child running on the early-out path.
             let _ = child.kill();
             let _ = child.wait();
-            return None;
+            return Err("browser version probe had no stdout pipe".into());
         }
     };
     let stdout = std::thread::spawn(move || {
@@ -413,7 +457,7 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
             Err(_) => break,
         }
         if reaped.is_none() && std::time::Instant::now() >= deadline {
-            // Wedged browser — kill the whole tree, not just the parent.
+            // Wedged browser : kill the whole tree, not just the parent.
             kill_probe_tree(Some(pid));
             let _ = child.kill();
             reaped = child.wait().ok();
@@ -429,12 +473,46 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
         let _ = child.wait();
     }
     let out = stdout.join().unwrap_or_default();
-
-    parse_version_major(&out)
+    match reaped {
+        Some(status) if status.success() => {
+            // "Chromium 151.0.7922.108\n" -> "151.0.7922.108".
+            // The banner word varies per build (Chromium, Chrome,
+            // Edge, CloakBrowser); the dotted token is the truth.
+            parse_version_string(&out)
+                .ok_or_else(|| format!("browser version probe returned no version token: {out:?}"))
+        }
+        Some(status) => Err(format!("browser version probe exited with {status}")),
+        None => Err("browser version probe did not exit".into()),
+    }
 }
 
+/// Resolve without downloading: this synchronous probe runs from async entry
+/// points, and the blocking installer must stay inside its dedicated check.
+pub(crate) fn probe_spawned_major() -> Option<u32> {
+    let browser = crate::ghost::resolve_browser_without_download().ok()?;
+    probe_version_at_path(&browser.path.to_string_lossy())
+}
+
+/// Parse the first full dotted Chromium version from a version banner.
+pub(crate) fn parse_version_string(line: &str) -> Option<String> {
+    line.split_whitespace().find_map(|token| {
+        let parts: Vec<_> = token.split('.').collect();
+        if parts.len() >= 4
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+            && parts[0]
+                .parse::<u32>()
+                .is_ok_and(|major| (20..=400).contains(&major))
+        {
+            Some(token.to_string())
+        } else {
+            None
+        }
+    })
+}
 /// Kill the probe process and its children (Windows: taskkill /T so
-/// the whole tree dies; Unix: kill the process group-less child — its
+/// the whole tree dies; Unix: kill the process group-less child : its
 /// renderers exit when the browser dies).
 fn kill_probe_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
@@ -496,7 +574,7 @@ mod locale_tests {
 
 #[cfg(test)]
 mod probe_tests {
-    use super::parse_version_major;
+    use super::{parse_version_major, parse_version_string};
 
     #[test]
     fn parses_known_banner_shapes() {
@@ -517,10 +595,19 @@ mod probe_tests {
     }
 
     #[test]
+    fn parses_full_version() {
+        assert_eq!(
+            parse_version_string("Chromium 146.0.7680.177.5 Arch Linux"),
+            Some("146.0.7680.177.5".into())
+        );
+        assert_eq!(parse_version_string("not a version"), None);
+    }
+
+    #[test]
     fn rejects_non_versions() {
         assert_eq!(parse_version_major(""), None);
         assert_eq!(parse_version_major("no numbers here"), None);
-        // Plausibility band: 20..=400 — rejects years, build ids, ports.
+        // Plausibility band: 20..=400 : rejects years, build ids, ports.
         assert_eq!(parse_version_major("Chrome 1985.1"), None);
         assert_eq!(parse_version_major("Chrome 100000"), None);
     }

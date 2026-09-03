@@ -1,4 +1,4 @@
-//! Egress pool + governor — the rate-limit solver.
+//! Egress pool + governor : the rate-limit solver.
 //!
 //! Rate limits are a BUDGET problem, not a rotation
 //! problem. Rotation spreads the burn; this system never
@@ -10,7 +10,7 @@
 //!   engine per query, reserved for engines whose proxy
 //!   lanes are learned-burned.
 //! - STRESS GAUGE: EWMA of recent outcomes. The caller
-//!   reads it to shrink fan-out under pressure — you
+//!   reads it to shrink fan-out under pressure : you
 //!   can't be rate-limited if you never exceed the rate.
 //! - JITTERED PACING: a metronome is a bot signal.
 //! - PREFLIGHT: dead/bad-auth proxies are probed at
@@ -32,7 +32,7 @@ const DIRECT_JITTER_MS: u64 = 2000;
 
 /// Engines known to aggressively block proxy/datacenter IPs.
 /// These prefer the direct lane even when proxies are
-/// available — a 429/CAPTCHA from DDG or Brave on a proxy
+/// available : a 429/CAPTCHA from DDG or Brave on a proxy
 /// is a wasted fan-out slot. Direct works for these engines
 /// because our residential IP isn't on blocklists.
 const PROXY_AVERSE: &[&str] = &["brave", "ddg"];
@@ -216,7 +216,7 @@ impl EgressPool {
             }
         }
         // Direct is the fallback of last resort (e.g. all
-        // proxies dead globally) — better a rested home IP
+        // proxies dead globally) : better a rested home IP
         // than a failed query.
         if best.is_none() && direct_available && !exclude.contains(&"direct".to_string()) {
             return self.egresses.first().cloned();
@@ -289,7 +289,7 @@ impl EgressPool {
             .clear();
     }
 
-    /// True when the pool has any proxy lanes at all — the
+    /// True when the pool has any proxy lanes at all : the
     /// no-proxy default changes lane policy (direct serves
     /// all engines, with strict pacing).
     pub fn has_proxies(&self) -> bool {
@@ -297,7 +297,7 @@ impl EgressPool {
     }
 
     /// Proxy auth failed (CONNECT 407): credentials wrong.
-    /// Bench long — wrong creds don't heal by waiting.
+    /// Bench long : wrong creds don't heal by waiting.
     pub fn report_auth_fail(&self, egress_id: &str) {
         self.stress_record(false);
         self.dead
@@ -308,7 +308,7 @@ impl EgressPool {
 
     /// Pacing with jitter: this (engine, egress) pair is
     /// not hit more than once per randomized interval.
-    /// The premium lane paces slower — protect the home IP.
+    /// The premium lane paces slower : protect the home IP.
     pub async fn pace(&self, engine: &str, egress_id: &str) {
         let (base, jit) = if egress_id == "direct" {
             (DIRECT_MIN_INTERVAL, DIRECT_JITTER_MS)

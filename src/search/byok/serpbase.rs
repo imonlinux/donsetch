@@ -1,28 +1,39 @@
-//! SerpApi (serpapi.com) search provider adapter.
+//! SerpBase (serpbase.dev) Google SERP provider adapter.
 //!
-//! GET https://serpapi.com/search
-//! Auth: api_key=<key> (query parameter, not a header)
-//! Params: q, engine, num, api_key, [tbm=nws for news]
-//! Response: { organic_results: [{ position, title, link, snippet }] }
-//!           news (tbm=nws) uses `news_results` instead.
-//!           paper intent switches engine to google_scholar, still
-//!           returns `organic_results`.
+//! POST https://api.serpbase.dev/google/search
+//! Auth: X-API-Key <key> (header)
+//! Body: { q, hl, gl, page, device }
+//! (no num parameter: the docs list q/hl/gl/page/device; results are
+//! capped locally after parse)
+//! Response: { status, organic: [{ position, title, link, snippet }], ... }
+//!
+//! `status` is a business-level code: 0 = success, non-zero = error
+//! (e.g. 1001 unauthorized). Errors may come back as HTTP 200 with a
+//! non-zero `status` envelope, so the status field must be checked
+//! even on 2xx responses.
+//!
+//! Correctness note: this adapter follows the *current* SerpBase API
+//! contract (POST + JSON body + `X-API-Key` header, results under
+//! `organic`). Earlier public examples used `GET /google/search?api_key=`
+//! and an `organic_results` field; that contract is outdated and will
+//! return HTTP 200 with a non-zero `status` error envelope.
 
 use super::ProviderOutcome;
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{KeyError, ProviderResult, SearchHit};
 
-const BASE: &str = "https://serpapi.com/search";
+const BASE: &str = "https://api.serpbase.dev/google/search";
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Extract hits from the results array named by `key`
-/// (`organic_results` or `news_results`). Pure function so it's
-/// testable without a live API call.
-fn parse_results(json: &Value, key: &str) -> Vec<SearchHit> {
-    json.get(key)
+/// Extract hits from the `organic` array. Pure function so it's
+/// testable without a live API call. Mirrors the serpapi/serper
+/// adapters: entries without a URL are dropped, and a relevance
+/// score is derived from position (1 → ~1.0, 10 → ~0.1).
+fn parse_results(json: &Value) -> Vec<SearchHit> {
+    json.get("organic")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -46,8 +57,6 @@ fn parse_results(json: &Value, key: &str) -> Vec<SearchHit> {
                         .unwrap_or("")
                         .to_string();
                     let position = r.get("position").and_then(Value::as_u64).unwrap_or(1) as f32;
-                    // SerpApi doesn't return a relevance score;
-                    // derive one from position (1 → ~1.0, 10 → ~0.1).
                     let score = 1.0 / position.max(1.0);
                     Some(SearchHit {
                         title,
@@ -66,36 +75,18 @@ pub async fn search(
     key: &str,
     query: &str,
     max: usize,
-    intent: &crate::search::intent::Intent,
+    _intent: &crate::search::intent::Intent,
 ) -> ProviderResult {
     let started = Instant::now();
 
-    // Route by intent: paper → google_scholar engine, news → the
-    // google engine's news vertical (tbm=nws), else plain google.
-    let mut params = vec![
-        ("q".to_string(), query.to_string()),
-        ("num".to_string(), max.min(10).to_string()),
-        ("api_key".to_string(), key.to_string()),
-    ];
-    let results_key = match intent {
-        crate::search::intent::Intent::Paper => {
-            params.push(("engine".to_string(), "google_scholar".to_string()));
-            "organic_results"
-        }
-        crate::search::intent::Intent::News => {
-            params.push(("engine".to_string(), "google".to_string()));
-            params.push(("tbm".to_string(), "nws".to_string()));
-            "news_results"
-        }
-        _ => {
-            params.push(("engine".to_string(), "google".to_string()));
-            "organic_results"
-        }
-    };
+    let body = json!({
+        "q": query,
+    });
 
     let resp = client
-        .get(BASE)
-        .query(&params)
+        .post(BASE)
+        .header("X-API-Key", key)
+        .json(&body)
         .timeout(TIMEOUT)
         .send()
         .await
@@ -116,16 +107,7 @@ pub async fn search(
     if status == 402 {
         return Err(KeyError::CreditDepleted);
     }
-    // SerpApi is documented to use 429 for both per-second rate
-    // limiting and monthly-plan exhaustion; message-sniffing here
-    // (like serper.rs's generic 4xx branch below) is unverified
-    // against a live account : adjust the substrings if a real
-    // account's wording differs.
     if status == 429 {
-        let lower = text.to_lowercase();
-        if lower.contains("run out") || lower.contains("plan") || lower.contains("quota") {
-            return Err(KeyError::CreditDepleted);
-        }
         return Err(KeyError::RateLimited);
     }
     if status >= 500 {
@@ -136,7 +118,7 @@ pub async fn search(
         if lower.contains("invalid") && lower.contains("key") {
             return Err(KeyError::InvalidKey);
         }
-        if lower.contains("run out") || lower.contains("quota") || lower.contains("plan") {
+        if lower.contains("credit") || lower.contains("quota") || lower.contains("billing") {
             return Err(KeyError::CreditDepleted);
         }
         return Err(KeyError::UnknownError(format!("HTTP {status}: {text}")));
@@ -145,18 +127,31 @@ pub async fn search(
     let json: Value = serde_json::from_str(&text)
         .map_err(|e| KeyError::UnknownError(format!("parse error: {e}")))?;
 
-    // SerpApi returns HTTP 200 with an `error` field for some
-    // failure modes (e.g. unsupported engine/param combos) instead
-    // of a non-2xx status.
-    if let Some(err) = json.get("error").and_then(Value::as_str) {
-        let lower = err.to_lowercase();
-        if lower.contains("invalid") && lower.contains("key") {
+    // Business-level error envelope: HTTP 200 with status != 0.
+    // 1001 = unauthorized (bad/revoked key), others are query-level
+    // errors. Map 1001 to InvalidKey so the key is marked dead and
+    // rotation moves to the next key; everything else is unknown.
+    if let Some(code) = json.get("status").and_then(Value::as_u64) {
+        if code == 1001 {
             return Err(KeyError::InvalidKey);
         }
-        return Err(KeyError::UnknownError(err.to_string()));
+        if code != 0 {
+            let msg = json
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            return Err(KeyError::UnknownError(format!(
+                "serpbase status {code}: {msg}"
+            )));
+        }
     }
 
-    let results = parse_results(&json, results_key);
+    let mut results = parse_results(&json);
+    // SerpBase has no num parameter (docs list q/hl/gl/page/device
+    // only): cap locally so a provider without server-side limits
+    // cannot flood the result set past the caller's budget.
+    results.truncate(max);
 
     let ms = started.elapsed().as_millis() as u64;
     Ok(ProviderOutcome {
@@ -174,12 +169,13 @@ mod tests {
     #[test]
     fn parse_results_organic() {
         let body = json!({
-            "organic_results": [
+            "status": 0,
+            "organic": [
                 { "position": 1, "title": "Rust", "link": "https://rust-lang.org", "snippet": "a systems language" },
                 { "position": 2, "title": "Rust book", "link": "https://doc.rust-lang.org/book", "snippet": "the book" },
             ]
         });
-        let hits = parse_results(&body, "organic_results");
+        let hits = parse_results(&body);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "Rust");
         assert_eq!(hits[0].url, "https://rust-lang.org");
@@ -191,44 +187,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_results_news_key() {
-        let body = json!({
-            "news_results": [
-                { "position": 1, "title": "Breaking", "link": "https://news.example.com/a", "snippet": "s" },
-            ]
-        });
-        let hits = parse_results(&body, "news_results");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].title, "Breaking");
-    }
-
-    #[test]
     fn parse_results_drops_entries_without_link() {
         let body = json!({
-            "organic_results": [
+            "organic": [
                 { "position": 1, "title": "No URL" },
                 { "position": 2, "title": "Has URL", "link": "https://example.com" },
             ]
         });
-        let hits = parse_results(&body, "organic_results");
+        let hits = parse_results(&body);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Has URL");
     }
 
     #[test]
     fn parse_results_missing_key_returns_empty() {
-        let body = json!({ "search_metadata": {} });
-        assert!(parse_results(&body, "organic_results").is_empty());
+        let body = json!({ "status": 0 });
+        assert!(parse_results(&body).is_empty());
     }
 
     #[test]
     fn parse_results_defaults_missing_position_to_one() {
         let body = json!({
-            "organic_results": [
+            "organic": [
                 { "title": "No position field", "link": "https://example.com" },
             ]
         });
-        let hits = parse_results(&body, "organic_results");
+        let hits = parse_results(&body);
         assert_eq!(hits.len(), 1);
         assert!((hits[0].score - 1.0).abs() < 0.001);
     }

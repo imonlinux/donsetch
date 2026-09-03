@@ -4,13 +4,13 @@
 //! to re-score search results by semantic relevance. The cross-encoder
 //! reads the query and each document **together** through full attention,
 //! capturing relationships that RRF (rank-based) and BM25 (keyword-based)
-//! fundamentally cannot — "fast web scraper" matches "high-speed crawler"
+//! fundamentally cannot : "fast web scraper" matches "high-speed crawler"
 //! even with zero word overlap.
 //!
 //! Same lazy-cache pattern as OCR: model files are downloaded + sha256-
 //! verified on first use, then loaded from disk on subsequent calls. If
 //! the model is unavailable (download failed, feature disabled, offline),
-//! reranking is skipped gracefully — results fall back to RRF+BM25 ranking.
+//! reranking is skipped gracefully : results fall back to RRF+BM25 ranking.
 //!
 //! The 23MB model runs in ~5ms/pair on CPU. For 50 results: ~250ms,
 //! negligible on top of 1-3s multi-engine search time.
@@ -216,8 +216,8 @@ mod inner {
         }
 
         // Dedicated plain thread: `reqwest::blocking` panics when used on
-        // a tokio runtime thread — and `panic = "abort"` turns that into a
-        // process abort — and first-use downloads are triggered from the
+        // a tokio runtime thread : and `panic = "abort"` turns that into a
+        // process abort : and first-use downloads are triggered from the
         // async search path.
         let url = url.to_string();
         let dest = dest.to_path_buf();
@@ -250,7 +250,7 @@ mod inner {
     }
 
     /// Initializes the reranker on first call. Returns `None` on any
-    /// failure — caller skips reranking gracefully.
+    /// failure : caller skips reranking gracefully.
     ///
     /// ONNX Runtime init runs in a separate thread with a 30s timeout.
     /// ONNX's C++ global constructors can deadlock on some platforms
@@ -283,7 +283,7 @@ mod inner {
             Ok(result) => result,
             Err(_) => {
                 eprintln!(
-                    "[rerank] ONNX Runtime init timed out (30s) — \
+                    "[rerank] ONNX Runtime init timed out (30s) : \
                      reranking disabled, falling back to RRF+BM25"
                 );
                 None
@@ -369,7 +369,7 @@ mod inner {
     }
 
     /// Returns true if the reranker model + tokenizer are already
-    /// on disk. Does NOT trigger a download — used by focus
+    /// on disk. Does NOT trigger a download : used by focus
     /// extraction to decide whether semantic scoring is available
     /// without surprising the user with a model download during
     /// a plain fetch.
@@ -396,7 +396,7 @@ mod inner {
 
         // Build (query, "title snippet") pairs for batch encoding.
         // The tokenizer's Dual mode produces [CLS] query [SEP] doc [SEP]
-        // automatically — we just pass (query, doc) tuples.
+        // automatically : we just pass (query, doc) tuples.
         let pairs: Vec<(&str, String)> = docs
             .iter()
             .map(|(title, snippet)| {
@@ -474,7 +474,7 @@ mod inner {
     }
 
     /// Min-max normalize a slice to [0, 1]. If all values are equal,
-    /// returns 0.5 for each (neutral — doesn't perturb the blend).
+    /// returns 0.5 for each (neutral : doesn't perturb the blend).
     fn min_max_normalize(values: &[f64]) -> Vec<f64> {
         let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -619,7 +619,7 @@ mod inner {
         fn blend_preserves_rrf_order_when_xenc_uniform() {
             // When cross-encoder gives all results the same score,
             // min_max returns 0.5 for all, so the blend reduces to
-            // a constant offset on the RRF ordering — A still > B.
+            // a constant offset on the RRF ordering : A still > B.
             let rrf = vec![0.8, 0.4];
             let xenc = vec![0.5, 0.5];
             let rrf_n = min_max_normalize(&rrf);
@@ -652,7 +652,7 @@ mod inner {
                 .collect();
             // blend[0] = 0.6*1.0 + 0.4*0.0 = 0.6
             // blend[1] = 0.6*0.0 + 0.4*1.0 = 0.4
-            // A still wins (0.6 > 0.4) — 40% weight isn't enough to flip
+            // A still wins (0.6 > 0.4) : 40% weight isn't enough to flip
             assert!(
                 blend[0] > blend[1],
                 "60/40 blend should NOT flip on moderate disagreement"

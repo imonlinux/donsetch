@@ -1,11 +1,11 @@
-//! Proxy support — the search engine's egress-diversity
+//! Proxy support : the search engine's egress-diversity
 //! layer. Residential proxies let each engine see a
 //! different IP, each below rate limits.
 //!
 //! Two protocols: HTTP CONNECT (RFC 7231 §4.3.6) and
 //! SOCKS5 (RFC 1928 + RFC 1929 auth). SOCKS5 matters
 //! because many residential-proxy providers offer
-//! SOCKS5-only lines — and SOCKS5 sends the target host
+//! SOCKS5-only lines : and SOCKS5 sends the target host
 //! as a domain name so the PROXY resolves DNS, not us
 //! (no local DNS leak = stealth-preserving).
 
@@ -74,7 +74,7 @@ impl Proxy {
             (ProxyScheme::Http, s)
         };
 
-        // Split auth@addr — auth is optional.
+        // Split auth@addr : auth is optional.
         let (user, pass, addr) = match rest.split_once('@') {
             Some((auth, addr)) => {
                 let (u, p) = auth
@@ -210,7 +210,7 @@ impl Proxy {
         target_host: &str,
         target_port: u16,
     ) -> Result<(), FetchError> {
-        // Step 1: greeting — offer no-auth (0x00) and if we
+        // Step 1: greeting : offer no-auth (0x00) and if we
         // have credentials, username/password (0x02).
         let has_auth = !self.user.is_empty();
         let methods: &[u8] = if has_auth { &[0x00, 0x02] } else { &[0x00] };
@@ -284,7 +284,7 @@ impl Proxy {
 
         // Step 3: CONNECT request. We send the target as a
         // DOMAIN NAME (ATYP 0x03) so the proxy resolves DNS
-        // — no local DNS leak, stealth-preserving.
+        // : no local DNS leak, stealth-preserving.
         let host_bytes = target_host.as_bytes();
         if host_bytes.len() > 255 {
             return Err(FetchError::Http(format!(
@@ -343,7 +343,7 @@ impl Proxy {
             )));
         }
 
-        // Skip BND.ADDR + BND.PORT — we don't need the
+        // Skip BND.ADDR + BND.PORT : we don't need the
         // bound address, just consume it so the stream is
         // clean for the caller's TLS handshake.
         let addr_len = match header[3] {
@@ -398,7 +398,7 @@ impl Proxy {
     }
 
     /// Chrome-compatible `--proxy-server` value (scheme://host:port, no
-    /// credentials — Chrome handles proxy auth via its own dialog or
+    /// credentials : Chrome handles proxy auth via its own dialog or
     /// `--proxy-auth` extension). Used for the Ghost browser tier.
     pub fn chrome_proxy_arg(&self) -> String {
         let scheme = match self.scheme {
@@ -428,7 +428,7 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Load proxies from the config file. Returns empty vec if the
-/// file doesn't exist (not an error — first run).
+/// file doesn't exist (not an error : first run).
 pub fn load_config() -> Vec<Proxy> {
     let path = config_path();
     let Ok(content) = std::fs::read_to_string(&path) else {
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn base64_rfc4648_vectors() {
-        // RFC 4648 §10 — covers every input-length remainder.
+        // RFC 4648 §10 : covers every input-length remainder.
         assert_eq!(base64(""), "");
         assert_eq!(base64("f"), "Zg==");
         assert_eq!(base64("fo"), "Zm8=");
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn base64_credentials_pad_at_the_end() {
         // Regression: the final partial group was emitted as padding
-        // first, data after — "dXNlcjpwYXNz==QA" instead of
+        // first, data after : "dXNlcjpwYXNz==QA" instead of
         // "dXNlcjpwYXNzd2Q=". Only credentials whose length was an exact
         // multiple of 3 survived, so most basic-auth and proxy-auth
         // headers went out corrupted.

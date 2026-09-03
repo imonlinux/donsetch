@@ -1,4 +1,4 @@
-//! Intent detection — routes the query to the right
+//! Intent detection : routes the query to the right
 //! engines + verticals, and feeds domain priors to rank.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub enum Intent {
 
 /// Intent is ADVISORY, never a gate: it selects bonus
 /// priors and which verticals join the fan-out. Wrong
-/// intent must never ruin a query — so signals split
+/// intent must never ruin a query : so signals split
 /// into UNAMBIGUOUS (always count) and TECH-GATED (only
 /// count with a tech token present). "How to fix a
 /// leaking kitchen faucet" is plumbing, full stop.
@@ -103,7 +103,7 @@ const NEWS_SIGNALS: &[&str] = &[
 const ENTITY_SIGNALS: &[&str] = &["what is", "who is", "who was", "define", "meaning of"];
 
 /// A conceptual query asks for an explanation of a thing,
-/// not a how-to or a product — Wikipedia is authoritative
+/// not a how-to or a product : Wikipedia is authoritative
 /// here, so it joins the fan-out at full engine weight.
 pub fn is_conceptual(query: &str) -> bool {
     let q = query.to_lowercase();
@@ -138,7 +138,7 @@ pub fn detect(query: &str) -> Intent {
     // "python habitat" costs a few wasted vertical lanes
     // (irrelevant hits BM25-sink out of the results),
     // while a false Web label on a real code query
-    // LOSES the StackExchange/MDN/GitHub verticals — a
+    // LOSES the StackExchange/MDN/GitHub verticals : a
     // true quality loss. So a tech token alone leans Code.
     let code = score(CODE_STRONG) + if tech { score(CODE_TECH_GATED) + 1 } else { 0 };
     let paper = score(PAPER_SIGNALS);
@@ -173,7 +173,7 @@ pub fn detect(query: &str) -> Intent {
 /// Engines to fan out per intent. Order = trust prior.
 /// Bing family (bing/ddg/yahoo) + independent indexes
 /// (mojeek/brave) for consensus diversity.
-/// DDG and Brave are PROXY_AVERSE — they prefer the direct
+/// DDG and Brave are PROXY_AVERSE : they prefer the direct
 /// lane because proxy IPs get CAPTCHA'd/429'd.
 pub fn engines_for(intent: Intent) -> &'static [&'static str] {
     match intent {
@@ -194,7 +194,7 @@ pub fn verticals_for(intent: Intent, query: &str) -> &'static [&'static str] {
         Intent::Paper => &["scholar", "arxiv"],
         Intent::News => &["news", "hn"],
         Intent::Entity => &["wikipedia"],
-        // Wiki safety net only on CONCEPTUAL web queries —
+        // Wiki safety net only on CONCEPTUAL web queries :
         // firing it everywhere flooded merges and crowded
         // out real canonicals (bench round 2 regression).
         Intent::Web if is_conceptual(query) => &["wikipedia"],
@@ -257,7 +257,7 @@ pub fn domain_prior(intent: Intent, host: &str, query: &str) -> f64 {
             "imdb.com",
         ],
         Intent::Web => &[
-            // Authoritative explainers — SEO-gamed titles
+            // Authoritative explainers : SEO-gamed titles
             // win BM25 otherwise.
             "cloudflare.com",
             "developer.mozilla.org",
@@ -283,7 +283,7 @@ pub fn domain_prior(intent: Intent, host: &str, query: &str) -> f64 {
 /// Cross-intent utility prior: DIY/how-to queries get
 /// their canonical cluster regardless of Web/Code label.
 /// Farms keyword-stuff titles (exact-match "How to Fix a
-/// Leaking Kitchen Faucet") to win BM25 + consensus —
+/// Leaking Kitchen Faucet") to win BM25 + consensus :
 /// measured in bench/headtohead.py: engines returned
 /// thisoldhouse/wikihow but exact-match farms outranked
 /// them. This bonus is the only layer that knows humans
@@ -350,7 +350,7 @@ mod tests {
     use super::*;
 
     /// Intent is advisory-only, but classification must
-    /// still be right on the realistic spread — a wrong
+    /// still be right on the realistic spread : a wrong
     /// label can never be allowed to steer a query.
     #[test]
     fn intent_never_steals_real_world_queries() {

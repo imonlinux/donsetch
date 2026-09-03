@@ -38,7 +38,7 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
     let server = header(headers, "server").unwrap_or_default().to_lowercase();
     let cf_ray = header(headers, "cf-ray").is_some();
     let is_cf = server.contains("cloudflare") || cf_ray;
-    // Challenge markers live in the title/head — scanning
+    // Challenge markers live in the title/head : scanning
     // the whole body false-positives on articles that merely
     // MENTION a vendor (a Wikipedia page about Akamai).
     let scan = &body[..body.len().min(64 * 1024)];
@@ -55,7 +55,7 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
 
     if (200..300).contains(&status) {
         // Binary bodies (PDFs, images, archives) never carry HTML
-        // challenge markers — marker-scanning their lossy-decoded
+        // challenge markers : marker-scanning their lossy-decoded
         // bytes is how an arXiv PDF behind Cloudflare ("attention
         // required" occurring inside the paper text, plus a cf-ray
         // header) got false-flagged as Blocked at HTTP 200. Bot
@@ -69,7 +69,7 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
         // Interstitials dressed as 200. Body markers only
         // count on SMALL pages: interstitials are tiny,
         // while real pages (a Bing SERP, an article about
-        // Cloudflare) mention vendors in passing — the
+        // Cloudflare) mention vendors in passing : the
         // lesson the ghost oracle learned first.
         let allow_body_markers = scan.len() < 32 * 1024;
         let v = classify_wall(&text, headers, is_cf, status, allow_body_markers);
@@ -89,13 +89,13 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
     // Any other status (4xx/5xx not specifically handled above)
     // is a server error, not content. Previously this fell through
     // to ContentOk, causing 400/500/502 etc. to be treated as
-    // successful fetches — the agent would trust error pages as
+    // successful fetches : the agent would trust error pages as
     // real content.
     Verdict::Blocked
 }
 
 /// Detect wall from a ghost-rendered DOM (no HTTP headers).
-/// Always checks body markers — the DOM is already rendered,
+/// Always checks body markers : the DOM is already rendered,
 /// so challenge markers in the HTML are real, not false
 /// positives from CSS class names mentioning a vendor.
 /// Scans first 64KB (challenge markers live in <head>).
@@ -123,12 +123,12 @@ pub fn detect_dom(body: &[u8]) -> Verdict {
 ///
 /// This function first checks visible text: if the page has
 /// ≥ 80 non-whitespace chars outside scripts/styles, it's real
-/// content — return ContentOk regardless of challenge markers.
+/// content : return ContentOk regardless of challenge markers.
 /// Only when the page is visually empty (< 80 visible chars)
 /// does it fall back to `detect_dom` for challenge detection.
 ///
 /// Challenge interstitials (CF, DataDome, PX) always have
-/// < 80 visible chars — they're mostly JS/HTML structure.
+/// < 80 visible chars : they're mostly JS/HTML structure.
 /// The Amazon 51KB block page has ~50 visible chars.
 /// Real pages have 80+ visible chars even when they embed
 /// challenge widgets in a small section.
@@ -136,7 +136,7 @@ pub fn detect_dom_smart(body: &[u8]) -> Verdict {
     // Interstitials first: the ≥80-visible-chars override below
     // must never whitewash a challenge page. Modern CF interstitials
     // ("Performing security verification") carry 300-400 chars of
-    // vendor boilerplate — enough to pass the old visible-text gate
+    // vendor boilerplate : enough to pass the old visible-text gate
     // and get served as content.
     if let Some(v) = detect_interstitial(body) {
         return Verdict::Challenge(v);
@@ -150,7 +150,7 @@ pub fn detect_dom_smart(body: &[u8]) -> Verdict {
 
 /// Interstitial titles/phrases that vendor challenge pages use in
 /// `<title>` / `<h1>`. Real pages virtually never title themselves
-/// these — a page ABOUT Cloudflare has its own title.
+/// these : a page ABOUT Cloudflare has its own title.
 const INTERSTITIAL_TITLES: &[&str] = &[
     "just a moment",
     "performing security verification",
@@ -199,7 +199,7 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
 
     // Near-empty route: tiny visible text + challenge script + no
     // form (a login/contact page with a Turnstile widget has BOTH a
-    // form and real visible text — it must not match).
+    // form and real visible text : it must not match).
     let visible = visible_text_count(body);
     if visible < 400
         && INTERSTITIAL_MARKERS.iter().any(|m| text.contains(m))
@@ -261,7 +261,7 @@ fn vendor_from_markers(lower_text: &str) -> Option<Vendor> {
 
 /// Fast visible-text estimate: strip tags + script/style/noscript
 /// bodies, count non-whitespace characters. No lowercasing, no
-/// DOM — byte scan. Shared with callers that need shell evidence
+/// DOM : byte scan. Shared with callers that need shell evidence
 /// (a big body with almost no visible text is a JS shell).
 pub fn visible_text_count(html: &[u8]) -> usize {
     let b = html;
@@ -278,7 +278,7 @@ pub fn visible_text_count(html: &[u8]) -> usize {
                 } else if starts_ci(&b[i + 1..], b"noscript") {
                     b"</noscript"
                 } else {
-                    // Not a skipped tag — skip to end of this tag.
+                    // Not a skipped tag : skip to end of this tag.
                     while i < b.len() && b[i] != b'>' {
                         i += 1;
                     }
@@ -338,13 +338,13 @@ fn classify_wall(
         {
             return Verdict::Challenge(Vendor::Cloudflare);
         }
-        // No challenge markers — WAF block (403) or
+        // No challenge markers : WAF block (403) or
         // origin error (503). Ghost solve won't help.
         return Verdict::Blocked;
     }
     // DataDome: the x-datadome header is present on ALL responses
     // from DataDome-protected sites (200s with real content AND 403
-    // challenge pages). The header alone is NOT a wall signal —
+    // challenge pages). The header alone is NOT a wall signal :
     // DataDome runs in monitoring mode on many sites (Forbes,
     // Reddit), tagging every response but only blocking on
     // actual bot detection. The wall is:
@@ -374,7 +374,7 @@ fn classify_wall(
     // Body markers below. On 2xx these only run for SMALL
     // pages: interstitials are tiny; large real pages
     // (Bing SERPs embed inactive turnstile scripts,
-    // articles mention vendors) false-positive otherwise —
+    // articles mention vendors) false-positive otherwise :
     // the lesson the ghost oracle learned first.
     if !allow_body_markers {
         return Verdict::ContentOk;
@@ -382,7 +382,7 @@ fn classify_wall(
 
     // Google: sorry/consent interstitials. "unusual traffic"
     // + recaptcha is the sorry page; /sorry/ + recaptcha is
-    // its form target. Both are challenge pages, not content —
+    // its form target. Both are challenge pages, not content :
     // without this, a CAPTCHA page passes as ContentOk.
     if (text.contains("unusual traffic") && text.contains("recaptcha"))
         || (text.contains("/sorry/") && text.contains("recaptcha"))
@@ -541,7 +541,7 @@ mod tests {
     fn forbes_200_with_datadome_header_is_content() {
         // Forbes returns x-datadome: protected on ALL responses
         // (200s with full 1.3MB articles AND 403 challenge pages).
-        // The header alone is NOT a wall — DataDome runs in
+        // The header alone is NOT a wall : DataDome runs in
         // monitoring mode. A 200 with a large body is ContentOk.
         let body = vec![b'<'; 1_300_000]; // 1.3MB of content
         let headers = vec![
@@ -551,7 +551,7 @@ mod tests {
         let v = detect(200, &headers, &body);
         assert!(
             matches!(v, Verdict::ContentOk),
-            "got {v:?} — Forbes 200 with x-datadome + large body must be ContentOk"
+            "got {v:?} : Forbes 200 with x-datadome + large body must be ContentOk"
         );
     }
 
@@ -590,7 +590,7 @@ mod tests {
         let v = detect(200, &headers, body);
         assert!(
             matches!(v, Verdict::ContentOk),
-            "got {v:?} — monitoring script must not trigger challenge"
+            "got {v:?} : monitoring script must not trigger challenge"
         );
     }
 
@@ -614,30 +614,30 @@ mod tests {
         let v = detect_dom_smart(body);
         assert!(
             matches!(v, Verdict::ContentOk),
-            "got {v:?} — page with Turnstile widget + real content must be ContentOk"
+            "got {v:?} : page with Turnstile widget + real content must be ContentOk"
         );
     }
 
     #[test]
     fn detect_dom_smart_challenge_interstitial_is_challenge() {
-        // A challenge interstitial has < 80 visible chars — detect_dom_smart
+        // A challenge interstitial has < 80 visible chars : detect_dom_smart
         // falls back to detect_dom and correctly identifies the challenge.
         let body = b"<html><head><script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script></head><body><div class=\"cf-turnstile\"></div></body></html>";
         let v = detect_dom_smart(body);
         assert!(
             matches!(v, Verdict::Challenge(_)),
-            "got {v:?} — challenge interstitial must be Challenge"
+            "got {v:?} : challenge interstitial must be Challenge"
         );
     }
 
     #[test]
     fn detect_500_is_blocked_not_content() {
-        // A 500 status code should NOT be ContentOk — it's a server error.
+        // A 500 status code should NOT be ContentOk : it's a server error.
         let body = b"<html><body>500 Internal Server Error</body></html>";
         let v = detect(500, &[], body);
         assert!(
             matches!(v, Verdict::Blocked),
-            "got {v:?} — 500 must be Blocked, not ContentOk"
+            "got {v:?} : 500 must be Blocked, not ContentOk"
         );
     }
 
@@ -648,7 +648,7 @@ mod tests {
         let v = detect(400, &[], body);
         assert!(
             matches!(v, Verdict::Blocked),
-            "got {v:?} — 400 must be Blocked"
+            "got {v:?} : 400 must be Blocked"
         );
     }
 
@@ -659,7 +659,7 @@ mod tests {
         let v = detect(502, &[], body);
         assert!(
             matches!(v, Verdict::Blocked),
-            "got {v:?} — 502 must be Blocked"
+            "got {v:?} : 502 must be Blocked"
         );
     }
 
@@ -671,7 +671,7 @@ mod tests {
         let v = detect(200, &[], body);
         assert!(
             matches!(v, Verdict::ContentOk),
-            "got {v:?} — bare 'turnstile' word must not trigger challenge"
+            "got {v:?} : bare 'turnstile' word must not trigger challenge"
         );
     }
 
@@ -679,8 +679,8 @@ mod tests {
     fn pdf_body_with_wall_markers_is_content() {
         // The live arXiv bug: an HTTP 200 PDF behind Cloudflare
         // (cf-ray header present, so is_cf=true) whose paper text
-        // contains "attention required" — the ONLY path to
-        // Blocked on a 200 — must parse as content. Body is
+        // contains "attention required" : the ONLY path to
+        // Blocked on a 200 : must parse as content. Body is
         // deliberately < 32KB so the marker scan WOULD run were
         // the binary gate absent.
         let mut body = Vec::new();
@@ -696,7 +696,7 @@ mod tests {
         let v = detect(200, &headers, &body);
         assert!(
             matches!(v, Verdict::ContentOk),
-            "got {v:?} — a real PDF must never be wall-classified"
+            "got {v:?} : a real PDF must never be wall-classified"
         );
     }
 
@@ -713,7 +713,7 @@ mod tests {
         let v = detect(200, &[], &body);
         assert!(
             matches!(v, Verdict::ContentOk),
-            "got {v:?} — binary bodies are not wall pages"
+            "got {v:?} : binary bodies are not wall pages"
         );
     }
 
@@ -726,7 +726,7 @@ mod tests {
         let v = detect(403, &[], body);
         assert!(
             !matches!(v, Verdict::ContentOk),
-            "got {v:?} — non-2xx must not become content via the binary gate"
+            "got {v:?} : non-2xx must not become content via the binary gate"
         );
     }
 
@@ -740,14 +740,14 @@ mod tests {
         let v = detect(200, &headers, body);
         assert!(
             matches!(v, Verdict::Challenge(Vendor::Cloudflare)),
-            "got {v:?} — JS-only shell must never be ContentOk"
+            "got {v:?} : JS-only shell must never be ContentOk"
         );
     }
 
     #[test]
     fn noscript_advice_is_still_content() {
         // Ordinary <noscript> "enable JavaScript for the best
-        // experience" advice on a real page stays content — the
+        // experience" advice on a real page stays content : the
         // "cookies to continue" co-marker is required.
         let body = b"<html><head><noscript>For the best experience enable JavaScript in your browser settings.</noscript></head><body><h1>Real Article</h1><p>Substantial real body text that is definitely present on this actual page and makes it a real page with content on it.</p></body></html>";
         let v = detect(200, &[], body);
@@ -766,7 +766,7 @@ mod tests {
         let v = detect_dom_smart(body);
         assert!(
             matches!(v, Verdict::Challenge(Vendor::Cloudflare)),
-            "got {v:?} — interstitial with visible text must be Challenge"
+            "got {v:?} : interstitial with visible text must be Challenge"
         );
         let v2 = detect(200, &[("server".into(), "cloudflare".into())], body);
         assert!(matches!(v2, Verdict::Challenge(_)), "got {v2:?}");
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn turnstile_contact_form_still_content_with_interstitial_layer() {
         // The contact form with a Turnstile widget: has a form +
-        // inputs + its own title — must stay content.
+        // inputs + its own title : must stay content.
         let body = b"<html><head><title>Contact Us</title><script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script></head><body><h1>Contact Us</h1><p>Fill out the form below and we will get back to you within 24 hours. Our team is dedicated to providing the best possible support.</p><div class=\"cf-turnstile\"></div><form><input name=\"email\"><textarea name=\"message\"></textarea><button>Send</button></form></body></html>";
         let v = detect_dom_smart(body);
         assert!(matches!(v, Verdict::ContentOk), "got {v:?}");

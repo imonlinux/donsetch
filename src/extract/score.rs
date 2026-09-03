@@ -145,7 +145,7 @@ fn walk<'a>(el: ElementRef<'a>, depth: usize) -> (Stats, Option<(f64, ElementRef
             * content_factor
             + tag_prior(name)
             + class_prior(el.value());
-        // Body is always a wrapper — it includes nav, sidebar,
+        // Body is always a wrapper : it includes nav, sidebar,
         // footer, and content. Without this penalty, large pages
         // (old.reddit with comments) score body higher than the
         // real content container, and extraction drowns in

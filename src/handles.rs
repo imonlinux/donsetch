@@ -1,14 +1,14 @@
 //! Reference handles: short session-scoped IDs that stand in for
-//! URLs. The URL-noise tax is real — a link-heavy page bleeds
+//! URLs. The URL-noise tax is real : a link-heavy page bleeds
 //! hundreds of tokens on raw URLs the daemon can remember instead.
 //!
 //! Two namespaces:
 //!
-//! - **`L{id}`** — link handles, interned from fetched-page markdown
+//! - **`L{id}`** : link handles, interned from fetched-page markdown
 //!   (`[text](LxK7mP2q)` instead of `[text](https://very-long-url…) `).
 //!   Stable: the same URL always maps to the same handle while the
 //!   entry lives. LRU-evicted, persisted with 24h TTL, cap 2048.
-//! - **`S{id}`** — search handles, one per result. In-memory only:
+//! - **`S{id}`** : search handles, one per result. In-memory only:
 //!   never persisted, die with the process. A new search mints new
 //!   handles, so earlier ones keep resolving to what they always
 //!   meant (no silent rebind).
@@ -16,7 +16,7 @@
 //! **Security (GHSA-g279-2v66-j8g2):** handle IDs are random
 //! 8-char base62 tokens generated from SHA-256 of (nanosecond
 //! timestamp + PID + atomic counter + ASLR stack address). The
-//! output space is 62^8 ≈ 2.18×10^14 — enumeration is infeasible.
+//! output space is 62^8 ≈ 2.18×10^14 : enumeration is infeasible.
 //! A page that was never given a handle cannot name one. Search
 //! handles are not persisted, so they cannot leak across sessions
 //! through the on-disk table. `DONSETCH_URL_HANDLES=off` disables
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// Handle lifetime. A handle that outlives a research session by a
 /// day is a handle nobody remembers producing.
 const TTL_SECS: u64 = 24 * 60 * 60;
-/// L-entry cap — bounded memory, oldest-eviction.
+/// L-entry cap : bounded memory, oldest-eviction.
 const MAX_L_ENTRIES: usize = 2048;
 /// Random ID length (base62 chars after the prefix).
 const ID_LEN: usize = 8;
@@ -49,7 +49,7 @@ const BASE62: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST
 struct LEntry {
     url: String,
     at: u64,
-    /// LRU eviction order (monotonic counter, not wall clock —
+    /// LRU eviction order (monotonic counter, not wall clock :
     /// seconds-granularity `at` can collide for rapid inserts).
     seq: u64,
 }
@@ -144,11 +144,11 @@ impl HandleTable {
         let Ok(p) = serde_json::from_slice::<Persisted>(&bytes) else {
             // Corrupt table or old format (no version field): treat
             // as empty. Handles are a cache, never a source of
-            // truth — losing them costs nothing.
+            // truth : losing them costs nothing.
             return t;
         };
-        // Reject old format (version 1 had no version field — it
-        // failed to deserialize above — but be explicit).
+        // Reject old format (version 1 had no version field : it
+        // failed to deserialize above : but be explicit).
         if p.version != PERSIST_VERSION {
             return t;
         }
@@ -291,7 +291,7 @@ impl HandleTable {
             };
             let url = &md[url_start..url_start + close_rel];
             // Sanity: spaces or control chars mean this isn't a
-            // clean generated link — leave it untouched.
+            // clean generated link : leave it untouched.
             if url.chars().any(|c| c.is_whitespace()) {
                 let skip = pos + rel + 6;
                 out.push_str(&md[pos..skip]);
@@ -312,7 +312,7 @@ impl HandleTable {
 
 /// Check if a string matches the current handle format: prefix
 /// (S or L) + exactly ID_LEN alphanumeric chars. Does NOT match
-/// old sequential format (S1, L12 — too short).
+/// old sequential format (S1, L12 : too short).
 fn is_valid_handle_id(s: &str) -> bool {
     if s.len() != ID_LEN + 1 {
         return false;
@@ -402,8 +402,8 @@ mod tests {
         assert!(is_handle("Lb9R4nW3p"));
         assert!(is_handle("saB3cD4eF")); // lowercase prefix
         assert!(!is_handle("https://example.com"));
-        assert!(!is_handle("S1")); // old format — too short
-        assert!(!is_handle("L12")); // old format — too short
+        assert!(!is_handle("S1")); // old format : too short
+        assert!(!is_handle("L12")); // old format : too short
         assert!(!is_handle("S")); // no suffix
         assert!(!is_handle("Sx")); // too short
         assert!(!is_handle("SxK7mP2qExtra")); // too long

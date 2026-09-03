@@ -1,4 +1,4 @@
-//! GhostManager — the daemon's browser lifecycle brain.
+//! GhostManager : the daemon's browser lifecycle brain.
 //!
 //! One browser, one tab, one job at a time. Frozen
 //! between jobs (0 CPU), reaped after 10 min frozen,
@@ -6,7 +6,7 @@
 //!
 //! On Linux, an Xvfb virtual display is started at init
 //! and kept warm. Ghost launches headful Chrome on this
-//! display — the stealth path that passes Cloudflare/DataDome.
+//! display : the stealth path that passes Cloudflare/DataDome.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -77,7 +77,7 @@ impl Drop for GhostGuard {
 fn xvfb_missing_hint() -> Option<&'static str> {
     if cfg!(target_os = "linux") {
         Some(
-            "[ghost] Xvfb not found — install with `apt install xvfb` or `pacman -S xorg-server-xvfb` (or your distro's equivalent) for invisible headful Chrome on Linux",
+            "[ghost] Xvfb not found : install with `apt install xvfb` or `pacman -S xorg-server-xvfb` (or your distro's equivalent) for invisible headful Chrome on Linux",
         )
     } else {
         None
@@ -93,8 +93,14 @@ impl GhostManager {
             .map(|p| p.to_string_lossy().contains("com.termux"))
             .unwrap_or(false);
 
-        // Start Xvfb on Linux if available (and not Termux).
-        let xvfb = if !is_termux && super::xvfb::is_available() {
+        // A forced headless backend does not need a virtual display. Avoid
+        // starting Xvfb so the selection is explicit in both process and args.
+        let xvfb = if super::cloak::headless_mode_requested() {
+            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                eprintln!("[ghost] headless backend selected, skipping Xvfb");
+            }
+            None
+        } else if !is_termux && super::xvfb::is_available() {
             match super::xvfb::Xvfb::start().await {
                 Ok(xvfb) => {
                     let disp = xvfb.display_env();

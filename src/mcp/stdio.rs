@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::mcp::server::{CancelMap, Daemon, handle};
 
 /// Run the stdio MCP daemon until stdin closes.
-/// Never returns Err on client garbage — only on fatal IO.
+/// Never returns Err on client garbage : only on fatal IO.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = Arc::new(Daemon::new().await?);
     let (tx, mut rx) = mpsc::channel::<String>(256);
@@ -24,7 +24,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // A broken stdout (client died, pipe closed) must not be
             // swallowed: every later response would be silently
             // dropped while the daemon pretends to serve. Log the
-            // real cause and stop — the client is gone.
+            // real cause and stop : the client is gone.
             if let Err(e) = out.write_all(line.as_bytes()).await {
                 eprintln!("[mcp] stdout write failed, shutting down: {e}");
                 std::process::exit(1);
@@ -53,7 +53,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if line.is_empty() {
             continue;
         }
-        // Cancellation notifications are handled inline — they must
+        // Cancellation notifications are handled inline : they must
         // reach the running tool NOW, not after a spawn.
         if let Ok(v) = serde_json::from_str::<Value>(&line)
             && v.get("id").is_none()

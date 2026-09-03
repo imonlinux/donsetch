@@ -1,6 +1,6 @@
 //! Hacker News dedicated extractor.
 //!
-//! HN's comment tree is a nested <table> layout — the generic
+//! HN's comment tree is a nested <table> layout : the generic
 //! pipeline renders it as pipe-table rows (truncating every comment
 //! to 120 chars) or loses it to main-content scoring. HN's markup
 //! has been frozen for 15+ years, so a dedicated extractor is the
@@ -347,7 +347,7 @@ fn extract_thread(
     }
 
     if focus_missed && let Some(q) = &opts.focus {
-        md = format!("*(focus \"{q}\": no matches — showing full thread)*\n\n{md}");
+        md = format!("*(focus \"{q}\": no matches : showing full thread)*\n\n{md}");
     }
 
     let total = md.len();

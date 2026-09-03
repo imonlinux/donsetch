@@ -1,6 +1,6 @@
 //! Feed extractor: RSS 2.0 / Atom / JSON Feed → structured
 //! markdown. A feed URL returned as a raw XML blob (the v2.1
-//! behavior — 25K chars of CDATA soup) is worthless to an agent;
+//! behavior : 25K chars of CDATA soup) is worthless to an agent;
 //! this renders the feed the way a feed reader shows it: channel
 //! header + items with title/link/date/summary.
 
@@ -57,7 +57,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
 fn extract_xml_feed(text: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
     // HTML parsers mangle XML feeds two ways: `<link>` is a VOID
     // element in HTML (its child text vanishes) and `<![CDATA[..]]>`
-    // becomes literal text. Preprocess both away — the markers
+    // becomes literal text. Preprocess both away : the markers
     // never appear legitimately inside feed text content.
     let text = text.replace("<![CDATA[", "").replace("]]>", "");
     let text = text
@@ -325,7 +325,7 @@ fn first_attr(doc: &scraper::Html, sels: &[&str], attr: &str) -> Option<String> 
     None
 }
 
-/// Feed summaries carry inline HTML — strip to visible text.
+/// Feed summaries carry inline HTML : strip to visible text.
 fn clean_html(s: &str) -> String {
     if !s.contains('<') {
         return s.trim().to_string();

@@ -1,4 +1,4 @@
-//! Solve + Render — the ghost's two jobs.
+//! Solve + Render : the ghost's two jobs.
 
 use std::time::{Duration, Instant};
 
@@ -12,10 +12,10 @@ pub struct SolveResult {
     /// Clearance + session cookies with real expiry.
     pub cookies: Vec<CookieRecord>,
     /// Wall vendor detected during the challenge ("cloudflare",
-    /// "datadome", etc.) — feeds the domain profile.
+    /// "datadome", etc.) : feeds the domain profile.
     #[allow(dead_code)]
     pub vendor: Option<String>,
-    /// Last DOM snapshot — fallback content if tier 1 with
+    /// Last DOM snapshot : fallback content if tier 1 with
     /// harvested cookies still gets refused.
     #[allow(dead_code)]
     pub html: String,
@@ -24,13 +24,13 @@ pub struct SolveResult {
 
 pub enum SolveOutcome {
     Solved(SolveResult),
-    /// Interactive captcha — human/service territory.
+    /// Interactive captcha : human/service territory.
     /// Honest dead end, no solving service by design.
     CaptchaWalled,
     TimedOut,
 }
 
-/// Clearance cookie names worth noting (not exhaustive —
+/// Clearance cookie names worth noting (not exhaustive :
 /// a ContentOk verdict is the real success signal).
 const CLEARANCE_NAMES: &[&str] = &[
     "cf_clearance",
@@ -64,7 +64,7 @@ const DISMISS_MODALS_JS: &str = r#"(() => {
 /// are small, markers live in small pages, and the
 /// clearance cookie must corroborate for known vendors.
 /// A "clear" verdict must hold for TWO polls (300ms
-/// apart) — challenge pages re-navigate after pass and
+/// apart) : challenge pages re-navigate after pass and
 /// a mid-redirect snapshot can fake ContentOk.
 pub async fn solve(
     ghost: &mut Ghost,
@@ -73,7 +73,7 @@ pub async fn solve(
 ) -> Result<SolveOutcome, FetchError> {
     let start = Instant::now();
     ghost.navigate(url).await?;
-    // No resource blocking — challenges need resources to load.
+    // No resource blocking : challenges need resources to load.
     let _ = ghost
         .cdp
         .call(
@@ -95,7 +95,7 @@ pub async fn solve(
             Err(_) => continue, // mid-navigation, poll again
         };
         // Mid-navigation guard: about:blank is tiny and
-        // marker-free — it would fake a clear streak.
+        // marker-free : it would fake a clear streak.
         // Require a real URL and real bytes before any
         // clear vote counts.
         let cur = ghost.current_url().await.unwrap_or_default();
@@ -126,7 +126,12 @@ pub async fn solve(
             // for extra certainty; hold for 2 polls.
             clear_streak += 1;
             if clear_streak >= 2 {
-                let cookies = ghost.cookies().await.unwrap_or_default();
+                let cookies =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), ghost.cookies())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
                 ghost.touch();
                 return Ok(SolveOutcome::Solved(SolveResult {
                     cookies,
@@ -224,7 +229,7 @@ pub struct GhostPage {
     pub cookies: Vec<CookieRecord>,
     /// Challenge vendor seen during the wait (if any).
     pub vendor: Option<String>,
-    /// Interactive captcha — honest dead end.
+    /// Interactive captcha : honest dead end.
     pub captcha: bool,
     #[allow(dead_code)]
     pub took: Duration,
@@ -241,7 +246,7 @@ pub struct GhostPage {
 ///    drift < 1% across two polls).
 /// 4. Then capture DOM + cookies.
 ///
-/// A cleared-but-empty shell never satisfies this oracle —
+/// A cleared-but-empty shell never satisfies this oracle :
 /// that's the flaw that made tier 2 return SPA shells.
 pub async fn ghost_fetch(
     ghost: &mut Ghost,
@@ -250,7 +255,7 @@ pub async fn ghost_fetch(
 ) -> Result<GhostPage, FetchError> {
     let start = Instant::now();
     ghost.navigate(url).await?;
-    // No resource blocking — challenges verify that resources
+    // No resource blocking : challenges verify that resources
     // (images, fonts) load. Blocking them breaks Cloudflare
     // and DataDome challenge solving. The speed cost is small
     // (a few extra KB of fonts/images) vs the reliability gain.
@@ -310,7 +315,7 @@ pub async fn ghost_fetch(
         }
 
         // Challenge still up → wait it out (click turnstile once).
-        // Use detect_dom_smart (not detect_dom) — real pages with
+        // Use detect_dom_smart (not detect_dom) : real pages with
         // embedded challenge widgets (Turnstile on a contact form)
         // have challenge markers but also substantial visible text.
         // detect_dom alone would classify these as Challenge on every
@@ -327,7 +332,7 @@ pub async fn ghost_fetch(
             }
             settle_streak = 0;
             // Turnstile widget: the iframe renders LATE (after the
-            // widget JS boots) and repositions per layout — a
+            // widget JS boots) and repositions per layout : a
             // one-shot click fired before it attached always missed.
             // Re-find the geometry and click again every few polls,
             // up to 3 attempts total.
@@ -369,7 +374,7 @@ pub async fn ghost_fetch(
         }
 
         // Consent interstitial (Google / EU GDPR walls): click
-        // through once. Not a wall detector case — the page is
+        // through once. Not a wall detector case : the page is
         // "ContentOk" but it's the consent form, not content.
         if !clicked_consent && lower.contains("before you continue") {
             let _ = ghost.click(560.0, 430.0).await;
@@ -387,13 +392,13 @@ pub async fn ghost_fetch(
         }
 
         // Still hydrating: aria-busy spinners, modal-hidden
-        // body. Not a wall — the SPA just hasn't loaded its
+        // body. Not a wall : the SPA just hasn't loaded its
         // content yet. Kick it once (dismiss consent modals +
         // scroll to trigger lazy fetches) and keep waiting;
         // never settle on a skeleton page.
         //
         // NOTE: "skeleton" in CSS class names is NOT a reliable
-        // loading signal — Amazon, React apps, and many CSS
+        // loading signal : Amazon, React apps, and many CSS
         // frameworks use "skeleton" in class names even after
         // the page has fully hydrated. Using it here causes the
         // ghost to never settle on pages with real content.
@@ -426,16 +431,16 @@ pub async fn ghost_fetch(
         // real pages (example.com, httpbin) have 80+. A page with
         // 80+ visible chars that's stable across 2 polls is real
         // content. The old cur_len >= 4_000 gate was too strict
-        // for simple pages — ghost_fetch ran the full 20s timeout
+        // for simple pages : ghost_fetch ran the full 20s timeout
         // on example.com (visible=122, cur_len=559) instead of
         // returning immediately.
         //
         // SPA hydration guard: small DOMs (< 50KB) need more
         // time before settling. SPAs download, parse, and execute
-        // JS bundles asynchronously — a stable 8KB DOM at t=400ms
+        // JS bundles asynchronously : a stable 8KB DOM at t=400ms
         // is a SvelteKit/React shell, not a complete page. Wait
         // at least 3 seconds for the DOM to grow before settling.
-        // Large DOMs (≥ 50KB) are already rendered — settle fast.
+        // Large DOMs (≥ 50KB) are already rendered : settle fast.
         // Measured: crates.io shell 8KB (needs ~3s), Discourse
         // shell 30KB (needs ~2-3s), both grow to 100-400KB after
         // hydration. example.com 559B (already complete at t=0).
@@ -451,7 +456,12 @@ pub async fn ghost_fetch(
         if substantive && stable && past_min {
             settle_streak += 1;
             if settle_streak >= 2 {
-                let cookies = ghost.cookies().await.unwrap_or_default();
+                let cookies =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), ghost.cookies())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
                 ghost.touch();
                 return Ok(GhostPage {
                     html,
@@ -467,7 +477,7 @@ pub async fn ghost_fetch(
 
         // Dead DOM early exit: if the DOM is static (not changing)
         // AND has < 80 visible chars for several seconds, it's a dead
-        // page — a block/challenge page that the ghost can't solve.
+        // page : a block/challenge page that the ghost can't solve.
         // Don't waste 20s waiting; exit early and let the caller
         // handle it. This saves 12s on Amazon-type pages.
         //
@@ -475,7 +485,7 @@ pub async fn ghost_fetch(
         // dynamic ads/trackers don't reset the streak.
         //
         // Adaptive threshold: tiny DOMs (< 5KB) exit faster (8 polls
-        // ≈ 1.6s early / 4s late) — a 2KB DOM with 0 visible chars is
+        // ≈ 1.6s early / 4s late) : a 2KB DOM with 0 visible chars is
         // clearly dead. Larger DOMs get 15 polls (≈ 3s / 7.5s).
         if prev_len > 0 && visible < 80 && cur_len.abs_diff(prev_len) < 100 {
             dead_streak += 1;
@@ -506,15 +516,15 @@ pub async fn ghost_fetch(
         }
     }
 
-    // Timeout: return whatever rendered — partial beats none,
+    // Timeout: return whatever rendered : partial beats none,
     // the caller's extraction yield decides success.
-    // Timeout: return whatever rendered — partial beats none,
+    // Timeout: return whatever rendered : partial beats none,
     // the caller's extraction yield decides success.
     //
     // BUT: if the final DOM is still a challenge/wall page, flag it
     // as captcha so ghost_escalate doesn't extract and cache the
     // interstitial as content (the Indeed false-positive bug).
-    // Use detect_dom_smart — a real page with an embedded challenge
+    // Use detect_dom_smart : a real page with an embedded challenge
     // widget (Turnstile) has challenge markers but also visible text.
     // detect_dom alone would flag it as captcha; detect_dom_smart
     // checks visible text first.
@@ -534,7 +544,11 @@ pub async fn ghost_fetch(
             took: start.elapsed(),
         });
     }
-    let cookies = ghost.cookies().await.unwrap_or_default();
+    let cookies = tokio::time::timeout(std::time::Duration::from_secs(5), ghost.cookies())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
     ghost.touch();
     Ok(GhostPage {
         html,
@@ -546,7 +560,7 @@ pub async fn ghost_fetch(
 }
 
 /// Fast visible-text estimate: strip tags + script/style bodies,
-/// count non-whitespace. No lowercasing, no DOM — byte scan.
+/// count non-whitespace. No lowercasing, no DOM : byte scan.
 fn visible_text_len(html: &str) -> usize {
     let b = html.as_bytes();
     let mut n = 0usize;
@@ -596,7 +610,7 @@ fn find_ci(b: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 }
 
 /// RENDER mode: execute a JS shell, return the live DOM.
-/// Success = outerHTML length stable across two polls —
+/// Success = outerHTML length stable across two polls :
 /// robust for SPAs, no Network domain needed.
 pub async fn render(ghost: &mut Ghost, url: &str, timeout: Duration) -> Result<String, FetchError> {
     let start = Instant::now();
@@ -624,7 +638,7 @@ pub async fn render(ghost: &mut Ghost, url: &str, timeout: Duration) -> Result<S
         prev_len = len;
     }
     ghost.touch();
-    // Timeout: return whatever rendered — partial beats none.
+    // Timeout: return whatever rendered : partial beats none.
     if html.is_empty() {
         Err(FetchError::ghost("render produced no DOM"))
     } else {
@@ -635,7 +649,10 @@ pub async fn render(ghost: &mut Ghost, url: &str, timeout: Duration) -> Result<S
 /// Fingerprint self-test: navigate our local page,
 /// read results back from the DOM (no Runtime ever).
 pub async fn selftest(ghost: &mut Ghost) -> Result<String, FetchError> {
-    let page = super::profile_dir().join(format!("selftest-{}.html", std::process::id()));
+    // Lives in the system temp dir, never the persistent profile:
+    // a hard-killed daemon used to leave selftest-<pid>.html
+    // litter inside the shared profile root.
+    let page = std::env::temp_dir().join(format!("donsetch-selftest-{}.html", std::process::id()));
     std::fs::write(&page, include_str!("selftest.html"))
         .map_err(|e| FetchError::ghost(format!("selftest: {e}")))?;
     let url = format!("file://{}", page.display());

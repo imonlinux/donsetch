@@ -1,4 +1,4 @@
-//! Verticals — keyless JSON APIs with near-100%
+//! Verticals : keyless JSON APIs with near-100%
 //! reliability. They feed the SAME merge as web engines:
 //! a GitHub repo that also ranks in Brave gets consensus.
 
@@ -57,7 +57,7 @@ pub fn endpoint(vertical: &str, query: &str) -> Option<String> {
             .any(|s| lower.contains(s))
                 || words <= 4;
             // Natural-language how-tos return spam repos from
-            // GitHub's loose matcher — skip the vertical.
+            // GitHub's loose matcher : skip the vertical.
             if !errorish && !repoish {
                 return None;
             }

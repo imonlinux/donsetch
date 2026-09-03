@@ -1,7 +1,7 @@
 //! The crawl orchestrator. Owns: frontier loop, worker pool,
 //! budgets, stop conditions, near-dup detection, resume tokens.
 //!
-//! Fetch I/O goes through the `PageFetcher` trait — the real
+//! Fetch I/O goes through the `PageFetcher` trait : the real
 //! crawl rides DonShadow; tests ride a mock. Never does the
 //! orchestrator touch sockets directly.
 
@@ -38,7 +38,7 @@ pub struct FetchedPage {
     pub body: Vec<u8>,
     pub verdict: Verdict,
     pub latency: Duration,
-    /// True when served from the revalidation/pool cache — these
+    /// True when served from the revalidation/pool cache : these
     /// are FREE and must not count against pacing budgets.
     pub cached: bool,
     /// Human-readable failure note (network error, etc.).
@@ -46,7 +46,7 @@ pub struct FetchedPage {
 }
 
 /// Ghost-rendered page from tier-2 browser escalation.
-/// The orchestrator stays ghost-agnostic — this is the
+/// The orchestrator stays ghost-agnostic : this is the
 /// payload the injected `GhostHook` returns.
 pub struct GhostRender {
     pub html: String,
@@ -54,7 +54,7 @@ pub struct GhostRender {
 
 /// Injected ghost escalation hook. Takes a URL, returns
 /// rendered HTML + cookies on success, Err(reason) on failure
-/// (captcha, timeout, launch error) — the reason flows into the
+/// (captcha, timeout, launch error) : the reason flows into the
 /// crawl's skipped[] so the agent sees WHY the browser tier
 /// declined, not just that it did. The orchestrator calls it
 /// when a page is a JS shell (thin extraction) or a bot wall
@@ -72,7 +72,7 @@ pub type PageFetcher =
 pub enum CrawlMode {
     /// Both phases (default): sitemap-map first, then content.
     Full,
-    /// URL map only — cheap, extractable for agent decisions.
+    /// URL map only : cheap, extractable for agent decisions.
     Map,
     /// Skip the sitemap phase, crawl links BFS-style only.
     Content,
@@ -101,16 +101,16 @@ pub struct CrawlPage {
 /// whether to resume or re-scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// Frontier exhausted — the whole reachable scope was read.
+    /// Frontier exhausted : the whole reachable scope was read.
     FrontierEmpty,
     MaxPages,
     CharBudget,
     DepthLimit,
     Deadline,
-    /// Client cancelled (MCP notifications/cancelled) — workers
+    /// Client cancelled (MCP notifications/cancelled) : workers
     /// stopped gracefully, resume token persisted.
     Cancelled,
-    /// Host boxed us out (all lanes walled) — resume later.
+    /// Host boxed us out (all lanes walled) : resume later.
     ThrottledOut,
 }
 
@@ -125,7 +125,7 @@ pub struct CrawlResult {
     pub skipped: Vec<(String, String)>,
     pub stop: StopReason,
     pub elapsed: Duration,
-    /// Sitemap map (Map phase) — capped URLs.
+    /// Sitemap map (Map phase) : capped URLs.
     pub map: Vec<String>,
     /// robots.txt Crawl-delay honored by pacing (seconds). Surfaces
     /// in the output so a slow crawl explains itself.
@@ -134,11 +134,11 @@ pub struct CrawlResult {
     pub resume: Option<String>,
 }
 
-/// v3: (done, queued) — fired per completed page, throttled by the caller.
+/// v3: (done, queued) : fired per completed page, throttled by the caller.
 pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
 /// v3: true = skip the URL entirely (recorded fingerprint still fresh).
 pub type SkipFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
-/// v3: (url, fingerprint, markdown, title) — the delta-crawl memory feed.
+/// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
 pub type OnPageFn = std::sync::Arc<dyn Fn(&str, Option<&str>, &str, Option<&str>) + Send + Sync>;
 
 #[derive(Clone)]
@@ -164,17 +164,17 @@ pub struct CrawlOptions {
     pub concurrency: usize,
     /// Obey robots.txt Disallow rules.
     pub respect_robots: bool,
-    /// v3: cancellation — the client aborted the request. Workers
+    /// v3: cancellation : the client aborted the request. Workers
     /// observe this between pages and stop gracefully.
     pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
-    /// v3: progress callback (done, queued) — fired per completed
+    /// v3: progress callback (done, queued) : fired per completed
     /// page, throttled by the caller.
     pub progress: Option<ProgressFn>,
-    /// v3: delta crawl — URLs for which this returns true are
+    /// v3: delta crawl : URLs for which this returns true are
     /// skipped entirely (recorded fingerprint still fresh).
     pub skip_unchanged: Option<SkipFn>,
     /// v3: record a fetched page's fingerprint (url, fingerprint,
-    /// markdown, title) — the delta-crawl memory feed.
+    /// markdown, title) : the delta-crawl memory feed.
     pub on_page: Option<OnPageFn>,
     /// Map hard cap.
     pub map_cap: usize,
@@ -214,7 +214,7 @@ struct ResumeState {
     seed: String,
     /// (url, score, depth, retries, parent)
     queue: Vec<(String, f64, u32, u8, Option<String>)>,
-    /// Seen-set from run 1 — without it, run-2 pages re-link
+    /// Seen-set from run 1 : without it, run-2 pages re-link
     /// to already-fetched pages and they crawl AGAIN.
     seen: Vec<String>,
 }
@@ -404,7 +404,7 @@ impl Crawler {
             let skipped = if map.is_empty() {
                 vec![(
                     seed.to_string(),
-                    "no sitemap found at common locations — use mode=content to BFS from the seed"
+                    "no sitemap found at common locations : use mode=content to BFS from the seed"
                         .into(),
                 )]
             } else {
@@ -519,7 +519,7 @@ impl Crawler {
         let skipped: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let filtered_out = Arc::new(AtomicUsize::new(0));
         let dup_sigs: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-        // Locale-canonical paths of fetched pages — prevents
+        // Locale-canonical paths of fetched pages : prevents
         // crawling translated variants (de/, es/, fr/ copies).
         let locale_seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let chars_total = Arc::new(AtomicUsize::new(total_chars));
@@ -578,7 +578,7 @@ impl Crawler {
                         }
                         break 'work;
                     }
-                    // v3: client cancellation — graceful stop; the
+                    // v3: client cancellation : graceful stop; the
                     // resume checkpoint keeps everything gathered.
                     if let Some(rx) = &opts_worker.cancel
                         && (*rx.borrow() || rx.has_changed().unwrap_or(false))
@@ -635,7 +635,7 @@ impl Crawler {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .pop();
                     let Some(item) = next else {
-                        // Frontier empty — but other workers may add.
+                        // Frontier empty : but other workers may add.
                         // Grace: spin briefly, then exit.
                         tokio::time::sleep(Duration::from_millis(150)).await;
                         if queue
@@ -659,7 +659,7 @@ impl Crawler {
                         Err(_) => {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((item.url.clone(), "unparseable".into()));
                             continue 'work;
                         }
@@ -689,7 +689,7 @@ impl Crawler {
                     {
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((item.url.clone(), "unchanged (since_last)".into()));
                         continue 'work;
                     }
@@ -712,7 +712,7 @@ impl Crawler {
                     // already-fetched pages. The first variant
                     // fetched claims the canonical path; all other
                     // language versions (de/, es/, fr/, zh-CN/...)
-                    // are blocked. The seed is exempt — it's the
+                    // are blocked. The seed is exempt : it's the
                     // entry point and always fetched.
                     if !is_seed {
                         let lcanon = frontier::locale_canonical(parsed.path());
@@ -731,7 +731,7 @@ impl Crawler {
                     // least-blocked for this host takes it.
                     let Some(lane) = governor.best_lane(host).cloned() else {
                         if governor.wait_for(host, "*", seq) > Duration::ZERO {
-                            // Whole host boxed — if the frontier
+                            // Whole host boxed : if the frontier
                             // holds only this host, we're done.
                             if queue
                                 .lock()
@@ -773,13 +773,13 @@ impl Crawler {
 
                     let page = fetch(item.url.clone(), lane.id.clone(), item.parent.clone()).await;
                     if page.cached {
-                        // Warm-cache hit: free — no governor signal.
+                        // Warm-cache hit: free : no governor signal.
                     } else {
                         match (page.status, &page.verdict) {
                             (200, Verdict::ContentOk) => {
                                 // Skim dwell: proportional to page size,
                                 // capped at 300ms. v1 used up to 2s/page
-                                // ("a human reads a 50KB article") — but
+                                // ("a human reads a 50KB article") : but
                                 // an agent skims for extraction, not
                                 // reading, and the dwell's real job is
                                 // anti-metronome entropy, which jitter +
@@ -846,7 +846,7 @@ impl Crawler {
                     }
 
                     // Wall/denylist verdicts → skip honestly.
-                    // (Unless ghost rendered the page — then treat
+                    // (Unless ghost rendered the page : then treat
                     // as ContentOk and proceed to extraction.)
                     if ghost_html.is_none() && !matches!(page.verdict, Verdict::ContentOk) {
                         let why = if item.retries > 0 {
@@ -910,7 +910,7 @@ impl Crawler {
                         let kind = ctype.split(';').next().unwrap_or("unknown").trim();
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((item.url.clone(), format!("binary ({kind})")));
                         continue 'work;
                     }
@@ -974,7 +974,7 @@ impl Crawler {
                         Err(e) => {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((item.url.clone(), format!("extract failed: {e}")));
                             continue 'work;
                         }
@@ -1037,7 +1037,7 @@ impl Crawler {
 
                     // Near-dup signature: title + first 200 normalized
                     // chars of the CONTENT (frontmatter carries the
-                    // page URL — identical docs at different URLs
+                    // page URL : identical docs at different URLs
                     // must still dedup).
                     let body_md = md.split_once("\n\n").map(|x| x.1).unwrap_or(md.as_str());
                     let sig_str = format!(
@@ -1063,19 +1063,19 @@ impl Crawler {
 
                     // Quality gate: skip near-empty pages (boilerplate,
                     // redirects, error pages). Does NOT count against
-                    // the page budget — low-quality pages should not
+                    // the page budget : low-quality pages should not
                     // steal slots from real content. The total_fetched
                     // safety valve (3x cap) prevents infinite loops.
                     if !duplicate && r.quality < opts_worker.min_quality {
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), format!("low quality ({:.2})", r.quality)));
                         continue 'work;
                     }
 
                     // Scope gate for results: the seed is ALWAYS
-                    // in scope — the user explicitly asked to crawl it.
+                    // in scope : the user explicitly asked to crawl it.
                     // Non-seed pages already passed scope before fetching.
                     let in_scope = is_seed
                         || scope_allowed(
@@ -1092,7 +1092,7 @@ impl Crawler {
                         // harvest outlinks (seed → in-scope pages).
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
                     } else {
                         let done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1129,7 +1129,7 @@ impl Crawler {
                         if duplicate {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((page.url.clone(), "near-duplicate".into()));
                             continue 'work;
                         }
@@ -1163,7 +1163,7 @@ impl Crawler {
                         });
 
                         // Pagination: <link rel="next"> continues a
-                        // linear chain — push at the SAME depth so
+                        // linear chain : push at the SAME depth so
                         // pagination doesn't consume depth budget.
                         let next_hrefs = extract_link_rel(&html, "next");
                         {

@@ -11,11 +11,11 @@ use std::net::IpAddr;
 ///
 /// Handles literal IPs and well-known localhost names. This
 /// is a synchronous helper that only handles literal/obvious
-/// names — hostname DNS safety is enforced by the async
+/// names : hostname DNS safety is enforced by the async
 /// `ensure_url_safe` which resolves hostnames and rejects
 /// private addresses.
 pub fn is_ssrf_host(host: &str) -> bool {
-    // url::Url::host_str() keeps brackets on IPv6 literals —
+    // url::Url::host_str() keeps brackets on IPv6 literals :
     // strip them so the IP parser actually sees an IP.
     let unbracketed = host
         .strip_prefix('[')
@@ -87,11 +87,11 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 0) // 0.0.0.0/8 (software)
                 // Carrier-grade NAT: 100.64.0.0/10
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
-                // 192.88.99.0/24 (6to4 relay anycast) — deprecated/reserved
+                // 192.88.99.0/24 (6to4 relay anycast) : deprecated/reserved
                 || (v4.octets()[0] == 192 && v4.octets()[1] == 88 && v4.octets()[2] == 99)
         }
         IpAddr::V6(v6) => {
-            // IPv4-mapped (::ffff:a.b.c.d) is the v4 address —
+            // IPv4-mapped (::ffff:a.b.c.d) is the v4 address :
             // check it as v4 or it slips past every v6 rule.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_private_ip(&IpAddr::V4(v4));
@@ -139,12 +139,12 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(crate::error::FetchError::Http(format!(
-            "blocked: scheme {scheme} not allowed — only http/https"
+            "blocked: scheme {scheme} not allowed : only http/https"
         )));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(crate::error::FetchError::Http(
-            "blocked: URL contains credentials — SSRF guard".into(),
+            "blocked: URL contains credentials : SSRF guard".into(),
         ));
     }
     let host = url
@@ -152,7 +152,7 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
         .ok_or_else(|| crate::error::FetchError::InvalidUrl(url_str.into()))?;
     if is_ssrf_host(host) && !private_egress_allowed() {
         return Err(crate::error::FetchError::Http(format!(
-            "blocked: {host} is a private/loopback address — SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)"
+            "blocked: {host} is a private/loopback address : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)"
         )));
     }
     // Also check host_str for bracketed IPv6 that Url keeps brackets on? is_ssrf_host handles it.
@@ -207,23 +207,23 @@ pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::Fe
                 any = true;
                 if is_ssrf_resolved_ip(&addr.ip()) {
                     return Err(crate::error::FetchError::Http(format!(
-                        "blocked: {host} resolves to private/loopback address {} — SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)",
+                        "blocked: {host} resolves to private/loopback address {} : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)",
                         addr.ip()
                     )));
                 }
             }
             if !any {
                 return Err(crate::error::FetchError::Http(format!(
-                    "blocked: {host} DNS returned no addresses — fail-closed SSRF guard"
+                    "blocked: {host} DNS returned no addresses : fail-closed SSRF guard"
                 )));
             }
             Ok(url)
         }
         Ok(Err(e)) => Err(crate::error::FetchError::Http(format!(
-            "blocked: DNS resolution failed for {host}: {e} — fail-closed SSRF guard"
+            "blocked: DNS resolution failed for {host}: {e} : fail-closed SSRF guard"
         ))),
         Err(_) => Err(crate::error::FetchError::Http(format!(
-            "blocked: DNS resolution timeout for {host} — fail-closed SSRF guard"
+            "blocked: DNS resolution timeout for {host} : fail-closed SSRF guard"
         ))),
     }
 }

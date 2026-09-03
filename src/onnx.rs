@@ -3,11 +3,11 @@
 //! ONNX Runtime backs OCR and the semantic reranker. It is acquired,
 //! linked and initialized differently on every target:
 //!
-//! - **Linux x86_64** — dlopen'd at runtime behind an AVX gate
-//! - **Linux aarch64** — no ONNX; released without `ocr,rerank`
-//! - **macOS arm64** — statically linked
-//! - **macOS x86_64** — no ONNX; released without `ocr,rerank`
-//! - **Windows x64** — statically linked; imports a `DirectML.dll` it
+//! - **Linux x86_64** : dlopen'd at runtime behind an AVX gate
+//! - **Linux aarch64** : no ONNX; released without `ocr,rerank`
+//! - **macOS arm64** : statically linked
+//! - **macOS x86_64** : no ONNX; released without `ocr,rerank`
+//! - **Windows x64** : statically linked; imports a `DirectML.dll` it
 //!   never calls
 //!
 //! Which targets get OCR/rerank at all is decided in the release matrix
@@ -16,8 +16,8 @@
 //! **The one rule that has already broken a release:** declare `ort` only
 //! in the two mutually exclusive `[target.'cfg(...)'.dependencies]`
 //! sections of `Cargo.toml`, never in shared `[dependencies]`. Cargo
-//! **unions** features across every target section whose cfg matches — it
-//! does not pick one — so a shared entry leaks Linux's `load-dynamic` onto
+//! **unions** features across every target section whose cfg matches : it
+//! does not pick one : so a shared entry leaks Linux's `load-dynamic` onto
 //! Windows/macOS, where it wins over static linking and ships a binary
 //! with no ONNX in it, no dylib beside it, and no error anywhere. That is
 //! exactly how v3.3.0 went out with OCR and rerank dead on win32-x64 and
@@ -27,7 +27,7 @@
 //! postmortem of the v3.3.0 wiring bug, and the Windows DirectML story.
 //! Read the section for the platform or failure you are actually touching.
 //!
-//! ## Linux x86_64 — dlopen behind an AVX gate
+//! ## Linux x86_64 : dlopen behind an AVX gate
 //!
 //! Dynamically loaded to avoid SIGILL on non-AVX CPUs. The prebuilt ONNX
 //! static archive contains unguarded AVX instructions in C++ global
@@ -38,57 +38,57 @@
 //! beside the binary, and dlopen'd at runtime after an AVX check. Non-AVX
 //! CPUs get a working binary minus OCR/rerank instead of a SIGILL.
 //!
-//! ## Linux aarch64 — no ONNX
+//! ## Linux aarch64 : no ONNX
 //!
 //! Released without `ocr,rerank`. ONNX Runtime's static global
 //! constructors can deadlock there (issue #9), so the features are simply
 //! not built rather than shipped broken.
 //!
-//! ## macOS — static link (arm64 only)
+//! ## macOS : static link (arm64 only)
 //!
 //! arm64 links statically via `download-binaries`; there is no AVX concept
 //! on ARM (NEON), so no gate is needed. x86_64-apple-darwin is released
 //! without `ocr,rerank` because `ort-sys` publishes no prebuilt for that
 //! target.
 //!
-//! ## Windows x64 — static link
+//! ## Windows x64 : static link
 //!
 //! Statically linked via `download-binaries`. AVX issues are rare (most
 //! x64 CPUs since 2011 have it), and dynamic loading is not an option
-//! regardless: pyke ships **no `onnxruntime.dll` for Windows at all** —
+//! regardless: pyke ships **no `onnxruntime.dll` for Windows at all** :
 //! the artifact is `onnxruntime.lib` (a ~305MB static archive) plus
 //! `DirectML.dll`, nothing else. Even if a DLL existed, the MSVC linker
 //! cannot build one from that archive because of duplicate protobuf
 //! symbols. See the DirectML section below for what the static link drags
 //! in.
 //!
-//! ## Postmortem — how the v3.3.0 feature leak stayed silent
+//! ## Postmortem : how the v3.3.0 feature leak stayed silent
 //!
 //! The rule itself is at the top of this comment; this is why nothing
 //! caught the violation. `load-dynamic` implies `ort-sys/disable-linking`,
-//! and `ort-sys`'s build script early-returns on that flag — before
-//! downloading anything and before `copy-dylibs` runs — so there is no
+//! and `ort-sys`'s build script early-returns on that flag : before
+//! downloading anything and before `copy-dylibs` runs : so there is no
 //! build-time error, only a runtime dlopen that finds nothing. At runtime,
 //! `load_and_init()` below still discards `commit()`'s `Result`, and the
 //! doctor's "static link, compiled in" line is a `cfg` constant rather
 //! than a probe, so neither surfaced it either. Worth fixing if you touch
 //! this again. The tell in the shipped artifacts was the Windows exe
-//! dropping 35.6MB -> 16.3MB — the missing ONNX static archive.
+//! dropping 35.6MB -> 16.3MB : the missing ONNX static archive.
 //!
-//! ## Windows — `DirectML.dll` is linked and never called
+//! ## Windows : `DirectML.dll` is linked and never called
 //!
 //! pyke's Windows archive is always built with the DirectML execution
 //! provider, so `ort-sys` unconditionally emits `dxguid`, `DXCORE`,
 //! `DXGI`, `D3D12` and `DirectML` link directives (see `ort-sys`
 //! `build/static_link/mod.rs`). `donsetch.exe` therefore hard-imports
 //! `DirectML.dll` by ordinal 2 (`DMLCreateDevice1`) and maps it at process
-//! start — but never calls it: we register no execution providers, so ONNX
+//! start : but never calls it: we register no execution providers, so ONNX
 //! runs on the CPU provider. Cost is address space plus a `DllMain`, not
 //! resident memory.
 //!
 //! This cannot be removed by features: `ort`'s `directml` feature maps to
 //! `ort-sys`'s `directml = []`, which is empty and referenced nowhere in
-//! its build scripts — it gates only the Rust-side EP API, not the
+//! its build scripts : it gates only the Rust-side EP API, not the
 //! prebuilt. Dropping the dependency would mean building ONNX Runtime from
 //! source without `--use_dml` and pointing `ORT_LIB_PATH` at it.
 //!
@@ -277,7 +277,7 @@ fn load_and_init() -> Result<(), String> {
     // Just initialize the ONNX environment (static link).
     // Surface commit() failures: the 3.3.0 leak shipped binaries
     // where the static archive was never linked in and this call
-    // failed silently — treat it as an error instead.
+    // failed silently : treat it as an error instead.
     // NOTE: commit() reports bool on this path too.
     if !ort::init().commit() {
         return Err("ONNX Runtime init failed (static)".to_string());

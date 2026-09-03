@@ -1,12 +1,12 @@
-//! OCR tier (Tier B) — text where the glyph stream fails.
+//! OCR tier (Tier B) : text where the glyph stream fails.
 //!
 //! Triggers (fusion trust audit):
 //!   - page has ink but zero glyph chars (scans)
 //!   - page glyph stream is garbage (PUA ratio high → broken encodings)
 //!
 //! Pipeline: PP-OCRv5 detection + recognition through `oar-ocr`
-//! (Apache-2.0, ONNX Runtime CPU). Models are the oar-ocr REGISTRY set —
-//! the exact checkpoints the crate is tested against — sha256-pinned in
+//! (Apache-2.0, ONNX Runtime CPU). Models are the oar-ocr REGISTRY set :
+//! the exact checkpoints the crate is tested against : sha256-pinned in
 //! this file and verified after download. Non-registry mirrors
 //! (monkt/paddleocr-onnx) have incompatible preprocessing; we do not use
 //! them. First use downloads ~12MB (EN) / ~21MB (CJK) to the lazy cache.
@@ -125,7 +125,7 @@ mod imp {
     }
 
     /// Download `m` (atomic tmp+rename) and verify the pinned sha256.
-    /// Fails closed on mismatch — a poisoned model is worse than no OCR.
+    /// Fails closed on mismatch : a poisoned model is worse than no OCR.
     fn fetch_model(m: &Model, dir: &std::path::Path) -> Result<PathBuf, String> {
         fn inner(m: &Model, dir: &std::path::Path) -> Result<PathBuf, String> {
             let dst = dir.join(m.name);
@@ -171,8 +171,8 @@ mod imp {
         }
 
         // Dedicated plain thread: `reqwest::blocking` panics when used on
-        // a tokio runtime thread — and `panic = "abort"` turns that into a
-        // process abort — and first-use downloads are triggered from async
+        // a tokio runtime thread : and `panic = "abort"` turns that into a
+        // process abort : and first-use downloads are triggered from async
         // fetch paths.
         let m = Model {
             name: m.name,
@@ -219,7 +219,7 @@ mod imp {
             // Run ONNX engine init in a separate thread with a timeout.
             // ONNX Runtime's C++ global constructors can deadlock on
             // some platforms (see pykeio/ort#579); the timeout prevents
-            // an infinite hang — if ONNX doesn't respond in 30s, OCR
+            // an infinite hang : if ONNX doesn't respond in 30s, OCR
             // is disabled and pages fall back to the glyph stream.
             let det_s = det.to_string_lossy().to_string();
             let rec_s = rec.to_string_lossy().to_string();
@@ -234,7 +234,7 @@ mod imp {
             match rx.recv_timeout(std::time::Duration::from_secs(30)) {
                 Ok(result) => result,
                 Err(_) => Err(
-                    "ONNX Runtime init timed out (30s) — OCR disabled, falling back to glyph stream"
+                    "ONNX Runtime init timed out (30s) : OCR disabled, falling back to glyph stream"
                         .to_string(),
                 ),
             }

@@ -101,7 +101,7 @@ pub fn assemble(page: PageChars) -> PageLines {
             let a = c.angle.abs();
             // Clean horizontal text only. Drop dummy glyphs (CR/LF,
             // size-1 decorations) and dingbat-font glyphs (checkboxes,
-            // seals — pictures, not text). Real space glyphs kept at
+            // seals : pictures, not text). Real space glyphs kept at
             // any size.
             a < 30.0 && c.cp != '\0' && (c.cp == ' ' || c.size >= 2.0) && !c.dingbat
         })
@@ -124,7 +124,7 @@ pub fn assemble(page: PageChars) -> PageLines {
     // the orchestrator flags it when /.-ratio is significant.
 
     // Baseline clustering: the glyph-box BOTTOM is the invariant anchor
-    // across tight/full charbox metrics — centers drift 1–3pt between
+    // across tight/full charbox metrics : centers drift 1-3pt between
     // kerned fragments and punctuation descenders on the same physical
     // line, which scrambled reading order when clustering on centers.
     chars.sort_by(|a, b| {
@@ -267,7 +267,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
     let mut g: Vec<f32> = Vec::new();
     // Real glyphs only. Space glyphs are SPLIT INTO TWO KINDS:
     //  - "real spaces": an actual drawn space claiming advance width
-    //    (word boundary — Korean, Devanagari, CJK↔Latin junctions)
+    //    (word boundary : Korean, Devanagari, CJK↔Latin junctions)
     //  - decorations: near-zero-width run markers, invisible.
     // Distinguisher is measured WIDTH, not presence.
     let space_width_real = |c: &&PdfChar| (c.x1 - c.x0) > 0.18 * c.size.max(2.0);
@@ -311,7 +311,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
         ly1 = ly1.max(c.y1);
 
         // Space insertion: script-aware + statistics-aware (real glyph
-        // gaps only — decorations are out of `reals`).
+        // gaps only : decorations are out of `reals`).
         if i > 0 {
             let gap = c.x0 - prev_x1;
             let widen = 0.16 * prev_size;

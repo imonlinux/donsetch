@@ -2,7 +2,7 @@
 //!
 //! Parses argv into the same JSON args the MCP dispatcher receives,
 //! calls the exact same `call_tool`, and renders the result.
-//! Zero logic duplication — all behavior lives in the core.
+//! Zero logic duplication : all behavior lives in the core.
 
 use crate::mcp::server::{self, Daemon};
 use crate::spec;
@@ -387,7 +387,7 @@ fn render_json_envelope(result: &Value, url: &str) -> Value {
             "error": {"kind": kind, "message": content},
         });
         // Errors carry structure too (next_action, escalation
-        // trace, url, status) — surface it, don't drop it.
+        // trace, url, status) : surface it, don't drop it.
         if !sc.is_null() {
             envelope["meta"] = sc;
         }
@@ -412,7 +412,7 @@ fn render_json_envelope(result: &Value, url: &str) -> Value {
 
 /// Print top-level help (when no subcommand given or --help).
 pub fn print_top_help() {
-    println!("donsetch — web research for AI agents: fetch, search, crawl");
+    println!("donsetch : web research for AI agents: fetch, search, crawl");
     println!();
     println!("USAGE: donsetch <command> [args]");
     println!();

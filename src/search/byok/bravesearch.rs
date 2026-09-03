@@ -2,7 +2,7 @@
 //!
 //! Distinct from the keyless `brave` SERP scraper in
 //! `src/search/engines.rs` (which scrapes search.brave.com's HTML,
-//! no key required) — this hits Brave's own REST API and needs a
+//! no key required) : this hits Brave's own REST API and needs a
 //! subscription token. Named `bravesearch` here to keep the two
 //! unambiguous in the provider list.
 //!
@@ -18,6 +18,7 @@
 //! Brave doesn't return a per-result position/rank field, so the
 //! score is derived from array order.
 
+use super::ProviderOutcome;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -54,7 +55,7 @@ fn parse_results(arr: &[Value]) -> Vec<SearchHit> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            // No position field from Brave — derive from array
+            // No position field from Brave : derive from array
             // order (0 → ~1.0, 9 → ~0.1).
             let score = 1.0 / (i as f32 + 1.0);
             Some(SearchHit {
@@ -146,7 +147,11 @@ pub async fn search(
     };
 
     let ms = started.elapsed().as_millis() as u64;
-    Ok((results, ms))
+    Ok(ProviderOutcome {
+        hits: results,
+        ms,
+        degraded: false,
+    })
 }
 
 #[cfg(test)]

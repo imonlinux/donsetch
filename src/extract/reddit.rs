@@ -1,12 +1,12 @@
 //! Reddit dedicated extractor for old.reddit.com.
 //!
-//! Bypasses DonSift entirely — selects and formats reddit-
+//! Bypasses DonSift entirely : selects and formats reddit-
 //! specific elements (posts, comments, vote buttons, tags)
 //! into compact, token-efficient markdown. Handles subreddit
 //! listings and comment threads with proper nesting.
 //!
 //! Returns `None` for non-reddit or unrecognized reddit pages
-//! (search, user pages without .thing elements) — the caller
+//! (search, user pages without .thing elements) : the caller
 //! falls back to generic DonSift.
 
 use scraper::{ElementRef, Html, Node, Selector};
@@ -14,9 +14,9 @@ use scraper::{ElementRef, Html, Node, Selector};
 use super::{ContentKind, ExtractOptions, Extracted, inline};
 
 /// Entry point. Tries the reddit extractor; returns `None`
-/// to signal "not reddit, or unrecognized — use generic".
+/// to signal "not reddit, or unrecognized : use generic".
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    // Respect explicit selectors and TOC — let DonSift handle.
+    // Respect explicit selectors and TOC : let DonSift handle.
     if opts.selector.is_some() || opts.toc {
         return None;
     }
@@ -134,7 +134,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
             "{rank}. {prefix}**{title}** ({domain}) · {score_n} pts · u/{author} · {time_abbr} · {comments} comments\n\n"
         ));
 
-        // Self-post body preview (if expanded in listing —
+        // Self-post body preview (if expanded in listing :
         // stickied/announcement posts often are).
         if let Some(body) = link.select(&body_sel).next() {
             let body_text = inline::plain(body);
@@ -217,7 +217,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         }
     }
 
-    // Comments — walk the nested tree.
+    // Comments : walk the nested tree.
     let comment_sel = Selector::parse("div.thing.comment").ok()?;
     let sitetable_sel = Selector::parse("div.sitetable").ok()?;
 
@@ -262,7 +262,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
 // ── Comment tree ──────────────────────────────────────────────
 
 /// Direct child `div.thing` elements of a sitetable (not
-/// descendants — old.reddit nests comments inside
+/// descendants : old.reddit nests comments inside
 /// `.child > .sitetable`, and scraper's `select` returns
 /// all descendants, which would double-count).
 fn get_direct_things(sitetable: ElementRef) -> Vec<ElementRef> {
@@ -348,7 +348,7 @@ fn render_comment(
 // ── Reddit .md content → markdown ──────────────────────────────
 
 fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
-    // Reddit comments always need links — links to playgrounds,
+    // Reddit comments always need links : links to playgrounds,
     // docs, code are content, not navigation.
     let md_opts = ExtractOptions {
         include_links: true,

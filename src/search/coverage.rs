@@ -9,7 +9,7 @@
 //! - **Compound terms**: "B-tree" becomes `b` + `tree`. A result
 //!   about "binary tree" matches `tree` and gets BM25 credit for
 //!   a compound it doesn't contain. The cross-encoder might even
-//!   agree — they're both tree data structures — but "binary tree"
+//!   agree : they're both tree data structures : but "binary tree"
 //!   is not "B-tree".
 //!
 //! - **Version numbers**: "5.2" becomes `5` + `2`. A result about
@@ -29,7 +29,7 @@
 //!   *different* version with the same major number, that's a
 //!   version drift → 0.3× penalty. If no query version appears
 //!   at all and a different version is present, same penalty.
-//!   If ANY query version appears in the result, no penalty —
+//!   If ANY query version appears in the result, no penalty :
 //!   handles "python 3.12 vs 3.11" comparison queries.
 //!
 //! The penalty is a multiplier on the existing score, so it
@@ -45,13 +45,13 @@ const ANCHOR_MISS_PENALTY: f64 = 0.3;
 
 /// Penalty for version/year mismatch (different value, same
 /// category). 0.3 = 70% score reduction. A wrong version is
-/// a different entity — "GLM 5.5" is not "GLM 5.2", just as
+/// a different entity : "GLM 5.5" is not "GLM 5.2", just as
 /// "binary tree" is not "B-tree". Same severity as anchor miss.
 const SPECIFIER_MISMATCH_PENALTY: f64 = 0.3;
 
 #[derive(Debug, Clone)]
 struct Entity {
-    /// Lowercased match forms — any of these in the result text
+    /// Lowercased match forms : any of these in the result text
     /// counts as a match.
     variants: Vec<String>,
 }
@@ -241,7 +241,7 @@ pub fn penalize(query: &str, results: &mut [Merged]) {
 
         // Version specifier: only penalize if NO query version
         // appears in the result. Handles "python 3.12 vs 3.11"
-        // — a result mentioning 3.11 matches one query version.
+        // : a result mentioning 3.11 matches one query version.
         let any_version_matches = query_versions.iter().any(|v| text_lower.contains(v));
         if !any_version_matches {
             for qv in &query_versions {
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn version_vs_query_no_penalty_for_either() {
-        // "python 3.12 vs 3.11" — result about 3.11 should NOT be
+        // "python 3.12 vs 3.11" : result about 3.11 should NOT be
         // penalized because 3.11 is also a query version.
         let mut results = vec![merged(
             "Python 3.11 release",
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn version_different_major_no_mismatch() {
-        // "5.2" in query, "3.8" in result — different major,
+        // "5.2" in query, "3.8" in result : different major,
         // "3.8" is probably a statistic, not a version mismatch
         let mut results = vec![merged(
             "GLM model",
@@ -583,7 +583,7 @@ mod tests {
         ];
         penalize("GLM-5.2 benchmarks", &mut results);
         // Result 0: has "glm-5.2" (anchor match) → no anchor penalty
-        // But wait — "GLM-5.2" is an anchor, and the query is "GLM-5.2 benchmarks"
+        // But wait : "GLM-5.2" is an anchor, and the query is "GLM-5.2 benchmarks"
         // The anchor is "glm-5.2" with variants ["glm-5.2", "glm 5.2", "glm5.2"]
         // Result 0 title has "GLM-5.2" → matches "glm-5.2" → no penalty
         assert!((results[0].score - 1.0).abs() < 1e-9);

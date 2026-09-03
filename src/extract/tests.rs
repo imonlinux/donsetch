@@ -1,4 +1,4 @@
-//! Comprehensive integration tests for DonSift — the
+//! Comprehensive integration tests for DonSift : the
 //! extraction engine. Tests the full pipeline: HTML bytes in
 //! → agent-ready markdown out. Every language, every block
 //! type, every edge case. This is what makes DonSift
@@ -214,7 +214,7 @@ fn extract_russian_article() {
     let html = r#"<html lang="ru"><head><title>Машинное обучение</title></head>
 <body><article>
 <h1>Машинное обучение</h1>
-<p>Машинное обучение — это раздел искусственного интеллекта,
+<p>Машинное обучение : это раздел искусственного интеллекта,
 который позволяет компьютерам учиться на данных.</p>
 <h2>Контролируемое обучение</h2>
 <p>При контролируемом обучении используются размеченные данные
@@ -763,13 +763,13 @@ fn edge_only_nav_and_footer() {
 <footer>© 2026 Site. All rights reserved.</footer>
 </body></html>"#;
     let r = extract_html(html);
-    // Should have minimal content — nav and footer are junk.
+    // Should have minimal content : nav and footer are junk.
     assert!(r.blocks_shown < 5);
 }
 
 #[test]
 fn edge_div_soup() {
-    // No semantic tags — just divs with text.
+    // No semantic tags : just divs with text.
     let html = r#"<html><body>
 <div class="wrapper">
 <div class="content">This is the main content paragraph with enough text to be extracted properly.</div>
@@ -864,7 +864,7 @@ fn pagination_utf8_boundary_safe() {
     );
     // Should not panic on UTF-8 boundaries.
     assert!(!r.markdown.is_empty());
-    // The slice should be valid UTF-8 (implicit — if it wasn't, the String would be invalid).
+    // The slice should be valid UTF-8 (implicit : if it wasn't, the String would be invalid).
 }
 
 #[test]
@@ -929,6 +929,25 @@ fn toc_mode_flat_page() {
         },
     );
     assert!(r.markdown.contains("no headings"));
+}
+
+#[test]
+fn toc_mode_is_not_replaced_by_raw_text_fallback() {
+    let body = "This paragraph belongs to the page body, not to its requested outline. ".repeat(20);
+    let html = format!(
+        r#"<html><head><title>Small guide</title></head><body><article>
+<h1>Small guide</h1><p>{body}</p>
+</article></body></html>"#
+    );
+    let r = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            toc: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.markdown.contains("[s1] Small guide"), "{}", r.markdown);
+    assert!(!r.markdown.contains("This paragraph belongs"));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1145,6 +1164,43 @@ fn content_density_large_page_many_chars_not_thin() {
     );
 }
 
+#[test]
+fn short_pdf_is_not_classified_as_an_html_shell() {
+    let doc = Html::parse_document("<html lang=\"en\"><title>Receipt</title></html>");
+    let meta = metadata::metadata(&doc);
+    let blocks = vec![blocks::Block::Para {
+        md: "Total due: EUR 12".to_string(),
+        link_density: 0.0,
+        path: Vec::new(),
+    }];
+    let pages = vec![crate::pdf::PageMeta {
+        page: 0,
+        chars: 17,
+        ocr: false,
+        confidence: 1.0,
+    }];
+    let lang = language::detect(&doc);
+
+    let out = downstream(
+        &meta,
+        blocks,
+        25_000,
+        false,
+        false,
+        Vec::new(),
+        lang,
+        Some(pages),
+        "https://example.com/receipt.pdf",
+        &ExtractOptions::default(),
+        16_000,
+    )
+    .unwrap();
+
+    assert!(!out.thin);
+    assert!(!out.markdown.contains("JS-rendered"));
+    assert_eq!(out.pdf_pages.as_ref().map(Vec::len), Some(1));
+}
+
 // ════════════════════════════════════════════════════════════
 // 12. CROSS-BLOCK DEDUP
 // ════════════════════════════════════════════════════════════
@@ -1236,7 +1292,7 @@ fn junk_script_style_stripped() {
 #[test]
 fn junk_sidebar_size_gated() {
     // A "sidebar" class on a LARGE container should NOT be
-    // stripped (false positive — could be the main content).
+    // stripped (false positive : could be the main content).
     let html = r#"<html><body>
 <div class="sidebar">
 <p>This is actually the main content despite the class name. It has substantial text content that makes it clearly the primary content of the page, not a sidebar at all. The size-gating should prevent this from being stripped by the junk filter even though the class name says sidebar.</p>
@@ -1457,7 +1513,7 @@ fn mixed_language_focus_cjk() {
             ..Default::default()
         },
     );
-    // "React" is Latin mixed into CJK — should still match.
+    // "React" is Latin mixed into CJK : should still match.
     assert!(!r.markdown.contains("*[focus"));
     assert!(r.markdown.contains("React") || r.markdown.contains("Facebook"));
 }
@@ -1584,7 +1640,7 @@ fn jsonld_unicode_escape_decoded() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 24. TABLE WITHOUT <th> — FIRST ROW PROMOTED TO HEADERS
+// 24. TABLE WITHOUT <th> : FIRST ROW PROMOTED TO HEADERS
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1605,7 +1661,7 @@ fn table_without_th_promotes_first_row() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 25. TABLE CELL TRUNCATION — CHAR-BASED (CJK)
+// 25. TABLE CELL TRUNCATION : CHAR-BASED (CJK)
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1688,7 +1744,7 @@ fn details_summary_as_heading() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 28. CODE BLOCK LANGUAGE DETECTION — MULTIPLE PATTERNS
+// 28. CODE BLOCK LANGUAGE DETECTION : MULTIPLE PATTERNS
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1710,7 +1766,7 @@ fn code_lang_detection_patterns() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 29. PAGINATE START — RESUMES AT BLOCK BOUNDARY
+// 29. PAGINATE START : RESUMES AT BLOCK BOUNDARY
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1757,7 +1813,7 @@ fn paginate_resume_starts_at_block_boundary() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 30. DESCRIPTION CAP — 500 CHARS MAX
+// 30. DESCRIPTION CAP : 500 CHARS MAX
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1834,7 +1890,7 @@ fn hn_extractor_fires_on_live_thread_shape() {
 }
 
 // ════════════════════════════════════════════════════════════
-// 30. PAGINATE — HOSTILE ARGS MUST NOT PANIC
+// 30. PAGINATE : HOSTILE ARGS MUST NOT PANIC
 // ════════════════════════════════════════════════════════════
 
 #[test]
@@ -1977,7 +2033,7 @@ fn v3_probe_regex_mode() {
         },
     );
     assert!(
-        r.markdown.starts_with("probe: MATCH — 2 hits"),
+        r.markdown.starts_with("probe: MATCH : 2 hits"),
         "{}",
         r.markdown
     );

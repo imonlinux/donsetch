@@ -1,6 +1,6 @@
 //! Docs-framework adapter: mkdocs / Docusaurus / Sphinx / Antora
 //! sites carry a nav sidebar that IS the site map. When detected,
-//! the output gains a compact `Site outline` — the agent sees the
+//! the output gains a compact `Site outline` : the agent sees the
 //! whole doc tree (and via L-handles, cheap links into it) before
 //! deciding what to read next. Composes with crawl's map phase.
 
@@ -35,7 +35,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     };
 
     // Render the outline. Version-switcher entries (bare semver
-    // labels) are picker UI, not pages — drop them; dedupe repeats.
+    // labels) are picker UI, not pages : drop them; dedupe repeats.
     let mut outline = String::from("## Site outline\n\n");
     let mut n = 0;
     let mut seen: Vec<(String, String)> = Vec::new();
@@ -68,7 +68,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let _ = fw;
 
     // Generic extraction of the MAIN content, with the outline
-    // prepended. We don't re-implement DonSift here — instead the
+    // prepended. We don't re-implement DonSift here : instead the
     // adapter mutates the HTML: strip the nav/sidebar/footer so
     // the generic pipeline focuses on content, and prepend the
     // outline as a leading heading block.
@@ -161,7 +161,7 @@ fn detect(doc: &Html) -> Option<Framework> {
     None
 }
 
-/// Nav entries as (depth, text, href) — depth from class
+/// Nav entries as (depth, text, href) : depth from class
 /// markers when present, else nesting level.
 fn nav_from(doc: &Html, selectors: &str) -> Vec<(usize, String, String)> {
     let sel = match Selector::parse(selectors) {

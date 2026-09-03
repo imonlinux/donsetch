@@ -1,4 +1,4 @@
-//! Dev/internal commands (`donsetch dev ...`) — extraction
+//! Dev/internal commands (`donsetch dev ...`) : extraction
 //! debugging, raw fetch probes, TLS fingerprint checks, ghost
 //! browser operations. Not part of the agent surface.
 

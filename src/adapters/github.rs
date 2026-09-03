@@ -1,5 +1,5 @@
 //! GitHub adapter: issues / PRs / releases / commits pages
-//! restructured from server-rendered HTML — no auth, no API-key
+//! restructured from server-rendered HTML : no auth, no API-key
 //! rate jail. The generic pipeline mangles these (sidebars,
 //! reaction rows, filter bars); the agent wants the thread.
 //!
@@ -80,7 +80,7 @@ fn text_of(el: ElementRef) -> String {
 fn render_issue_list(doc: &Html) -> Option<String> {
     // GitHub shipped a React list (2025+): CSS-module hashed
     // classnames, but stable data-testid hooks. The old
-    // li.js-issue-row markup still exists on some surfaces —
+    // li.js-issue-row markup still exists on some surfaces :
     // try the new shape first, keep the old as fallback.
     if let Some(md) = render_issue_list_modern(doc) {
         return Some(md);
@@ -308,11 +308,11 @@ fn render_thread_modern(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
             md.push_str("\n\n");
         }
     }
-    // Comments stream via JS — say so instead of silently
+    // Comments stream via JS : say so instead of silently
     // omitting the discussion.
     if doc.select(&skeleton_sel).next().is_some() {
         md.push_str(
-            "*(comments load dynamically — re-fetch with tier=2 to read the discussion)*\n",
+            "*(comments load dynamically : re-fetch with tier=2 to read the discussion)*\n",
         );
     }
     Some(md.trim_end().to_string())
@@ -417,7 +417,7 @@ fn render_releases(doc: &Html) -> Option<String> {
             .map(|d| d.chars().take(10).collect::<String>())
             .unwrap_or_default();
         n += 1;
-        md.push_str(&format!("## {tag} — {date}\n\n"));
+        md.push_str(&format!("## {tag} : {date}\n\n"));
         if let Some(notes) = rel.select(&notes_sel).next() {
             let notes_md =
                 crate::extract::inline::markdown(notes, "https://github.com", &gh_inline_opts()).0;
@@ -491,7 +491,7 @@ fn render_commits(doc: &Html) -> Option<String> {
 }
 
 // Links ARE the content on GitHub threads (commit refs, cross
-// links) — always render them.
+// links) : always render them.
 fn gh_inline_opts() -> crate::extract::ExtractOptions {
     ExtractOptions {
         include_links: true,
@@ -574,7 +574,7 @@ mod tests {
           </section>
         </body></html>"#;
         let ex = extract(html, "https://github.com/o/r/releases", &opts()).unwrap();
-        assert!(ex.markdown.contains("## v2.0.0 — 2026-02-01"));
+        assert!(ex.markdown.contains("## v2.0.0 : 2026-02-01"));
         assert!(ex.markdown.contains("Big rewrite"));
     }
 

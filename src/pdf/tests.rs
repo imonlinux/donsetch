@@ -1,6 +1,6 @@
 //! DonSheet corpus battery. Real-world PDFs in `tests/pdf-corpus/`
 //! (not committed). Every assertion is an invariant proven during
-//! the debugging campaign — they are regression gates, not hopes.
+//! the debugging campaign : they are regression gates, not hopes.
 
 use std::path::PathBuf;
 
@@ -254,7 +254,7 @@ fn w9_form_content() {
         !text.contains("ppy"),
         "dingbat checkbox glyphs leaked into text"
     );
-    // The IRS body font reports size 1.0 via GetFontSize — our matrix
+    // The IRS body font reports size 1.0 via GetFontSize : our matrix
     // fallback must give real sizes so paragraphs/grouping work.
     assert!(
         parsed.blocks.len() > 10,

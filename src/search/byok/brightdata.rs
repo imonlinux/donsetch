@@ -15,6 +15,7 @@
 //! Zone can also be set via DONSETCH_BRIGHTDATA_ZONE env var,
 //! which takes priority over the default but not over `::`.
 
+use super::ProviderOutcome;
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -26,32 +27,54 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DEFAULT_ZONE: &str = "serp_api1";
 
 /// Split the key into (token, zone). Supports `token::zone`
-/// encoding. Falls back to the env var, then the default.
-fn parse_key(key: &str) -> (String, String) {
-    if let Some((token, zone)) = key.split_once("::") {
-        return (token.to_string(), zone.to_string());
+/// encoding. Falls back to the env var, then the default. Empty
+/// token/zone is rejected: the user typed something wrong and
+/// the API would bill nothing but return a confusing error.
+pub(crate) fn parse_key(key: &str) -> Result<(String, String), String> {
+    if key.trim().is_empty() {
+        return Err("brightdata key is empty".to_string());
     }
-    let zone =
-        std::env::var("DONSETCH_BRIGHTDATA_ZONE").unwrap_or_else(|_| DEFAULT_ZONE.to_string());
-    (key.to_string(), zone)
+    if let Some((token, zone)) = key.split_once("::") {
+        if token.trim().is_empty() {
+            return Err("empty token before `::`".to_string());
+        }
+        if zone.trim().is_empty() {
+            return Err("empty zone after `::` (add a zone name or drop the suffix)".to_string());
+        }
+        return Ok((token.to_string(), zone.to_string()));
+    }
+    let zone = std::env::var("DONSETCH_BRIGHTDATA_ZONE")
+        .ok()
+        .filter(|z| !z.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ZONE.to_string());
+    Ok((key.trim().to_string(), zone))
 }
 
-/// URL-encode the query for the Google search URL.
+/// Percent-encode the query exactly per RFC 3986 over its UTF-8
+/// bytes (unreserved: A-Z a-z 0-9 - _ . ~). A char-code formatter
+/// like `%{:02X} c` is wrong for any non-ASCII input: 'é' encodes
+/// as %C3%A9 (two UTF-8 bytes), never %E9, and astral chars need
+/// four bytes. Spaces become '+' which Google accepts in queries.
 fn encode_query(q: &str) -> String {
-    q.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c.to_string()
-            } else if c == ' ' {
-                "+".to_string()
-            } else {
-                format!("%{:02X}", c as u32)
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(q.len() * 3);
+    for b in q.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' => {
+                out.push(*b as char)
             }
-        })
-        .collect()
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
-pub async fn search(
+pub(crate) async fn search(
     client: &reqwest::Client,
     key: &str,
     query: &str,
@@ -59,7 +82,7 @@ pub async fn search(
     intent: &crate::search::intent::Intent,
 ) -> ProviderResult {
     let started = Instant::now();
-    let (token, zone) = parse_key(key);
+    let (token, zone) = parse_key(key).map_err(|_| KeyError::InvalidKey)?;
 
     // Build the Google search URL with brd_json=1 for parsed JSON.
     // q must come first per Bright Data's docs.
@@ -168,7 +191,11 @@ pub async fn search(
         .unwrap_or_default();
 
     let ms = started.elapsed().as_millis() as u64;
-    Ok((results, ms))
+    Ok(ProviderOutcome {
+        hits: results,
+        ms,
+        degraded: false,
+    })
 }
 
 #[cfg(test)]
@@ -177,16 +204,35 @@ mod tests {
 
     #[test]
     fn parse_key_simple() {
-        let (token, zone) = parse_key("my-token-123");
+        let (token, zone) = parse_key("my-token-123").unwrap();
         assert_eq!(token, "my-token-123");
         assert_eq!(zone, "serp_api1");
     }
 
     #[test]
     fn parse_key_with_zone() {
-        let (token, zone) = parse_key("my-token-123::my_zone");
+        let (token, zone) = parse_key("my-token-123::my_zone").unwrap();
         assert_eq!(token, "my-token-123");
         assert_eq!(zone, "my_zone");
+    }
+
+    #[test]
+    fn parse_key_rejects_empty_parts() {
+        assert!(parse_key("").is_err());
+        assert!(parse_key("  ").is_err());
+        assert!(parse_key("::").is_err());
+        assert!(parse_key("tok::").is_err());
+        assert!(parse_key("::zon").is_err());
+    }
+
+    #[test]
+    fn parse_key_env_zone_fallback() {
+        unsafe { std::env::set_var("DONSETCH_BRIGHTDATA_ZONE", "env_zone") };
+        let (_, zone) = parse_key("abc").unwrap();
+        assert_eq!(zone, "env_zone");
+        let (_, zone2) = parse_key("abc::explicit").unwrap();
+        assert_eq!(zone2, "explicit");
+        unsafe { std::env::remove_var("DONSETCH_BRIGHTDATA_ZONE") };
     }
 
     #[test]
@@ -198,5 +244,16 @@ mod tests {
     #[test]
     fn encode_query_special() {
         assert_eq!(encode_query("a+b/c"), "a%2Bb%2Fc");
+    }
+
+    #[test]
+    fn encode_query_utf8_multibyte() {
+        // 'é' is U+00E9 = 0xC3 0xA9 in UTF-8. A char-code encode
+        // would emit %E9, which Google decodes as Latin-1 garbage.
+        assert_eq!(encode_query("café"), "caf%C3%A9");
+        // CJK: 日本語 = E6 97 A5 E6 9C AC E8 AA 9E
+        assert_eq!(encode_query("日本語"), "%E6%97%A5%E6%9C%AC%E8%AA%9E");
+        // Astral: emoji is 4 UTF-8 bytes.
+        assert_eq!(encode_query("a 🦀"), "a+%F0%9F%A6%80");
     }
 }

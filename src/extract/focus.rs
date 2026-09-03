@@ -13,7 +13,7 @@ const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
 /// Max blocks for semantic scoring. Pages with more blocks
-/// fall back to BM25-only — large pages are usually reference
+/// fall back to BM25-only : large pages are usually reference
 /// docs where keyword matching works well, and the latency
 /// of cross-encoder on 100+ blocks isn't worth it.
 const SEMANTIC_MAX_BLOCKS: usize = 80;
@@ -618,7 +618,7 @@ fn stem_en_double(stem: &str) -> String {
     if n >= 2 && chars[n - 1] == chars[n - 2] {
         let c = chars[n - 1];
         // Only double consonants (not vowels, not 'l'/'s'/'z'
-        // which Porter treats specially — but we keep it simple).
+        // which Porter treats specially : but we keep it simple).
         if !"aeioulsz".contains(c) {
             return chars[..n - 1].iter().collect();
         }
@@ -627,7 +627,7 @@ fn stem_en_double(stem: &str) -> String {
 }
 
 /// Light suffix stripping for Romance languages. Not a full
-/// stemmer — just strips common inflectional endings to
+/// stemmer : just strips common inflectional endings to
 /// improve cross-form matching. Conservative: stem ≥ 3 chars.
 fn stem_romance(word: &str, lang: &str) -> String {
     let w = word;
@@ -776,15 +776,15 @@ fn tokenize_cjk(text: &str, lang: &str) -> Vec<String> {
     for c in text.chars() {
         let s = language::char_script(c);
         if language::needs_char_tokenize(s) {
-            // CJK/Kana/Hangul/Thai char — flush any Latin word.
+            // CJK/Kana/Hangul/Thai char : flush any Latin word.
             flush_word(&mut word_buf, &mut tokens);
             cjk_buf.push(c);
         } else if c.is_alphanumeric() {
-            // Latin/Cyrillic/etc — flush CJK buffer, collect word.
+            // Latin/Cyrillic/etc : flush CJK buffer, collect word.
             flush_cjk(&mut cjk_buf, &mut tokens);
             word_buf.push(c);
         } else {
-            // Whitespace/punctuation — flush both buffers.
+            // Whitespace/punctuation : flush both buffers.
             flush_cjk(&mut cjk_buf, &mut tokens);
             flush_word(&mut word_buf, &mut tokens);
         }
@@ -846,7 +846,7 @@ fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
 
 /// BM25 block filter. Returns (kept blocks, fell_back).
 /// fell_back = true when the query matched nothing and we
-/// returned the full page — the CALLER must signal this,
+/// returned the full page : the CALLER must signal this,
 /// or the agent mistakes full content for focus matches.
 ///
 /// BM25-only version. Production code uses `filter_semantic`
@@ -1391,7 +1391,7 @@ mod tests {
         // Kanji unigrams.
         assert!(tokens.contains(&"機".to_string()));
         assert!(tokens.contains(&"械".to_string()));
-        // "の" is a stopword — should be filtered.
+        // "の" is a stopword : should be filtered.
         assert!(!tokens.contains(&"の".to_string()));
         // Non-stopword kana should be present.
         // "分" is a kanji (not kana), but let's test a non-stopword.

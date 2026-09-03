@@ -13,6 +13,20 @@ pub struct Cookie {
     host_only: bool,
     /// Unix-seconds expiry. None = session cookie.
     expires_at: Option<u64>,
+    /// Set only when a Secure attribute was present AND the
+    /// cookie was received over HTTPS. See RFC 6265 \u00a74.1.2.5
+    /// and \u00a78.5: a Secure cookie must never travel over a
+    /// plain-HTTP channel, in either direction.
+    secure: bool,
+    /// HttpOnly has no effect on a non-browser client (we have no
+    /// script context): it is carried for snapshot/vault
+    /// round-trip fidelity only.
+    http_only: bool,
+    /// "strict" | "lax" | "none", lowercase. SameSite is not
+    /// enforced at attach time (our fetch is its own top-level
+    /// context, so a direct GET is always a top-level navigation),
+    /// it is stored for round-trip fidelity.
+    same_site: String,
 }
 
 #[derive(Default)]
@@ -120,7 +134,11 @@ impl CookieJar {
     }
 
     /// Store all Set-Cookie headers from a response for `host`.
-    pub fn store_from_headers(&mut self, host: &str, headers: &[(String, String)]) {
+    /// `is_https` must reflect the scheme the response arrived
+    /// over: Secure cookies received over plain HTTP are dropped
+    /// (RFC 6265 §4.1.2.5), and the `__Secure-` / `__Host-`
+    /// prefix rules are enforced here.
+    pub fn store_from_headers(&mut self, host: &str, headers: &[(String, String)], is_https: bool) {
         let Some(normalized_host) = normalize_host(host) else {
             return;
         };
@@ -149,11 +167,16 @@ impl CookieJar {
             let mut path = "/".to_string();
             let mut expired = false;
             let mut expires_at: Option<u64> = None;
+            let mut secure = false;
+            let mut http_only = false;
+            let mut same_site = "lax".to_string();
+            let mut domain_attr_seen = false;
             for attr in parts {
                 let attr = attr.trim();
                 if let Some((k, val)) = attr.split_once('=') {
                     match k.trim().to_ascii_lowercase().as_str() {
                         "domain" => {
+                            domain_attr_seen = true;
                             let Some(normalized) = normalize_domain(val.trim()) else {
                                 continue;
                             };
@@ -164,7 +187,7 @@ impl CookieJar {
                             }
                             // RFC 6265 §5.3 step 6: reject Domain
                             // attributes that are not the request
-                            // host or a parent of it — otherwise any
+                            // host or a parent of it : otherwise any
                             // origin can pin cookies on any victim
                             // domain (cookie tossing).
                             if normalized == normalized_host
@@ -189,9 +212,41 @@ impl CookieJar {
                                 );
                             }
                         }
+                        "samesite" => {
+                            same_site = match val.trim().to_ascii_lowercase().as_str() {
+                                "strict" => "strict".to_string(),
+                                "lax" => "lax".to_string(),
+                                "none" => "none".to_string(),
+                                _ => "lax".to_string(),
+                            };
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Bare-flag attributes: Secure, HttpOnly.
+                    match attr.to_ascii_lowercase().as_str() {
+                        "secure" => secure = true,
+                        "httponly" | "http_only" => http_only = true,
                         _ => {}
                     }
                 }
+            }
+            // Attribute consistency rules (RFC 6265bis + prefix
+            // semantics). Violations reject the cookie outright:
+            // a setter asking for two contradictory things gets
+            // neither, and a Secure cookie can never enter the jar
+            // over plain HTTP.
+            if secure && !is_https {
+                continue;
+            }
+            if same_site == "none" && !secure {
+                continue;
+            }
+            if name.starts_with("__Secure-") && !secure {
+                continue;
+            }
+            if name.starts_with("__Host-") && (!secure || domain_attr_seen || path != "/") {
+                continue;
             }
             // Replace any existing cookie with same (name, domain, path).
             self.cookies
@@ -204,6 +259,9 @@ impl CookieJar {
                     path,
                     host_only,
                     expires_at,
+                    secure,
+                    http_only,
+                    same_site,
                 });
             }
         }
@@ -211,18 +269,19 @@ impl CookieJar {
     }
 
     /// Inject a cookie harvested out-of-band (DonGhost
-    /// clearance handoff). Leading-dot domains are
-    /// subdomain cookies; bare domains are host-only.
-    /// `expires_at` carries the real CDP expiry.
-    pub fn store_raw(&mut self, name: &str, value: &str, domain: &str, expires_at: Option<u64>) {
+    /// clearance handoff) into the jar. The record carries the
+    /// flags the browser saw at set time; a secure harvest must
+    /// never replay over plain HTTP, and prefix rules are
+    /// enforced on this ingress too.
+    pub fn store_raw(&mut self, rec: &CookieRecord) {
         // Same control-character rejection as store_from_headers:
         // CDP-harvested values must never split the Cookie header.
-        if name.contains(['\r', '\n', '\0']) || value.contains(['\r', '\n', '\0']) {
+        if rec.name.contains(['\r', '\n', '\0']) || rec.value.contains(['\r', '\n', '\0']) {
             return;
         }
         // Preserve leading-dot subdomain semantics
-        let is_subdomain = domain.trim().starts_with('.');
-        let Some(normalized) = normalize_domain(domain) else {
+        let is_subdomain = rec.domain.trim().starts_with('.');
+        let Some(normalized) = normalize_domain(&rec.domain) else {
             return;
         };
         // Reject invalid/public-suffix domains
@@ -230,15 +289,41 @@ impl CookieJar {
             return;
         }
         let host_only = !is_subdomain;
+        let path = if rec.path.is_empty() {
+            "/".to_string()
+        } else {
+            rec.path.clone()
+        };
+        // Prefix semantics, mirrored from store_from_headers: the
+        // harvest path is a second ingress into the same jar and
+        // must not be a route around the rules.
+        if rec.name.starts_with("__Secure-") && !rec.secure {
+            return;
+        }
+        if rec.name.starts_with("__Host-") && (!rec.secure || !host_only || path != "/") {
+            return;
+        }
+        let same_site = match rec.same_site.to_ascii_lowercase().as_str() {
+            "strict" => "strict",
+            "lax" => "lax",
+            "none" => "none",
+            _ => "lax",
+        };
+        if same_site == "none" && !rec.secure {
+            return;
+        }
         self.cookies
-            .retain(|c| !(c.name == name && c.domain == normalized && c.path == "/"));
+            .retain(|c| !(c.name == rec.name && c.domain == normalized && c.path == path));
         self.cookies.push(Cookie {
-            name: name.to_string(),
-            value: value.to_string(),
+            name: rec.name.clone(),
+            value: rec.value.clone(),
             domain: normalized,
-            path: "/".into(),
+            path,
             host_only,
-            expires_at,
+            expires_at: rec.expires_at,
+            secure: rec.secure,
+            http_only: rec.http_only,
+            same_site: same_site.to_string(),
         });
     }
 
@@ -264,13 +349,20 @@ impl CookieJar {
                 name: c.name.clone(),
                 value: c.value.clone(),
                 domain: c.domain.clone(),
+                path: "/".to_string(),
                 expires_at: c.expires_at,
+                secure: c.secure,
+                http_only: c.http_only,
+                same_site: c.same_site.clone(),
             })
             .collect()
     }
 
-    /// Cookie header value for a request to `host` + `path`, if any match.
-    pub fn header_for(&self, host: &str, path: &str) -> Option<String> {
+    /// Cookie header value for a request to `host` + `path` over
+    /// a channel of the given scheme, if any match. `is_https`
+    /// gates the Secure set: a Secure cookie is attached only on
+    /// a secure channel.
+    pub fn header_for(&self, host: &str, path: &str, is_https: bool) -> Option<String> {
         let normalized_host = normalize_host(host)?;
         let now = now_secs();
         let mut pairs: Vec<&Cookie> = Vec::new();
@@ -278,6 +370,10 @@ impl CookieJar {
             // Session cookies (no expiry) always match; expired
             // cookies must never be replayed.
             if c.expires_at.is_some_and(|e| e <= now) {
+                continue;
+            }
+            // Secure cookies never travel over plain HTTP.
+            if c.secure && !is_https {
                 continue;
             }
             let domain_ok = if c.host_only {
@@ -333,14 +429,15 @@ mod tests {
         jar.store_from_headers(
             "example.com",
             &[("Set-Cookie".to_string(), "a=1; Domain=com".to_string())],
+            false,
         );
         // Public suffix should be rejected -> fallback to host-only
         assert_eq!(jar.snapshot_for("example.com").len(), 1);
         assert_eq!(jar.snapshot_for("sub.example.com").len(), 0);
         assert_eq!(jar.snapshot_for("evil.com").len(), 0);
-        assert!(jar.header_for("example.com", "/").is_some());
-        assert!(jar.header_for("sub.example.com", "/").is_none());
-        assert!(jar.header_for("other.com", "/").is_none());
+        assert!(jar.header_for("example.com", "/", false).is_some());
+        assert!(jar.header_for("sub.example.com", "/", false).is_none());
+        assert!(jar.header_for("other.com", "/", false).is_none());
     }
 
     #[test]
@@ -349,45 +446,67 @@ mod tests {
         jar.store_from_headers(
             "example.co.uk",
             &[("Set-Cookie".to_string(), "a=1; Domain=co.uk".to_string())],
+            false,
         );
         assert_eq!(jar.snapshot_for("example.co.uk").len(), 1);
         assert_eq!(jar.snapshot_for("sub.example.co.uk").len(), 0);
         assert_eq!(jar.snapshot_for("evil.co.uk").len(), 0);
-        assert!(jar.header_for("example.co.uk", "/").is_some());
-        assert!(jar.header_for("sub.example.co.uk", "/").is_none());
+        assert!(jar.header_for("example.co.uk", "/", false).is_some());
+        assert!(jar.header_for("sub.example.co.uk", "/", false).is_none());
     }
 
     #[test]
     fn host_only_exact_match() {
         let mut jar = CookieJar::new();
-        jar.store_raw("a", "1", "example.com", None);
-        assert!(jar.header_for("example.com", "/").is_some());
-        assert!(jar.header_for("sub.example.com", "/").is_none());
-        assert!(jar.header_for("evil-example.com", "/").is_none());
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
+        assert!(jar.header_for("example.com", "/", false).is_some());
+        assert!(jar.header_for("sub.example.com", "/", false).is_none());
+        assert!(jar.header_for("evil-example.com", "/", false).is_none());
         assert_eq!(jar.snapshot_for("example.com").len(), 1);
         assert_eq!(jar.snapshot_for("sub.example.com").len(), 0);
         // host-only should not be visible on parent or unrelated
-        assert!(jar.header_for("other.com", "/").is_none());
+        assert!(jar.header_for("other.com", "/", false).is_none());
     }
 
     #[test]
     fn valid_example_com_matches_subdomain_not_evil() {
         let mut jar = CookieJar::new();
-        jar.store_raw("a", "1", ".example.com", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: ".example.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         // exact host matches
-        assert_eq!(jar.header_for("example.com", "/"), Some("a=1".to_string()));
+        assert_eq!(
+            jar.header_for("example.com", "/", false),
+            Some("a=1".to_string())
+        );
         // subdomains match
         assert_eq!(
-            jar.header_for("sub.example.com", "/"),
+            jar.header_for("sub.example.com", "/", false),
             Some("a=1".to_string())
         );
         assert_eq!(
-            jar.header_for("deep.sub.example.com", "/"),
+            jar.header_for("deep.sub.example.com", "/", false),
             Some("a=1".to_string())
         );
         // dot-boundary prevents evil-example.com
-        assert!(jar.header_for("evil-example.com", "/").is_none());
-        assert!(jar.header_for("evil.com", "/").is_none());
+        assert!(jar.header_for("evil-example.com", "/", false).is_none());
+        assert!(jar.header_for("evil.com", "/", false).is_none());
         // snapshot similarly
         assert_eq!(jar.snapshot_for("sub.example.com").len(), 1);
         assert_eq!(jar.snapshot_for("evil-example.com").len(), 0);
@@ -402,20 +521,33 @@ mod tests {
                 "Set-Cookie".to_string(),
                 "a=1; Domain=example.com".to_string(),
             )],
+            false,
         );
-        assert!(jar.header_for("sub.example.com", "/").is_some());
-        assert!(jar.header_for("example.com", "/").is_some());
-        assert!(jar.header_for("other.sub.example.com", "/").is_some());
-        assert!(jar.header_for("evil-example.com", "/").is_none());
+        assert!(jar.header_for("sub.example.com", "/", false).is_some());
+        assert!(jar.header_for("example.com", "/", false).is_some());
+        assert!(
+            jar.header_for("other.sub.example.com", "/", false)
+                .is_some()
+        );
+        assert!(jar.header_for("evil-example.com", "/", false).is_none());
     }
 
     #[test]
     fn unrelated_hosts_no_leak() {
         let mut jar = CookieJar::new();
-        jar.store_raw("a", "1", ".example.com", None);
-        assert!(jar.header_for("other.com", "/").is_none());
-        assert!(jar.header_for("example.org", "/").is_none());
-        assert!(jar.header_for("example.com.evil.com", "/").is_none());
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: ".example.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
+        assert!(jar.header_for("other.com", "/", false).is_none());
+        assert!(jar.header_for("example.org", "/", false).is_none());
+        assert!(jar.header_for("example.com.evil.com", "/", false).is_none());
         assert_eq!(jar.snapshot_for("other.com").len(), 0);
         assert_eq!(jar.snapshot_for("example.org").len(), 0);
     }
@@ -424,25 +556,88 @@ mod tests {
     fn malformed_domains_rejected() {
         let mut jar = CookieJar::new();
         // empty label
-        jar.store_raw("a", "1", "example..com", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: "example..com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
         // leading hyphen
-        jar.store_raw("b", "1", "-example.com", None);
+        jar.store_raw(&CookieRecord {
+            name: "b".to_string(),
+            value: "1".to_string(),
+            domain: "-example.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
         // trailing hyphen
-        jar.store_raw("c", "1", "example-.com", None);
+        jar.store_raw(&CookieRecord {
+            name: "c".to_string(),
+            value: "1".to_string(),
+            domain: "example-.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
         // empty
-        jar.store_raw("d", "1", "", None);
+        jar.store_raw(&CookieRecord {
+            name: "d".to_string(),
+            value: "1".to_string(),
+            domain: "".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
         // control char
-        jar.store_raw("e", "1", "example.com\u{00}", None);
+        jar.store_raw(&CookieRecord {
+            name: "e".to_string(),
+            value: "1".to_string(),
+            domain: "example.com\u{00}".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
         // underscore invalid label
-        jar.store_raw("f", "1", "exa_mple.com", None);
+        jar.store_raw(&CookieRecord {
+            name: "f".to_string(),
+            value: "1".to_string(),
+            domain: "exa_mple.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
         // double leading dot -> empty label after stripping one
-        jar.store_raw("g", "1", "..example.com", None);
+        jar.store_raw(&CookieRecord {
+            name: "g".to_string(),
+            value: "1".to_string(),
+            domain: "..example.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
 
         // via store_from_headers malformed should fallback to host-only
@@ -453,6 +648,7 @@ mod tests {
                 "Set-Cookie".to_string(),
                 "a=1; Domain=example..com".to_string(),
             )],
+            false,
         );
         // fallback host-only: only example.com visible
         assert_eq!(jar2.snapshot_for("example.com").len(), 1);
@@ -462,20 +658,74 @@ mod tests {
     #[test]
     fn raw_public_suffix_rejected() {
         let mut jar = CookieJar::new();
-        jar.store_raw("a", "1", "com", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: "com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("com").len(), 0);
         assert_eq!(jar.snapshot_for("example.com").len(), 0);
-        jar.store_raw("a", "1", ".com", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: ".com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("com").len(), 0);
-        jar.store_raw("a", "1", "co.uk", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: "co.uk".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("co.uk").len(), 0);
-        jar.store_raw("a", "1", ".co.uk", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: ".co.uk".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("co.uk").len(), 0);
-        jar.store_raw("a", "1", ".example.com.", None); // trailing dot should still be valid
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: ".example.com.".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        }); // trailing dot should still be valid
         assert_eq!(jar.snapshot_for("example.com").len(), 1);
         // but pure public suffix with trailing dot rejected
         jar = CookieJar::new();
-        jar.store_raw("a", "1", "com.", None);
+        jar.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: "com.".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
         assert_eq!(jar.snapshot_for("com").len(), 0);
     }
 
@@ -488,16 +738,26 @@ mod tests {
                 "Set-Cookie".to_string(),
                 "a=1; Domain=EXAMPLE.COM".to_string(),
             )],
+            false,
         );
         // normalized to lower case
-        assert!(jar.header_for("example.com", "/").is_some());
-        assert!(jar.header_for("EXAMPLE.COM", "/").is_some());
-        assert!(jar.header_for("sub.example.com", "/").is_some());
+        assert!(jar.header_for("example.com", "/", false).is_some());
+        assert!(jar.header_for("EXAMPLE.COM", "/", false).is_some());
+        assert!(jar.header_for("sub.example.com", "/", false).is_some());
         // trailing root dot stripped
         let mut jar2 = CookieJar::new();
-        jar2.store_raw("a", "1", ".Example.COM.", None);
-        assert!(jar2.header_for("example.com", "/").is_some());
-        assert!(jar2.header_for("sub.example.com.", "/").is_some());
+        jar2.store_raw(&CookieRecord {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            domain: ".Example.COM.".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
+        assert!(jar2.header_for("example.com", "/", false).is_some());
+        assert!(jar2.header_for("sub.example.com.", "/", false).is_some());
     }
 
     #[test]
@@ -509,9 +769,180 @@ mod tests {
                 "Set-Cookie".to_string(),
                 "a=1; Domain=exa\r\nmple.com".to_string(),
             )],
+            false,
         );
         // should fallback to host-only
         assert_eq!(jar.snapshot_for("example.com").len(), 1);
         assert_eq!(jar.snapshot_for("sub.example.com").len(), 0);
+    }
+
+    // -- Secure attribute semantics (GHSA draft, mnaza) -----------
+
+    #[test]
+    fn secure_cookie_never_replays_over_plain_http() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "sess=SECRET; Secure; Path=/".to_string(),
+            )],
+            true,
+        );
+        assert_eq!(jar.header_for("example.com", "/", false), None);
+        assert_eq!(
+            jar.header_for("example.com", "/", true),
+            Some("sess=SECRET".to_string())
+        );
+    }
+
+    #[test]
+    fn nonsecure_cookie_replays_over_both_schemes() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            &[("Set-Cookie".to_string(), "a=1".to_string())],
+            true,
+        );
+        assert!(jar.header_for("example.com", "/", false).is_some());
+        assert!(jar.header_for("example.com", "/", true).is_some());
+    }
+
+    #[test]
+    fn secure_cookie_from_plain_http_response_is_dropped() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "sess=SECRET; Secure; Path=/".to_string(),
+            )],
+            false,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 0);
+        assert_eq!(jar.header_for("example.com", "/", false), None);
+    }
+
+    #[test]
+    fn imported_secure_cookie_respects_the_flag() {
+        let mut jar = CookieJar::new();
+        jar.store_raw(&CookieRecord {
+            name: "sess".to_string(),
+            value: "SECRET".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            expires_at: None,
+            secure: true,
+            http_only: false,
+            same_site: "Lax".to_string(),
+        });
+        assert_eq!(jar.header_for("example.com", "/", false), None);
+        assert_eq!(
+            jar.header_for("example.com", "/", true),
+            Some("sess=SECRET".to_string())
+        );
+        // round-trips into the snapshot with the real flags
+        let snap = jar.snapshot_for("example.com");
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].secure);
+        assert!(!snap[0].http_only);
+    }
+
+    #[test]
+    fn httponly_flag_roundtrips_but_never_blocks_replay() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "a=1; HttpOnly; Path=/".to_string(),
+            )],
+            true,
+        );
+        let snap = jar.snapshot_for("example.com");
+        assert!(snap[0].http_only);
+        assert!(jar.header_for("example.com", "/", true).is_some());
+    }
+
+    #[test]
+    fn secure_prefix_cookie_requires_secure_attribute() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "__Secure-sess=SECRET; Path=/".to_string(),
+            )],
+            true,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 0);
+
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "__Secure-sess=SECRET; Secure; Path=/".to_string(),
+            )],
+            true,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 1);
+    }
+
+    #[test]
+    fn host_prefix_cookie_requires_secure_host_only_and_root_path() {
+        let mut jar = CookieJar::new();
+        // No Secure attribute: rejected.
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "__Host-sess=SECRET; Path=/".to_string(),
+            )],
+            true,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 0);
+        // Domain attribute: rejected even with Secure.
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "__Host-sess=SECRET; Secure; Domain=example.com; Path=/".to_string(),
+            )],
+            true,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 0);
+        // Correct form: accepted.
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "__Host-sess=SECRET; Secure; Path=/".to_string(),
+            )],
+            true,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 1);
+    }
+
+    #[test]
+    fn samesite_none_without_secure_is_dropped() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            &[("Set-Cookie".to_string(), "a=1; SameSite=None".to_string())],
+            true,
+        );
+        assert_eq!(jar.snapshot_for("example.com").len(), 0);
+
+        jar.store_from_headers(
+            "example.com",
+            &[(
+                "Set-Cookie".to_string(),
+                "a=1; SameSite=None; Secure".to_string(),
+            )],
+            true,
+        );
+        let snap = jar.snapshot_for("example.com");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].same_site, "none");
     }
 }

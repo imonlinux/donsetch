@@ -7,10 +7,10 @@ pub struct Meta {
     pub byline: Option<String>,
     pub published: Option<String>,
     pub site: Option<String>,
-    /// Meta description or og:description — a one-line summary
+    /// Meta description or og:description : a one-line summary
     /// agents can use to decide relevance without reading.
     pub description: Option<String>,
-    /// Canonical URL from <link rel="canonical"> — the
+    /// Canonical URL from <link rel="canonical"> : the
     /// authoritative version of the page (dedup signal).
     #[allow(dead_code)]
     pub canonical: Option<String>,
@@ -138,7 +138,7 @@ fn decode_unicode_escapes(s: &str) -> String {
             rest = &rest[4..];
             continue;
         }
-        // Invalid escape — keep literal.
+        // Invalid escape : keep literal.
         result.push_str("\\u");
     }
     result.push_str(rest);

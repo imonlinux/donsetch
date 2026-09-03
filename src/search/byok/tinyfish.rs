@@ -7,6 +7,7 @@
 //!
 //! Search is free (no credit cost), just rate-limited per key.
 
+use super::ProviderOutcome;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -121,5 +122,9 @@ pub async fn search(
         .unwrap_or_default();
 
     let ms = started.elapsed().as_millis() as u64;
-    Ok((results, ms))
+    Ok(ProviderOutcome {
+        hits: results,
+        ms,
+        degraded: false,
+    })
 }

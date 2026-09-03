@@ -12,10 +12,10 @@ pub struct H1Response {
 }
 
 /// Hard cap on an HTTP/1.1 response body (matches the
-/// decompression cap — bombs must fail before they allocate).
+/// decompression cap : bombs must fail before they allocate).
 const MAX_BODY: usize = 64 << 20;
 
-/// Generic over any async stream — works for both TLS
+/// Generic over any async stream : works for both TLS
 /// (`SslStream<TcpStream>`) and raw plaintext `TcpStream`
 /// (the http:// path).
 pub async fn get<S>(
@@ -28,13 +28,13 @@ where
 {
     // Header values are synthesized partly from response data
     // (cookies). A CR/LF/NUL inside one would split the request
-    // on the wire — refuse to send instead.
+    // on the wire : refuse to send instead.
     for (n, v) in headers {
         if !crate::fetch::guards::valid_header_value(n)
             || !crate::fetch::guards::valid_header_value(v)
         {
             return Err(FetchError::Http(
-                "h1: invalid header value (CR/LF/NUL) — refused to send".into(),
+                "h1: invalid header value (CR/LF/NUL) : refused to send".into(),
             ));
         }
     }
@@ -107,7 +107,7 @@ where
         }
         body.truncate(cl);
     } else {
-        // Read to close — still capped.
+        // Read to close : still capped.
         loop {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {

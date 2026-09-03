@@ -1,4 +1,4 @@
-//! `donsetch proxy` — manage proxy configuration.
+//! `donsetch proxy` : manage proxy configuration.
 //!
 //! Subcommands:
 //!   add <url> [url...] [--no-check]  Add proxies (validated, optionally probed)
@@ -219,7 +219,7 @@ async fn cmd_remove(args: &[String]) {
         } else if let Ok(n) = arg.parse::<usize>()
             && n >= 1
         {
-            // Index out of range — report as not found.
+            // Index out of range : report as not found.
             None
         } else {
             let id = normalize_id(arg);
@@ -580,7 +580,7 @@ async fn cmd_export(args: &[String]) {
 // ── Probe ────────────────────────────────────────────────────
 
 /// Connect through the proxy to api.ipify.org:80 via HTTP/1.0.
-/// No TLS — we're testing the tunnel, not the TLS stack. The
+/// No TLS : we're testing the tunnel, not the TLS stack. The
 /// response body is the exit IP address.
 async fn probe_proxy(px: &Proxy) -> ProbeResult {
     let t0 = Instant::now();

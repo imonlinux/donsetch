@@ -94,7 +94,7 @@ pub fn build_connector(
 
     // Session storage lives in connect(): tickets are
     // egress-scoped there (a proxy's ticket must never
-    // resume from the direct IP or another proxy — that
+    // resume from the direct IP or another proxy : that
     // would link the lanes at the edge).
 
     // OCSP stapling request (status_request extension), like Chrome.
@@ -183,7 +183,7 @@ pub async fn connect(
         .await
         .map_err(|e| FetchError::Tls(format!("{e:?}")))?;
 
-    // Chrome caches session tickets aggressively — so do
+    // Chrome caches session tickets aggressively : so do
     // we, but EGRESS-SCOPED (session_key carries the
     // proxy id when proxied; see fetch/client.rs).
     if let Some(sess) = stream.ssl().session() {

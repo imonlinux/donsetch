@@ -4,15 +4,19 @@
 
 **The web, for AI agents.**
 
+<div align="center">
+<a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
+</div>
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
+
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-751%20passed-00d4aa)](#)
+[![Tests](https://img.shields.io/badge/tests-766%20passed-00d4aa)](#)
 [![npm](https://img.shields.io/npm/v/donsetch?color=cb3837&logo=npm)](https://www.npmjs.com/package/donsetch)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
 
 [Install](#-install) · [Quickstart](#-quickstart) · [The 3 tools](#-the-3-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
 
@@ -35,8 +39,10 @@
 > straight into a Bright Data account.
 
 DonSeTch gives any AI agent full web research from a single local process.
-Three tools, zero API keys, zero accounts. Rust, one binary. Every layer
-built from scratch: no reqwest, no hyper, no Playwright, no Selenium.
+Three tools, zero API keys, zero accounts. Rust, one binary. The fetch
+and crawl transport is built from scratch: no hyper, no Playwright, no
+Selenium. (BYOK adapters and the opt-in CloakBrowser installer use
+reqwest; the core paths that run on every fetch do not.)
 
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes)
 and as a standalone CLI.
@@ -99,8 +105,9 @@ npm install -g donsetch
 ```
 
 Downloads the prebuilt binary for your platform from GitHub Releases
-with SHA256 verification. No build tools needed. Linux x86_64 works on
-any glibc >= 2.27 distro (Ubuntu 18.04+).
+with SHA256 verification. No build tools needed. Linux prebuilts run
+on glibc >= 2.35 (Ubuntu 22.04 LTS and newer; the bundled ONNX lib
+keeps its own 2.27 floor, so OCR/rerank work on every one of those).
 
 **Homebrew (macOS/Linux):**
 
@@ -135,6 +142,20 @@ cd donsetch
 cargo build --release --features ocr,rerank,http
 ```
 
+On Ubuntu 22.04 (or any distro with bfd 2.38): build with lld
+explicitly. bfd cannot parse the `.crel` relocations rustc 1.86+
+emits for aarch64, and the default link dies with "unknown
+architecture" errors:
+
+```bash
+sudo apt-get install -y cmake build-essential pkg-config libclang-dev clang lld nasm golang-go
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" cargo build --release
+```
+
+Same recipe works for the release-binaries-for-22.04 case: any
+prebuilt from v3.4.5+ is built on the Ubuntu 22.04 baseline and
+runs there directly.
+
 First build compiles BoringSSL (~2 min), cached after. Chromium is
 optional (tier 2 escalation); DonSeTch auto-discovers system Chromium,
 Playwright's cached builds, or Edge on Windows.
@@ -148,6 +169,47 @@ for those targets). Linux ARM64 has two honest limits: no OCR/rerank
 loader hang in some paths, tracked in CI).
 
 </details>
+
+### Selectable Ghost browser backend
+
+DonSeTch supports the original Chromium browser and CloakBrowser. The original
+Chromium backend remains the default behavior: headful on Xvfb/off-screen when
+available, with `--headless=new` only when no display is available.
+
+Set `DONSETCH_BROWSER_BACKEND` explicitly when choosing the runtime:
+
+```bash
+# Original Chromium backend (preserves the shipped behavior)
+DONSETCH_BROWSER_BACKEND=chromium donsetch doctor
+
+# Original Chromium binary, forced into headless mode
+DONSETCH_BROWSER_BACKEND=headless donsetch doctor --deep
+
+# CloakBrowser
+DONSETCH_BROWSER_BACKEND=cloakbrowser \
+  CLOAKBROWSER_BINARY_PATH=/path/to/chrome donsetch doctor --deep
+```
+
+Accepted aliases are `original` for `chromium` and `original-headless` for
+`headless`. `auto` (the default) always uses the original Chromium backend
+with the shipped headful/off-screen behavior. CloakBrowser is used only
+after explicit selection via `DONSETCH_BROWSER_BACKEND=cloakbrowser`; a
+bare `CLOAKBROWSER_BINARY_PATH` on its own never switches the backend.
+
+For a local CloakBrowser build, `CLOAKBROWSER_BINARY_PATH` is used without any
+network access. Public downloads are opt-in only:
+
+```bash
+DONSETCH_BROWSER_BACKEND=cloakbrowser \
+  DONSETCH_CLOAK_AUTO_DOWNLOAD=1 donsetch doctor --deep
+```
+
+The installer downloads the platform archive from CloakBrowser's public GitHub
+release, verifies its detached Ed25519-signed `SHA256SUMS`, binds the manifest
+to the requested Chromium version, checks the archive SHA-256, rejects unsafe
+archive paths, and caches the executable below DonSeTch's cache directory.
+`CLOAKBROWSER_VERSION` pins a full numeric version. CloakBrowser binaries are
+not bundled in DonSeTch releases or Docker images.
 
 **Verify the install:**
 
@@ -412,6 +474,7 @@ donsetch keys add tavily tvly-...       # Tavily
 donsetch keys add exa sk-exa-...        # Exa (stackable)
 donsetch keys add serper ...            # Serper.dev
 donsetch keys add serpapi ...           # SerpApi
+donsetch keys add serpbase sb-...       # SerpBase Google SERP (100 free searches)
 donsetch keys add bravesearch ...       # Brave Search API
 donsetch keys add tinyfish sk-...       # TinyFish (free tier)
 donsetch keys add parallel nKil3...     # Parallel AI (fast mode)
@@ -423,6 +486,42 @@ donsetch keys default local             # dispatch order: keyless first
 > Bright Data SERP, Web Unlocker, and their proxy/data products are
 > available at [get.brightdata.com](https://get.brightdata.com/ivqwoicrrlbr)
 > (affiliate link).
+
+### BYOK plugins (providers not natively supported yet)
+
+If the platform you have a key for is not natively supported, you can
+use a plugin as a workaround in the meantime: register any executable
+that answers a tiny stdin/stdout JSON contract, and DonSeTch treats it
+like any other search provider (default chain, fallback, attribution).
+Any language works: shell, Python, a compiled binary. No code changes
+to DonSeTch, no waiting for a release.
+
+```bash
+donsetch keys add plugin searxng --cmd 'python3 ~/searxng-adapter.py' --test
+```
+
+The adapter reads one JSON document on stdin and prints one on stdout.
+Request:
+
+```json
+{"format":1,"query":"rust async","max_results":8,"intent":"web","deadline_ms":30000}
+```
+
+Response:
+
+```json
+{"format":1,"results":[{"title":"...","url":"https://...","snippet":"...","score":0.9}]}
+```
+
+Errors: exit non-zero with a message on stderr, or respond with
+`{"format":1,"error":"...","retryable":true}`. Constraints that
+keep it reliable: hard timeout (default 30s, `--timeout` to change),
+8 MiB stdout cap, direct exec (no shell), killed on cancellation, and
+a malformed response degrades gracefully to the fallback chain.
+Keys belong in the adapter's own environment, never in DonSeTch
+config. Native support for the big/keyed providers (Exa, Bright Data,
+Tavily, Serper, SerpApi, Brave) keeps coming; plugins are the bridge
+for everything else.
 
 <div align="center">
 
@@ -458,20 +557,29 @@ heading breadcrumbs.
   `Docs` / `Table` / `Page`, quality score 0-1, agent-trust signals
   inline (focus-miss, JS-shell warning, empty-content note).
 
-**Tier 3 bypass** (opt-in): when ghost itself hits a hard wall, fetch
-falls back to Bright Data Web Unlocker if a key is configured
+**Tier 3 bypass** (opt-in): when ghost itself hits a hard wall,
+fetch falls back to Bright Data Web Unlocker if a key is configured
 (`donsetch keys add unlocker <key>[::zone]`). The unlocker solves
 server-side, captchas included, and returns rendered HTML into the
-normal pipeline. Advanced users only; DonSeTch works identically
-without it. (Bright Data sign-up link above is an affiliate link.)
+normal pipeline. Failures carry exact guidance (token rejected,
+zone not found, balance empty, rate limit, target still walled)
+attached to the fetch escalation trace, and `donsetch doctor --deep`
+validates the token and zone for free before the first paid call.
+Advanced users only; DonSeTch works identically without it.
+(Bright Data sign-up link above is an affiliate link.)
 
 **Solve-cache**: every successful unlock is cached locally (URL-hash
 keyed, sliding 6h TTL, 200 entries, parallel fetches share one paid
-call). Same page again inside the TTL = served from cache at zero cost.
+call, bodies stored byte-exact). Same page again inside the TTL =
+served from cache at zero cost.
 Env knobs: `DONSETCH_BYPASS=0` (off), `DONSETCH_BYPASS_MAX_DAILY`
-(default 50), `DONSETCH_BYPASS_TIMEOUT_SECS`, `DONSETCH_BYPASS_RENDER`,
-`DONSETCH_BYPASS_CACHE_TTL_SECS`, `DONSETCH_BYPASS_CACHE_MAX_ENTRIES`,
-`DONSETCH_BYPASS_CACHE=0`.
+(default 50), `DONSETCH_BYPASS_TIMEOUT_SECS` (default 120),
+`DONSETCH_BYPASS_RENDER`, `DONSETCH_BYPASS_CACHE_TTL_SECS`,
+`DONSETCH_BYPASS_CACHE_MAX_ENTRIES`, `DONSETCH_BYPASS_CACHE=0`,
+`DONSETCH_UNLOCKER_ZONE` (default zone), `DONSETCH_BYPASS_ENDPOINT`
+(test hook). Solver failures carry a concrete fix attached to the
+fetch's escalation trace, and `donsetch doctor --deep` probes the
+token + zone against Bright Data for free (no spend) first.
 
 <details>
 <summary><b>Anti-bot benchmark</b></summary>

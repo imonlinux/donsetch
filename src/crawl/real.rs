@@ -45,7 +45,7 @@ pub fn build(fetcher: Arc<Fetcher>, proxies: Vec<Proxy>) -> (Crawler, Arc<Govern
                 } else {
                     proxies.iter().find(|p| p.id() == lane)
                 };
-                // Proxy lanes: shared jar OUT — one cookie carrying
+                // Proxy lanes: shared jar OUT : one cookie carrying
                 // lane B's identity would link the two egress IPs.
                 let use_jar = proxy.is_none();
                 match fetcher

@@ -2,7 +2,7 @@
 //! blip, not a death.
 //!
 //! `donsetch mcp --supervised` spawns the real daemon as a child
-//! and proxies stdio. Release builds run `panic = "abort"` — a
+//! and proxies stdio. Release builds run `panic = "abort"` : a
 //! hostile page that trips an unguarded path would otherwise take
 //! the whole MCP session down. Under the supervisor the child
 //! restarts (500ms backoff, honest give-up after 5 rapid
@@ -13,7 +13,7 @@
 //! channel; the main loop multiplexes (new input | child death)
 //! with a poll timeout, so an idle crash is caught within 500ms
 //! and any bytes read-but-not-yet-forwarded when a child died are
-//! held as `pending` and written to the NEXT child — a request is
+//! held as `pending` and written to the NEXT child : a request is
 //! never silently dropped. The MCP surface is stateless here (the
 //! daemon answers requests without gating on `initialize`), so a
 //! restarted child resumes the session as-is.
@@ -91,7 +91,7 @@ pub fn run() -> std::io::Result<()> {
                     }
                 }
             });
-            // Held bytes first — they predate this child.
+            // Held bytes first : they predate this child.
             // (Write failure: this child already died; keep pending.)
             if !pending.is_empty() && stdin.write_all(&pending).is_ok() {
                 let _ = stdin.flush();
@@ -107,10 +107,10 @@ pub fn run() -> std::io::Result<()> {
                 if stdin.write_all(&bytes).is_ok() {
                     let _ = stdin.flush();
                 } else {
-                    // Child died under this write — hold the bytes
+                    // Child died under this write : hold the bytes
                     // for its replacement, never drop them.
                     pending = bytes;
-                    eprintln!("[supervisor] daemon died mid-write — holding request for restart");
+                    eprintln!("[supervisor] daemon died mid-write : holding request for restart");
                     restart_child(c, &mut restarts);
                     child = None;
                 }
@@ -124,7 +124,7 @@ pub fn run() -> std::io::Result<()> {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Idle: is the child still alive?
                 if let Ok(Some(_status)) = c.try_wait() {
-                    eprintln!("[supervisor] daemon died while idle — restarting");
+                    eprintln!("[supervisor] daemon died while idle : restarting");
                     restart_child(c, &mut restarts);
                     child = None;
                 }
@@ -143,7 +143,7 @@ fn restart_child(c: &mut Child, restarts: &mut u32) {
     *restarts += 1;
     if *restarts >= MAX_RAPID_RESTARTS {
         eprintln!(
-            "[supervisor] {MAX_RAPID_RESTARTS} rapid crashes — giving up (the daemon needs a look)"
+            "[supervisor] {MAX_RAPID_RESTARTS} rapid crashes : giving up (the daemon needs a look)"
         );
         std::process::exit(1);
     }

@@ -44,7 +44,7 @@ async fn main() {
             }
             // Without the `http` cargo feature the checks above compile
             // out, so a requested HTTP transport would silently fall
-            // through to stdio — fail loudly instead. (The linux-arm64
+            // through to stdio : fail loudly instead. (The linux-arm64
             // and macOS-x64 prebuilt binaries are core-only.)
             #[cfg(not(feature = "http"))]
             if args.iter().any(|a| a == "--http")
@@ -61,7 +61,7 @@ async fn main() {
             if args.iter().any(|a| a == "--supervised") {
                 // v3 crash-only design: `--supervised` spawns a child
                 // daemon and proxies stdio; a panic-abort (release runs
-                // panic=abort — one dead request would otherwise kill
+                // panic=abort : one dead request would otherwise kill
                 // the whole MCP session) restarts the child instead.
                 // Persistent state (handles, history, profiles) reloads
                 // from disk; the client sees a blip, not a death.
@@ -75,7 +75,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        "keys" => cli::keys::run(&args),
+        "keys" => cli::keys::run(&args).await,
         "proxy" => cli::proxy::run(&args).await,
         "status" => cli::status::run().await,
         "stop" => cli::stop::run(),
@@ -119,7 +119,7 @@ async fn route_help(cmd: &str) {
             let _ = cli::tool::run(cmd, &help_args).await;
         }
         "keys" => {
-            cli::keys::run(&["donsetch".into(), "keys".into(), "help".into()]);
+            cli::keys::run(&["donsetch".into(), "keys".into(), "help".into()]).await;
         }
         "proxy" => {
             // proxy::run is async, but print_help is sync.
@@ -157,7 +157,7 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch status");
             println!();
             println!("  Shows a quick overview: version, search config, proxies, cache, health.");
-            println!("  No probes, no browser launch — fast.");
+            println!("  No probes, no browser launch : fast.");
             println!("  For full diagnostics, run `donsetch doctor`.");
         }
         "doctor" => {

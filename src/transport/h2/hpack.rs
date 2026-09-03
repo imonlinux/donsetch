@@ -218,7 +218,7 @@ impl Encoder {
     /// Encode a header list in order. Indexed for exact static matches,
     /// literal-with-incremental-indexing otherwise (Chrome's strategy).
     /// Sensitive headers (cookie, authorization) use never-indexed to
-    /// match Chrome's HPACK encoder — keeps the dynamic table identical.
+    /// match Chrome's HPACK encoder : keeps the dynamic table identical.
     pub fn encode(&mut self, headers: &[(String, String)]) -> Vec<u8> {
         let mut out = Vec::new();
         for (name, value) in headers {
