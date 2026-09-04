@@ -124,6 +124,21 @@ pi install npm:donsetch
 Registers the 3 tools as native pi tools, spawns the binary at session
 start, self-updates with `pi update --extensions`.
 
+**DeepSeek Harness (`dsh`, first-class plugin):**
+
+```bash
+dsh plugin --profile web add github:dondai44423/donsetch-dsh
+```
+
+One line, and every dsh agent gets fetch, search and crawl as native
+`donsetch_*` tools (no `mcp__` import names, no manual MCP config): the
+plugin downloads the verified DonSeTch binary for your platform,
+registers the tools in-process on the harness registry, auto-updates
+with DonSeTch releases, and picks up `donsetch keys add` changes live
+from the terminal. Keyless engines work out of the box. See the
+[donsetch-dsh repo](https://github.com/dondai44423/donsetch-dsh) for
+the config reference and update semantics.
+
 <details>
 <summary><b>Build from source</b></summary>
 

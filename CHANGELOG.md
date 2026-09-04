@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Proxy` and BYOK `KeyEntry` derived a plaintext `Debug`:** neither
+  type has a live call site that formats it with `{:?}` today, but
+  nothing in the type system stopped one from being added later and
+  silently leaking a proxy password or a BYOK API key into a log or
+  error message. Both now redact the secret field behind a hand-
+  written `Debug` impl; `ProviderConfig`/`ByokConfig`'s derived
+  `Debug` picks up the redaction automatically through the nested
+  `KeyEntry`.
+
+## [3.5.2] - 2026-09-03
+
+### Added
+
+- **DeepSeek Harness (dsh) native plugin:** first-class dsh support
+  in a separate repo, [donsetch-dsh](https://github.com/dondai44423/donsetch-dsh).
+  One install line (`dsh plugin --profile web add github:dondai44423/donsetch-dsh`)
+  gives every dsh agent the full web suite as native `donsetch_*`
+  tools: in-process registration on the harness registry (permissions,
+  timeouts and cancellation apply like any native tool), platform
+  binary auto-download with SHA256 verification against the release
+  sidecar, auto-updates tracking DonSeTch releases, live pickup of
+  `donsetch keys add` config changes from the terminal, call/result
+  cards in the Web workbench, and a `donsetch_status` self-diagnostic
+  tool. Keyless engines work out of the box: no API key required.
+
 ### Added
 
 - **BYOK search plugins:** platforms without a native adapter can
