@@ -76,6 +76,8 @@ async fn main() {
             }
         }
         "keys" => cli::keys::run(&args).await,
+
+        "login" => cli::login::run(&args).await,
         "proxy" => cli::proxy::run(&args).await,
         "status" => cli::status::run().await,
         "stop" => cli::stop::run(),
@@ -207,6 +209,19 @@ async fn route_help(cmd: &str) {
             println!("  DONSETCH_HTTP_TOKEN=TOKEN     Require Authorization: Bearer TOKEN on /mcp");
             println!("  DONSETCH_HTTP_TIMEOUT_SECS=N  Per-request timeout (default 300)");
             println!("  DONSETCH_HTTP_CORS=1          Allow cross-origin requests (default off)");
+        }
+        "login" => {
+            println!("Usage: donsetch login [domain]");
+            println!();
+            println!("  Opens a real browser for you to sign into a site. Press Enter");
+            println!("  when done: the session is stored (vault, 0600) and every later");
+            println!("  fetch of that domain replays it, tier 1 and tier 2 alike.");
+            println!();
+            println!("  donsetch login --list      Show stored sessions (masked).");
+            println!("  donsetch login --status D  Detail one domain.");
+            println!("  donsetch login --logout D  Forget a domain.");
+            println!("  donsetch login --import F  Import a Netscape cookies.txt export.");
+            println!("  Credentials never enter donsetch: you type them into the browser.");
         }
         "tools" => {
             println!("Usage: donsetch tools");

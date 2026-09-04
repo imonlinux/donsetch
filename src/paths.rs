@@ -14,6 +14,11 @@ use std::path::{Component, Path, PathBuf};
 /// if the platform reports no cache directory (shouldn't happen
 /// on any real user account).
 pub fn cache_dir() -> PathBuf {
+    // Test/container override: everything stateful hangs off this
+    // one root, so redirecting it isolates a whole daemon cleanly.
+    if let Some(d) = std::env::var_os("DONSETCH_CACHE_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(d);
+    }
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("donsetch")

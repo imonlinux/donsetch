@@ -11,6 +11,12 @@ use crate::profile::BrowserProfile;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// Chrome's request-stream priority block: exclusive=1, dependent=0,
+/// weight=255 (main_nav / u=0,i). Ground truth: Chrome 151 Linux,
+/// captured live (examples/chrome_h2_probe.rs). Flags: END_STREAM|
+/// END_HEADERS|PRIORITY = 0x25.
+const CHROME_REQ_PRIORITY: [u8; 5] = [0x80, 0x00, 0x00, 0x00, 0xff];
+
 /// Hard cap on the decoded response body (matches h1/decompress).
 const MAX_BODY: usize = 64 << 20;
 /// Hard cap on the accumulated (possibly CONTINUATION-chained)
@@ -120,12 +126,17 @@ impl H2Conn {
         ];
         headers.extend(extra_headers.iter().cloned());
         let block = self.encoder.encode(&headers);
+        // PRIORITY flag + Chrome's 5-byte priority block, exactly as
+        // the real browser sends it on the request HEADERS frame.
+        let mut framed = Vec::with_capacity(CHROME_REQ_PRIORITY.len() + block.len());
+        framed.extend_from_slice(&CHROME_REQ_PRIORITY);
+        framed.extend_from_slice(&block);
         write_frame(
             &mut self.stream,
             HEADERS,
-            FLAG_END_HEADERS | FLAG_END_STREAM,
+            FLAG_END_HEADERS | FLAG_END_STREAM | FLAG_PRIORITY,
             stream_id,
-            &block,
+            &framed,
         )
         .await?;
         self.stream.flush().await?;
@@ -316,6 +327,16 @@ mod parity_tests {
                 0x00, 0x06, 0x00, 0x04, 0x00, 0x00, // MAX_HEADER_LIST_SIZE = 262144
             ]
         );
+    }
+
+    /// v3.6: Chromium 151 Linux live capture (examples/chrome_h2_probe.rs,
+    /// 2026-09-04): request HEADERS = flags 0x25 (END_STREAM|END_HEADERS|
+    /// PRIORITY) with the 5-byte priority block [E=1, dep=0, weight=255]
+    /// before the HPACK block. Update ONLY from a new capture.
+    #[test]
+    fn request_priority_matches_chrome_151() {
+        assert_eq!(CHROME_REQ_PRIORITY, [0x80, 0x00, 0x00, 0x00, 0xff]);
+        assert_eq!(FLAG_END_HEADERS | FLAG_END_STREAM | FLAG_PRIORITY, 0x25);
     }
 
     /// Pseudo-header order: m,a,s,p : Chromium's header order.

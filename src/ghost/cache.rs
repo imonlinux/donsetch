@@ -104,6 +104,19 @@ pub struct DomainProfile {
     /// earn a doomed tier-1 roundtrip.
     #[serde(default)]
     pub replay_ok: bool,
+
+    // === Solve-failure memory (v3.6: fail fast, honestly) ===
+    /// Consecutive ghost passes where the wall persisted even in a
+    /// REAL browser (challenge never cleared, content never came).
+    /// Two in a row puts the domain into a cooldown: the odds the
+    /// same host clears the same wall 20 minutes later are slim,
+    /// so fetches fail fast with an honest answer instead of
+    /// burning a full browser cycle per attempt.
+    #[serde(default)]
+    pub wall_fail_streak: u32,
+    /// Unix seconds of the most recent wall-persisted ghost pass.
+    #[serde(default)]
+    pub last_wall_fail: u64,
 }
 
 /// How to route a fetch to this host.
@@ -119,6 +132,10 @@ pub enum RouteDecision {
     /// Known to need tier 2, but hasn't been cold-checked in a
     /// while : try tier 1 cold. The wall may have been removed.
     RecheckCold,
+    /// The wall PERSISTED through real-browser solves recently
+    /// (twice or more). Fail fast with an honest answer; retry in
+    /// the carried number of seconds. No browser cycle wasted.
+    SolveCooldown(u64),
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -148,6 +165,16 @@ const RECHECK_INTERVAL: u64 = 24 * 60 * 60; // 24 hours
 
 /// SPA renders stale after 5 min.
 const RENDER_TTL: u64 = 5 * 60;
+
+/// Solve-cooldown backoff: 15 min base, doubling per consecutive
+/// wall-persisted failure, hard-capped at 2 hours. A permanently
+/// walled domain costs days of sub-second honest errors instead of
+/// a full browser cycle per fetch.
+fn solve_cooldown_secs(streak: u32) -> u64 {
+    let base: u64 = 15 * 60;
+    let shifts = streak.saturating_sub(2).min(3);
+    base << shifts
+}
 
 /// Max render cache entries. Each stores full HTML : cap to
 /// prevent unbounded growth. LRU eviction when full.
@@ -310,7 +337,7 @@ const SESSION_AUTH_HINTS: &[&str] = &[
 /// explicit auth-shaped names pass even with an expiry. Everything
 /// else (trackers, preferences, A/B buckets) is dropped so the
 /// vault stays small and meaningful.
-pub(crate) fn is_session_worthy(c: &CookieRecord) -> bool {
+pub fn is_session_worthy(c: &CookieRecord) -> bool {
     if c.domain.is_empty() || c.value.is_empty() {
         return false;
     }
@@ -358,7 +385,7 @@ pub(crate) fn merge_session_cookies(vault: &mut Vec<CookieRecord>, harvested: &[
 /// Load-modify-save with the same atomic tmp+rename write as the
 /// rest of the state file: a mid-write crash can never corrupt the
 /// vault it updates.
-pub(crate) fn store_session_cookies(cookies: &[CookieRecord]) {
+pub fn store_session_cookies(cookies: &[CookieRecord]) {
     if cookies.is_empty() {
         return;
     }
@@ -405,7 +432,7 @@ pub(crate) fn store_session_cookies(cookies: &[CookieRecord]) {
 
 /// Everything currently vaulted, across all domains, for replay
 /// into a fresh browser launch.
-pub(crate) fn load_session_cookies() -> Vec<CookieRecord> {
+pub fn load_session_cookies() -> Vec<CookieRecord> {
     let state = GhostState::load();
     let mut out = Vec::new();
     for p in state.profiles.values() {
@@ -416,6 +443,31 @@ pub(crate) fn load_session_cookies() -> Vec<CookieRecord> {
         }
     }
     out
+}
+
+/// Logout helper: drop every vaulted cookie whose domain belongs
+/// to `domain` (apex + subdomains + host-only subdomain cookies
+/// that feed the same session). Returns true if anything was
+/// removed. Load-modify-save, atomic, same as the harvest path.
+pub fn clear_session_cookies_for(domain: &str) -> bool {
+    let key = domain.trim_start_matches('.').to_ascii_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    let mut state = GhostState::load();
+    let mut removed = false;
+    for p in state.profiles.values_mut() {
+        let before = p.session_cookies.len();
+        p.session_cookies.retain(|c| {
+            let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
+            !crate::auth::cookie_belongs_to(&key, &host)
+        });
+        removed |= p.session_cookies.len() != before;
+    }
+    if removed {
+        state.save();
+    }
+    removed
 }
 
 // ────────────────────────── helpers ──────────────────────────
@@ -643,6 +695,20 @@ impl GhostState {
             return RouteDecision::Cold;
         };
         let n = now();
+        // Solve-cooldown comes FIRST: a domain whose wall survived
+        // real-browser passes recently fails fast until the cooldown
+        // lapses. Exponential backoff per failure streak, capped at
+        // 2 hours, so a permanently-walled domain costs an honest
+        // sub-second error instead of a 20-40s browser cycle per
+        // fetch.
+        if profile.wall_fail_streak >= 2 {
+            let cooldown = solve_cooldown_secs(profile.wall_fail_streak);
+            if profile.last_wall_fail > 0 && n.saturating_sub(profile.last_wall_fail) < cooldown {
+                return RouteDecision::SolveCooldown(
+                    cooldown.saturating_sub(n.saturating_sub(profile.last_wall_fail)),
+                );
+            }
+        }
         if profile.needs_tier2 {
             // Warm only when cookies are fresh AND tier-1 replay has
             // actually been verified to work for this domain. Vendors
@@ -686,6 +752,10 @@ impl GhostState {
         p.fetch_count += 1;
         p.last_cold_check = n;
         p.warm_fail_streak = 0;
+        // Tier 1 got real content : whatever wall state existed
+        // is irrelevant now. Clear the wall + cooldown memory.
+        p.wall_fail_streak = 0;
+        p.last_wall_fail = 0;
         if p.needs_tier2 {
             p.needs_tier2 = false;
             p.wall_vendor = None;
@@ -796,6 +866,10 @@ impl GhostState {
         p.needs_tier2 = true;
         p.warm_fail_streak = 0;
         p.replay_ok = replay_ok;
+        // A SOLVED wall clears the failure memory: the browser got
+        // through, so the environment can solve this domain today.
+        p.wall_fail_streak = 0;
+        p.last_wall_fail = 0;
         // A fresh solve restarts the lifetime observation window :
         // stale pre-fix lifetimes (the 1-second clamp bug) must
         // not outlive the solve that invalidated them.
@@ -808,7 +882,18 @@ impl GhostState {
         self.save();
     }
 
-    // ── Render cache (unchanged from v1) ──
+    /// Ghost pass ended walled: the challenge persisted even in a
+    /// REAL browser. Consecutive failures drive the solve-cooldown.
+    pub fn record_wall_failed(&mut self, host: &str) {
+        let n = now();
+        let p = self.profiles.entry(host.to_string()).or_default();
+        p.wall_fail_streak = p.wall_fail_streak.saturating_add(1);
+        p.last_wall_fail = n;
+        // A wall that survives a real browser tells nothing about
+        // cookies: keep whatever solve state existed. Only the
+        // cooldown memory updates.
+        self.save();
+    }
 
     pub fn record_render(&mut self, url: &str, html: &str) {
         // Skip oversized pages : caching 1MB+ HTML bloats the state
@@ -1239,6 +1324,70 @@ mod tests {
         assert!(p.replay_ok);
         // Still Warm-routable (cookies alive).
         assert!(matches!(s.route_for("hard.com"), RouteDecision::Warm(_)));
+    }
+
+    #[test]
+    fn solve_cooldown_backoff_caps_at_two_hours() {
+        assert_eq!(solve_cooldown_secs(2), 15 * 60);
+        assert_eq!(solve_cooldown_secs(3), 30 * 60);
+        assert_eq!(solve_cooldown_secs(4), 60 * 60);
+        assert_eq!(solve_cooldown_secs(5), 120 * 60);
+        assert_eq!(solve_cooldown_secs(9), 120 * 60, "hard cap");
+    }
+
+    #[test]
+    fn solve_cooldown_routes_fast_fail_then_heals() {
+        let mut s = GhostState::default();
+        s.record_wall_failed("poison.com");
+        s.record_wall_failed("poison.com");
+        // Inside the cooldown: fail fast, no browser cycle.
+        assert!(matches!(
+            s.route_for("poison.com"),
+            RouteDecision::SolveCooldown(_)
+        ));
+        // Cooldown lapsed: falls back to normal routing (cold here:
+        // no other memory on this fresh profile).
+        let p = s.profiles.get_mut("poison.com").unwrap();
+        p.last_wall_fail = now() - 16 * 60;
+        assert!(matches!(s.route_for("poison.com"), RouteDecision::Cold));
+    }
+
+    #[test]
+    fn solved_wall_clears_cooldown_memory() {
+        let mut s = GhostState::default();
+        s.record_wall_failed("heals.com");
+        s.record_wall_failed("heals.com");
+        s.record_solved(
+            "heals.com",
+            &[cr("cf_clearance", "x", ".heals.com", Some(9_999_999_999))],
+            Some("Cloudflare"),
+            true,
+        );
+        let p = &s.profiles["heals.com"];
+        assert_eq!(p.wall_fail_streak, 0);
+        assert_eq!(p.last_wall_fail, 0);
+        assert!(matches!(s.route_for("heals.com"), RouteDecision::Warm(_)));
+    }
+
+    #[test]
+    fn cold_ok_clears_cooldown_memory() {
+        let mut s = GhostState::default();
+        s.record_wall_failed("eases.com");
+        s.record_wall_failed("eases.com");
+        s.record_cold_ok("eases.com");
+        let p = &s.profiles["eases.com"];
+        assert_eq!(p.wall_fail_streak, 0);
+        assert!(!p.needs_tier2);
+    }
+
+    #[test]
+    fn one_wall_fail_is_not_a_cooldown() {
+        let mut s = GhostState::default();
+        s.record_wall_failed("once.com");
+        assert!(
+            !matches!(s.route_for("once.com"), RouteDecision::SolveCooldown(_)),
+            "a single failure must not gate the domain"
+        );
     }
 
     #[test]

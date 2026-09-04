@@ -265,6 +265,7 @@ pub async fn ghost_fetch(
     let mut clicked_consent = false;
     let mut kicked = false;
     let mut vendor: Option<String> = None;
+    let mut scrolled = false; // one-time lazy-load kick for big SPAs
     let mut settle_streak = 0u8;
     let mut dead_streak = 0u32; // consecutive polls: DOM static + visible < 80
     let mut prev_len = 0usize;
@@ -444,8 +445,22 @@ pub async fn ghost_fetch(
         // Measured: crates.io shell 8KB (needs ~3s), Discourse
         // shell 30KB (needs ~2-3s), both grow to 100-400KB after
         // hydration. example.com 559B (already complete at t=0).
+        // Tiered settle: small DOMs = static pages, 80 visible chars
+        // is substance. Big DOMs (>= 50KB) = JS-heavy SPAs: anything
+        // under the extraction thin-gate (800 chars) is a shell that
+        // hasn't finished hydrating (sephora's PDP: 591KB DOM, 400
+        // visible chars of nav/boilerplate at t=5s, product content
+        // lands later). Big DOMs need 800+ visible chars to settle;
+        // below that, one scroll kick fires to trigger lazy
+        // hydration (infinite scroll + viewport-gated render).
+        let big_dom = cur_len >= 50_000;
         let visible = visible_text_len(&html);
-        let substantive = visible >= 80;
+        let substantive = visible >= if big_dom { 800 } else { 80 };
+        if big_dom && visible < 800 && !scrolled && start.elapsed() > Duration::from_secs(8) {
+            scrolled = true;
+            let _ = ghost.scroll("down", 2400).await;
+            continue;
+        }
         let stable = prev_len > 0 && cur_len.abs_diff(prev_len) < cur_len / 100 + 64;
         let min_settle = if cur_len < 50_000 {
             Duration::from_secs(4)

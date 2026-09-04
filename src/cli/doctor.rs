@@ -133,6 +133,9 @@ pub async fn run() {
     // 8. Cache directory.
     report!("Cache directory", check_cache_dir());
 
+    // 8b. Auth sessions (donsetch login).
+    report!("Auth sessions", check_auth_sessions());
+
     // 9. State permissions.
     report!("State permissions", check_state_permissions());
 
@@ -565,6 +568,38 @@ fn check_ghost_profile() -> CheckResult {
         }
         Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
     }
+}
+
+fn check_auth_sessions() -> CheckResult {
+    let reg = crate::auth::AuthRegistry::load();
+    if reg.domains.is_empty() {
+        return CheckResult::Pass(
+            "no stored logins (use `donsetch login <domain>` to fetch gated sites)".into(),
+        );
+    }
+    let t = crate::ghost::cache::now();
+    let mut unverified = Vec::new();
+    let mut expiring = Vec::new();
+    for (d, s) in &reg.domains {
+        if s.verified == Some(false) {
+            unverified.push(d.clone());
+        }
+        // Session cookies (no expiry) never trip the near-expiry warn.
+        if let Some(min) = s.expires_min
+            && min > t
+            && min < t + 86_400
+        {
+            expiring.push(format!("{d} ({})", crate::auth::fmt_expiry(Some(min))));
+        }
+    }
+    let mut note = format!("{} domain(s) with stored sessions", reg.domains.len());
+    if !unverified.is_empty() {
+        note.push_str(&format!("; unverified: {}", unverified.join(", ")));
+    }
+    if !expiring.is_empty() {
+        note.push_str(&format!("; expiring soon: {}", expiring.join(", ")));
+    }
+    CheckResult::Pass(note)
 }
 
 fn check_cache_dir() -> CheckResult {

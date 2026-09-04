@@ -36,6 +36,15 @@ pub struct Daemon {
     crawler: Crawler,
     handles: Arc<Mutex<crate::handles::HandleTable>>,
     history: Arc<std::sync::Mutex<crate::pages::history::PageHistory>>,
+    /// (modified, len) of ghost-state.json at the last vault refresh:
+    /// a login or logout CLI write flips this and the next tool call
+    /// resyncs the cookie jar. mtime-only would miss same-second
+    /// login+logout pairs, hence the length pair.
+    vault_seen: tokio::sync::Mutex<Option<(u64, u64)>>,
+    /// One background pre-solve at a time: search hints for a walled
+    /// domain trigger a solve while the agent is still reading
+    /// results. Cheap spinlock: a lost race just skips the win.
+    pre_solve_busy: std::sync::atomic::AtomicBool,
 }
 
 impl Daemon {
@@ -140,6 +149,8 @@ impl Daemon {
             history: Arc::new(std::sync::Mutex::new(
                 crate::pages::history::PageHistory::load(),
             )),
+            vault_seen: tokio::sync::Mutex::new(None),
+            pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -147,6 +158,38 @@ impl Daemon {
     /// Called by the CLI before exit; by the MCP daemon on close.
     pub async fn shutdown(&self) {
         self.ghost_mgr.shutdown().await;
+    }
+
+    /// Resync the tier-1 cookie jar from the session vault when the
+    /// on-disk file moved (login/logout/rotation). Stat-only in the
+    /// hot path; parse only after a real change.
+    pub async fn refresh_vault(&self) {
+        let meta = std::fs::metadata(crate::paths::cache_dir().join("ghost-state.json"))
+            .ok()
+            .map(|m| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    (m.mtime() as u64, m.len())
+                }
+                #[cfg(not(unix))]
+                {
+                    (0u64, m.len())
+                }
+            });
+        let Some(sig) = meta else { return };
+        let changed = {
+            let mut seen = self.vault_seen.lock().await;
+            let changed = *seen != Some(sig);
+            if changed {
+                *seen = Some(sig);
+            }
+            changed
+        };
+        if changed {
+            let cookies = crate::ghost::cache::load_session_cookies();
+            self.fetcher.reset_to(&cookies).await;
+        }
     }
 }
 
@@ -410,6 +453,7 @@ pub(crate) async fn call_tool_ctx(
 /// DonSift. Resume tokens make huge sites paginable.
 #[allow(clippy::field_reassign_with_default)]
 async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) -> Value {
+    daemon.refresh_vault().await;
     // Resume can work without a url (the seed is stored in the
     // resume state). If url is missing AND no resume token, error.
     let url = match args.get("url").and_then(Value::as_str) {
@@ -842,6 +886,7 @@ fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String {
 /// with warm-start and render cache.
 #[allow(clippy::field_reassign_with_default)]
 async fn fetch_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx>) -> Value {
+    daemon.refresh_vault().await;
     let deadline = args
         .get("deadline_ms")
         .and_then(Value::as_u64)
@@ -1415,8 +1460,29 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
         RouteDecision::Warm(_) => "warm",
         RouteDecision::SkipToSolve => "skip-to-solve",
         RouteDecision::RecheckCold => "recheck-cold",
+        RouteDecision::SolveCooldown(_) => "solve-cooldown",
     };
     trace.step("route", "domain-profile", route_name, 0);
+
+    // Fail-fast memory: the wall survived real-browser passes
+    // recently. Honest error, no browser cycle. The cooldown
+    // lapses on its own; success memories from other layers
+    // (record_cold_ok) clear it on their own cadence.
+    if let RouteDecision::SolveCooldown(retry_in) = route {
+        return tool_error_structured(
+            format!(
+                "known wall at {host} : recent browser passes did not clear it on this host; retrying before {retry_in}s from now would waste a solve cycle"
+            ),
+            "walled",
+            Some(json!({
+                "url": url,
+                "status": 0,
+                "retry_in_secs": retry_in,
+                "next_action": "wait for the cooldown, or browse the site with an interactive agent browser (your human session clears walls this host cannot)",
+                "escalation": trace.value(),
+            })),
+        );
+    }
 
     // === Fetch (tier 1, unless skipped) ===
     let mut out: Option<crate::fetch::client::FetchOutcome> = None;
@@ -2152,7 +2218,7 @@ async fn ghost_escalate(
         .map_err(|e| (format!("browser launch failed: {e}"), "permanent"))?;
     trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
     let t1 = std::time::Instant::now();
-    let page = match ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20)).await {
+    let mut page = match ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20)).await {
         Ok(p) => p,
         Err(e) => {
             // CDP timeouts on first attempt are transient : the
@@ -2188,15 +2254,99 @@ async fn ghost_escalate(
         );
     }
     if page.captcha {
-        if let Some(p) = shot {
-            let _ = g.screenshot(p).await;
+        // Solve-grade second pass: some vendors (Akamai) run the
+        // sensor on the first load and only clear on a follow-up
+        // navigation once their first-party state is planted. The
+        // browser is warm now: one bounded re-render, then a
+        // settle re-check. Never more: two passes is the ceiling,
+        // an honest captcha stays an honest captcha.
+        let t1b = std::time::Instant::now();
+        let page2 = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
+            .await
+            .ok();
+        match page2 {
+            Some(p2) if !p2.captcha => {
+                trace.step(
+                    "2",
+                    "solve-pass2",
+                    &format!(
+                        "cleared: captcha={} dom={}KB",
+                        p2.captcha,
+                        p2.html.len() / 1024
+                    ),
+                    t1b.elapsed().as_millis(),
+                );
+                // Fall through into the normal harvest/retry flow.
+                page = p2;
+            }
+            Some(p2) if p2.captcha => {
+                if let Some(p) = shot {
+                    let _ = g.screenshot(p).await;
+                }
+                // The wall survived BOTH passes in a real browser:
+                // this is wall-persisting evidence, recorded.
+                daemon.state.lock().await.record_wall_failed(host);
+                return Err((
+                    format!(
+                        "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
+                    ),
+                    "walled",
+                ));
+            }
+            // ghost_fetch errored on the retry (automation failure,
+            // not a wall): no wall memory recorded.
+            None => {
+                if let Some(p) = shot {
+                    let _ = g.screenshot(p).await;
+                }
+                return Err((
+                    format!(
+                        "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
+                    ),
+                    "walled",
+                ));
+            }
+            _ => unreachable!(),
         }
-        return Err((
-            format!(
-                "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
-            ),
-            "walled",
-        ));
+    }
+    if !page.captcha {
+        // Solve-grade pass for invisible walls: Akamai-class vendors
+        // render a "still checking" page that settles (no captcha
+        // form) but whose DOM classifies as a wall. The sensor fires
+        // during pass 1 and plants first-party state; a warm re-render
+        // right after is the pass that gets the real page. One
+        // attempt only, then fall into the normal flow regardless.
+        let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
+        // Gate: a stuck wall burns the FULL 20s in pass 1; a second
+        // 20s pass2b on top = 40s of dead air. Only re-render when
+        // pass 1 returned fast (the wall cleared mid-flight and the
+        // re-render catches the real page).
+        if matches!(
+            dom_verdict,
+            crate::detect::walls::Verdict::Challenge(_) | crate::detect::walls::Verdict::Blocked
+        ) && page.took < std::time::Duration::from_secs(12)
+        {
+            let t1b = std::time::Instant::now();
+            if let Ok(p2) = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20)).await
+            {
+                let v2 = crate::detect::walls::detect_dom_smart(p2.html.as_bytes());
+                if !p2.captcha
+                    && !matches!(
+                        v2,
+                        crate::detect::walls::Verdict::Challenge(_)
+                            | crate::detect::walls::Verdict::Blocked
+                    )
+                {
+                    trace.step(
+                        "2",
+                        "solve-pass2",
+                        &format!("cleared after re-render: {}KB", p2.html.len() / 1024),
+                        t1b.elapsed().as_millis(),
+                    );
+                    page = p2;
+                }
+            }
+        }
     }
     if !page.cookies.is_empty() {
         daemon.fetcher.import_cookies(&page.cookies).await;
@@ -2424,6 +2574,7 @@ async fn ghost_escalate(
     // (→ "not found"), sometimes larger (→ "blocked").
     let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
     if matches!(dom_verdict, Verdict::Challenge(_)) {
+        daemon.state.lock().await.record_wall_failed(host);
         return Err((
             format!(
                 "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
@@ -2439,6 +2590,7 @@ async fn ghost_escalate(
             "permanent",
         ));
     }
+    daemon.state.lock().await.record_wall_failed(host);
     Err((
         format!(
             "blocked at {url} : tier 2 rendered a {}KB DOM but no real content was extractable. Use an Agent browser to browse sites like these",
@@ -3343,6 +3495,7 @@ async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> Vec<String> 
 }
 
 async fn search_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx>) -> Value {
+    daemon.refresh_vault().await;
     let deadline = args
         .get("deadline_ms")
         .and_then(Value::as_u64)
@@ -3470,7 +3623,11 @@ async fn search_inner(
     intent: Option<Intent>,
 ) -> Value {
     match search_outcome(daemon, query, max, intent).await {
-        Ok(out) => render_search_outcome(daemon, &out, query).await,
+        Ok(out) => {
+            let top = out.results.first().map(|r| r.url.as_str());
+            maybe_pre_solve(daemon, top);
+            render_search_outcome(daemon, &out, query).await
+        }
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried),
     }
 }
@@ -3505,6 +3662,10 @@ async fn search_batch_inner(
         .iter()
         .map(|query| search_outcome(daemon, query, max, intent));
     let outcomes = futures_util::future::join_all(futures).await;
+    if let Some(Ok(first)) = outcomes.first() {
+        let top = first.results.first().map(|r| r.url.as_str());
+        maybe_pre_solve(daemon, top);
+    }
     let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
     if ok == 0 {
         let errors = queries
@@ -3646,6 +3807,103 @@ async fn search_outcome(
 /// Search failure → structured error: every engine (and BYOK if
 /// tried) failed. The agent needs to know retrying is safe and
 /// what the levers are (BYOK keys, intent, simpler query).
+/// Predict-prefetch the walledest top result while the agent reads
+/// results: when the top URL's domain is known-walled (skip-to-solve
+/// route), start ONE background solve NOW. The agent's fetch a few
+/// seconds later rides warm. Bounded: one in flight daemon-wide, top
+/// result only, no extraction, and every failure feeds the same
+/// cooldown memory the fetch path uses.
+pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
+    let Some(url) = top_url else { return };
+    if !url.starts_with("http") {
+        return;
+    }
+    let Some(host) = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .filter(|h| !h.is_empty() && h.contains('.'))
+    else {
+        return;
+    };
+    let d = daemon.clone();
+    let host_str = host.to_string();
+    let url_str = url.to_string();
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        if d.pre_solve_busy.swap(true, Ordering::SeqCst) {
+            return; // one pre-solve at a time
+        }
+        let _guard = PreSolveGuard(&d);
+        {
+            let state = d.state.lock().await;
+            if !matches!(
+                state.route_for(&host_str),
+                RouteDecision::SkipToSolve | RouteDecision::RecheckCold
+            ) {
+                return; // not a known wall: the search prewarm covers it
+            }
+        }
+        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            eprintln!(
+                "[pre-solve] kicking background solve for {} ({})",
+                host_str, url_str
+            );
+        }
+        let t0 = std::time::Instant::now();
+        let Ok(mut g) = d.ghost_mgr.acquire(&d.profile).await else {
+            return;
+        };
+        let page =
+            match ops::ghost_fetch(&mut g, &url_str, std::time::Duration::from_secs(20)).await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+        if page.captcha
+            || matches!(
+                crate::detect::walls::detect_dom_smart(page.html.as_bytes()),
+                crate::detect::walls::Verdict::Challenge(_)
+                    | crate::detect::walls::Verdict::Blocked
+            )
+        {
+            d.state.lock().await.record_wall_failed(&host_str);
+            return;
+        }
+        if !page.cookies.is_empty() {
+            d.fetcher.import_cookies(&page.cookies).await;
+            crate::ghost::cache::store_session_cookies(&page.cookies);
+            // Honest replay_ok: only verified tier-1 replay earns
+            // warm routing.
+            let replay_ok = matches!(
+                d.fetcher.fetch(&url_str).await,
+                Ok(o) if o.verdict == crate::detect::walls::Verdict::ContentOk
+            );
+            d.state.lock().await.record_solved(
+                &host_str,
+                &page.cookies,
+                page.vendor.as_deref(),
+                replay_ok,
+            );
+        }
+        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            eprintln!(
+                "[pre-solve] done for {} in {}ms",
+                host_str,
+                t0.elapsed().as_millis()
+            );
+        }
+    });
+}
+
+/// RAII reset: the pre-solve flag clears when the task ends no
+/// matter how it exits.
+struct PreSolveGuard<'a>(&'a Daemon);
+impl Drop for PreSolveGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.0.pre_solve_busy.store(false, Ordering::SeqCst);
+    }
+}
+
 fn search_error(query: &str, cause: &str, byok_tried: bool) -> Value {
     let mut trace = Trace::default();
     trace.step("search", "engines", "error", 0);

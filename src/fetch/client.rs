@@ -55,6 +55,15 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
+    /// Warm = a cached TLS session under `origin`: the repeat-navigation
+    /// signal that flips TFO on at the TCP layer (Linux).
+    fn sessions_has(&self, origin: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(origin)
+    }
+
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
         let sessions = tls::new_session_store();
         let connector = tls::build_connector(&profile, sessions.clone())?;
@@ -84,6 +93,17 @@ impl Fetcher {
         for c in cookies {
             jar.store_raw(c);
         }
+    }
+
+    /// Replace the jar wholesale from the session vault (login or
+    /// logout just happened on disk). Anything not in `cookies` is
+    /// gone, which is exactly what a logout requires.
+    pub async fn reset_to(&self, cookies: &[CookieRecord]) {
+        let mut jar = self
+            .jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        jar.reset(cookies);
     }
 
     /// Export all cookies for a host with their expiry, for
@@ -386,9 +406,11 @@ impl Fetcher {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cookie) = jar.header_for(host, &path, is_https) {
+                // Chrome 151 capture: cookie sits after sec-fetch-dest,
+                // before accept-encoding.
                 let pos = req_headers
                     .iter()
-                    .position(|(n, _)| n == "priority")
+                    .position(|(n, _)| n == "accept-encoding")
                     .unwrap_or(req_headers.len());
                 req_headers.insert(pos, ("cookie".into(), cookie));
             }
@@ -514,7 +536,9 @@ impl Fetcher {
     ) -> Result<FetchOutcome, FetchError> {
         let tcp = match proxy {
             Some(p) => p.connect(host, port).await?,
-            None => tcp::happy_connect(host, port).await?,
+            // Warm = a cached TLS session for this origin: Chrome's
+            // repeat-navigation signal, and it flips TFO on (Linux).
+            None => tcp::happy_connect_with(host, port, self.sessions_has(origin)).await?,
         };
 
         // ── Plaintext http://: raw TCP straight into h1. ──
@@ -599,6 +623,7 @@ impl Fetcher {
             .iter()
             .filter(|(n, _)| n != "host" && n != "connection")
             .cloned()
+            .chain(std::iter::once(("priority".into(), "u=0, i".into())))
             .collect();
         let resp = tokio::time::timeout(RESPONSE_TIMEOUT, conn.get(authority, path, &h2_headers))
             .await

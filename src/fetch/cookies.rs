@@ -32,6 +32,10 @@ pub struct Cookie {
 #[derive(Default)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    /// Domains currently fed from the session vault (the last
+    /// rewrite). A vault rewrite DROPS only these: warm/solve
+    /// cookies from a fetch pipeline are never collateral.
+    vault_domains: std::collections::HashSet<String>,
 }
 
 fn normalize_domain(raw: &str) -> Option<String> {
@@ -131,6 +135,30 @@ fn normalize_host(raw: &str) -> Option<String> {
 impl CookieJar {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the vault-sourced subset: drop everything from
+    /// domains previously fed by the vault, then store the new
+    /// set. Warm pipeline cookies (solves, clearances) from other
+    /// domains survive untouched.
+    pub fn reset(&mut self, cookies: &[CookieRecord]) {
+        // Drop (a) prior vault domains and (b) the incoming
+        // domains, so a logout (an absent domain) really clears.
+        let mut touched: std::collections::HashSet<String> = self.vault_domains.clone();
+        for c in cookies {
+            if let Some(d) = normalize_domain(&c.domain) {
+                touched.insert(d);
+            }
+        }
+        self.cookies
+            .retain(|c| !touched.contains(&normalize_domain(&c.domain).unwrap_or_default()));
+        self.vault_domains.clear();
+        for c in cookies {
+            self.store_raw(c);
+            if let Some(d) = normalize_domain(&c.domain) {
+                self.vault_domains.insert(d);
+            }
+        }
     }
 
     /// Store all Set-Cookie headers from a response for `host`.
@@ -422,6 +450,51 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(domain: &str, name: &str) -> CookieRecord {
+        CookieRecord {
+            domain: domain.into(),
+            path: "/".into(),
+            name: name.into(),
+            value: "v".into(),
+            expires_at: None,
+            http_only: false,
+            secure: false,
+            same_site: "Lax".into(),
+        }
+    }
+
+    /// Vault rewrites touch ONLY vault-sourced domains: warm solve
+    /// cookies from the fetch pipeline survive a login resync.
+    #[test]
+    fn reset_preserves_non_vault_domains_and_applies_logout() {
+        let mut jar = CookieJar::new();
+        jar.store_raw(&rec("solve-host.test", "clearance"));
+        jar.reset(&[rec(".x.com", "AUTH")]);
+        // Both present after login.
+        assert!(jar.snapshot_for("x.com").iter().any(|c| c.name == "AUTH"));
+        assert!(
+            jar.snapshot_for("solve-host.test")
+                .iter()
+                .any(|c| c.name == "clearance")
+        );
+
+        // Logout: the vault set empties, the warm cookie survives.
+        jar.reset(&[]);
+        assert!(jar.snapshot_for("x.com").is_empty());
+        assert!(
+            jar.snapshot_for("solve-host.test")
+                .iter()
+                .any(|c| c.name == "clearance")
+        );
+
+        // Subdomain cleanup: a vault rewrite for the apex also drops
+        // previously vaulted subdomain cookies of the same site.
+        let mut jar2 = CookieJar::new();
+        jar2.reset(&[rec("login.x.com", "host_only")]);
+        jar2.reset(&[]);
+        assert!(jar2.snapshot_for("login.x.com").is_empty());
+    }
 
     #[test]
     fn domain_com_not_shared() {

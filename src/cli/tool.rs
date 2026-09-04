@@ -430,6 +430,10 @@ pub fn print_top_help() {
     println!("MANAGEMENT:");
     println!("  {:8} Start MCP server (JSON-RPC on stdio)", "mcp");
     println!("  {:8} Manage BYOK search provider keys", "keys");
+    println!(
+        "  {:8} Sign into a site: later fetches replay your session",
+        "login"
+    );
     println!("  {:8} Manage proxy configuration", "proxy");
     println!("  {:8} Quick status overview", "status");
     println!(

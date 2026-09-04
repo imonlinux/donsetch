@@ -5,7 +5,74 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.6.0] - 2026-09-04
+
+### Added
+
+- **Self-improvement engine upgraded: fail-fast wall memory + background
+  pre-solve.** The domain profile now remembers when a wall survives REAL
+  browser solves (not just tier-1 challenges): two consecutive
+  wall-persisted passes put the domain into a solve-cooldown with
+  exponential backoff (15 min base, doubling, 2 h cap). Inside the
+  cooldown a fetch answers honestly in milliseconds instead of burning
+  a 20-40 s browser cycle per attempt. The memory heals itself: a
+  successful solve or a tier-1 cold success clears it. Searches now
+  opportunistically pre-solve the top result's domain in the
+  background while the agent reads results (bounded: one in flight,
+  top result only), so the follow-up fetch lands warm. Wall failures
+  in the ghost path feed the same memory, and warm routing still
+  requires a verified tier-1 replay.
+
+### Added
+
+- **Stealth floor rebuilt (v3.6 line, part 1): wire-truth tier 1,
+  capture-driven, no guesses.** A dev rig now captures the REAL
+  browser's HTTP/2 byte stream (examples/chrome_h2_probe.rs: real
+  Chromium against a raw-boring acceptor) and parity tests are
+  generated from those captures, never hand-edited. From the first
+  capture batch: request HEADERS now carry Chromium's PRIORITY flag
+  + 5-byte priority block (exclusive=1, dep=0, weight=255), the
+  `priority: u=0, i` header moved to h2-only exactly where Chrome
+  puts it, the cookie header now sits after sec-fetch-dest /
+  before accept-encoding, and sec-ch-ua now reflects the ACTUAL
+  host browser: greased brand `"Not=A?Brand";v="99"`, Chromium
+  first, and the `Google Chrome` brand only when the host binary
+  really is branded Chrome (distro Chromium gets the two-brand
+  list it actually sends). Warmer connects on Linux now request
+  TCP Fast Open (TCP_FASTOPEN_CONNECT) for repeat-navigation
+  origins, matching Chrome's behavior, non-fatal everywhere.
+- **Wall classification + escalation floor.** Cloudflare's
+  explicit `cf-mitigated: challenge` header now classifies a 403
+  as a challenge (glassdoor-class pages whose markers sit 100KB+
+  deep; error-status bodies get a widened 256KB marker window).
+  Ghost solves get a solve-grade second pass (warm re-render
+  when the first render settles on an invisible wall), and big
+  SPA DOMs no longer settle on 80 visible chars of shell: they
+  need 800+ visible chars or a scroll kick, so product-page
+  style hydration is waited out instead of snapshot-mid-load.
+- **Dev rig: chrome_h2_probe** (examples/, dev-only, never
+  ships): byte-exact h2 capture of the installed Chromium,
+  incl. HPACK decode via our own decoder.
+
+
+- **`donsetch login`: authenticated sessions for gated sites.**
+  `donsetch login x.com` opens a real browser on your display (a
+  dedicated profile, never the automation one): you sign in yourself,
+  press Enter, and donsetch harvests the session cookies into the
+  existing 0600 vault. Tier-1 fetches and tier-2 renders of that
+  domain replay the login automatically, no daemon restart needed,
+  and the per-call vault resync makes logouts (and seconds-old
+  logins) take effect live. Credentials never enter the process:
+  no keystroke capture, no screenshots, no CDP attach before
+  Enter, and `auth-state.json` stores masked metadata only (names,
+  counts, expiries, probe verdicts, never values). Ships with
+  `--list`, `--status`, `--logout`, `--import` (Netscape
+  cookies.txt, the server/CI path), multi-site mode (bare `login`),
+  a post-login wall probe (redirect-to-/login, 401/403), a doctor
+  check, hostile-input hardening (userinfo URL rejection, IDNA,
+  loopback ports), and a 12-test integration battery including a
+  live local gate-server E2E of login → gated fetch → logout →
+  re-gated fetch.
 
 ### Fixed
 

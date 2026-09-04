@@ -37,11 +37,23 @@ pub enum Verdict {
 pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict {
     let server = header(headers, "server").unwrap_or_default().to_lowercase();
     let cf_ray = header(headers, "cf-ray").is_some();
-    let is_cf = server.contains("cloudflare") || cf_ray;
+    // cf-mitigated: challenge is Cloudflare's explicit challenge
+    // declaration header on block responses (glassdoor 2026-09).
+    let cf_mitigated = header(headers, "cf-mitigated")
+        .map(|v| v.to_lowercase().contains("challenge"))
+        .unwrap_or(false);
+    let is_cf = server.contains("cloudflare") || cf_ray || cf_mitigated;
     // Challenge markers live in the title/head : scanning
     // the whole body false-positives on articles that merely
     // MENTION a vendor (a Wikipedia page about Akamai).
-    let scan = &body[..body.len().min(64 * 1024)];
+    // Error statuses (403/429/503) get the wide window: their
+    // bodies ARE block pages, and vendors like Cloudflare put
+    // the markers at the BOTTOM of a large bilingual shell
+    // (glassdoor's 403: nearest marker at byte 126k). Content
+    // pages keep the narrow window. `true` for error statuses
+    // below mirrors the call sites in this fn.
+    let wide = matches!(status, 403 | 429 | 503);
+    let scan = &body[..body.len().min(if wide { 256 * 1024 } else { 64 * 1024 })];
     let text = String::from_utf8_lossy(scan).to_lowercase();
 
     match status {
@@ -802,6 +814,35 @@ mod tests {
         let body = b"<html><head><script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script></head><body><div class=\"cf-turnstile\"></div></body></html>";
         assert!(detect_interstitial(body).is_some());
         let v = detect_dom_smart(body);
+        assert!(matches!(v, Verdict::Challenge(_)), "got {v:?}");
+    }
+
+    /// glassdoor 2026-09 golden fixture: CF block pages put EVERY
+    /// challenge marker past the 64KB narrow window (nearest at
+    /// byte ~126k inside a 241KB bilingual shell). The 403 must be
+    /// a Challenge, never a Blocked (Blocked skips escalation and
+    /// the fetch dies on tier 1 alone).
+    #[test]
+    fn glassdoor_cf_block_markers_beyond_64k() {
+        let mut body = vec![b' '; 150_000]; // bilingual shell padding
+        body.extend_from_slice(
+            b"<div>Ray ID: 8b1234567890abcd</div><script src='https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/orchestrate/chl_api/v1'></script><p>Your IP has been blocked. captcha</p>pre>",
+        );
+        let headers = vec![
+            ("server".into(), "cloudflare".into()),
+            ("cf-mitigated".into(), "challenge".into()),
+        ];
+        let v = detect(403, &headers, &body);
+        assert!(matches!(v, Verdict::Challenge(_)), "got {v:?}");
+    }
+
+    /// Same shape withOUT the cf-mitigated header must still classify
+    /// via the wide window (the header is not always present).
+    #[test]
+    fn glassdoor_cf_block_no_header_wide_window() {
+        let mut body = vec![b' '; 150_000];
+        body.extend_from_slice(b"<div>Ray ID: 8b1234567890abcd</div> challenge-platform captcha");
+        let v = detect(403, &[("server".into(), "cloudflare".into())], &body);
         assert!(matches!(v, Verdict::Challenge(_)), "got {v:?}");
     }
 }

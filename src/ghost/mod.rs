@@ -1162,11 +1162,10 @@ impl Ghost {
             .to_string())
     }
 
-    /// All browser cookies with real expiry (browser-level Storage
-    /// domain). CDP's `expires` is a Unix timestamp in seconds
-    /// (float); -1 or 0 means session cookie → None.
-    pub async fn cookies(&self) -> Result<Vec<cache::CookieRecord>, FetchError> {
-        let res = self.cdp.call(None, "Storage.getCookies", json!({})).await?;
+    /// Parse the `cookies` array of a Storage.getCookies CDP response
+    /// into vault records. Shared by Ghost::cookies and the interactive
+    /// login harvest (both paths must store identical shapes).
+    pub fn parse_cdp_cookies(res: &Value) -> Vec<cache::CookieRecord> {
         let mut out = Vec::new();
         if let Some(arr) = res.get("cookies").and_then(Value::as_array) {
             for c in arr {
@@ -1200,7 +1199,15 @@ impl Ghost {
                 }
             }
         }
-        Ok(out)
+        out
+    }
+
+    /// All browser cookies with real expiry (browser-level Storage
+    /// domain). CDP's `expires` is a Unix timestamp in seconds
+    /// (float); -1 or 0 means session cookie → None.
+    pub async fn cookies(&self) -> Result<Vec<cache::CookieRecord>, FetchError> {
+        let res = self.cdp.call(None, "Storage.getCookies", json!({})).await?;
+        Ok(Self::parse_cdp_cookies(&res))
     }
 
     /// Replant the session vault into a fresh browser. Best-effort:
