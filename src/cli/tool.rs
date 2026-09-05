@@ -4,6 +4,7 @@
 //! calls the exact same `call_tool`, and renders the result.
 //! Zero logic duplication : all behavior lives in the core.
 
+use crate::DISPLAY_NAME;
 use crate::mcp::server::{self, Daemon};
 use crate::spec;
 use clap::error::ErrorKind as ClapErrorKind;
@@ -160,6 +161,11 @@ async fn run_bulk_fetch(
             if i > 0 {
                 println!();
             }
+            // Multi-fetch markers: a 12-URL batch of similar pages is
+            // unparseable without an explicit per-result boundary.
+            if urls.len() > 1 {
+                println!("### [{}] {}", i + 1, urls[i]);
+            }
             match result {
                 Ok(v) => {
                     let code = render_result(v, false, quiet, "fetch");
@@ -227,23 +233,47 @@ fn render_result(result: &Value, json_mode: bool, quiet: bool, cmd: &str) -> u8 
         print!("{content}");
     }
 
-    if !quiet
-        && !is_error
-        && let Some(sc) = result.get("structuredContent")
-    {
-        eprintln!("{}", stats_line(cmd, sc, content.len()));
+    if !quiet && !is_error {
+        eprintln!("{}", stats_line(cmd, result, content.len()));
     }
 
     exit
 }
 
+/// Read a field from model state first, then from the client-only
+/// debug payload. Compact MCP contracts move transport telemetry to
+/// `_meta`; the CLI still surfaces it.
+fn pick<'a>(sc: &'a Value, dbg: &'a Value, name: &str) -> Option<&'a Value> {
+    sc.get(name).or_else(|| dbg.get(name))
+}
+
 /// Build the compact one-line stats string for stderr.
-fn stats_line(cmd: &str, sc: &Value, content_len: usize) -> String {
+fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
+    let sc = result.get("structuredContent").cloned().unwrap_or_default();
+    let dbg = result
+        .pointer("/_meta")
+        .cloned()
+        .map(|meta| {
+            let ns = match cmd {
+                "fetch" => "com.donsetch/fetch-debug",
+                "search" => "com.donsetch/search-debug",
+                "crawl" => "com.donsetch/crawl-debug",
+                _ => "",
+            };
+            meta.get(ns).cloned().unwrap_or_default()
+        })
+        .unwrap_or_default();
     match cmd {
         "fetch" => {
-            let tokens_est = sc.get("tokens_est").and_then(|v| v.as_u64()).unwrap_or(0);
-            let tier = sc.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
-            let verdict = sc.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
+            let tokens_est = pick(&sc, &dbg, "tokens_est")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let tier = pick(&sc, &dbg, "tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let verdict = pick(&sc, &dbg, "verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let mut parts = vec![
                 format!("{content_len} chars"),
                 format!("~{tokens_est} tokens"),
@@ -266,9 +296,10 @@ fn stats_line(cmd: &str, sc: &Value, content_len: usize) -> String {
                 .and_then(|r| r.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            let ms = sc.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-            let provider = sc
-                .get("provider")
+            let ms = pick(&sc, &dbg, "elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let provider = pick(&sc, &dbg, "provider")
                 .and_then(|v| v.as_str())
                 .unwrap_or("local");
             let mut parts = vec![
@@ -281,7 +312,7 @@ fn stats_line(cmd: &str, sc: &Value, content_len: usize) -> String {
             }
             // Surface degraded engine health in plain mode so agents
             // can tell coverage dropped without parsing --json.
-            if let Some(engines) = sc.get("engines").and_then(|e| e.as_array()) {
+            if let Some(engines) = pick(&sc, &dbg, "engines").and_then(|e| e.as_array()) {
                 let degraded: Vec<String> = engines
                     .iter()
                     .filter_map(|e| {
@@ -311,7 +342,7 @@ fn stats_line(cmd: &str, sc: &Value, content_len: usize) -> String {
                 .and_then(|r| r.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
-            let total: u64 = sc
+            let total: u64 = dbg
                 .get("pages")
                 .and_then(|r| r.as_array())
                 .map(|a| {
@@ -320,8 +351,12 @@ fn stats_line(cmd: &str, sc: &Value, content_len: usize) -> String {
                         .sum()
                 })
                 .unwrap_or(0);
-            let elapsed = sc.get("elapsed_s").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let stop = sc.get("stop").and_then(|v| v.as_str()).unwrap_or("?");
+            let elapsed = pick(&sc, &dbg, "elapsed_s")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let stop = pick(&sc, &dbg, "stop")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let mut parts = vec![
                 format!("{n} pages"),
                 format!("{total} chars"),
@@ -399,7 +434,7 @@ fn render_json_envelope(result: &Value, url: &str) -> Value {
         let mut envelope = json!({
             "ok": true,
             "content": content,
-            "meta": sc,
+            "meta": machine_meta(result, &sc),
         });
         if !url.is_empty() {
             envelope["url"] = json!(url);
@@ -408,11 +443,46 @@ fn render_json_envelope(result: &Value, url: &str) -> Value {
     }
 }
 
+/// Machine meta for the --json channel: the compact model surface
+/// (structuredContent) plus the full machine view re-materialized
+/// from the client-only debug namespace when the tool carries one
+/// (search). The MCP contract keeps _meta out of the model's
+/// context by design; the CLI channel is FOR machines, so it loses
+/// nothing (the compact-contract PR had silently broken every
+/// script that reads meta.results[].snippet; the live bench
+/// caught it).
+fn machine_meta(result: &Value, sc: &Value) -> Value {
+    const SEARCH_MACHINE_FIELDS: &[&str] = &[
+        "intent",
+        "weak",
+        "cached",
+        "elapsed_ms",
+        "provider",
+        "results",
+        "engines",
+    ];
+    let debug = result
+        .get("_meta")
+        .and_then(|m| m.get("com.donsetch/search-debug"))
+        .filter(|p| p.is_object());
+    let mut meta = sc.clone();
+    if let Some(dbg) = debug.and_then(|p| p.as_object())
+        && let Some(meta_obj) = meta.as_object_mut()
+    {
+        for field in SEARCH_MACHINE_FIELDS {
+            if let Some(v) = dbg.get(*field) {
+                meta_obj.insert((*field).to_string(), v.clone());
+            }
+        }
+    }
+    meta
+}
+
 // ── Top-level help ───────────────────────────────────────────
 
 /// Print top-level help (when no subcommand given or --help).
 pub fn print_top_help() {
-    println!("donsetch : web research for AI agents: fetch, search, crawl");
+    println!("{DISPLAY_NAME} : web research for AI agents: fetch, search, crawl");
     println!();
     println!("USAGE: donsetch <command> [args]");
     println!();
@@ -512,48 +582,70 @@ mod tests {
 
     #[test]
     fn stats_line_fetch() {
-        let sc = json!({
-            "total_chars": 15853,
-            "tokens_est": 4000,
-            "tier": "1",
-            "verdict": "ContentOk",
-            "next_offset": 15923,
-            "thin": false
+        let v = json!({
+            "structuredContent": {
+                "total_chars": 15853,
+                "next_offset": 15923,
+                "thin": false
+            },
+            "_meta": {
+                "com.donsetch/fetch-debug": {
+                    "tokens_est": 4000,
+                    "tier": "1",
+                    "verdict": "ContentOk"
+                }
+            }
         });
-        let s = stats_line("fetch", &sc, 15853);
+        let s = stats_line("fetch", &v, 15853);
         assert!(s.contains("15853 chars"));
+        assert!(s.contains("~4000 tokens"));
         assert!(s.contains("tier 1"));
         assert!(s.contains("ContentOk"));
         assert!(s.contains("next_offset 15923"));
     }
 
     #[test]
-    fn stats_line_search() {
-        let sc = json!({
-            "results": [{"title": "a"}, {"title": "b"}],
-            "elapsed_ms": 2100,
-            "provider": null,
-            "weak": true
+    fn stats_line_fetch_prefers_model_state() {
+        // Field present in both surfaces: model state wins over debug.
+        let v = json!({
+            "structuredContent": { "tier": "2(ghost)", "verdict": "ContentOk" },
+            "_meta": { "com.donsetch/fetch-debug": { "tier": "1", "verdict": "Blocked" } }
         });
-        let s = stats_line("search", &sc, 0);
+        let s = stats_line("fetch", &v, 0);
+        assert!(s.contains("tier 2(ghost)"));
+        assert!(s.contains("ContentOk"));
+    }
+
+    #[test]
+    fn stats_line_search() {
+        let v = json!({
+            "structuredContent": {"results": [{"rank": 1}, {"rank": 2}], "weak": true},
+            "_meta": {
+                "com.donsetch/search-debug": {"elapsed_ms": 2100, "provider": null}
+            }
+        });
+        let s = stats_line("search", &v, 0);
         assert!(s.contains("2 results"));
         assert!(s.contains("weak consensus"));
     }
 
     #[test]
     fn stats_line_search_degraded_engines() {
-        let sc = json!({
-            "results": [{"title": "a"}],
-            "elapsed_ms": 5000,
-            "provider": null,
-            "weak": false,
-            "engines": [
-                {"engine": "bing", "status": "ok", "hits": 5, "ms": 800},
-                {"engine": "mojeek", "status": "blocked:429", "hits": 0, "ms": 100},
-                {"engine": "brave", "status": "timeout", "hits": 0, "ms": 5000}
-            ]
+        let v = json!({
+            "structuredContent": {"results": [{"rank": 1}], "weak": false},
+            "_meta": {
+                "com.donsetch/search-debug": {
+                    "elapsed_ms": 5000,
+                    "provider": null,
+                    "engines": [
+                        {"engine": "bing", "status": "ok", "hits": 5, "ms": 800},
+                        {"engine": "mojeek", "status": "blocked:429", "hits": 0, "ms": 100},
+                        {"engine": "brave", "status": "timeout", "hits": 0, "ms": 5000}
+                    ]
+                }
+            }
         });
-        let s = stats_line("search", &sc, 0);
+        let s = stats_line("search", &v, 0);
         assert!(s.contains("degraded"));
         assert!(s.contains("mojeek blocked"));
         assert!(s.contains("brave timeout"));
@@ -578,13 +670,20 @@ mod tests {
 
     #[test]
     fn stats_line_crawl() {
-        let sc = json!({
-            "pages": [{"chars": 5000}, {"chars": 3000}],
-            "elapsed_s": 12.3,
-            "stop": "MaxPages",
-            "resume": "abc123"
+        let v = json!({
+            "structuredContent": {
+                "pages": [{"url": "https://e.com/1"}, {"url": "https://e.com/2"}],
+                "stop": "MaxPages",
+                "resume": "abc123"
+            },
+            "_meta": {
+                "com.donsetch/crawl-debug": {
+                    "pages": [{"chars": 5000}, {"chars": 3000}],
+                    "elapsed_s": 12.3
+                }
+            }
         });
-        let s = stats_line("crawl", &sc, 0);
+        let s = stats_line("crawl", &v, 0);
         assert!(s.contains("2 pages"));
         assert!(s.contains("8000 chars"));
         assert!(s.contains("stop MaxPages"));

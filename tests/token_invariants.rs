@@ -126,6 +126,18 @@ fn mcp_instructions_stay_cheap() {
 }
 
 #[test]
+fn split_mcp_contract_stays_under_2500_estimated_tokens() {
+    // chars/4 is the repository-wide offline estimator. Exact tokenizer
+    // measurements belong in the external evaluation report.
+    let bytes = donsetch::mcp::tools::list().to_string().len();
+    let estimated_tokens = bytes.div_ceil(4);
+    assert!(
+        estimated_tokens <= 2_500,
+        "split MCP schema costs ~{estimated_tokens} tokens (>2500)"
+    );
+}
+
+#[test]
 fn links_on_renders_real_links() {
     // Wikipedia article body: hundreds of interwiki links. With
     // links=true the pipeline must render them as markdown links

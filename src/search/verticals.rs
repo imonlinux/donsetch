@@ -114,6 +114,15 @@ pub async fn run(
     })
 }
 
+/// Body → hits router, shared by run() and tests.
+pub fn parse(vertical: &str, body: &str) -> Vec<Hit> {
+    match vertical {
+        "news" => parse_rss(body),
+        "arxiv" => parse_arxiv(body),
+        _ => parse_json(vertical, body),
+    }
+}
+
 /// RFC-822-ish date from RSS pubDate -> ISO date string.
 /// "Thu, 31 Jul 2026 07:00:00 GMT" -> "2026-07-31".
 pub fn rss_date_to_iso(date: &str) -> Option<String> {
@@ -307,10 +316,23 @@ fn parse_rss(body: &str) -> Vec<Hit> {
         let date = grab("pubDate");
         let iso = rss_date_to_iso(&date);
         if !title.is_empty() && url.starts_with("http") {
+            // Google News titles end in " - Publisher"; a date
+            // alone is a snippet that says nothing about the
+            // story, so carry publisher + date instead.
+            let publisher = title
+                .rsplit_once(" - ")
+                .map(|(_, p)| p.trim())
+                .unwrap_or("")
+                .to_string();
+            let snippet = if publisher.is_empty() {
+                date.clone()
+            } else {
+                format!("{publisher} · {date}")
+            };
             hits.push(Hit {
                 title,
                 url,
-                snippet: date.clone(),
+                snippet,
                 rank,
                 published: iso,
             });

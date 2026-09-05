@@ -10,14 +10,18 @@
 //! Dev-only rig: the unsafe server code never ships (examples are not
 //! part of the release binary).
 
+#[cfg(target_os = "linux")]
 use boring_sys as bs;
 
+#[cfg(target_os = "linux")]
 use std::net::TcpListener;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 /// ALPN select callback: hand h2 back when the client offers it.
+#[cfg(target_os = "linux")]
 extern "C" fn alpn_select(
     _ssl: *mut bs::SSL,
     out: *mut *const u8,
@@ -46,12 +50,12 @@ extern "C" fn alpn_select(
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("chrome_h2_probe is a Linux dev rig; it never runs on Windows");
+    eprintln!("chrome_h2_probe is a Linux-only dev rig");
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn main() {
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     let cert = format!("{root}/tests/landmarks/h2cert.pem\0");
@@ -169,6 +173,7 @@ fn main() {
     browser.join().ok();
 }
 
+#[cfg(target_os = "linux")]
 fn complete(buf: &[u8]) -> bool {
     let mut off = 0usize;
     while off + 9 <= buf.len() {
@@ -186,10 +191,12 @@ fn complete(buf: &[u8]) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn u24(b: &[u8]) -> u32 {
     ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32
 }
 
+#[cfg(target_os = "linux")]
 fn parse_and_print(buf: &[u8]) {
     let start = if buf.starts_with(b"PRI * HTTP/2.0") {
         24
@@ -225,6 +232,7 @@ fn parse_and_print(buf: &[u8]) {
 
 /// Decode the first request HEADERS with OUR hpack decoder: proves
 /// both Chrome's header list and our decoder on real Chrome bytes.
+#[cfg(target_os = "linux")]
 fn decode_and_print(buf: &[u8]) {
     let mut off = if buf.starts_with(b"PRI * HTTP/2.0") {
         24

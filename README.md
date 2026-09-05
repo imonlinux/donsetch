@@ -58,7 +58,7 @@ and as a standalone CLI.
 | 🔑 **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus + local semantic reranking. No API keys. $0 forever. BYOK optional. |
 | 📄 **Pixel-fusion PDF** | Glyphs + rendered pixels from the same stream, fused deterministically. Per-region trust audit. Scanned PDFs auto-OCR'd. |
 | 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
-| 🪶 **~3.5k tokens** | Three tools, ~3.5k tokens total in the MCP context. Every token earns its place. |
+| 🪶 **~2k tokens** | Three tools, ~2.0k tokens of total schema (tools/list, measured). Every token earns its place. |
 
 ## 🆕 v3, the agent-first upgrade
 
@@ -322,8 +322,12 @@ The CLI is a thin adapter over the same engine the MCP server uses:
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap + frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 
 Tool schemas: `donsetch tools`. Every tool returns structured errors
-with stable codes + `next_action`; every content result carries
-`content_ok`, `quality`, and the escalation trace.
+with stable codes + `next_action`. v3.6 compact contracts: the model
+surface (content + structuredContent) carries only evidence and the
+state that can alter the next action, `content_ok`, `thin`, `changed`,
+`next_offset`, error codes, while transport telemetry (tier, quality,
+escalation trace, timings, engines) stays available to clients under
+`_meta` e.g. `_meta["com.donsetch/fetch-debug"]`.
 
 ## 🖱️ Browser actions, page control inside fetch
 
@@ -474,21 +478,36 @@ Disable with `DONSEEK_NO_DISK_STATE=1`.
 
 ## 🔎 Keyless search
 
-No API key, no account. 10+ keyless backends in parallel on your
-machine, merged, deduped, ranked.
+No API key, no account. 5 keyless engines across 4 independent index
+families + 8 official verticals run in parallel on your machine, merged,
+deduped, ranked.
 
-- **Backends**: Brave, Bing, DuckDuckGo, Mojeek, Yandex, Startpage
+- **Backends:** Bing-family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek
   + keyless verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv,
   StackExchange, MDN, Google News).
+- **Ghost SERP cascade lane:** if the plain fan-out and its retry wave
+  leave the merge thin (<3 lanes or <15 hits), one headless render
+  unlocks Google's 2026 JS-shell SERP as a 4th consensus family. Costs
+  nothing when healthy (only fires under underdelivery); reports itself
+  honestly as `google_ghost`.
 - **Semantic reranking**: local ONNX cross-encoder
   (`ms-marco-MiniLM-L-6-v2`, 23MB) reads query + title + snippet
-  through full attention. 60/40 blend with RRF + BM25 + consensus.
+  through full attention. 60/40 blend with RRF + BM25 + consensus, plus
+  a post-enrichment top-up that re-scores close calls using the
+  destination page's real title/description instead of SERP fragments.
 - **Consensus**: a URL several independent indexes return gets a
-  boost; every result carries `score`, `consensus`, `engines`.
+  boost; every result carries `score`, `consensus` (independent-index
+  families), `engines`. Corroboration also rides the compact model
+  surface as `· N sources` per result.
+- **Engine health is learned and persisted:** per-engine trust EWMAs
+  and chronic-failure quarantine survive daemon restarts; dead engines
+  get benched instead of burning fan-out slots every query.
 - **Entity coverage penalty**: anchor entities ("B-tree", version
   numbers, years) checked against results. Wrong entity → 0.3x.
 - **Honest reporting**: `weak=true` means low consensus; per-engine
   status is always visible. No fake "no results".
+- **Bench harness note:** search-quality result caching lives in
+  `~/.cache/donsetch/bench-search/`; delete it when comparing binaries.
 
 Keyless quality (110 questions, 11 niches, no keys): **95.5%**
 answer-in-snippet vs Tavily's published 93.3% LLM-graded. Reproduce:

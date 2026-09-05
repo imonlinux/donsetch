@@ -37,6 +37,13 @@ use serde::{Deserialize, Serialize};
 const TTL_SECS: u64 = 24 * 60 * 60;
 /// L-entry cap : bounded memory, oldest-eviction.
 const MAX_L_ENTRIES: usize = 2048;
+/// S-entry cap. The MCP daemon is a long-lived process: a search
+/// handle-table that only ever inserts grows without bound for the
+/// daemon’s whole life (every tool search call mints up to 12).
+/// FIFO eviction of the oldest-minted handles keeps memory bounded;
+/// agents address recent results, exactly like the L-table’s LRU
+/// bound trades unbounded stability for bounded memory.
+const MAX_S_ENTRIES: usize = 2048;
 /// Random ID length (base62 chars after the prefix).
 const ID_LEN: usize = 8;
 /// Persistence format version. Old format (no version field) will
@@ -71,6 +78,8 @@ pub struct HandleTable {
     rev: HashMap<String, String>,
     /// Search handle-id → URL (in-memory only, never persisted).
     s: HashMap<String, String>,
+    /// Mint order of S-handles (oldest first). FIFO eviction base.
+    s_order: std::collections::VecDeque<String>,
     /// Monotonic counter for LRU eviction ordering.
     next_seq: u64,
 }
@@ -250,7 +259,19 @@ impl HandleTable {
                 }
             };
             self.s.insert(id.clone(), url.clone());
+            self.s_order.push_back(id.clone());
             handles.push(id);
+            // Bounded memory: the daemon is long-lived, so the
+            // in-memory S-table must not grow without bound. Oldest-
+            // minted handles evict FIFO, matching how agents actually
+            // reference search results (the results they act on are
+            // the recent ones).
+            while self.s.len() > MAX_S_ENTRIES {
+                let Some(oldest) = self.s_order.pop_front() else {
+                    break;
+                };
+                self.s.remove(&oldest);
+            }
         }
         handles
     }
@@ -342,6 +363,7 @@ mod tests {
             l: HashMap::new(),
             rev: HashMap::new(),
             s: HashMap::new(),
+            s_order: std::collections::VecDeque::new(),
             next_seq: 0,
         }
     }
@@ -486,6 +508,33 @@ mod tests {
         assert_eq!(t.resolve("S12"), None);
         assert_eq!(t.resolve("L1"), None);
         assert_eq!(t.resolve("L2048"), None);
+    }
+
+    #[test]
+    fn search_handles_stay_bounded_fifo() {
+        // A long-lived daemon mints S-handles on every search forever;
+        // without a cap the in-memory table grows without bound.
+        let mut t = table();
+        let oldest = t.set_search_results(&["https://old.example/1".into()])[0].clone();
+        for i in 0..MAX_S_ENTRIES {
+            t.set_search_results(&[format!("https://fill.example/{i}")]);
+        }
+        assert_eq!(t.s.len(), MAX_S_ENTRIES, "table must stay capped");
+        // The oldest-minted entry was evicted first (FIFO).
+        assert_eq!(t.resolve(&oldest), None);
+        // The newest mint still resolves.
+        let last = t
+            .set_search_results(&["https://fresh.example/latest".into()])
+            .pop()
+            .unwrap();
+        assert_eq!(
+            t.s.len(),
+            MAX_S_ENTRIES,
+            "mint past the cap evicts, never grows"
+        );
+        assert_eq!(t.resolve(&last).unwrap(), "https://fresh.example/latest");
+        // The previously newest fill entry also still resolves.
+        assert_eq!(t.s_order.len(), t.s.len(), "queue and map agree");
     }
 
     #[test]

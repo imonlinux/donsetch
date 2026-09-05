@@ -397,14 +397,19 @@ function getSearchProvider(sc: any): string {
 }
 
 /**
- * Extract the fetch source label from structuredContent.
+ * Extract the fetch source label from model state with a
+ * client-only diagnostics fallback. Compact MCP contracts keep
+ * transport telemetry in _meta["com.donsetch/fetch-debug"], so the
+ * tier can live there; older servers still expose it on
+ * structuredContent.
  * Returns "cache" when tier is "1(warm)" (warm cookies, not a
  * fresh fetch), "ghost" when tier starts with "2" (browser
  * escalation), or "" for a normal tier-1 fetch.
  */
-function getFetchSource(sc: any): string {
-  if (!sc) return "";
-  const tier = String(sc.tier || "");
+function getFetchSource(sc: any, dbg: any): string {
+  const tier = String(
+    (sc && sc.tier) || (dbg && dbg.tier) || ""
+  );
   if (tier.includes("warm")) return "cache";
   if (tier.startsWith("2")) return "ghost";
   return "";
@@ -487,6 +492,7 @@ export default function (pi: ExtensionAPI) {
               .join("") || "";
             const isErr = result?.isError ?? false;
             const sc = result?.structuredContent ?? null;
+            const dbg = result?._meta?.["com.donsetch/fetch-debug"] ?? null;
 
             // Build details for TUI rendering
             const details: any = {
@@ -500,7 +506,7 @@ export default function (pi: ExtensionAPI) {
               details.topResult = getFirstResultTitle(text);
               details.provider = getSearchProvider(sc);
             } else if (toolName === "web_fetch") {
-              details.source = getFetchSource(sc);
+              details.source = getFetchSource(sc, dbg);
               details.status = getFetchStatus(sc);
               if (sc?.stitched) details.stitched = sc.stitched;
             } else if (toolName === "web_crawl") {

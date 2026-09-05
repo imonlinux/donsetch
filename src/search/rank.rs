@@ -17,7 +17,7 @@ const MAX_PER_DOMAIN: usize = 2;
 /// a weaker signal than a URL three engines agree on.
 const VERTICAL_WEIGHT: f64 = 0.6;
 
-fn is_vertical(engine: &str) -> bool {
+pub(crate) fn is_vertical(engine: &str) -> bool {
     matches!(
         engine,
         "github" | "hn" | "wikipedia" | "scholar" | "news" | "arxiv" | "stackexchange" | "mdn"
@@ -384,16 +384,32 @@ pub fn merge(
     diverse
 }
 
-/// Index family: engines sharing an index count once for
-/// consensus (a Bing hit + DDG hit = one opinion, not two).
-fn engine_family(engine: &str) -> &str {
+// Index family: engines sharing an index count once for
+// consensus (a Bing hit + DDG hit = one opinion, not two).
+// google_ghost is the browser-render lane running the same
+// Google index as the plain parser would: one family.
+pub(crate) fn engine_family(engine: &str) -> &str {
     match engine {
         "bing" | "ddg" | "ddg_lite" | "ddg_html" | "yahoo" => "bing",
         "brave" => "brave",
         "mojeek" => "mojeek",
-        "google" => "google",
+        "google" | "google_ghost" => "google",
         other => other, // verticals are their own family
     }
+}
+
+/// Independent index families behind one merged result: the
+/// consensus signal the ranking itself is built on, exposed so
+/// the model surface can carry agreement evidence cheaply.
+pub(crate) fn family_count(r: &Merged) -> usize {
+    let mut families: Vec<&str> = Vec::new();
+    for (e, _) in &r.sources {
+        let f = engine_family(e);
+        if !families.contains(&f) {
+            families.push(f);
+        }
+    }
+    families.len()
 }
 
 /// Weak-results honesty: no cross-family consensus on the

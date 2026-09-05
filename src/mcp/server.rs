@@ -51,11 +51,6 @@ impl Daemon {
     pub async fn new() -> Result<Self, crate::error::FetchError> {
         let profile = BrowserProfile::host_default();
         let fetcher = Arc::new(Fetcher::new(profile.clone())?);
-        let searcher = Arc::new(Searcher::new(
-            Fetcher::new(profile.clone())?,
-            EgressPool::from_env(),
-        ));
-        searcher.preflight();
         let proxies = crate::transport::proxy::load_all();
         let ghost_mgr = GhostManager::new().await;
         let state = Arc::new(Mutex::new(GhostState::load()));
@@ -72,71 +67,34 @@ impl Daemon {
         // Build ghost escalation hook for the crawl: renders
         // JS-only pages in the headless browser so SPA sites
         // yield real content instead of empty shells. Capped at
-        // 3 per crawl by the orchestrator.
-        let ghost_hook: crate::crawl::GhostHook = {
-            let ghost_mgr = Arc::clone(&ghost_mgr);
-            let profile = profile.clone();
-            let fetcher = Arc::clone(&fetcher);
-            let state = Arc::clone(&state);
-            Arc::new(move |url: String| {
-                let ghost_mgr = Arc::clone(&ghost_mgr);
-                let profile = profile.clone();
-                let fetcher = Arc::clone(&fetcher);
-                let state = Arc::clone(&state);
-                async move {
-                    // Render cache shortcut.
-                    {
-                        let s = state.lock().await;
-                        if let Some(rc) = s.render_for(&url) {
-                            return Ok(crate::crawl::GhostRender {
-                                html: rc.html.clone(),
-                            });
-                        }
-                    }
-                    let mut g = match ghost_mgr.acquire(&profile).await {
-                        Ok(g) => g,
-                        Err(e) => return Err(format!("browser launch: {e}")),
-                    };
-                    let page =
-                        match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20))
-                            .await
-                        {
-                            Ok(p) => p,
-                            Err(first) => {
-                                // Retry once on transient timeout.
-                                match ops::ghost_fetch(
-                                    &mut g,
-                                    &url,
-                                    std::time::Duration::from_secs(20),
-                                )
-                                .await
-                                {
-                                    Ok(p) => p,
-                                    Err(second) => {
-                                        return Err(format!("render: {first}; retry: {second}"));
-                                    }
-                                }
-                            }
-                        };
-                    if page.captcha {
-                        return Err("interactive captcha (unsolvable by design)".to_string());
-                    }
-                    if !page.cookies.is_empty() {
-                        fetcher.import_cookies(&page.cookies).await;
-                        crate::ghost::cache::store_session_cookies(&page.cookies);
-                    }
-                    {
-                        let mut s = state.lock().await;
-                        s.record_render(&url, &page.html);
-                    }
-                    Ok(crate::crawl::GhostRender { html: page.html })
-                }
-                .boxed()
-            })
-        };
+        // 3 per crawl by the orchestrator. The search clone runs
+        // the SAME machinery but never serves from the render
+        // cache: a cached walled SERP would replay as "no
+        // results" forever inside one TTL window.
+        let ghost_hook = make_ghost_hook(
+            Arc::clone(&ghost_mgr),
+            profile.clone(),
+            Arc::clone(&fetcher),
+            Arc::clone(&state),
+            false,
+        );
+        let search_ghost = make_ghost_hook(
+            Arc::clone(&ghost_mgr),
+            profile.clone(),
+            Arc::clone(&fetcher),
+            Arc::clone(&state),
+            true,
+        );
 
         let (crawler, _gov) = crawl_real::build(Arc::clone(&fetcher), proxies);
         let crawler = crawler.with_ghost(ghost_hook);
+
+        let searcher = Arc::new(
+            Searcher::new(Fetcher::new(profile.clone())?, EgressPool::from_env())
+                .with_ghost(search_ghost),
+        );
+        searcher.preflight();
+
         Ok(Self {
             fetcher,
             profile,
@@ -420,6 +378,7 @@ fn initialize(params: &Value) -> Value {
         "instructions": tools::instructions(),
         "serverInfo": {
             "name": tools::SERVER_NAME,
+            "title": tools::SERVER_TITLE,
             "version": tools::SERVER_VERSION
         }
     })
@@ -591,6 +550,7 @@ async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) ->
         }
     }
 
+    let requested_mode = opts.mode;
     let crawl_t0 = std::time::Instant::now();
     let result = match daemon.crawler.crawl(&url, opts, resume.as_deref()).await {
         Ok(r) => {
@@ -637,104 +597,105 @@ async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) ->
         }
     };
 
-    // Content text: the map (if any) + pages. Keep the lead-in
-    // small; the pages are the payload.
+    render_crawl_result(&result, requested_mode)
+}
+
+fn render_crawl_result(result: &crate::crawl::CrawlResult, requested_mode: CrawlMode) -> Value {
+    // One linear evidence document: page identity and body appear exactly once.
     let mut text = String::new();
-    text.push_str(&format!(
-        "# crawl: {} ({} pages, stop={:?}, {:.1}s)\n\n",
-        result.seed,
-        result.pages.len(),
-        result.stop,
-        result.elapsed.as_secs_f64()
-    ));
-    // A crawl-delay-pace crawl looks hung without this note :
-    // the site demanded the pace, we honored it, say so.
-    if let Some(cd) = result.crawl_delay
-        && cd > 2.0
-    {
-        text.push_str(&format!(
-            "*robots crawl-delay: {cd:.0}s between requests (site-declared; pass respect_robots=false to override)*\n\n"
-        ));
-    }
-    if !result.map.is_empty() {
-        text.push_str("## map\n");
+    text.push_str(&format!("# Crawl\n{}\n\n", result.seed));
+    if requested_mode == CrawlMode::Map {
+        text.push_str("## Discovered URLs\n");
         for u in &result.map {
             text.push_str(&format!("- {u}\n"));
         }
         text.push('\n');
     }
-    for p in &result.pages {
-        if p.duplicate {
-            continue;
+    if requested_mode != CrawlMode::Map {
+        for (index, page) in result
+            .pages
+            .iter()
+            .filter(|page| !page.duplicate)
+            .enumerate()
+        {
+            text.push_str(&format!("## [{}]", index + 1));
+            if !page.title.is_empty() {
+                text.push_str(&format!(" {}", page.title));
+            }
+            text.push('\n');
+            text.push_str(&page.url);
+            let body = strip_source_frontmatter(
+                &page.markdown,
+                &page.url,
+                (!page.title.is_empty()).then_some(page.title.as_str()),
+            );
+            if !body.is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&body);
+            }
+            text.push_str("\n\n---\n\n");
         }
-        text.push_str(&format!("## [{}] {}\n", p.title, p.url));
-        text.push_str(&format!(
-            "kind={:?} quality={:.2} {} chars\n\n",
-            p.kind, p.quality, p.chars
-        ));
-        text.push_str(&p.markdown);
-        text.push_str("\n\n---\n\n");
-    }
-    if !result.skipped.is_empty() {
-        text.push_str("## skipped\n");
-        for (u, why) in &result.skipped {
-            text.push_str(&format!("- {u}: {why}\n"));
+        if requested_mode == CrawlMode::Full {
+            let rendered = result
+                .pages
+                .iter()
+                .filter(|page| !page.duplicate)
+                .map(|page| page.url.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let remaining = result
+                .map
+                .iter()
+                .filter(|url| !rendered.contains(url.as_str()))
+                .collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                text.push_str("## Discovered URLs not fetched\n");
+                for url in remaining {
+                    text.push_str(&format!("- {url}\n"));
+                }
+            }
         }
-    }
-    if let Some(tok) = &result.resume {
-        text.push_str(&format!(
-            "\nresume: call crawl again with resume={tok} to continue.\n"
-        ));
     }
 
-    // Agent guidance: next_action tells the agent what to try
-    // next when results are poor or empty. Computed from the
-    // stop reason, skip reasons, and page count.
-    let next_action = compute_crawl_next_action(&result);
-    if !next_action.is_empty() {
-        text.push_str(&format!("\n💡 {next_action}\n"));
-    }
-
-    let structured = json!({
+    let next_action = compute_crawl_next_action(result);
+    let mut structured = json!({
         "seed": result.seed,
+        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
         "pages": result.pages.iter().filter(|p| !p.duplicate).map(|p| json!({
+            "url": p.url,
+            "lastmod": p.lastmod,
+        })).collect::<Vec<_>>(),
+        "stop": format!("{:?}", result.stop),
+    });
+    if let Some(resume) = &result.resume {
+        structured["resume"] = json!(resume);
+    }
+    if !next_action.is_empty() {
+        structured["next_action"] = json!(next_action);
+    }
+    let debug = json!({
+        "mode": format!("{:?}", requested_mode),
+        "map": result.map,
+        "queued": result.queued,
+        "filtered_out": result.filtered_out,
+        "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
+        "pages": result.pages.iter().map(|p| json!({
             "url": p.url,
             "title": p.title,
             "kind": format!("{:?}", p.kind),
             "chars": p.chars,
             "quality": p.quality,
+            "duplicate": p.duplicate,
             "parent": p.parent,
             "score": (p.score * 100.0).round() / 100.0,
             "lastmod": p.lastmod,
         })).collect::<Vec<_>>(),
-        "map": result.map,
-        "queued": result.queued,
-        "filtered_out": result.filtered_out,
-        "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
-        "stop": format!("{:?}", result.stop),
         "crawl_delay": result.crawl_delay,
         "elapsed_s": result.elapsed.as_secs_f64(),
-        "resume": result.resume,
-        "next_action": next_action,
     });
-    let mut meta = json!({
-        "seed": result.seed,
-        "pages": result.pages.iter().filter(|p| !p.duplicate).count(),
-        "stop": format!("{:?}", result.stop),
-        "elapsed_s": (result.elapsed.as_secs_f64() * 10.0).round() / 10.0,
-    });
-    if let Some(tok) = &result.resume {
-        meta["resume"] = json!(tok);
-    }
-    if !next_action.is_empty() {
-        meta["next_action"] = json!(next_action);
-    }
     json!({
-        "content": [
-            {"type": "text", "text": format!("[meta] {}", compact_json(&meta))},
-            {"type": "text", "text": text},
-        ],
-        "structuredContent": structured
+        "content": [{"type": "text", "text": text.trim_end()}],
+        "structuredContent": structured,
+        "_meta": {"com.donsetch/crawl-debug": debug},
     })
 }
 
@@ -1042,29 +1003,11 @@ async fn fetch_multi(
 
     let is_err = |v: &Value| v.get("isError").and_then(Value::as_bool).unwrap_or(false);
     let md_of = |v: &Value| {
-        v.pointer("/content/1/text")
+        v.pointer("/content/0/text")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string()
     };
-    let title_of = |v: &Value| {
-        v.pointer("/structuredContent/title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let tokens_of = |v: &Value| {
-        v.pointer("/structuredContent/tokens_est")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
-    };
-    let tier_of = |v: &Value| {
-        v.pointer("/structuredContent/tier")
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string()
-    };
-
     // Budget slicing: proportional to returned size, floor 300
     // chars, only when the sum overflows.
     let mut markdowns: Vec<Option<String>> = results
@@ -1130,7 +1073,31 @@ async fn fetch_multi(
         }
     }
 
-    // Compose.
+    render_fetch_batch(&urls, &results, &markdowns, budget_tokens, &sliced_flags)
+}
+
+/// Compose a batch without repeating page evidence or transport telemetry on
+/// model-visible surfaces. Kept pure so partial and all-failed contracts are
+/// deterministic unit-test inputs.
+fn render_fetch_batch(
+    urls: &[String],
+    results: &[Value],
+    markdowns: &[Option<String>],
+    budget_tokens: Option<usize>,
+    sliced_flags: &[bool],
+) -> Value {
+    debug_assert_eq!(urls.len(), results.len());
+    debug_assert_eq!(urls.len(), markdowns.len());
+    debug_assert_eq!(urls.len(), sliced_flags.len());
+
+    let is_err = |v: &Value| v.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let title_of = |v: &Value| {
+        v.pointer("/_meta/com.donsetch~1fetch-debug/title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+
     let mut text = String::new();
     let ok_count = markdowns.iter().filter(|m| m.is_some()).count();
     let err_count = results.len() - ok_count;
@@ -1142,67 +1109,120 @@ async fn fetch_multi(
             } else {
                 title.as_str()
             };
+            let body = strip_source_frontmatter(
+                md,
+                &urls[i],
+                (!title.is_empty()).then_some(title.as_str()),
+            );
             text.push_str(&format!(
-                "## [{i}] {} : {}\ntier={} tokens≈{}\n\n{}\n\n---\n\n",
+                "## [{}] {}\n{}\n\n{}\n\n---\n\n",
+                i + 1,
                 head,
                 urls[i],
-                tier_of(r),
-                (md.len() / 4).max(1),
-                md
+                body
             ));
         } else {
             let msg = r
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)
                 .unwrap_or("fetch failed");
-            text.push_str(&format!("## [{i}] {} : ERROR\n{}\n\n---\n\n", urls[i], msg));
+            text.push_str(&format!(
+                "## [{}] {} : ERROR\n{}\n\n---\n\n",
+                i + 1,
+                urls[i],
+                msg
+            ));
         }
     }
-    let mut meta = json!({
-        "urls": results.len(),
-        "ok": ok_count,
-        "errors": err_count,
-    });
-    if let Some(b) = budget_tokens {
-        meta["budget_tokens"] = json!(b);
-    }
-    let structured = json!({
-        "urls": urls,
-        "results": results.iter().enumerate().map(|(i, r)| {
+    let structured_results = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
             let mut o = json!({
                 "url": urls[i],
                 "ok": !is_err(r),
-                "tier": tier_of(r),
-                "tokens_est": tokens_of(r),
             });
+            if !is_err(r) {
+                let state = &r["structuredContent"];
+                if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
+                    o["content_ok"] = json!(false);
+                }
+                for field in ["next_offset", "archived"] {
+                    if let Some(value) = state.get(field)
+                        && !value.is_null()
+                    {
+                        o[field] = value.clone();
+                    }
+                }
+                for field in ["thin", "cloak_suspected"] {
+                    if state.get(field).and_then(Value::as_bool).unwrap_or(false) {
+                        o[field] = json!(true);
+                    }
+                }
+                if let Some(changed) = state.get("changed").and_then(Value::as_str)
+                    && changed != "new"
+                {
+                    o["changed"] = json!(changed);
+                }
+            }
             if sliced_flags[i] {
                 o["sliced"] = json!(true);
             }
             if is_err(r) {
-                o["error"] = json!(r.pointer("/content/0/text").and_then(Value::as_str).unwrap_or("fetch failed"));
+                o["code"] = r
+                    .pointer("/structuredContent/code")
+                    .cloned()
+                    .unwrap_or_else(|| json!("content.extract"));
             }
             o
-        }).collect::<Vec<_>>(),
+        })
+        .collect::<Vec<_>>();
+    let mut structured = json!({
+        "ok": ok_count,
+        "errors": err_count,
+        "results": structured_results,
+    });
+    let debug_results = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let fetch_debug = &result["_meta"]["com.donsetch/fetch-debug"];
+            let mut item = json!({"url": urls[index]});
+            for field in ["tier", "tokens_est"] {
+                if let Some(value) = fetch_debug.get(field)
+                    && !value.is_null()
+                {
+                    item[field] = value.clone();
+                }
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    let debug = json!({
+        "count": results.len(),
         "budget_tokens": budget_tokens,
+        "results": debug_results,
     });
 
     if ok_count == 0 {
-        return tool_error_structured(
-            format!("fetch: all {} urls failed", results.len()),
+        structured["next_action"] =
+            json!("inspect the per-URL errors above; retry only transient failures individually");
+        let mut error = tool_error_structured(
+            format!(
+                "fetch: all {} urls failed\n\n{}",
+                results.len(),
+                text.trim_end()
+            ),
             "transient",
-            Some(json!({
-                "urls": urls,
-                "results": structured["results"].clone(),
-                "next_action": "see per-url errors in structuredContent.results : fetch promising ones individually",
-            })),
+            Some(structured),
         );
+        error["_meta"]["com.donsetch/fetch-batch-debug"] = debug;
+        return error;
     }
     json!({
-        "content": [
-            {"type": "text", "text": format!("[meta] {}", compact_json(&meta))},
-            {"type": "text", "text": text},
-        ],
-        "structuredContent": structured
+        "content": [{"type": "text", "text": text.trim_end()}],
+        "structuredContent": structured,
+        "_meta": {"com.donsetch/fetch-batch-debug": debug},
     })
 }
 
@@ -1844,9 +1864,10 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
                     &trace,
                     t0.elapsed().as_millis(),
                 );
-                res["_meta"] = json!({ "ttlMs": 300_000, "cacheScope": "session" });
-                if prewarmed && let Some(sc) = res.pointer_mut("/structuredContent") {
-                    sc["prewarmed_by_search"] = json!(true);
+                res["_meta"]["ttlMs"] = json!(300_000);
+                res["_meta"]["cacheScope"] = json!("session");
+                if prewarmed {
+                    res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
                 }
                 apply_link_handles(daemon, &mut res).await;
                 return res;
@@ -2038,8 +2059,8 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
         &trace,
         t0.elapsed().as_millis(),
     );
-    if prewarmed && let Some(sc) = res.pointer_mut("/structuredContent") {
-        sc["prewarmed_by_search"] = json!(true);
+    if prewarmed {
+        res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
     }
     if stitched_parts > 1
         && let Some(sc) = res.pointer_mut("/structuredContent")
@@ -2060,7 +2081,7 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
         cloak_warning = Some(note);
     }
     if let Some(note) = &cloak_warning {
-        if let Some(cell) = res.pointer_mut("/content/1/text")
+        if let Some(cell) = res.pointer_mut("/content/0/text")
             && let Some(md) = cell.as_str().map(String::from)
         {
             *cell = json!(format!("*[cloak_suspected: {note}]*\n\n{md}"));
@@ -2184,13 +2205,11 @@ async fn try_bypass(
         trace,
         t0.elapsed().as_millis(),
     );
-    if let Some(sc) = res.pointer_mut("/structuredContent") {
-        sc["bypass"] = json!({
-            "provider": "brightdata",
-            "tier": if outcome.cached { "cache" } else { "unlocker" },
-            "cache": outcome.cached,
-        });
-    }
+    res["_meta"]["com.donsetch/fetch-debug"]["bypass"] = json!({
+        "provider": "brightdata",
+        "tier": if outcome.cached { "cache" } else { "unlocker" },
+        "cache": outcome.cached,
+    });
     apply_link_handles(daemon, &mut res).await;
     Some(res)
 }
@@ -2868,14 +2887,6 @@ async fn fetch_with_actions(
     res
 }
 
-/// Compact JSON string (no whitespace) for embedding in text
-/// content blocks. Used for [meta] blocks that give clients
-/// (Claude Code, VSCode) essential fields they'd otherwise
-/// only get from structuredContent.
-fn compact_json(v: &Value) -> String {
-    serde_json::to_string(v).unwrap_or_default()
-}
-
 /// v3 image OCR: fetch + OCR the page's content images (up to 4,
 /// 5MB each, SSRF-guarded) and append an `## image text` section
 /// to the result. On-demand only : OCR models are heavy and most
@@ -2961,7 +2972,7 @@ async fn apply_image_ocr(daemon: &Arc<Daemon>, res: &mut Value, images: &[(Strin
                 }
             }
         }
-        if let Some(cell) = res.pointer_mut("/content/1/text")
+        if let Some(cell) = res.pointer_mut("/content/0/text")
             && let Some(md) = cell.as_str().map(String::from)
         {
             *cell = json!(md + &section);
@@ -3122,35 +3133,26 @@ async fn try_resurrect(daemon: &Arc<Daemon>, url: &str, live_error: &Value) -> O
     let mut trace = Trace::default();
     trace.step("archive", "wayback", &format!("snapshot {ts}"), 0);
     let structured = json!({
+        "content_ok": !ex.thin,
+        "url": url,
+        "snapshot_url": snap_url,
+        "archived": { "snapshot": ts, "date": date, "age_days": age_days },
+    });
+    let debug = json!({
         "status": snap.status,
         "tier": "1(wayback)",
         "verdict": "Archived",
-        "content_ok": !ex.thin,
         "thin": ex.thin,
         "title": ex.title,
         "total_chars": ex.total_chars,
         "tokens_est": tokens,
-        "url": url,
-        "snapshot_url": snap_url,
-        "archived": { "snapshot": ts, "date": date, "age_days": age_days },
         "live_error": live_reason,
         "escalation": trace.value(),
     });
-    let meta = json!({
-        "url": url,
-        "tier": "1(wayback)",
-        "verdict": "Archived",
-        "archived": date,
-        "age_days": age_days,
-        "tokens_est": tokens,
-        "title": ex.title,
-    });
     Some(json!({
-        "content": [
-            {"type": "text", "text": format!("[meta] {}", compact_json(&meta))},
-            {"type": "text", "text": ex.markdown},
-        ],
+        "content": [{"type": "text", "text": format_fetch_markdown(&ex, &snap_url, url)}],
         "structuredContent": structured,
+        "_meta": {"com.donsetch/fetch-debug": debug},
     }))
 }
 
@@ -3256,9 +3258,9 @@ fn apply_page_history(
     if since_last {
         let title_line = ex_title.map(|t| format!("# {t}\n")).unwrap_or_default();
         let body = match (changed.as_str(), &delta) {
-            ("unchanged", _) => format!(
-                "{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago) : fingerprint {fp}*\n"
-            ),
+            ("unchanged", _) => {
+                format!("{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago)*\n")
+            }
             (_, Some(d)) => format!(
                 "{title_line}{url}\n\n*changed since last fetch ({changed}, {ago}s ago):*\n\n- {d}\n\n*(full content: refetch without since_last)*\n"
             ),
@@ -3266,17 +3268,14 @@ fn apply_page_history(
                 "{title_line}{url}\n\n*{changed} since last fetch ({ago}s ago) : refetch without since_last for full content*\n"
             ),
         };
-        if let Some(cell) = res.pointer_mut("/content/1/text") {
+        if let Some(cell) = res.pointer_mut("/content/0/text") {
             *cell = json!(body);
-        }
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["tokens_est"] = json!(body.len() / 4);
         }
     } else if changed != "new" {
         // Note in the content on change (first contact with the
         // delta is valuable; unchanged stays silent).
         if let Some(d) = &delta
-            && let Some(cell) = res.pointer_mut("/content/1/text")
+            && let Some(cell) = res.pointer_mut("/content/0/text")
             && let Some(md) = cell.as_str().map(String::from)
         {
             *cell = json!(format!(
@@ -3286,31 +3285,17 @@ fn apply_page_history(
         }
     }
 
-    // Stamp meta + structuredContent.
-    let mut meta_patch = json!({ "fp": fp, "changed": changed });
-    if ago > 0 {
-        meta_patch["age_s"] = json!(ago);
-    }
-    if let Some(d) = &delta {
-        meta_patch["changed_sections"] = json!(d);
-    }
-    if let Some(cell) = res.pointer_mut("/content/0/text")
-        && let Some(t) = cell.as_str().map(String::from)
-        && t.ends_with('}')
-    {
-        let mut obj: serde_json::Map<String, Value> =
-            serde_json::from_str(&t.replace("[meta] ", "")).unwrap_or_default();
-        for (k, v) in meta_patch.as_object().unwrap() {
-            obj.insert(k.clone(), v.clone());
-        }
-        *cell = json!(format!("[meta] {}", Value::Object(obj)));
-    }
+    // Change state affects the next model decision. Opaque fingerprints and
+    // observation age are client diagnostics.
     if let Some(sc) = res.pointer_mut("/structuredContent") {
-        sc["fingerprint"] = json!(fp);
         sc["changed"] = json!(changed);
         if let Some(d) = &delta {
             sc["changed_sections"] = json!(d);
         }
+    }
+    res["_meta"]["com.donsetch/fetch-debug"]["fingerprint"] = json!(fp);
+    if ago > 0 {
+        res["_meta"]["com.donsetch/fetch-debug"]["history_age_s"] = json!(ago);
     }
 }
 
@@ -3322,7 +3307,7 @@ fn now_unix() -> u64 {
 }
 
 /// v3 reference handles: rewrite markdown links in a fetch result
-/// to `L{n}` handles and stamp the count into the [meta] block.
+/// to `L{n}` handles and expose the count as compact machine state.
 /// Mutates `res` in place; no-op when links aren't in the output.
 async fn apply_link_handles(daemon: &Arc<Daemon>, res: &mut Value) {
     // When handles are disabled, links keep their hrefs.
@@ -3330,7 +3315,7 @@ async fn apply_link_handles(daemon: &Arc<Daemon>, res: &mut Value) {
         return;
     }
     let Some(text) = res
-        .pointer("/content/1/text")
+        .pointer("/content/0/text")
         .and_then(Value::as_str)
         .map(String::from)
     else {
@@ -3342,22 +3327,59 @@ async fn apply_link_handles(daemon: &Arc<Daemon>, res: &mut Value) {
         return;
     }
     ht.flush();
-    if let Some(cell) = res.pointer_mut("/content/1/text") {
+    if let Some(cell) = res.pointer_mut("/content/0/text") {
         *cell = json!(new_md);
-    }
-    // Stamp the handle count into the [meta] line so the agent
-    // knows links are fetchable handles now. The meta text is
-    // "[meta] {compact json}" : splice before the closing brace.
-    if let Some(meta_text) = res.pointer_mut("/content/0/text")
-        && let Some(s) = meta_text.as_str().map(String::from)
-        && s.ends_with('}')
-    {
-        let patched = s.trim_end_matches('}').to_string() + &format!(",\"link_handles\":{n}}}");
-        *meta_text = json!(patched);
     }
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["link_handles"] = json!(n);
     }
+}
+
+/// Remove only frontmatter represented by the wrapper's canonical source
+/// header. Byline, publication date and summaries remain evidence.
+fn strip_source_frontmatter(markdown: &str, url: &str, title: Option<&str>) -> String {
+    const FRONTMATTER_LINES: usize = 8;
+    let mut dropped_title = false;
+    let mut dropped_url = false;
+    let mut lines = Vec::new();
+    for (index, line) in markdown.lines().enumerate() {
+        let is_same_title = title.is_some_and(|title| {
+            line.strip_prefix("# ")
+                .is_some_and(|candidate| candidate.trim() == title.trim())
+        });
+        if index < FRONTMATTER_LINES && !dropped_title && is_same_title {
+            dropped_title = true;
+            continue;
+        }
+        if index < FRONTMATTER_LINES && !dropped_url && same_fetch_url(line.trim(), url) {
+            dropped_url = true;
+            continue;
+        }
+        lines.push(line);
+    }
+    lines.join("\n").trim().to_string()
+}
+
+fn same_fetch_url(candidate: &str, expected: &str) -> bool {
+    match (url::Url::parse(candidate), url::Url::parse(expected)) {
+        (Ok(candidate), Ok(expected)) => candidate == expected,
+        _ => candidate == expected,
+    }
+}
+
+/// Present one canonical title and source URL followed by the evidence body.
+fn format_fetch_markdown(ex: &extract::Extracted, source_url: &str, display_url: &str) -> String {
+    let body = strip_source_frontmatter(&ex.markdown, source_url, ex.title.as_deref());
+    let mut markdown = String::new();
+    if let Some(title) = &ex.title {
+        markdown.push_str(&format!("# {title}\n"));
+    }
+    markdown.push_str(display_url);
+    if !body.is_empty() {
+        markdown.push_str("\n\n");
+        markdown.push_str(&body);
+    }
+    markdown
 }
 
 fn finish_result(
@@ -3390,15 +3412,36 @@ fn finish_result(
             "per_page_capped": pages.len() > 50,
         })
     });
+    // The model-facing object contains only state that can alter its next
+    // action. Evidence itself appears once in the text block below.
     let mut structured = json!({
+        "url": url,
+        "content_ok": !ex.thin && verdict == "ContentOk",
+        "content_kind": format!("{:?}", ex.content_kind),
+    });
+    if ex.thin {
+        structured["thin"] = json!(true);
+    }
+    if !matches!(ex.lang.as_str(), "" | "und" | "unknown") {
+        structured["lang"] = json!(ex.lang);
+    }
+    if let Some(next_offset) = ex.next_offset {
+        structured["next_offset"] = json!(next_offset);
+    }
+    if let Some(pdf) = &pdf {
+        structured["pdf"] = json!({
+            "pages": pdf["pages"],
+            "ocr_pages": pdf["ocr_pages"],
+        });
+    }
+
+    // Transport and extraction telemetry remains available to MCP clients but
+    // no longer competes with source evidence in model context.
+    let debug = json!({
         "status": status,
         "tier": tier,
         "verdict": verdict,
-        "content_ok": !ex.thin && verdict == "ContentOk",
-        "thin": ex.thin,
-        "content_kind": format!("{:?}", ex.content_kind),
         "quality": ex.quality,
-        "lang": ex.lang,
         "title": ex.title,
         "byline": ex.byline,
         "published": ex.published,
@@ -3406,52 +3449,16 @@ fn finish_result(
         "blocks_shown": ex.blocks_shown,
         "blocks_total": ex.blocks_total,
         "total_chars": ex.total_chars,
-        "next_offset": ex.next_offset,
         "tokens_est": ex.tokens_est,
+        "elapsed_ms": elapsed_ms,
         "escalation": trace.value(),
+        "via": ex.via,
         "pdf": pdf,
-        "url": url,
-        "ms": elapsed_ms,
     });
-    // v3: the honest adapter label : the agent sees WHICH
-    // structured source produced this result.
-    if let Some(via) = ex.via {
-        structured["via"] = json!(via);
-    }
-    // Compact metadata text block prepended for clients (Claude Code,
-    // VSCode) that drop text content when structuredContent is present.
-    let mut meta = json!({
-        "url": url,
-        "tier": tier,
-        "verdict": verdict,
-        "content_ok": !ex.thin && verdict == "ContentOk",
-        "thin": ex.thin,
-        "tokens_est": ex.tokens_est,
-        "total_chars": ex.total_chars,
-        "ms": elapsed_ms,
-        "lang": ex.lang,
-    });
-    if let Some(n) = ex.next_offset {
-        meta["next_offset"] = json!(n);
-    }
-    if let Some(via) = ex.via {
-        meta["via"] = json!(via);
-    }
-    if let Some(t) = &ex.title {
-        meta["title"] = json!(t);
-    }
-    if let Some(p) = &pdf {
-        meta["pdf_pages"] = json!(p["pages"]);
-        if p["ocr_pages"].as_u64().unwrap_or(0) > 0 {
-            meta["pdf_ocr"] = json!(p["ocr_pages"]);
-        }
-    }
     json!({
-        "content": [
-            {"type": "text", "text": format!("[meta] {}", compact_json(&meta))},
-            {"type": "text", "text": ex.markdown},
-        ],
+        "content": [{"type": "text", "text": format_fetch_markdown(ex, url, url)}],
         "structuredContent": structured,
+        "_meta": {"com.donsetch/fetch-debug": debug},
     })
 }
 
@@ -3607,10 +3614,77 @@ fn search_batch_deadline_error(queries: &[String]) -> Value {
     )
 }
 
+/// Ghost render capability shared by the crawl and the search
+/// SERP cascade lane. `skip_cache_read` = never serve a previous
+/// render from the cache (the search lane uses this: a cached
+/// walled SERP would replay "no results" for the whole TTL).
+/// Writes are always kept: the cache still serves normal fetches
+/// of the same URL.
+fn make_ghost_hook(
+    ghost_mgr: std::sync::Arc<GhostManager>,
+    profile: BrowserProfile,
+    fetcher: std::sync::Arc<Fetcher>,
+    state: Arc<tokio::sync::Mutex<GhostState>>,
+    skip_cache_read: bool,
+) -> crate::crawl::GhostHook {
+    std::sync::Arc::new(move |url: String| {
+        let ghost_mgr = std::sync::Arc::clone(&ghost_mgr);
+        let profile = profile.clone();
+        let fetcher = std::sync::Arc::clone(&fetcher);
+        let state = Arc::clone(&state);
+        async move {
+            // Render cache shortcut (crawl only).
+            if !skip_cache_read {
+                let s = state.lock().await;
+                if let Some(rc) = s.render_for(&url) {
+                    return Ok(crate::crawl::GhostRender {
+                        html: rc.html.clone(),
+                    });
+                }
+            }
+            let mut g = match ghost_mgr.acquire(&profile).await {
+                Ok(g) => g,
+                Err(e) => return Err(format!("browser launch: {e}")),
+            };
+            let page = match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20))
+                .await
+            {
+                Ok(p) => p,
+                Err(first) => {
+                    // Retry once on transient timeout.
+                    match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20)).await {
+                        Ok(p) => p,
+                        Err(second) => {
+                            return Err(format!("render: {first}; retry: {second}"));
+                        }
+                    }
+                }
+            };
+            if page.captcha {
+                return Err("interactive captcha (unsolvable by design)".to_string());
+            }
+            if !page.cookies.is_empty() {
+                fetcher.import_cookies(&page.cookies).await;
+                crate::ghost::cache::store_session_cookies(&page.cookies);
+            }
+            {
+                let mut s = state.lock().await;
+                s.record_render(&url, &page.html);
+            }
+            Ok(crate::crawl::GhostRender { html: page.html })
+        }
+        .boxed()
+    })
+}
+
 #[derive(Debug)]
 struct SearchFailure {
     cause: String,
     byok_tried: bool,
+    /// "permanent" for bad input that no retry or fallback fixes
+    /// (validate_query rejected it before any engine was contacted);
+    /// "transient" for exhausted engines/providers.
+    kind: &'static str,
 }
 
 /// The search pipeline: BYOK providers (if configured) with
@@ -3626,31 +3700,75 @@ async fn search_inner(
         Ok(out) => {
             let top = out.results.first().map(|r| r.url.as_str());
             maybe_pre_solve(daemon, top);
-            render_search_outcome(daemon, &out, query).await
+            render_search_outcome(daemon, &out).await
         }
-        Err(failure) => search_error(query, &failure.cause, failure.byok_tried),
+        Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
 }
 
-async fn render_search_outcome(
-    daemon: &Arc<Daemon>,
-    out: &crate::search::SearchOutcome,
-    query: &str,
-) -> Value {
+async fn render_search_outcome(daemon: &Arc<Daemon>, out: &crate::search::SearchOutcome) -> Value {
     let hs = bind_search_handles(daemon, out).await;
     let hints = route_hints(daemon, out).await;
-    let md = search::render_markdown(out, query, Some(&hs), &hints);
-    let meta = search::render_meta(out);
+    let md = search::render_compact_markdown(out, "# Search results", Some(&hs), &hints);
+    let model = search_model_meta(out, &hs);
+    let debug = search_debug_meta(out);
     json!({
         "content": [{ "type": "text", "text": md }],
-        "structuredContent": meta,
+        "structuredContent": model,
+        "_meta": {"com.donsetch/search-debug": debug},
     })
 }
 
-/// Execute explicit query variants concurrently but keep every result set
-/// separate. Cross-query score fusion would create a second, unbenchmarked
-/// ranker; grouped evidence lets the calling model compare formulations while
-/// each query retains DonSeTch's existing ranking semantics.
+/// Machine state needed to route a subsequent fetch. Titles and snippets are
+/// already present on the linear evidence surface; ranking and engine
+/// telemetry remain in client-only metadata.
+fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[String]) -> Value {
+    let results = out
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let mut item = json!({
+                "rank": index + 1,
+                "url": result.url,
+            });
+            if let Some(handle) = handles.get(index) {
+                item["handle"] = json!(handle);
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    json!({"weak": out.weak, "results": results})
+}
+
+fn search_debug_meta(out: &crate::search::SearchOutcome) -> Value {
+    // Full machine view: per-result title/url/snippet/score plus
+    // the engines report. This is the client-only namespace (the
+    // model never sees _meta), so the detail costs CLI/pipeline
+    // consumers nothing and no model tokens. The compact-contract
+    // PR pruned search-debug down to telemetry only, which broke
+    // every machine consumer reading meta.results[].snippet (the
+    // in-repo bench went 0/30 silently; live-found, restored).
+    search::render_meta(out)
+}
+
+/// Retrying a fully-failed batch only makes sense if at least one
+/// variant failed for a transient (engine/provider) reason; if every
+/// variant was rejected by validate_query ("permanent"), no engine
+/// was ever contacted and retrying the same queries won't help.
+/// Pulled out as a pure function so this logic is testable without a
+/// live `Daemon`.
+fn batch_failure_kind<'a>(kinds: impl Iterator<Item = &'a str>) -> &'static str {
+    if kinds.into_iter().all(|k| k == "permanent") {
+        "permanent"
+    } else {
+        "transient"
+    }
+}
+
+/// Execute explicit query variants concurrently and keep every result set
+/// separate. Grouped evidence lets the calling model compare formulations
+/// while each query retains DonSeTch's established ranking semantics.
 async fn search_batch_inner(
     daemon: &Arc<Daemon>,
     queries: &[String],
@@ -3676,13 +3794,22 @@ async fn search_batch_inner(
                 Err(failure) => Some(json!({"query": query, "error": failure.cause})),
             })
             .collect::<Vec<_>>();
+        let kind = batch_failure_kind(outcomes.iter().filter_map(|outcome| match outcome {
+            Ok(_) => None,
+            Err(f) => Some(f.kind),
+        }));
+        let next_action = if kind == "permanent" {
+            "fix the queries and search again"
+        } else {
+            "retry once, then reduce to the strongest single query"
+        };
         return tool_error_structured(
             format!("search: all {} query variants failed", queries.len()),
-            "transient",
+            kind,
             Some(json!({
                 "queries": queries,
                 "errors": errors,
-                "next_action": "retry once, then reduce to the strongest single query",
+                "next_action": next_action,
             })),
         );
     }
@@ -3697,16 +3824,18 @@ async fn search_batch_inner(
         .collect::<Vec<_>>();
     let handles = bind_search_urls(daemon, &urls).await;
     let mut handle_offset = 0usize;
-    let mut markdown = format!(
-        "*{} explicit query formulations searched in parallel; result sets are kept separate.*\n\n",
-        queries.len()
-    );
+    let mut markdown = format!("# Search results : {} formulations", queries.len());
     let mut searches = Vec::with_capacity(queries.len());
+    let mut diagnostics = Vec::with_capacity(queries.len());
 
     for (query, outcome) in queries.iter().zip(outcomes.iter()) {
-        if !markdown.ends_with("\n\n") {
-            markdown.push_str("\n\n");
-        }
+        markdown.push_str("\n\n");
+        let role = if searches.is_empty() {
+            "primary"
+        } else {
+            "variant"
+        };
+        let heading = format!("## q{} {role} : {query}", searches.len());
         match outcome {
             Ok(out) => {
                 let count = out.results.len();
@@ -3717,22 +3846,27 @@ async fn search_batch_inner(
                 };
                 handle_offset += count;
                 let hints = route_hints(daemon, out).await;
-                markdown.push_str(&search::render_markdown(out, query, query_handles, &hints));
-                markdown.push_str("\n---\n");
-                let mut meta = search::render_meta(out);
-                meta["query"] = json!(query);
-                searches.push(meta);
+                markdown.push_str(&search::render_compact_markdown(
+                    out,
+                    &heading,
+                    query_handles,
+                    &hints,
+                ));
+                let mut model = search_model_meta(out, query_handles.unwrap_or(&[]));
+                model["query"] = json!(query);
+                searches.push(model);
+                let mut debug = search_debug_meta(out);
+                debug["query"] = json!(query);
+                diagnostics.push(debug);
             }
             Err(failure) => {
-                markdown.push_str(&format!(
-                    "# Search: {query}\n\n*failed: {}*\n\n---\n",
-                    failure.cause
-                ));
+                markdown.push_str(&format!("{heading}\nFailed : {}", failure.cause));
                 searches.push(json!({
                     "query": query,
                     "error": failure.cause,
                     "results": [],
                 }));
+                diagnostics.push(json!({"query": query, "error": failure.cause}));
             }
         }
     }
@@ -3743,9 +3877,12 @@ async fn search_batch_inner(
             "query_count": queries.len(),
             "ok": ok,
             "errors": queries.len() - ok,
-            "elapsed_ms": started.elapsed().as_millis() as u64,
             "searches": searches,
         },
+        "_meta": {"com.donsetch/search-debug": {
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "searches": diagnostics,
+        }},
     })
 }
 
@@ -3758,6 +3895,15 @@ async fn search_outcome(
     max: usize,
     intent: Option<Intent>,
 ) -> Result<crate::search::SearchOutcome, SearchFailure> {
+    // Input hygiene first: a bad query is a permanent-shaped failure
+    // whether the fanout would have been BYOK or local.
+    if let Some(problem) = search::validate_query(query) {
+        return Err(SearchFailure {
+            cause: problem,
+            byok_tried: false,
+            kind: "permanent",
+        });
+    }
     // Reload from disk first : picks up keys added/removed
     // via CLI while the daemon was running.
     daemon.byok.reload();
@@ -3792,12 +3938,14 @@ async fn search_outcome(
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
                         byok_tried: true,
+                        kind: "transient",
                     }),
                 }
             } else {
                 Err(SearchFailure {
                     cause: e.to_string(),
                     byok_tried: false,
+                    kind: "transient",
                 })
             }
         }
@@ -3904,7 +4052,21 @@ impl Drop for PreSolveGuard<'_> {
     }
 }
 
-fn search_error(query: &str, cause: &str, byok_tried: bool) -> Value {
+fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &str) -> Value {
+    if kind == "permanent" {
+        // validate_query rejected the query before any engine or
+        // provider was ever contacted : no escalation trace to show,
+        // and retrying the same query (or adding an API key) won't
+        // help, unlike the exhausted-engines case below.
+        return tool_error_structured(
+            format!("search: {cause}"),
+            "permanent",
+            Some(json!({
+                "query": query,
+                "next_action": "fix the query and search again",
+            })),
+        );
+    }
     let mut trace = Trace::default();
     trace.step("search", "engines", "error", 0);
     if byok_tried {
@@ -4057,10 +4219,8 @@ fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str) -> String 
 
 /// Escalation trace: the ordered record of what DonSeTch tried :
 /// HTTP → browser → OCR-style fallbacks : with tier, action,
-/// outcome and per-step latency. Surfaced as
-/// structuredContent.escalation on successes AND errors, so the
-/// agent sees exactly why a fetch took its path (and what a
-/// 20s latency was spent on) without re-deriving it.
+/// outcome and per-step latency. Successes expose it through client-only
+/// `_meta`; errors retain actionable state on the model surface.
 #[derive(Default)]
 struct Trace {
     steps: Vec<Value>,
@@ -4101,6 +4261,57 @@ fn fetch_error_kind(e: &FetchError) -> &'static str {
 #[cfg(test)]
 mod stitch_tests {
     use super::*;
+
+    // search_error used to hardcode errorKind: "transient" for every
+    // failure, including validate_query rejections (empty/oversized
+    // query) that never contact an engine -- contradicting its own
+    // caller's comment ("a bad query is a permanent-shaped failure")
+    // and, via exit_code_of in cli/tool.rs, handing scripts the wrong
+    // exit code for a non-retryable input error.
+    #[test]
+    fn search_error_permanent_has_no_false_escalation_trace() {
+        let v = search_error(
+            "",
+            "empty query : pass a non-empty query string",
+            false,
+            "permanent",
+        );
+        assert_eq!(v["errorKind"], "permanent");
+        assert!(
+            v["structuredContent"].get("escalation").is_none(),
+            "a validation failure never contacted an engine: no escalation trace to show"
+        );
+    }
+
+    #[test]
+    fn search_error_transient_keeps_engine_escalation_trace() {
+        let v = search_error("q", "all engines timed out", false, "transient");
+        assert_eq!(v["errorKind"], "transient");
+        assert!(v["structuredContent"].get("escalation").is_some());
+    }
+
+    #[test]
+    fn batch_failure_kind_permanent_only_when_every_variant_is() {
+        assert_eq!(
+            batch_failure_kind(["permanent", "permanent"].into_iter()),
+            "permanent"
+        );
+        assert_eq!(batch_failure_kind(["permanent"].into_iter()), "permanent");
+    }
+
+    #[test]
+    fn batch_failure_kind_transient_if_any_variant_is() {
+        // One transient variant means a retry could still succeed :
+        // the batch as a whole should be reported retryable.
+        assert_eq!(
+            batch_failure_kind(["permanent", "transient"].into_iter()),
+            "transient"
+        );
+        assert_eq!(
+            batch_failure_kind(["transient", "transient"].into_iter()),
+            "transient"
+        );
+    }
 
     #[test]
     fn rel_next_found_and_resolved() {
@@ -4226,6 +4437,265 @@ mod error_code_tests {
             "crawl.resume"
         );
         assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
+    }
+}
+
+#[cfg(test)]
+mod fetch_output_contract_tests {
+    use super::{Trace, finish_result, format_fetch_markdown};
+    use crate::extract::{ContentKind, Extracted};
+
+    pub(super) fn extracted(markdown: &str) -> Extracted {
+        Extracted {
+            markdown: markdown.into(),
+            title: Some("Example".into()),
+            byline: Some("A. Author".into()),
+            published: Some("2026-09-04".into()),
+            site: Some("Example Site".into()),
+            total_chars: markdown.len(),
+            next_offset: None,
+            blocks_total: 4,
+            blocks_shown: 3,
+            tokens_est: markdown.len() / 4,
+            thin: false,
+            content_kind: ContentKind::Article,
+            lang: "en".into(),
+            quality: 0.91,
+            pdf_pages: None,
+            images: Vec::new(),
+            fingerprint: Some("opaque".into()),
+            via: None,
+        }
+    }
+
+    #[test]
+    fn fetch_renders_identity_once_and_hides_diagnostics_from_model_state() {
+        let mut trace = Trace::default();
+        trace.step("1", "http-fetch", "ok", 12);
+        let output = finish_result(
+            &extracted("https://example.com/page\n\n# Example\n\nEvidence."),
+            "1",
+            200,
+            "ContentOk",
+            "https://example.com/page",
+            &trace,
+            14,
+        );
+
+        assert_eq!(output["content"].as_array().unwrap().len(), 1);
+        let text = output["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.matches("# Example").count(), 1);
+        assert_eq!(text.matches("https://example.com/page").count(), 1);
+        assert!(!text.starts_with("[meta]"));
+        let state = output["structuredContent"].as_object().unwrap();
+        for absent in [
+            "title",
+            "tier",
+            "quality",
+            "tokens_est",
+            "escalation",
+            "status",
+        ] {
+            assert!(
+                !state.contains_key(absent),
+                "{absent} leaked to model state"
+            );
+        }
+        assert_eq!(state["url"], "https://example.com/page");
+        assert_eq!(output["_meta"]["com.donsetch/fetch-debug"]["tier"], "1");
+
+        let unrelated = extracted("# Actual first section\n\nEvidence.");
+        assert!(
+            format_fetch_markdown(
+                &unrelated,
+                "https://example.com/page",
+                "https://example.com/page"
+            )
+            .contains("# Actual first section")
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_output_contract_tests {
+    use super::{search_debug_meta, search_model_meta};
+    use crate::search::SearchOutcome;
+    use crate::search::intent::Intent;
+    use crate::search::rank::Merged;
+    use std::time::Duration;
+
+    #[test]
+    fn search_structure_routes_without_repeating_ranked_evidence() {
+        let output = SearchOutcome {
+            results: vec![Merged {
+                title: "Visible in markdown".into(),
+                url: "https://example.com/answer".into(),
+                snippet: "Evidence belongs to text".into(),
+                sources: vec![("bing".into(), 0)],
+                score: 0.9,
+                published: None,
+            }],
+            weak: false,
+            intent: Intent::Web,
+            report: Vec::new(),
+            cached: false,
+            elapsed: Duration::from_millis(10),
+            provider: None,
+            reranked: true,
+        };
+        let state = search_model_meta(&output, &["S1".into()]);
+        assert_eq!(state["results"][0]["rank"], 1);
+        assert_eq!(state["results"][0]["handle"], "S1");
+        for absent in ["title", "snippet", "score", "engines"] {
+            assert!(state["results"][0].get(absent).is_none());
+        }
+        let debug = search_debug_meta(&output);
+        assert_eq!(debug["results"][0]["score"], 0.9);
+        // The machine channel (client-only _meta) carries the full
+        // per-result view: scripts, the bench, and pipelines read
+        // meta.results[].snippet through the CLI --json re-materializer.
+        assert_eq!(debug["results"][0]["title"], "Visible in markdown");
+        assert_eq!(debug["results"][0]["url"], "https://example.com/answer");
+        assert_eq!(debug["results"][0]["snippet"], "Evidence belongs to text");
+    }
+}
+
+#[cfg(test)]
+mod batch_output_contract_tests {
+    use super::fetch_output_contract_tests::extracted;
+    use super::{Trace, finish_result, render_fetch_batch};
+    use serde_json::json;
+
+    #[test]
+    fn batch_keeps_evidence_order_and_per_url_failure_codes() {
+        let urls: Vec<String> = vec![
+            "https://example.com/a".into(),
+            "https://example.com/b".into(),
+        ];
+        let success = finish_result(
+            &extracted("# Example\nhttps://example.com/a\n\nAlpha."),
+            "1",
+            200,
+            "ContentOk",
+            &urls[0],
+            &Trace::default(),
+            1,
+        );
+        let failure = json!({
+            "content": [{"type": "text", "text": "request timed out"}],
+            "structuredContent": {"code": "network.timeout"},
+            "isError": true,
+        });
+        let results = vec![success, failure];
+        let markdowns = vec![
+            Some(
+                results[0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            ),
+            None,
+        ];
+        let output = render_fetch_batch(&urls, &results, &markdowns, Some(2_000), &[false, false]);
+        assert_eq!(output["content"].as_array().unwrap().len(), 1);
+        let text = output["content"][0]["text"].as_str().unwrap();
+        assert!(text.find("Alpha.").unwrap() < text.find("request timed out").unwrap());
+        assert_eq!(
+            output["structuredContent"]["results"][1]["code"],
+            "network.timeout"
+        );
+        let first = &output["structuredContent"]["results"][0];
+        assert!(first.get("content_ok").is_none());
+        assert!(first.get("content_kind").is_none());
+        assert!(first.get("thin").is_none());
+        assert!(first.get("changed").is_none());
+        assert!(first.get("tier").is_none());
+        let first_debug = &output["_meta"]["com.donsetch/fetch-batch-debug"]["results"][0];
+        assert_eq!(first_debug["tier"], "1");
+        assert!(first_debug.get("tokens_est").is_some());
+        assert!(first_debug.get("quality").is_none());
+        assert!(first_debug.get("escalation").is_none());
+
+        let flagged = json!({
+            "content": [{"type": "text", "text": "# Thin\nhttps://example.com/a"}],
+            "structuredContent": {
+                "content_ok": false,
+                "content_kind": "Page",
+                "thin": true,
+                "changed": "major",
+                "next_offset": 16000,
+                "cloak_suspected": true,
+                "archived": {"date": "2026-09-01", "age_days": 3}
+            }
+        });
+        let flagged_output = render_fetch_batch(
+            &urls[..1],
+            &[flagged],
+            &[Some("# Thin\nhttps://example.com/a".into())],
+            None,
+            &[false],
+        );
+        let flagged_state = &flagged_output["structuredContent"]["results"][0];
+        assert_eq!(flagged_state["content_ok"], false);
+        assert!(flagged_state.get("content_kind").is_none());
+        assert_eq!(flagged_state["thin"], true);
+        assert_eq!(flagged_state["changed"], "major");
+        assert_eq!(flagged_state["next_offset"], 16000);
+        assert_eq!(flagged_state["cloak_suspected"], true);
+        assert_eq!(flagged_state["archived"]["age_days"], 3);
+    }
+}
+
+#[cfg(test)]
+mod crawl_output_contract_tests {
+    use super::render_crawl_result;
+    use crate::crawl::{CrawlMode, CrawlPage, CrawlResult, StopReason};
+    use crate::extract::ContentKind;
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn crawl_renders_page_identity_once_and_keeps_resume_as_state() {
+        let page = CrawlPage {
+            url: "https://example.com/docs/page".into(),
+            title: "Evidence page".into(),
+            kind: ContentKind::Article,
+            markdown: "# Evidence page\nhttps://example.com/docs/page\n\nUseful evidence.".into(),
+            chars: 16,
+            quality: 0.93,
+            duplicate: false,
+            parent: Some("https://example.com/docs/".into()),
+            score: 0.88,
+            lastmod: Some("2026-09-04".into()),
+        };
+        let result = CrawlResult {
+            seed: "https://example.com/docs/".into(),
+            pages: vec![page],
+            queued: vec![],
+            filtered_out: 0,
+            skipped: vec![],
+            stop: StopReason::MaxPages,
+            elapsed: Duration::from_millis(42),
+            map: vec![],
+            crawl_delay: None,
+            resume: Some("opaque-resume".into()),
+        };
+        let output = render_crawl_result(&result, CrawlMode::Full);
+        let text = output["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.matches("Evidence page").count(), 1);
+        assert_eq!(text.matches("https://example.com/docs/page").count(), 1);
+        assert!(!text.contains("quality="));
+        assert!(!text.contains("opaque-resume"));
+        assert_eq!(output["structuredContent"]["resume"], "opaque-resume");
+        assert!(
+            output["structuredContent"]["pages"][0]
+                .get("quality")
+                .is_none()
+        );
+        assert_eq!(
+            output["_meta"]["com.donsetch/crawl-debug"]["pages"][0]["quality"],
+            json!(0.93_f32)
+        );
     }
 }
 

@@ -5,6 +5,194 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.3] - 2026-09-05
+
+### Added
+
+- **Windows binaries carry a version resource:** Explorer, Task Manager,
+  UAC prompts and `Get-Command` showed no publisher, description or
+  version. `build.rs` now stamps `VERSIONINFO` derived entirely from
+  `Cargo.toml`: `FileDescription` the display name, `Comments` the
+  package description, `LegalCopyright` the license. The numeric
+  `FILEVERSION` carries `MAJOR.MINOR.PATCH`, the string field the full
+  version, and a version suffix marks the build unofficial (`rc`/`beta`
+  set `VS_FF_PRERELEASE`, anything else `VS_FF_PRIVATEBUILD`). Best
+  effort: a missing `rc.exe` warns instead of failing the build.
+  `CompanyName` is left as a disabled hook : there is no publisher to
+  claim.
+- **`serverInfo.title` in the MCP handshake:** MCP separates the
+  programmatic identifier from the display label (`title`, optional
+  since 2025-06-18), so clients that prefer it now show `DonSeTch`
+  instead of the `donsetch` package id. Older clients ignore the field.
+
+### Changed
+
+- **One source for the product name:** hardcoded in 16 places across the
+  CLI, it now lives in `src/display_name.rs` (`donsetch::DISPLAY_NAME`),
+  read by the CLI titles, the MCP title and build.rs alike : the last by
+  `include!`, since a build script cannot `use` items from the crate it
+  builds.
+- **`donsetch help` header now reads `DonSeTch`,** not the lowercase
+  `donsetch`: the invocation name is already on the `USAGE:` line below
+  it. Every `USAGE:`/`Usage:` line still shows the command exactly as
+  typed.
+
+### Fixed
+
+- **False-like private-egress values no longer disable SSRF guards:**
+  `DONSETCH_ALLOW_PRIVATE_EGRESS` previously enabled private egress from
+  presence alone, so `false`, `0`, an empty string, or an unknown value
+  bypassed the URL, DNS, and socket checks. One shared fail-closed parser now
+  accepts only `1`, `true`, or `on` (case-insensitive, with surrounding
+  whitespace ignored); malformed and non-Unicode values remain disabled.
+- **Engine trust EWMA was eroded by infra failures:** the quarantine
+  gate excluded `dead-proxy`/`auth-fail`/`no-results` but the trust
+  EWMA only excluded `no-results`, so dead egresses and BYOK key
+  problems quietly dinged engine trust (the ranking weight) for
+  failures the engine had nothing to do with. One shared predicate
+  (`is_engine_fault`) now drives both, with a table test. Credit:
+  mnaza (#124).
+- **Ranking `topup()` could leave the result vector non-sorted past
+  its depth-8 prefix**: the score nudge could push `results[7]`
+  below `results[8]`'s untouched score (a near-tied pair straddling
+  the top-up depth boundary), and callers taking more than
+  `depth` results (merge keeps 12; top-up runs at depth 8) got a
+  slice whose rank order contradicted its score order at that
+  boundary. `topup` now re-sorts the whole vector (a provided
+  testable `apply_topup_scores` helper), with a discriminating
+  boundary test. Credit: mnaza (#125).
+- **Search (S-)handles were the one unbounded in-memory store in a
+  daemon meant to run forever:** every tool search call minted up
+  to 12 fresh S-handles into the handle table and nothing ever
+  evicted them (every sibling structure is bounded: L-handles
+  2048 LRU, search cache 500, prewarms 10, HTTP sessions 1024,
+  crawl governor 1024). FIFO cap of 2048, oldest-minted evicted
+  first, with a discriminating bound test.
+- **Search validation failures reported the wrong error kind**:
+  `search_error` declared `errorKind: "transient"` (with an engine
+  escalation trace) for `validate_query` rejections that never
+  contacted an engine, contradicting the function's own caller
+  comment and the retry taxonomy, and mislabeling the CLI exit
+  code for a non-retryable input error. `SearchFailure` now carries
+  the kind (permanent for bad input, transient for exhausted
+  engines/providers), the permanent path drops the false escalation
+  trace, and the batch path composes kinds (any transient variant =
+  retryable batch). Four tests. Credit: mnaza (#126).
+
+## [3.6.2] - 2026-09-05
+
+### Added
+
+- **Ghost SERP cascade lane:** when the plain-HTTP fan-out AND its retry
+  wave leave the merge thin (<3 working lanes or <15 hits), one browser
+  render through the shared ghost hook fetches Google's 2026 JS-shell
+  SERP (plain HTTP gets 0 result anchors; the browser render parses with
+  the existing layered parser). Joins the merge as the independent
+  `google` index family (5 keyless families instead of 4). Costs zero
+  when healthy (never fires), trust/quarantine shared with the `google`
+  base, honest `google_ghost` engine reports. Kill switches:
+  `DONSEEK_NO_GHOST_LANES`, `DONSEEK_FORCE_GHOST_LANE` (dev bench).
+- **Persisted engine health:** trust EWMAs + failure streaks live in
+  `search-trust.json`, so a benched engine stays benched across daemon
+  crashes instead of re-paying three failure lanes after every restart.
+- **Corroboration on the model surface:** compact search lines carry the
+  independent-index-family count per result (`· 3 sources`), the same
+  math the ranking consensus uses.
+- **Ranking top-up on page truth:** after enrichment swaps in real page
+  titles/descriptions for the top slice, the cross-encoder gets a
+  bounded ±0.1 nudge on close calls (`DONSEEK_NO_TOPUP` = A/B switch).
+  Bench A/B: head-10 corpus MRR 0.75 → 0.80 with the top-up.
+
+### Fixed
+
+- **`donsetch login` post-login probe aborted the CLI process:** the
+  probe and the CDP endpoint poll built `reqwest::blocking` clients
+  inside the tokio runtime context, which is a documented reqwest
+  panic (and with `panic = "abort"`, a hard process abort). Reproduced
+  on master: `probe_domain` in a tokio test kills the process. Fixed
+  by running the probe on a dedicated thread and converting the
+  endpoint poll to an async client. Both paths regression-tested
+  under the runtime. Credit: mnaza (#122).
+- **Linux warm-connect (TFO) path shipped three real bugs in 3.6.x:**
+  (1) `sockaddr_of` returned a pointer to a local inside its own match
+  arm: dangling-pointer UB, benign only by stack-layout luck (the
+  shipped path "worked" by accident of stack reuse);
+  (2) `from_ne_bytes(...).to_be()` reversed the IPv4 octets on every
+  little-endian target, so warm TFO connects dialed octet-reversed
+  addresses (203.0.113.7 → 7.113.0.203), always failed, and silently
+  fell back to a plain connect: warm TCP Fast Open never actually
+  worked on Linux in 3.6.x, and the fix makes warm connects genuinely
+  faster (fewer round trips on repeat-navigation origins);
+  (3) the raw `libc::connect` on a TFO-requesting socket is a real
+  blocking syscall that ran inline on the executor thread: measured
+  against loopback by the author at ~135s vs ~220µs for a plain
+  connect, silently defeating the outer connect timeout. Fixed with
+  `spawn_blocking` + honest fallback to a plain connect. Structs now
+  returned by value, execute-test covers the executor-freedom pattern
+  with a stated caveat. Credit: mnaza (#123).
+- **search --json lost titles/snippets for machine consumers** (compact
+  contracts, v3.6.0): the model surface (structuredContent) stays
+  compact, but the client-only `com.donsetch/search-debug` namespace now
+  carries the full per-result machine view (title/url/snippet/score/)
+  and the CLI `--json` re-materializes it into `meta` for pipelines.
+  The in-repo search bench had silently gone 0/30 because of the loss:
+  found live, restored, and the bench now measures real recall
+  (snippet accuracy 96.7% over the 30-question corpus, MRR 0.80).
+- **`consensus` double-counted same-engine ranks** in the JSON meta: a
+  Yahoo URL at two ranks read as consensus 2 for one opinion. Now counts
+  index families (same math as ranking), matching its own field name.
+- **Enrichment demoted slow-alive pages as dead links:** transport
+  timeouts no longer halve a result's score; only refused/DNS-dead/
+  4xx/5xx answers do (slow ≠ dead).
+- **Single-flight stampede:** two identical searches at different
+  max_results each paid a full fan-out; the flight now keys on
+  query+intent since the leader publishes the full top-12 anyway.
+- **Oversized/empty queries** now fail fast with a clean message +
+  next_action on BOTH paths (BYOK providers included), instead of
+  burning a fan-out: `donsetch search "<862-char query>"` no longer
+  reaches exa/engine endpoints.
+- **Search-health single write per search:** trust snapshots now save
+  once per completed search (not per engine outcome).
+
+### Changed
+
+- **Google News snippets** now carry `Publisher · date` instead of a bare
+  RFC-822 date string (a date alone says nothing about the story).
+- **search --json engines list** dedups engine names (an engine surfacing
+  a URL at two ranks is one opinion, same as the markdown surface).
+- **Bench harness:** `bench/search_quality.py` results cache note + the
+  search invocation verified against the current CLI arg surface.
+
+## [3.6.1] - 2026-09-05
+
+### Changed
+
+- **Compact MCP contracts:** model-facing tool schemas now keep lifecycle
+  guidance on the tool and field-specific rules on each parameter, while
+  preserving the full CLI help. Search, fetch, crawl, and batch responses
+  render evidence once, retain actionable routing and recovery state, and
+  move bounded diagnostics to client-only `_meta`. The three existing tools,
+  acquisition, ranking, explicit query grouping, and fallback behavior are
+  unchanged. tools/list schema tokens dropped from ~3.5k to ~2.0k (measured).
+  Credit: adaaaaaaaaaaaaaaaaaaaaa (#120). CLI stats footer updated in the
+  same change set to read moved telemetry from `_meta`.
+- **CLI multi-fetch markers:** `donsetch fetch url1 url2 ...` prints an
+  explicit `### [n] URL` boundary before each result, matching the MCP
+  batch layout; large batches are parseable again.
+- **README honesty:** token and envelope claims updated to the compact
+  contracts (2.0k tools/list, model-state vs client-telemetry division).
+
+### Fixed
+
+- **`chrome_h2_probe` non-Linux CI:** gate the Linux-only imports,
+  ALPN callback, and frame-decoding helpers together with the probe entry
+  point, so `cargo clippy --all-targets -- -Dwarnings` does not compile them
+  as unused code on Windows or macOS.
+  Credit: adaaaaaaaaaaaaaaaaaaaaa (#121).
+- **pi extension fetch badge:** the via-cache/via-ghost label reads the
+  tier from the compact-contract debug payload, so the badge survives the
+  new envelopes (and still falls back to the old surface).
+
 ## [3.6.0] - 2026-09-04
 
 ### Added
