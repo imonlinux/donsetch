@@ -3237,11 +3237,17 @@ async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
         return Avail::Empty;
     };
     match cdx_latest(&v) {
-        // Rebuild from the REQUESTED url, never the row's `original`:
-        // captures recorded as http://host:80/path replay
-        // unpredictably under the row form, while wayback resolves
-        // /web/<ts>/<requested> against the same urlkey it matched.
-        Some((ts, _)) => Avail::Found((format!("https://web.archive.org/web/{ts}/{url}"), ts)),
+        // Rebuild from the row's `original` : it is the exact form
+        // wayback replayed and canonicalized (urlkey is computed on
+        // it, trailing slashes, :80 port and all). Rebuilding from
+        // the REQUESTED url instead mismatched the urlkey when the
+        // capture was recorded under a different path form, and
+        // wayback answered with its calendar page instead of the
+        // capture.
+        Some((ts, original)) => {
+            let target: &str = if original.is_empty() { bare } else { original.as_str() };
+            Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
+        }
         None => Avail::Empty,
     }
 }
@@ -3365,10 +3371,12 @@ async fn try_resurrect(
         };
         // Wayback serves the ORIGINAL server-rendered HTML : thinness
         // here usually means a genuinely small page, not a JS shell.
-        // But wayback chrome around redirect stubs also extracts
-        // thin-ish text, so any thin or near-empty extraction gets
-        // one more look for a meta-refresh chain before it is served.
-        let chained = if hops < 2 && (ex.thin || ex.total_chars < 50) {
+        // But wayback's redirect interstitials carry enough IA nav
+        // chrome to pass any char threshold, so serving is gated on
+        // stub markers too : a stub hops (up to MAX), a real page
+        // serves, a true empty fails.
+        let stub = ex.thin || ex.total_chars < 50 || is_wayback_stub(&snap.body);
+        let chained = if hops < MAX_RESURRECT_HOPS && stub {
             meta_refresh_target(&snap.body).filter(|t| wayback_ts_of(t).is_some())
         } else {
             None
@@ -3381,7 +3389,7 @@ async fn try_resurrect(
                 }
                 snap_url = target;
             }
-            None if ex.total_chars < 50 => {
+            None if stub => {
                 return Err(ResurrectError {
                     stage: ResurrectStage::SnapshotThin(ex.total_chars),
                     snapshot_url: Some(snap_url.clone()),
@@ -3441,6 +3449,23 @@ async fn try_resurrect(
         "structuredContent": structured,
         "_meta": {"com.donsetch/fetch-debug": debug},
     }))
+}
+
+/// Redirect chains through wayback interstitials can run several
+/// captures deep (a dead domain's stub -> a host's redirect stub ->
+/// the real landing page). Bounded so a hostile chain cannot spin.
+const MAX_RESURRECT_HOPS: u8 = 4;
+
+/// Wayback's "Got an HTTP NNN at crawl time / Redirecting to... /
+/// Impatient?" interstitial and its capture-calendar page : both are
+/// wayback UI, not archived content, and both extract enough text to
+/// defeat char-count thinness checks.
+fn is_wayback_stub(body: &[u8]) -> bool {
+    let head = &body[..body.len().min(64 * 1024)];
+    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
+    text.contains("response at crawl time")
+        || text.contains("impatient?")
+        || text.contains("redirecting to...")
 }
 
 /// Pull the refresh target out of `<meta http-equiv="refresh"
@@ -5168,7 +5193,8 @@ mod initialize_tests {
 #[cfg(test)]
 mod resurrect_tests {
     use super::{
-        ResurrectStage, attr_value_span, cdx_latest, meta_refresh_target, wayback_ts_of,
+        ResurrectStage, attr_value_span, cdx_latest, is_wayback_stub, meta_refresh_target,
+        wayback_ts_of,
     };
     use serde_json::json;
 
@@ -5297,6 +5323,18 @@ mod resurrect_tests {
         assert!(!resurrectable("reset"));
         assert!(!resurrectable("network"));
         assert!(!resurrectable("protocol"));
+    }
+    #[test]
+    fn wayback_stub_markers_do_not_catch_real_pages() {
+        let interstitial = b"<html><body>Got an HTTP 301 response at crawl time.             Redirecting to... <a href=\"/web/20100101/http://x.example\">x</a>             <b>Impatient?</b></body></html>";
+        assert!(is_wayback_stub(interstitial));
+        assert!(!is_wayback_stub(
+            b"<html><body>Welcome to my Geocities page. Under construction.</body></html>"
+        ));
+        // An archived page ABOUT the wayback machine must not be
+        // misread as chrome : the calendar phrase differs from prose.
+        let article = b"<html><body><h1>History of the Wayback Machine</h1>            It preserves redirects and their targets.</body></html>";
+        assert!(!is_wayback_stub(article));
     }
 }
 
