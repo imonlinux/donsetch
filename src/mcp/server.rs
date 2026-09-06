@@ -1237,15 +1237,8 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     if archive == "only" {
         let no_live = tool_error(format!("archive=only : skipping live fetch for {url}"));
         return match try_resurrect(daemon, url, &no_live).await {
-            Some(v) => v,
-            None => tool_error_structured(
-                format!("archive: no Wayback snapshot found for {url}"),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "next_action": "the URL was never archived : try web_search for a live alternative",
-                })),
-            ),
+            Ok(v) => v,
+            Err(f) => resurrect_error(url, &f),
         };
     }
     let result = fetch_single_inner(daemon, args, url).await;
@@ -1267,8 +1260,61 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
         return result;
     }
     match try_resurrect(daemon, url, &result).await {
-        Some(v) => v,
-        None => result,
+        Ok(v) => v,
+        Err(f) => {
+            // The original live error stands as the primary answer;
+            // the archive attempt is recorded as context so a silent
+            // snapshot-side failure is visible in the payload.
+            let mut result = result;
+            if let Some(obj) = result
+                .pointer_mut("/structuredContent")
+                .and_then(Value::as_object_mut)
+            {
+                obj.insert("archive_stage".into(), json!(f.stage.tag()));
+            }
+            result
+        }
+    }
+}
+
+/// Build the archive=only error from the exact stage resurrection
+/// gave up at. "Never archived" is claimed ONLY when the index was
+/// consulted and answered empty : unreachable archives and
+/// found-but-unusable snapshots get their own honest messages.
+fn resurrect_error(url: &str, f: &ResurrectError) -> Value {
+    let tag = f.stage.tag();
+    match &f.stage {
+        ResurrectStage::LookupUnreachable => tool_error_structured(
+            format!("archive: Wayback Machine unreachable for {url}"),
+            "transient",
+            Some(json!({
+                "url": url,
+                "archive_stage": tag,
+                "next_action": "the archive lookup failed : retry, or try web_search for a live alternative",
+            })),
+        ),
+        ResurrectStage::NoSnapshot => tool_error_structured(
+            format!("archive: no Wayback snapshot found for {url}"),
+            "permanent",
+            Some(json!({
+                "url": url,
+                "archive_stage": tag,
+                "next_action": "the URL was never archived : try web_search for a live alternative",
+            })),
+        ),
+        _ => {
+            let snap = f.snapshot_url.clone().unwrap_or_default();
+            tool_error_structured(
+                format!("archive: Wayback snapshot found but unusable ({tag}) for {url}"),
+                "permanent",
+                Some(json!({
+                    "url": url,
+                    "archive_stage": tag,
+                    "snapshot_url": snap,
+                    "next_action": format!("a snapshot exists but could not be served : inspect it at {snap} or try web_search for a live alternative"),
+                })),
+            )
+        }
     }
 }
 
@@ -3043,49 +3089,141 @@ async fn anticloak_check(
 /// the nearest snapshot : labeled ruthlessly so archived content
 /// can never masquerade as live. `archive: auto` (default) only on
 /// dead-end failures; `only` skips the live attempt; `off` never.
-async fn try_resurrect(daemon: &Arc<Daemon>, url: &str, live_error: &Value) -> Option<Value> {
+///
+/// Err carries the exact stage that gave up, so the caller can
+/// never confuse "the URL was never archived" with "a snapshot
+/// exists but was unusable" or "the archive was unreachable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResurrectStage {
+    /// The availability/CDX endpoints could not be reached.
+    LookupUnreachable,
+    /// Both indexes were consulted and have no 200 capture.
+    NoSnapshot,
+    /// A snapshot exists but its recorded capture status isn't 200.
+    SnapshotStatus(u16),
+    /// The snapshot page failed at the transport layer.
+    SnapshotFetch,
+    /// The snapshot page tripped the wall detector.
+    SnapshotVerdict,
+    /// The snapshot body is binary (PDF/image), not extractable HTML.
+    SnapshotBinary,
+    /// The snapshot extracted to too little text to serve.
+    SnapshotThin(usize),
+}
+
+impl ResurrectStage {
+    /// Machine-readable tag for structuredContent.archive_stage.
+    fn tag(&self) -> String {
+        match self {
+            Self::LookupUnreachable => "lookup_unreachable".into(),
+            Self::NoSnapshot => "no_snapshot".into(),
+            Self::SnapshotStatus(s) => format!("snapshot_status_{s}"),
+            Self::SnapshotFetch => "snapshot_fetch_failed".into(),
+            Self::SnapshotVerdict => "snapshot_verdict_rejected".into(),
+            Self::SnapshotBinary => "snapshot_binary".into(),
+            Self::SnapshotThin(n) => format!("snapshot_extract_thin({n})"),
+        }
+    }
+}
+
+struct ResurrectError {
+    stage: ResurrectStage,
+    /// Nearest snapshot URL reached, when one was found : lets the
+    /// caller distinguish "never archived" from "archived but the
+    /// copy was unusable" (and hand over the URL for inspection).
+    snapshot_url: Option<String>,
+}
+
+async fn try_resurrect(
+    daemon: &Arc<Daemon>,
+    url: &str,
+    live_error: &Value,
+) -> Result<Value, ResurrectError> {
     // 1. Availability lookup (keyless, public API).
     let avail_url = format!(
         "https://archive.org/wayback/available?url={}",
         encode_query_value(url)
     );
-    let avail = tokio::time::timeout(
+    let lookup = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         daemon.fetcher.fetch(&avail_url),
     )
-    .await
-    .ok()?
-    .ok()?;
-    let v: Value = serde_json::from_slice(&avail.body).ok()?;
-    let closest = v.pointer("/archived_snapshots/closest")?.clone();
-    let snap_url = closest.get("url")?.as_str()?.to_string();
-    let ts = closest
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    // The API returns status as a STRING ("200"); accept both.
-    let snap_status = closest
-        .get("status")
-        .map(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
-    if snap_status != 200 {
-        return None;
-    }
+    .await;
+    let (snap_url, mut ts) = match lookup {
+        // "The archive is down" is not "the URL was never archived" :
+        // collapsing both into one message used to assert a fact the
+        // lookup never established.
+        Err(_) | Ok(Err(_)) => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::LookupUnreachable,
+                snapshot_url: None,
+            });
+        }
+        Ok(Ok(out)) => {
+            // A 200 whose body is not JSON (rate-limit HTML, an
+            // interstitial) says nothing about the archive's contents.
+            let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::LookupUnreachable,
+                    snapshot_url: None,
+                });
+            };
+            let Some(closest) = v.pointer("/archived_snapshots/closest") else {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::NoSnapshot,
+                    snapshot_url: None,
+                });
+            };
+            let Some(snap_url) = closest.get("url").and_then(Value::as_str) else {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::NoSnapshot,
+                    snapshot_url: None,
+                });
+            };
+            let ts = closest
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            // The API returns status as a STRING ("200"); accept both.
+            let snap_status = closest
+                .get("status")
+                .map(|s| {
+                    s.as_i64()
+                        .or_else(|| s.as_str().and_then(|x| x.parse().ok()))
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            if snap_status != 200 {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotStatus(snap_status as u16),
+                    snapshot_url: Some(snap_url.to_string()),
+                });
+            }
+            (snap_url.to_string(), ts)
+        }
+    };
 
     // 2. Fetch the snapshot : wayback is plain HTTP-friendly.
-    let snap = tokio::time::timeout(
+    let snap = match tokio::time::timeout(
         std::time::Duration::from_secs(20),
         daemon.fetcher.fetch(&snap_url),
     )
     .await
-    .ok()?
-    .ok()?;
+    {
+        Ok(Ok(s)) => s,
+        _ => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotFetch,
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+    };
     if !matches!(snap.verdict, Verdict::ContentOk) {
-        return None;
+        return Err(ResurrectError {
+            stage: ResurrectStage::SnapshotVerdict,
+            snapshot_url: Some(snap_url.clone()),
+        });
     }
     let ct = snap
         .headers
@@ -3094,15 +3232,29 @@ async fn try_resurrect(daemon: &Arc<Daemon>, url: &str, live_error: &Value) -> O
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     if crate::fetch::guards::is_binary(&snap.body, &ct) {
-        return None;
+        return Err(ResurrectError {
+            stage: ResurrectStage::SnapshotBinary,
+            snapshot_url: Some(snap_url.clone()),
+        });
     }
     let opts = ExtractOptions::default();
-    let mut ex = extract::extract(&snap.body, &ct, &snap_url, &opts).ok()?;
     // Wayback serves the ORIGINAL server-rendered HTML : thinness
     // here usually means a genuinely small page, not a JS shell.
     // Only truly empty extractions are useless.
+    let mut ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
+        Ok(ex) => ex,
+        Err(_) => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotThin(0),
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+    };
     if ex.total_chars < 50 {
-        return None;
+        return Err(ResurrectError {
+            stage: ResurrectStage::SnapshotThin(ex.total_chars),
+            snapshot_url: Some(snap_url.clone()),
+        });
     }
 
     // 3. Label everything: banner in content, fields in structure.
@@ -3149,7 +3301,7 @@ async fn try_resurrect(daemon: &Arc<Daemon>, url: &str, live_error: &Value) -> O
         "live_error": live_reason,
         "escalation": trace.value(),
     });
-    Some(json!({
+    Ok(json!({
         "content": [{"type": "text", "text": format_fetch_markdown(&ex, &snap_url, url)}],
         "structuredContent": structured,
         "_meta": {"com.donsetch/fetch-debug": debug},
