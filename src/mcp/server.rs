@@ -3461,8 +3461,10 @@ const MAX_RESURRECT_HOPS: u8 = 4;
 /// wayback UI, not archived content, and both extract enough text to
 /// defeat char-count thinness checks.
 fn is_wayback_stub(body: &[u8]) -> bool {
-    let head = &body[..body.len().min(64 * 1024)];
-    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
+    // No 64KB head window: replay pages wrap captures in the full
+    // IA nav (megabytes of markup), and the interstitial markers sit
+    // AFTER it, near the redirect notice at the document's end.
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     text.contains("response at crawl time")
         || text.contains("impatient?")
         || text.contains("redirecting to...")
