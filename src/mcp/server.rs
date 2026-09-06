@@ -5229,13 +5229,20 @@ mod resurrect_tests {
     #[test]
     fn meta_refresh_unquoted_and_delayed_forms() {
         let html = b"<meta http-equiv=refresh content=30;url=http://web.archive.org/web/19990101000000/http://a.example/>";
-        assert!(meta_refresh_target(html).is_none(), "unquoted attr values are not misparsed");
+        assert!(
+            meta_refresh_target(html).is_none(),
+            "unquoted attr values are not misparsed"
+        );
     }
 
     #[test]
     fn meta_refresh_off_wayback_or_missing_is_none() {
-        let live = b"<meta http-equiv=\"refresh\" content=\"0; url=https://parking.example/for-sale\">";
-        assert_eq!(meta_refresh_target(live).as_deref(), Some("https://parking.example/for-sale"));
+        let live =
+            b"<meta http-equiv=\"refresh\" content=\"0; url=https://parking.example/for-sale\">";
+        assert_eq!(
+            meta_refresh_target(live).as_deref(),
+            Some("https://parking.example/for-sale")
+        );
         assert_eq!(wayback_ts_of("https://parking.example/for-sale"), None);
         assert_eq!(meta_refresh_target(b"<html><body>hi</body></html>"), None);
         assert_eq!(
@@ -5250,8 +5257,14 @@ mod resurrect_tests {
             wayback_ts_of("https://web.archive.org/web/notatime/http://x.example"),
             None
         );
-        assert_eq!(wayback_ts_of("http://web.archive.org/other/20200101000000/x"), None);
-        assert_eq!(wayback_ts_of("https://spoof.example/web/20200101000000/x"), None);
+        assert_eq!(
+            wayback_ts_of("http://web.archive.org/other/20200101000000/x"),
+            None
+        );
+        assert_eq!(
+            wayback_ts_of("https://spoof.example/web/20200101000000/x"),
+            None
+        );
     }
 
     #[test]
@@ -5264,10 +5277,16 @@ mod resurrect_tests {
 
     #[test]
     fn stage_tags_are_stable_machine_strings() {
-        assert_eq!(ResurrectStage::LookupUnreachable.tag(), "lookup_unreachable");
+        assert_eq!(
+            ResurrectStage::LookupUnreachable.tag(),
+            "lookup_unreachable"
+        );
         assert_eq!(ResurrectStage::NoSnapshot.tag(), "no_snapshot");
         assert_eq!(ResurrectStage::SnapshotFetch.tag(), "snapshot_fetch_failed");
-        assert_eq!(ResurrectStage::SnapshotVerdict.tag(), "snapshot_verdict_rejected");
+        assert_eq!(
+            ResurrectStage::SnapshotVerdict.tag(),
+            "snapshot_verdict_rejected"
+        );
         assert_eq!(ResurrectStage::SnapshotBinary.tag(), "snapshot_binary");
         assert_eq!(
             ResurrectStage::SnapshotThin(12).tag(),
@@ -5277,9 +5296,33 @@ mod resurrect_tests {
     #[test]
     fn cdx_latest_picks_last_data_row() {
         let v = json!([
-            ["urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"],
-            ["com,geocities)/", "20010615131644", "http://www.geocities.com/", "text/html", "200", "AAA", "1000"],
-            ["com,geocities)/", "20190613084634", "http://www.geocities.com/", "text/html", "200", "BBB", "900"]
+            [
+                "urlkey",
+                "timestamp",
+                "original",
+                "mimetype",
+                "statuscode",
+                "digest",
+                "length"
+            ],
+            [
+                "com,geocities)/",
+                "20010615131644",
+                "http://www.geocities.com/",
+                "text/html",
+                "200",
+                "AAA",
+                "1000"
+            ],
+            [
+                "com,geocities)/",
+                "20190613084634",
+                "http://www.geocities.com/",
+                "text/html",
+                "200",
+                "BBB",
+                "900"
+            ]
         ]);
         let (ts, original) = cdx_latest(&v).expect("capture picked");
         assert_eq!(ts, "20190613084634", "nearest-to-present capture wins");
@@ -5288,10 +5331,16 @@ mod resurrect_tests {
 
     #[test]
     fn cdx_latest_handles_header_only_empty_and_garbage() {
-        assert_eq!(cdx_latest(&json!([["urlkey", "timestamp", "original"]])), None);
+        assert_eq!(
+            cdx_latest(&json!([["urlkey", "timestamp", "original"]])),
+            None
+        );
         assert_eq!(cdx_latest(&json!([])), None);
         assert_eq!(cdx_latest(&json!("not an array")), None);
-        assert_eq!(cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])), None);
+        assert_eq!(
+            cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])),
+            None
+        );
     }
 
     #[test]
@@ -5299,10 +5348,18 @@ mod resurrect_tests {
         use super::transport_class;
         use crate::error::FetchError;
         // Resurrectable: the site is gone.
-        assert_eq!(transport_class(&FetchError::Tls("certificate verify failed".into())), "tls");
-        assert_eq!(transport_class(&FetchError::Tls("handshake failure".into())), "tls");
         assert_eq!(
-            transport_class(&FetchError::Io(std::io::Error::other("Name or service not known"))),
+            transport_class(&FetchError::Tls("certificate verify failed".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Tls("handshake failure".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "Name or service not known"
+            ))),
             "dns"
         );
         assert_eq!(
@@ -5311,19 +5368,29 @@ mod resurrect_tests {
         );
         // Excluded: ambiguous or IP-level; a snapshot would lie.
         assert_eq!(transport_class(&FetchError::Timeout), "timeout");
-        assert_eq!(transport_class(&FetchError::Tls("connection reset by peer".into())), "reset");
         assert_eq!(
-            transport_class(&FetchError::Io(std::io::Error::other("connection timed out"))),
+            transport_class(&FetchError::Tls("connection reset by peer".into())),
+            "reset"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "connection timed out"
+            ))),
             "timeout"
         );
-        assert_eq!(transport_class(&FetchError::Http("parser died".into())), "protocol");
-        assert_eq!(transport_class(&FetchError::Ghost("no browser".into())), "ghost");
+        assert_eq!(
+            transport_class(&FetchError::Http("parser died".into())),
+            "protocol"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Ghost("no browser".into())),
+            "ghost"
+        );
     }
 
     #[test]
     fn resurrectable_transport_classes_are_exactly_tls_dns_refused() {
-        let resurrectable: fn(&str) -> bool =
-            |k| matches!(k, "tls" | "dns" | "refused");
+        let resurrectable: fn(&str) -> bool = |k| matches!(k, "tls" | "dns" | "refused");
         assert!(resurrectable("tls"));
         assert!(resurrectable("dns"));
         assert!(resurrectable("refused"));
@@ -5345,4 +5412,3 @@ mod resurrect_tests {
         assert!(!is_wayback_stub(article));
     }
 }
-
