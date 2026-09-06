@@ -3148,7 +3148,7 @@ struct ResurrectError {
 /// What an archive index said about the URL.
 enum Avail {
     /// A 200-status capture: (snapshot URL, capture timestamp).
-    Found(String, String),
+    Found((String, String)),
     /// The index answered and has nothing usable.
     Empty,
     /// The index could not be reached (or answered with a server
@@ -3238,7 +3238,7 @@ async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
     };
     match cdx_latest(&v) {
         Some((ts, original)) => {
-            let target = if original.is_empty() { bare } else { &original };
+            let target: &str = if original.is_empty() { bare } else { original.as_str() };
             Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
         }
         None => Avail::Empty,
@@ -3390,8 +3390,8 @@ async fn try_resurrect(
     };
 
     // 3. Label everything: banner in content, fields in structure.
-    let date = wayback_date(ts);
-    let age_days = wayback_age_days(ts);
+    let date = wayback_date(&ts);
+    let age_days = wayback_age_days(&ts);
     let live_reason = live_error
         .pointer("/content/0/text")
         .and_then(Value::as_str)
