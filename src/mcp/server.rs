@@ -1245,9 +1245,17 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     if archive == "off" || result.get("isError") != Some(&json!(true)) {
         return result;
     }
-    // Resurreactable failures only: dead pages and hard walls.
-    // Transient network errors mean "maybe dead", not "dead" : a
-    // snapshot would launder an unknown into fake certainty.
+    // Resurrectable failures only: dead pages, hard walls, and
+    // transport-level death (TLS handshake against a parked domain,
+    // DNS gone, port closed) : the archetypal dead links. Ambiguous
+    // transients : timeouts, resets, protocol errors : stay
+    // excluded : a snapshot would launder an unknown into fake
+    // certainty, and a reset can be an IP-level block that a
+    // snapshot must never paper over.
+    let transport_dead = result
+        .pointer("/structuredContent/fetch_error")
+        .and_then(Value::as_str)
+        .is_some_and(|k| matches!(k, "tls" | "dns" | "refused"));
     let resurrectable = result
         .pointer("/structuredContent/verdict")
         .and_then(Value::as_str)
@@ -1255,7 +1263,8 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
         || result
             .pointer("/structuredContent/status")
             .and_then(Value::as_u64)
-            .is_some_and(|s| s == 404 || s == 410);
+            .is_some_and(|s| s == 404 || s == 410)
+        || transport_dead;
     if !resurrectable {
         return result;
     }
@@ -1604,6 +1613,7 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
                     Some(json!({
                         "url": url,
                         "status": 0,
+                        "fetch_error": transport_class(&e),
                         "next_action": next_action_for(None, 0, fetch_error_kind(&e)),
                         "escalation": trace.value(),
                     })),
@@ -4615,6 +4625,42 @@ fn fetch_error_kind(e: &FetchError) -> &'static str {
     }
 }
 
+/// Machine class for a transport-level fetch failure, recorded in
+/// the error's structuredContent so callers (and the resurrection
+/// gate) can tell "the site is gone" from "the net is bad". Mirrors
+/// friendly_fetch_error's branching; the strings are API surface.
+fn transport_class(e: &FetchError) -> &'static str {
+    match e {
+        FetchError::Timeout => "timeout",
+        FetchError::TooManyRedirects => "too_many_redirects",
+        FetchError::InvalidUrl(_) => "invalid_url",
+        FetchError::Ghost(_) => "ghost",
+        FetchError::Http(_) => "protocol",
+        FetchError::Tls(msg) => {
+            let m = msg.to_lowercase();
+            if m.contains("reset") || m.contains("eof") {
+                "reset"
+            } else {
+                "tls"
+            }
+        }
+        FetchError::Io(err) => {
+            let m = err.to_string().to_lowercase();
+            if m.contains("refused") {
+                "refused"
+            } else if m.contains("timed out") {
+                "timeout"
+            } else if m.contains("not found") || m.contains("no address") {
+                "dns"
+            } else if m.contains("reset") {
+                "reset"
+            } else {
+                "network"
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod stitch_tests {
     use super::*;
@@ -5210,6 +5256,45 @@ mod resurrect_tests {
         assert_eq!(cdx_latest(&json!([])), None);
         assert_eq!(cdx_latest(&json!("not an array")), None);
         assert_eq!(cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])), None);
+    }
+
+    #[test]
+    fn transport_classes_separate_death_from_ambiguity() {
+        use super::transport_class;
+        use crate::error::FetchError;
+        // Resurrectable: the site is gone.
+        assert_eq!(transport_class(&FetchError::Tls("certificate verify failed".into())), "tls");
+        assert_eq!(transport_class(&FetchError::Tls("handshake failure".into())), "tls");
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("Name or service not known"))),
+            "dns"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("connection refused"))),
+            "refused"
+        );
+        // Excluded: ambiguous or IP-level; a snapshot would lie.
+        assert_eq!(transport_class(&FetchError::Timeout), "timeout");
+        assert_eq!(transport_class(&FetchError::Tls("connection reset by peer".into())), "reset");
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("connection timed out"))),
+            "timeout"
+        );
+        assert_eq!(transport_class(&FetchError::Http("parser died".into())), "protocol");
+        assert_eq!(transport_class(&FetchError::Ghost("no browser".into())), "ghost");
+    }
+
+    #[test]
+    fn resurrectable_transport_classes_are_exactly_tls_dns_refused() {
+        let resurrectable: fn(&str) -> bool =
+            |k| matches!(k, "tls" | "dns" | "refused");
+        assert!(resurrectable("tls"));
+        assert!(resurrectable("dns"));
+        assert!(resurrectable("refused"));
+        assert!(!resurrectable("timeout"));
+        assert!(!resurrectable("reset"));
+        assert!(!resurrectable("network"));
+        assert!(!resurrectable("protocol"));
     }
 }
 
