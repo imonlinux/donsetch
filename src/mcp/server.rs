@@ -3109,9 +3109,10 @@ enum ResurrectStage {
     /// The availability/CDX endpoints could not be reached.
     LookupUnreachable,
     /// Both indexes were consulted and have no 200 capture.
+    /// (Non-200 captures never get this far: availability and CDX
+    /// are both probed until a 200 capture turns up or both answer
+    /// empty.)
     NoSnapshot,
-    /// A snapshot exists but its recorded capture status isn't 200.
-    SnapshotStatus(u16),
     /// The snapshot page failed at the transport layer.
     SnapshotFetch,
     /// The snapshot page tripped the wall detector.
@@ -3128,7 +3129,6 @@ impl ResurrectStage {
         match self {
             Self::LookupUnreachable => "lookup_unreachable".into(),
             Self::NoSnapshot => "no_snapshot".into(),
-            Self::SnapshotStatus(s) => format!("snapshot_status_{s}"),
             Self::SnapshotFetch => "snapshot_fetch_failed".into(),
             Self::SnapshotVerdict => "snapshot_verdict_rejected".into(),
             Self::SnapshotBinary => "snapshot_binary".into(),
@@ -5229,7 +5229,6 @@ mod resurrect_tests {
     fn stage_tags_are_stable_machine_strings() {
         assert_eq!(ResurrectStage::LookupUnreachable.tag(), "lookup_unreachable");
         assert_eq!(ResurrectStage::NoSnapshot.tag(), "no_snapshot");
-        assert_eq!(ResurrectStage::SnapshotStatus(302).tag(), "snapshot_status_302");
         assert_eq!(ResurrectStage::SnapshotFetch.tag(), "snapshot_fetch_failed");
         assert_eq!(ResurrectStage::SnapshotVerdict.tag(), "snapshot_verdict_rejected");
         assert_eq!(ResurrectStage::SnapshotBinary.tag(), "snapshot_binary");
