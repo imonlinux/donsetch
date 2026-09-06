@@ -123,7 +123,7 @@ impl BrowserProfile {
                 conn_window_update: 15663105,
             },
             user_agent: format!(
-                "Mozilla/5. ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
+                "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
                 platform.ua_token()
             ),
             sec_ch_ua,
@@ -638,5 +638,22 @@ mod probe_tests {
         // Plausibility band: 20..=400 : rejects years, build ids, ports.
         assert_eq!(parse_version_major("Chrome 1985.1"), None);
         assert_eq!(parse_version_major("Chrome 100000"), None);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{BrowserProfile, Platform};
+
+    #[test]
+    fn user_agent_carries_a_real_browser_version() {
+        // "Mozilla/5." (no .0) shipped once : a standing bot
+        // signature on every tier-1 request, contradicting the
+        // Chrome-parity goal of the TLS/H2 tables.
+        for platform in [Platform::Linux, Platform::Windows, Platform::MacOs] {
+            let ua = BrowserProfile::chrome_150(platform).user_agent;
+            assert!(ua.starts_with("Mozilla/5.0 "), "bad UA: {ua}");
+            assert!(ua.contains("Chrome/150.0.0.0"), "bad UA: {ua}");
+        }
     }
 }
