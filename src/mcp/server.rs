@@ -3245,7 +3245,11 @@ async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
         // wayback answered with its calendar page instead of the
         // capture.
         Some((ts, original)) => {
-            let target: &str = if original.is_empty() { bare } else { original.as_str() };
+            let target: &str = if original.is_empty() {
+                bare
+            } else {
+                original.as_str()
+            };
             Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
         }
         None => Avail::Empty,
@@ -3522,8 +3526,7 @@ fn attr_value_span(tag_lower: &str, name: &str) -> Option<(usize, usize)> {
     let mut from = 0usize;
     while let Some(rel) = tag_lower[from..].find(&pat) {
         let at = from + rel;
-        let boundary_ok =
-            at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
+        let boundary_ok = at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
         let after = at + pat.len();
         if boundary_ok && after < bytes.len() && matches!(bytes[after], b'"' | b'\'') {
             let quote = bytes[after] as char;
@@ -4680,9 +4683,7 @@ fn transport_class(e: &FetchError) -> &'static str {
                 "refused"
             } else if m.contains("timed out") {
                 "timeout"
-            } else if m.contains("not found")
-                || m.contains("no address")
-                || m.contains("not known")
+            } else if m.contains("not found") || m.contains("no address") || m.contains("not known")
             {
                 // getaddrinfo: "Name or service not known" (Linux),
                 // "nodename nor servname provided, or not known" (macOS).
