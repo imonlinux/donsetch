@@ -3149,7 +3149,7 @@ async fn try_resurrect(
         daemon.fetcher.fetch(&avail_url),
     )
     .await;
-    let (snap_url, mut ts) = match lookup {
+    let (mut snap_url, mut ts) = match lookup {
         // "The archive is down" is not "the URL was never archived" :
         // collapsing both into one message used to assert a fact the
         // lookup never established.
@@ -3204,58 +3204,83 @@ async fn try_resurrect(
         }
     };
 
-    // 2. Fetch the snapshot : wayback is plain HTTP-friendly.
-    let snap = match tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        daemon.fetcher.fetch(&snap_url),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        _ => {
-            return Err(ResurrectError {
-                stage: ResurrectStage::SnapshotFetch,
-                snapshot_url: Some(snap_url.clone()),
-            });
-        }
-    };
-    if !matches!(snap.verdict, Verdict::ContentOk) {
-        return Err(ResurrectError {
-            stage: ResurrectStage::SnapshotVerdict,
-            snapshot_url: Some(snap_url.clone()),
-        });
-    }
-    let ct = snap
-        .headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    if crate::fetch::guards::is_binary(&snap.body, &ct) {
-        return Err(ResurrectError {
-            stage: ResurrectStage::SnapshotBinary,
-            snapshot_url: Some(snap_url.clone()),
-        });
-    }
+    // 2. Fetch the snapshot : wayback is plain HTTP-friendly. A thin
+    // extraction gets a second look first: a dead domain's last
+    // capture is very often a meta-refresh stub ("parked → redirect")
+    // that extracts to zero text but chains to the capture holding
+    // the content. Browsers follow the refresh; so does resurrection,
+    // but ONLY when wayback rewrote the target : a live-web target
+    // would fetch a URL that may still be dead, moved, or hostile.
     let opts = ExtractOptions::default();
-    // Wayback serves the ORIGINAL server-rendered HTML : thinness
-    // here usually means a genuinely small page, not a JS shell.
-    // Only truly empty extractions are useless.
-    let mut ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
-        Ok(ex) => ex,
-        Err(_) => {
+    let mut hops: u8 = 0;
+    let (snap, mut ex) = loop {
+        let snap = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            daemon.fetcher.fetch(&snap_url),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotFetch,
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        };
+        if !matches!(snap.verdict, Verdict::ContentOk) {
             return Err(ResurrectError {
-                stage: ResurrectStage::SnapshotThin(0),
+                stage: ResurrectStage::SnapshotVerdict,
                 snapshot_url: Some(snap_url.clone()),
             });
         }
+        let ct = snap
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        if crate::fetch::guards::is_binary(&snap.body, &ct) {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotBinary,
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+        let ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
+            Ok(ex) => ex,
+            Err(_) => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotThin(0),
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        };
+        // Wayback serves the ORIGINAL server-rendered HTML : thinness
+        // here usually means a genuinely small page, not a JS shell.
+        if ex.total_chars >= 50 {
+            break (snap, ex);
+        }
+        let chained = if hops < 2 {
+            meta_refresh_target(&snap.body).filter(|t| wayback_ts_of(t).is_some())
+        } else {
+            None
+        };
+        match chained {
+            Some(target) => {
+                hops += 1;
+                if let Some(t) = wayback_ts_of(&target) {
+                    ts = t;
+                }
+                snap_url = target;
+            }
+            None => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotThin(ex.total_chars),
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        }
     };
-    if ex.total_chars < 50 {
-        return Err(ResurrectError {
-            stage: ResurrectStage::SnapshotThin(ex.total_chars),
-            snapshot_url: Some(snap_url.clone()),
-        });
-    }
 
     // 3. Label everything: banner in content, fields in structure.
     let date = wayback_date(ts);
@@ -3306,6 +3331,89 @@ async fn try_resurrect(
         "structuredContent": structured,
         "_meta": {"com.donsetch/fetch-debug": debug},
     }))
+}
+
+/// Pull the refresh target out of `<meta http-equiv="refresh"
+/// content="[delay;] url=target">`. A dead domain's archived last
+/// capture is very often exactly this stub, and a browser would
+/// follow it : so does resurrection. Byte-scanned on an
+/// ASCII-lowercased copy (length-preserving, so spans index the
+/// original); the target keeps its original case because wayback
+/// capture paths are case-sensitive.
+fn meta_refresh_target(body: &[u8]) -> Option<String> {
+    let head = &body[..body.len().min(64 * 1024)];
+    let text = String::from_utf8_lossy(head).to_string();
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
+        from = end.max(start + 1);
+        let tag_lower = &lower[start..end];
+        let tag_orig = &text[start..end];
+        let is_refresh = attr_value_span(tag_lower, "http-equiv")
+            .and_then(|(s, e)| tag_lower.get(s..e))
+            .is_some_and(|v| v.trim() == "refresh");
+        if !is_refresh {
+            continue;
+        }
+        let Some((cs, ce)) = attr_value_span(tag_lower, "content") else {
+            continue;
+        };
+        let content_lower = tag_lower.get(cs..ce)?;
+        let content_orig = tag_orig.get(cs..ce)?;
+        // "[delay][;] *url=target" : find the url= part case-
+        // insensitively, keep the target's original bytes.
+        let Some(urel) = content_lower.find("url=") else {
+            continue;
+        };
+        let target = content_orig[urel + 4..].trim();
+        let target = target.trim_matches(|c| c == '\'' || c == '"').trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+    }
+    None
+}
+
+/// Byte span of `name="value"` (or single quotes) inside a tag.
+/// Offsets index the string given, so callers can slice the same
+/// spans out of the original-case text.
+fn attr_value_span(tag_lower: &str, name: &str) -> Option<(usize, usize)> {
+    let pat = format!("{name}=");
+    let bytes = tag_lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = tag_lower[from..].find(&pat) {
+        let at = from + rel;
+        let boundary_ok =
+            at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
+        let after = at + pat.len();
+        if boundary_ok && after < bytes.len() && matches!(bytes[after], b'"' | b'\'') {
+            let quote = bytes[after] as char;
+            let vstart = after + 1;
+            let vend = tag_lower[vstart..]
+                .find(quote)
+                .map_or(tag_lower.len(), |e| vstart + e);
+            return Some((vstart, vend));
+        }
+        from = at + pat.len();
+    }
+    None
+}
+
+/// `https://web.archive.org/web/<14-digit-ts>/<...>` → Some(ts).
+/// Only wayback-rewritten refresh targets are followed : a target
+/// pointing at the live web would silently fetch a URL that may
+/// still be dead (or hostile).
+fn wayback_ts_of(target: &str) -> Option<String> {
+    let after_scheme = target.split_once("://")?.1;
+    let (host, path) = after_scheme.split_once('/')?;
+    if !host.eq_ignore_ascii_case("web.archive.org") {
+        return None;
+    }
+    let seg = path.strip_prefix("web/")?;
+    let ts: String = seg.chars().take(14).collect();
+    (ts.len() == 14 && ts.bytes().all(|b| b.is_ascii_digit())).then_some(ts)
 }
 
 /// Percent-encode a value for a query string: everything outside
@@ -4908,5 +5016,80 @@ mod initialize_tests {
                 json!(v)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resurrect_tests {
+    use super::{ResurrectStage, attr_value_span, meta_refresh_target, wayback_ts_of};
+
+    #[test]
+    fn meta_refresh_follows_wayback_rewrite() {
+        let html = b"<html><head><script>x</script>\
+            <meta http-equiv=\"refresh\" content=\"0; url=http://web.archive.org/web/20190613084634/https://smallbusiness.yahoo.com/webhosting?source=geocities\"/>\
+            </head><body></body></html>";
+        let t = meta_refresh_target(html).expect("refresh target extracted");
+        assert!(t.starts_with("http://web.archive.org/web/20190613084634/"));
+        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20190613084634"));
+    }
+
+    #[test]
+    fn meta_refresh_is_case_insensitive_but_case_preserving() {
+        // Match must survive any case in the markup ; the target's
+        // case must survive the match (wayback paths are sensitive).
+        let html = b"<META HTTP-EQUIV='Refresh' CONTENT=\"5; URL=http://web.archive.org/web/20200101000000/HTTP://Example.COM/Page\">";
+        let t = meta_refresh_target(html).expect("refresh target extracted");
+        assert!(t.contains("Example.COM/Page"), "original case lost: {t}");
+        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20200101000000"));
+    }
+
+    #[test]
+    fn meta_refresh_unquoted_and_delayed_forms() {
+        let html = b"<meta http-equiv=refresh content=30;url=http://web.archive.org/web/19990101000000/http://a.example/>";
+        assert!(meta_refresh_target(html).is_none(), "unquoted attr values are not misparsed");
+    }
+
+    #[test]
+    fn meta_refresh_off_wayback_or_missing_is_none() {
+        let live = b"<meta http-equiv=\"refresh\" content=\"0; url=https://parking.example/for-sale\">";
+        assert_eq!(meta_refresh_target(live).as_deref(), Some("https://parking.example/for-sale"));
+        assert_eq!(wayback_ts_of("https://parking.example/for-sale"), None);
+        assert_eq!(meta_refresh_target(b"<html><body>hi</body></html>"), None);
+        assert_eq!(
+            meta_refresh_target(b"<meta http-equiv=\"refresh\" content=\"3\">"),
+            None
+        );
+    }
+
+    #[test]
+    fn wayback_ts_rejects_non_wayback_and_malformed() {
+        assert_eq!(
+            wayback_ts_of("https://web.archive.org/web/notatime/http://x.example"),
+            None
+        );
+        assert_eq!(wayback_ts_of("http://web.archive.org/other/20200101000000/x"), None);
+        assert_eq!(wayback_ts_of("https://spoof.example/web/20200101000000/x"), None);
+    }
+
+    #[test]
+    fn attr_value_span_respects_boundaries() {
+        let tag = "meta data-content=\"a\" content=\"real value\" x";
+        let (s, e) = attr_value_span(tag, "content").expect("span");
+        assert_eq!(&tag[s..e], "real value");
+        assert_eq!(attr_value_span(tag, "missing"), None);
+    }
+
+    #[test]
+    fn stage_tags_are_stable_machine_strings() {
+        assert_eq!(ResurrectStage::LookupUnreachable.tag(), "lookup_unreachable");
+        assert_eq!(ResurrectStage::NoSnapshot.tag(), "no_snapshot");
+        assert_eq!(ResurrectStage::SnapshotStatus(302).tag(), "snapshot_status_302");
+        assert_eq!(ResurrectStage::SnapshotFetch.tag(), "snapshot_fetch_failed");
+        assert_eq!(ResurrectStage::SnapshotVerdict.tag(), "snapshot_verdict_rejected");
+        assert_eq!(ResurrectStage::SnapshotBinary.tag(), "snapshot_binary");
+        assert_eq!(
+            ResurrectStage::SnapshotThin(12).tag(),
+            "snapshot_extract_thin(12)"
+        );
     }
 }
