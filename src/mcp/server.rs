@@ -3237,10 +3237,11 @@ async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
         return Avail::Empty;
     };
     match cdx_latest(&v) {
-        Some((ts, original)) => {
-            let target: &str = if original.is_empty() { bare } else { original.as_str() };
-            Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
-        }
+        // Rebuild from the REQUESTED url, never the row's `original`:
+        // captures recorded as http://host:80/path replay
+        // unpredictably under the row form, while wayback resolves
+        // /web/<ts>/<requested> against the same urlkey it matched.
+        Some((ts, _)) => Avail::Found((format!("https://web.archive.org/web/{ts}/{url}"), ts)),
         None => Avail::Empty,
     }
 }
@@ -3364,10 +3365,10 @@ async fn try_resurrect(
         };
         // Wayback serves the ORIGINAL server-rendered HTML : thinness
         // here usually means a genuinely small page, not a JS shell.
-        if ex.total_chars >= 50 {
-            break (snap, ex);
-        }
-        let chained = if hops < 2 {
+        // But wayback chrome around redirect stubs also extracts
+        // thin-ish text, so any thin or near-empty extraction gets
+        // one more look for a meta-refresh chain before it is served.
+        let chained = if hops < 2 && (ex.thin || ex.total_chars < 50) {
             meta_refresh_target(&snap.body).filter(|t| wayback_ts_of(t).is_some())
         } else {
             None
@@ -3380,12 +3381,14 @@ async fn try_resurrect(
                 }
                 snap_url = target;
             }
-            None => {
+            None if ex.total_chars < 50 => {
                 return Err(ResurrectError {
                     stage: ResurrectStage::SnapshotThin(ex.total_chars),
                     snapshot_url: Some(snap_url.clone()),
                 });
             }
+            // No chain, but real-enough content : serve it.
+            None => break (snap, ex),
         }
     };
 
