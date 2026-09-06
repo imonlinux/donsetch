@@ -4680,7 +4680,12 @@ fn transport_class(e: &FetchError) -> &'static str {
                 "refused"
             } else if m.contains("timed out") {
                 "timeout"
-            } else if m.contains("not found") || m.contains("no address") {
+            } else if m.contains("not found")
+                || m.contains("no address")
+                || m.contains("not known")
+            {
+                // getaddrinfo: "Name or service not known" (Linux),
+                // "nodename nor servname provided, or not known" (macOS).
                 "dns"
             } else if m.contains("reset") {
                 "reset"
