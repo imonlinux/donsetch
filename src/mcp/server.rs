@@ -1278,9 +1278,10 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
 }
 
 /// Build the archive=only error from the exact stage resurrection
-/// gave up at. "Never archived" is claimed ONLY when the index was
-/// consulted and answered empty : unreachable archives and
-/// found-but-unusable snapshots get their own honest messages.
+/// gave up at. "Never archived" is claimed ONLY when both indexes
+/// (availability + CDX) were consulted and answered empty :
+/// unreachable archives and found-but-unusable snapshots get their
+/// own honest messages.
 fn resurrect_error(url: &str, f: &ResurrectError) -> Value {
     let tag = f.stage.tag();
     match &f.stage {
@@ -3134,73 +3135,169 @@ struct ResurrectError {
     snapshot_url: Option<String>,
 }
 
+/// What an archive index said about the URL.
+enum Avail {
+    /// A 200-status capture: (snapshot URL, capture timestamp).
+    Found(String, String),
+    /// The index answered and has nothing usable.
+    Empty,
+    /// The index could not be reached (or answered with a server
+    /// error) : says nothing about the archive's contents.
+    Unreachable,
+}
+
+/// Availability API lookup (keyless, public).
+async fn availability_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
+    let avail_url = format!(
+        "https://archive.org/wayback/available?url={}",
+        encode_query_value(url)
+    );
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        daemon.fetcher.fetch(&avail_url),
+    )
+    .await;
+    let Ok(Ok(out)) = fetched else {
+        return Avail::Unreachable;
+    };
+    if !(200..300).contains(&out.status) {
+        return Avail::Unreachable;
+    }
+    // A 200 whose body is not JSON (rate-limit HTML, an interstitial)
+    // says nothing definitive : the CDX fallback gets its shot.
+    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+        return Avail::Empty;
+    };
+    let Some(closest) = v.pointer("/archived_snapshots/closest") else {
+        return Avail::Empty;
+    };
+    let Some(snap_url) = closest.get("url").and_then(Value::as_str) else {
+        return Avail::Empty;
+    };
+    let ts = closest
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // The API returns status as a STRING ("200"); accept both.
+    let snap_status = closest
+        .get("status")
+        .map(|s| {
+            s.as_i64()
+                .or_else(|| s.as_str().and_then(|x| x.parse().ok()))
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    if snap_status != 200 {
+        // A non-200 "closest" may have a 200 sibling the lossy
+        // availability view missed : let the complete index decide.
+        return Avail::Empty;
+    }
+    Avail::Found((snap_url.to_string(), ts))
+}
+
+/// The complete CDX capture index. `url=` goes schemeless : CDX
+/// canonicalizes the scheme away, so a capture recorded under
+/// http:// answers an https:// query (the availability API is
+/// scheme-strict and misses those). limit=-5 keeps the LAST rows,
+/// i.e. the captures nearest the present.
+async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
+    let bare = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let cdx_url = format!(
+        "https://web.archive.org/cdx/search/cdx?url={}&output=json&filter=statuscode:200&limit=-5",
+        encode_query_value(bare)
+    );
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        daemon.fetcher.fetch(&cdx_url),
+    )
+    .await;
+    let Ok(Ok(out)) = fetched else {
+        return Avail::Unreachable;
+    };
+    // CDX answers rate limits and abuse holds with HTML, not JSON :
+    // a transient condition, never evidence of "never archived".
+    if !(200..300).contains(&out.status) {
+        return Avail::Unreachable;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+        return Avail::Empty;
+    };
+    match cdx_latest(&v) {
+        Some((ts, original)) => {
+            let target = if original.is_empty() { bare } else { &original };
+            Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
+        }
+        None => Avail::Empty,
+    }
+}
+
+/// Pick the nearest-to-present 200 capture from a CDX json response.
+/// Rows are [["urlkey","timestamp","original", ...], ...] : row 0 is
+/// the header, the nearest capture is the last data row.
+fn cdx_latest(v: &Value) -> Option<(String, String)> {
+    let rows = v.as_array()?;
+    if rows.len() < 2 {
+        return None;
+    }
+    let last = &rows[rows.len() - 1];
+    let ts = last.get(1)?.as_str()?.to_string();
+    let original = last
+        .get(2)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((ts, original))
+}
+
 async fn try_resurrect(
     daemon: &Arc<Daemon>,
     url: &str,
     live_error: &Value,
 ) -> Result<Value, ResurrectError> {
-    // 1. Availability lookup (keyless, public API).
-    let avail_url = format!(
-        "https://archive.org/wayback/available?url={}",
-        encode_query_value(url)
-    );
-    let lookup = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        daemon.fetcher.fetch(&avail_url),
-    )
-    .await;
-    let (mut snap_url, mut ts) = match lookup {
+    // 1. Lookup: the availability API first (cheap, "closest"
+    // semantics), then the complete CDX index when it comes back
+    // empty. The availability index is lossy and scheme-strict (a
+    // capture recorded under http:// is invisible to an https://
+    // query), so an empty answer alone never earns "never archived".
+    let mut transport_failed = false;
+    let mut found = match availability_lookup(daemon, url).await {
+        Avail::Found(pair) => Some(pair),
+        Avail::Empty => None,
+        Avail::Unreachable => {
+            transport_failed = true;
+            None
+        }
+    };
+    if found.is_none() {
+        found = match cdx_lookup(daemon, url).await {
+            Avail::Found(pair) => Some(pair),
+            Avail::Empty => None,
+            Avail::Unreachable => {
+                transport_failed = true;
+                None
+            }
+        };
+    }
+    let (mut snap_url, mut ts) = match found {
+        Some(pair) => pair,
         // "The archive is down" is not "the URL was never archived" :
         // collapsing both into one message used to assert a fact the
         // lookup never established.
-        Err(_) | Ok(Err(_)) => {
+        None if transport_failed => {
             return Err(ResurrectError {
                 stage: ResurrectStage::LookupUnreachable,
                 snapshot_url: None,
             });
         }
-        Ok(Ok(out)) => {
-            // A 200 whose body is not JSON (rate-limit HTML, an
-            // interstitial) says nothing about the archive's contents.
-            let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::LookupUnreachable,
-                    snapshot_url: None,
-                });
-            };
-            let Some(closest) = v.pointer("/archived_snapshots/closest") else {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::NoSnapshot,
-                    snapshot_url: None,
-                });
-            };
-            let Some(snap_url) = closest.get("url").and_then(Value::as_str) else {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::NoSnapshot,
-                    snapshot_url: None,
-                });
-            };
-            let ts = closest
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            // The API returns status as a STRING ("200"); accept both.
-            let snap_status = closest
-                .get("status")
-                .map(|s| {
-                    s.as_i64()
-                        .or_else(|| s.as_str().and_then(|x| x.parse().ok()))
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-            if snap_status != 200 {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::SnapshotStatus(snap_status as u16),
-                    snapshot_url: Some(snap_url.to_string()),
-                });
-            }
-            (snap_url.to_string(), ts)
+        None => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::NoSnapshot,
+                snapshot_url: None,
+            });
         }
     };
 
@@ -5021,7 +5118,10 @@ mod initialize_tests {
 
 #[cfg(test)]
 mod resurrect_tests {
-    use super::{ResurrectStage, attr_value_span, meta_refresh_target, wayback_ts_of};
+    use super::{
+        ResurrectStage, attr_value_span, cdx_latest, meta_refresh_target, wayback_ts_of,
+    };
+    use serde_json::json;
 
     #[test]
     fn meta_refresh_follows_wayback_rewrite() {
@@ -5092,4 +5192,24 @@ mod resurrect_tests {
             "snapshot_extract_thin(12)"
         );
     }
+    #[test]
+    fn cdx_latest_picks_last_data_row() {
+        let v = json!([
+            ["urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"],
+            ["com,geocities)/", "20010615131644", "http://www.geocities.com/", "text/html", "200", "AAA", "1000"],
+            ["com,geocities)/", "20190613084634", "http://www.geocities.com/", "text/html", "200", "BBB", "900"]
+        ]);
+        let (ts, original) = cdx_latest(&v).expect("capture picked");
+        assert_eq!(ts, "20190613084634", "nearest-to-present capture wins");
+        assert_eq!(original, "http://www.geocities.com/");
+    }
+
+    #[test]
+    fn cdx_latest_handles_header_only_empty_and_garbage() {
+        assert_eq!(cdx_latest(&json!([["urlkey", "timestamp", "original"]])), None);
+        assert_eq!(cdx_latest(&json!([])), None);
+        assert_eq!(cdx_latest(&json!("not an array")), None);
+        assert_eq!(cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])), None);
+    }
 }
+
