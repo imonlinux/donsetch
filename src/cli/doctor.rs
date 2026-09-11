@@ -39,6 +39,18 @@ pub async fn run() {
     let deep = args.iter().any(|a| a == "--deep");
     let fix = args.iter().any(|a| a == "--fix");
     let only_mcp = args.iter().any(|a| a == "--mcp");
+    let stealth = args.iter().any(|a| a == "--stealth");
+    let stealth_record = args.iter().any(|a| a == "--stealth-record");
+    let parity = args.iter().any(|a| a == "--parity");
+
+    // --stealth / --stealth-record: the drift scorecard (v4 phase
+    // 0.4). Standalone mode: skips the general check battery.
+    // --parity (with --stealth, v4 phase 1.1): diff tier-1 against
+    // the REAL local browser instead of the fixture.
+    if stealth || stealth_record {
+        let code = stealth_scorecard(stealth_record, json, parity).await;
+        std::process::exit(code);
+    }
 
     cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
     println!();
@@ -108,6 +120,9 @@ pub async fn run() {
             CheckResult::Warn("skipped: fetcher unavailable".to_string())
         );
     }
+
+    // 2b. Fetch egress + trust posture (local-only, always runs).
+    report!("Fetch egress", check_fetch_egress());
 
     // 3. TLS fingerprint (fast enough to keep in fast mode).
     if let Some(ref fm) = fetcher {
@@ -237,10 +252,75 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
             out.elapsed.as_secs_f64() * 1000.0,
         )),
         Ok(out) => CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
-        Err(e) => CheckResult::Fail(
-            e.to_string(),
-            "Check your network connection and DNS".into(),
-        ),
+        Err(e) => {
+            // Egress-filter environments are the one common case
+            // where a "network is fine" box still fails every
+            // fetch: curl works via the env proxy, direct sockets
+            // get reset. Surface the fix instead of a generic
+            // "check your connection".
+            let proxy_env_set = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some());
+            let hint = if proxy_env_set {
+                "The environment exports a proxy and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors the env proxy automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> so the re-signed certificates verify, then re-run doctor."
+                    .to_string()
+            } else {
+                "Check your network connection and DNS. Behind an egress proxy? Export HTTPS_PROXY/HTTP_PROXY (donsetch honors them; NO_PROXY accepted).".into()
+            };
+            CheckResult::Fail(e.to_string(), hint)
+        }
+    }
+}
+
+/// Fetch egress + trust posture: env-proxy resolution, kill switch,
+/// and the two certificate stores the connector builds from.
+/// Local-only: no network, stays in fast mode.
+fn check_fetch_egress() -> CheckResult {
+    let kill = crate::config::env_flag("DONSETCH_NO_ENV_PROXY");
+    let resolved = if kill {
+        None
+    } else {
+        crate::transport::proxy::from_env_for("https://example.com")
+    };
+    let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
+    let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
+
+    let mut bits = Vec::new();
+    if let Some(p) = resolved {
+        bits.push(format!("egress via {} proxy {}:{} (env; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port));
+    } else {
+        bits.push(if kill {
+            "direct egress (DONSETCH_NO_ENV_PROXY=1 disables the env-proxy convention)".into()
+        } else {
+            "direct egress (no proxy env vars; export HTTPS_PROXY/HTTP_PROXY to route fetches)"
+                .into()
+        });
+    }
+    match cert_bundle {
+        Some(b) => {
+            if env_roots > 0 {
+                bits.push(format!(
+                    "trust: {sys_roots} system roots + {env_roots} from {b}"
+                ));
+                CheckResult::Pass(bits.join(" · "))
+            } else {
+                bits.push(format!("trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"));
+                CheckResult::Warn(bits.join(" · "))
+            }
+        }
+        None => {
+            bits.push(format!(
+                "trust: {sys_roots} system roots; SSL_CERT_FILE unset"
+            ));
+            CheckResult::Pass(bits.join(" · "))
+        }
     }
 }
 
@@ -844,14 +924,27 @@ fn check_plugins() -> CheckResult {
     }
 }
 
+/// Display form of a key: enough to recognize it, never enough to
+/// use it. Char-based throughout -- the old byte slices panicked on
+/// a key with a multibyte char in the cut position (`parse_key` /
+/// `keys import` never reject non-ASCII), and showed 7 of 8 chars of
+/// a short key.
 fn mask_key(k: &str) -> String {
     let start = k.split_once("::").map(|(t, _)| t).unwrap_or(k);
-    let b = start.as_bytes();
-    if b.len() <= 8 {
-        return format!("{}***", &start[..start.len().saturating_sub(1)]);
+    let n = start.chars().count();
+    if n <= 8 {
+        let shown: String = start.chars().take(n.saturating_sub(1).min(2)).collect();
+        return format!("{shown}***");
     }
-    let head = std::str::from_utf8(&b[..6]).unwrap_or("");
-    let tail = std::str::from_utf8(&b[b.len() - 4..]).unwrap_or("");
+    let head: String = start.chars().take(6).collect();
+    let tail: String = start
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}...{tail}")
 }
 
@@ -1211,4 +1304,175 @@ async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Resu
         cli::bold("done")
     );
     Ok(())
+}
+
+/// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
+/// layers match the baseline, 1 drift or capture failure
+/// (--stealth-record writes the fixture and exits 0 on success).
+/// --parity (v4 phase 1.1) instead diffs the live tier-1 capture
+/// against the REAL local browser (ghost): the evergreen check,
+/// no fixture involved. It cannot go stale; it fails when the
+/// profile and the floor diverge.
+async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
+    use crate::profile::scorecard;
+
+    cli::print_title(&format!("{DISPLAY_NAME} Stealth Scorecard"));
+    println!();
+
+    let fetcher = match Fetcher::new(crate::profile::BrowserProfile::host_default()) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("  fetcher init failed: {e}");
+            return 1;
+        }
+    };
+    let live = match scorecard::capture(&fetcher).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("  capture failed: {e}");
+            eprintln!("  (the echo endpoint is unreachable; retry or check egress)");
+            return 1;
+        }
+    };
+
+    if parity {
+        let mgr = crate::ghost::manager::GhostManager::new().await;
+        return match scorecard::capture_via_ghost(&mgr).await {
+            Ok(ghost) => {
+                let report = scorecard::diff(&ghost, &live);
+                let bad = report.iter().filter(|v| !v.same).count();
+                println!("  parity scope: tier-1 vs LOCAL BROWSER (fixtureless, evergreen)");
+                println!();
+                for v in &report {
+                    let mark = if v.same { "ok  " } else { "DIFF" };
+                    println!("  [{mark}] {:<8}", v.layer);
+                    if !v.same {
+                        println!("       tier1:   {}", v.live);
+                        println!("       browser: {}", v.baseline);
+                    }
+                }
+                println!();
+                if bad == 0 {
+                    println!("  parity: tier 1 matches the local browser. Evergreen.");
+                    0
+                } else {
+                    eprintln!("  {bad} layer(s) diverged from the local browser.");
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("  ghost parity unavailable: {e}");
+                eprintln!("  (need a local Chrome: ghost must render the echo once)");
+                // Parity is best-effort evergreen, not the fixture gate.
+                1
+            }
+        };
+    }
+
+    if record {
+        let mut fixture = live.clone();
+        fixture.source = format!(
+            "tier1 fetcher, profile {}, recorded via --stealth-record",
+            fetcher.profile().name
+        );
+        fixture.captured_at = "operator-recorded".to_string();
+        let path = "tests/fixtures/stealth-baseline.json";
+        match serde_json::to_string_pretty(&fixture) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(path, format!("{text}\n")) {
+                    eprintln!("  could not write {path}: {e}");
+                    return 1;
+                }
+                println!("  baseline recorded to {path}");
+                println!("  review the diff, then rebuild: the fixture is embedded at build time");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("  could not serialize fixture: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let baseline = match scorecard::baseline_fixture() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("  {e}");
+            return 1;
+        }
+    };
+    let verdicts = scorecard::diff(&baseline, &live);
+    let mut drifted = 0;
+    if json {
+        let layers: Vec<serde_json::Value> = verdicts
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "layer": v.layer,
+                    "same": v.same,
+                    "baseline": v.baseline,
+                    "live": v.live,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "endpoint": scorecard::ECHO_ENDPOINT,
+                "profile": live.profile,
+                "drifted": verdicts.iter().filter(|v| !v.same).count(),
+                "layers": layers,
+            }))
+            .unwrap()
+        );
+    } else {
+        for v in &verdicts {
+            if v.same {
+                cli::check_pass(v.layer, "matches baseline");
+            } else {
+                drifted += 1;
+                cli::check_fail(
+                    v.layer,
+                    "DRIFTED",
+                    "re-capture the profile and re-record the baseline deliberately",
+                );
+                println!("      baseline: {}", v.baseline);
+                println!("      live:     {}", v.live);
+            }
+        }
+        println!();
+        if drifted == 0 {
+            println!("  all layers match the baseline; no drift");
+        } else {
+            println!("  {drifted} layer(s) drifted. If Chrome bumped, re-capture the profile");
+            println!("  and re-record the baseline deliberately: donsetch doctor --stealth-record");
+        }
+    }
+    if drifted == 0 { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_key;
+
+    #[test]
+    fn mask_key_is_char_safe_and_never_shows_most_of_a_short_key() {
+        // 8 bytes, 7 chars, last char multibyte: `&start[..7]` panicked.
+        assert_eq!(mask_key("abcdefé"), "ab***");
+        // All-multibyte short key.
+        assert_eq!(mask_key("密钥测试"), "密钥***");
+        // Degenerate lengths.
+        assert_eq!(mask_key(""), "***");
+        assert_eq!(mask_key("a"), "***");
+        assert_eq!(mask_key("ab"), "a***");
+        // A real-length key keeps the recognizable head...tail shape.
+        assert_eq!(
+            mask_key("sk-abcdefghijklmnopqrstuvwxyz0123"),
+            "sk-abc...0123"
+        );
+        // Multibyte at both cut positions.
+        assert_eq!(mask_key("ключключключключ"), "ключкл...ключ");
+        // Bright Data `token::zone` keys mask the token only.
+        assert_eq!(mask_key("0123456789abcdef::my_zone"), "012345...cdef");
+    }
 }

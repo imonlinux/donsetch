@@ -47,17 +47,34 @@ pub fn instructions() -> String {
     // session whether or not we are used : keep it short.
     // tests/token_invariants.rs gates the size.
     format!(
-        "Web access: fetch, search, crawl : one URL, many URLs, or a whole site.\
+        "Web access: fetch, search, answer, crawl : pages, questions, or whole sites.\
         \n\n{tools}\n\n\
         Output is the page's own markdown : full wording, code blocks and tables preserved."
     )
 }
 
-/// tools/list payload : generated from the spec table.
+/// tools/list payload : generated from the spec table. web_answer
+/// disappears when its kill switch is on (law 6: honest-off state).
 pub fn list() -> Value {
     json!({
-        "tools": crate::spec::TOOLS.iter().map(crate::spec::mcp_schema).collect::<Vec<_>>()
+        "tools": crate::spec::TOOLS
+            .iter()
+            .filter(|tool| tool_visible(tool.name))
+            .map(crate::spec::mcp_schema)
+            .collect::<Vec<_>>()
     })
+}
+
+/// Kill-switch visibility: a disabled tool is not advertised at all.
+fn tool_visible(name: &str) -> bool {
+    if name == "web_answer" && crate::config::env_flag("DONSETCH_NO_ANSWER_TOOL") {
+        return false;
+    }
+    #[cfg(feature = "rerank")]
+    if name == "web_memory" && crate::memory::kill_switch() {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -68,14 +85,19 @@ mod tests {
     /// drifted from the shipped MCP contract.
     #[test]
     fn generated_schema_matches_fixture() {
-        let fixture: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/tools_list.json"
-            ))
-            .expect("read fixture"),
-        )
-        .expect("parse fixture");
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tools_list.json"
+        );
+        // Blessing escape hatch: when a new tool lands, regenerate
+        // the golden write once and the test locks it in forever.
+        if std::env::var_os("BLESS_MCP_FIXTURES").is_some() {
+            let json = serde_json::to_string_pretty(&super::list()).expect("serialize tools");
+            std::fs::write(fixture_path, format!("{json}\n")).expect("bless fixture");
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_path).expect("read fixture"))
+                .expect("parse fixture");
         assert_eq!(super::list(), fixture, "tools/list drifted from fixture");
     }
 }

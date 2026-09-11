@@ -10,6 +10,7 @@
 
 pub mod blocks;
 pub mod charset;
+pub mod fallback;
 pub mod feed;
 pub mod focus;
 pub mod hn;
@@ -26,7 +27,7 @@ pub mod score;
 #[cfg(test)]
 mod tests;
 
-use scraper::{Html, Node};
+use scraper::Html;
 
 #[derive(Default, Clone)]
 pub struct ExtractOptions {
@@ -479,8 +480,9 @@ pub fn extract(
     // fully-hydrated pages (Amazon, React apps), making it
     // a false-positive. aria-busy is a reliable loading
     // signal set by the browser, not CSS.
-    let lower_html = html_text.to_lowercase();
-    let has_skeletons = lower_html.matches("aria-busy=\"true\"").take(3).count() >= 3;
+    // ASCII-case-insensitive scan (L9): was a whole-document
+    // to_lowercase() allocation just to count three markers.
+    let has_skeletons = count_ascii_ci(&html_text, "aria-busy=\"true\"", 3) >= 3;
 
     // Scope: explicit selector or scored main-content detection.
     let roots: Vec<scraper::ElementRef<'_>> = if let Some(sel) = &opts.selector {
@@ -548,8 +550,11 @@ pub fn extract(
     // structure (h1-h6 → markdown headings) and paragraph breaks.
     // When focus is active, short content is intentional (the agent
     // asked for a filtered slice), not a sign of extraction failure.
-    let needs_fallback = extracted.thin || (extracted.total_chars < 200 && opts.focus.is_none());
-    if needs_fallback && let Some(mut fb) = text_fallback(&html_text, &meta, url, opts, max_chars) {
+    let needs_fallback = extracted.thin
+        || (extracted.total_chars < fallback::FALLBACK_MIN_TEXT && opts.focus.is_none());
+    if needs_fallback
+        && let Some(mut fb) = fallback::text_fallback(&html_text, &meta, url, opts, max_chars)
+    {
         // Comic/gallery pages go thin and fall back here; the
         // scoped Media blocks (the actual content images) must
         // survive the handoff for on-demand OCR.
@@ -572,167 +577,6 @@ fn body_starts_with_html(body: &[u8]) -> bool {
     let s = String::from_utf8_lossy(&s[..s.len().min(256)]);
     let t = s.trim_start().to_lowercase();
     t.starts_with("<!doctype html") || t.starts_with("<html")
-}
-
-/// Raw text fallback: strip tags and return visible text as
-/// markdown paragraphs. Used when DonSift's block-based extraction
-/// pipeline fails on complex DOMs. Preserves heading
-/// structure (h1-h6 → # ## ###) and paragraph breaks. Skips
-/// script/style/nav/footer/header/aside/form elements.
-///
-/// Returns None when there's < 200 chars of visible text : the
-/// page is genuinely empty (JS shell or block page).
-pub fn text_fallback(
-    html_text: &str,
-    meta: &metadata::Meta,
-    url: &str,
-    opts: &ExtractOptions,
-    max_chars: usize,
-) -> Option<Extracted> {
-    let doc = Html::parse_document(html_text);
-    let body_sel = scraper::Selector::parse("body").ok()?;
-    let body = doc.select(&body_sel).next()?;
-
-    let mut paragraphs: Vec<String> = Vec::new();
-    let mut current = String::new();
-    collect_fallback_text(body, &mut paragraphs, &mut current);
-    if !current.trim().is_empty() {
-        paragraphs.push(current.trim().to_string());
-    }
-
-    // Filter whitespace-only and single-char paragraphs
-    let paragraphs: Vec<String> = paragraphs
-        .into_iter()
-        .filter(|p| p.len() > 1 && p.chars().any(|c| !c.is_whitespace()))
-        .collect();
-
-    let total_text: usize = paragraphs.iter().map(|p| p.len()).sum();
-    if total_text < 200 {
-        return None;
-    }
-
-    let mut full = String::new();
-    if let Some(t) = &meta.title {
-        full.push_str(&format!("# {t}\n\n"));
-    }
-    full.push_str(&format!("{url}\n\n"));
-    full.push_str(&paragraphs.join("\n\n"));
-
-    let (slice, next) = paginate(&full, opts.offset, max_chars);
-    let blocks_total = paragraphs.len();
-    let tokens_est = slice.len() / 4;
-
-    // thin=true when < 800 chars: a JS shell with 300 chars of
-    // visible text (script filenames, noscript messages, meta
-    // descriptions) is NOT real content. The MCP layer must
-    // escalate to ghost. Only pages with >= 800 chars of real
-    // visible text are non-thin : those are genuinely complex
-    // DOMs where block extraction failed but text is real.
-    Some(Extracted {
-        markdown: slice,
-        title: meta.title.clone(),
-        byline: meta.byline.clone(),
-        published: meta.published.clone(),
-        site: meta.site.clone(),
-        total_chars: full.len(),
-        next_offset: next,
-        blocks_total,
-        blocks_shown: blocks_total,
-        tokens_est,
-        thin: total_text < 800,
-        content_kind: ContentKind::Page,
-        lang: "unknown".to_string(),
-        quality: 0.3, // lower quality than block-based extraction
-        pdf_pages: None,
-        images: Vec::new(),
-        fingerprint: None,
-        via: None,
-    })
-}
-
-const SKIP_FALLBACK_TAGS: &[&str] = &[
-    "script", "style", "noscript", "template", "svg", "canvas", "iframe", "object", "embed", "nav",
-    "aside", "footer", "header", "form", "button", "input", "select", "textarea", "option",
-];
-
-const PARAGRAPH_BREAK_TAGS: &[&str] = &[
-    "p",
-    "br",
-    "li",
-    "tr",
-    "blockquote",
-    "pre",
-    "dt",
-    "dd",
-    "figcaption",
-];
-
-fn heading_level(tag: &str) -> Option<usize> {
-    match tag {
-        "h1" => Some(1),
-        "h2" => Some(2),
-        "h3" => Some(3),
-        "h4" => Some(4),
-        "h5" => Some(5),
-        "h6" => Some(6),
-        _ => None,
-    }
-}
-
-fn collect_fallback_text(
-    el: scraper::ElementRef,
-    paragraphs: &mut Vec<String>,
-    current: &mut String,
-) {
-    for child in el.children() {
-        match child.value() {
-            Node::Text(t) => {
-                let text = t.text.trim();
-                if !text.is_empty() {
-                    if !current.is_empty() && !current.ends_with(' ') {
-                        current.push(' ');
-                    }
-                    current.push_str(text);
-                }
-            }
-            Node::Element(e) => {
-                let name = e.name();
-                if SKIP_FALLBACK_TAGS.contains(&name) {
-                    continue;
-                }
-                let Some(child_el) = scraper::ElementRef::wrap(child) else {
-                    continue;
-                };
-                // Headings: flush, prefix with markdown, recurse
-                if let Some(level) = heading_level(name) {
-                    if !current.trim().is_empty() {
-                        paragraphs.push(std::mem::take(current).trim().to_string());
-                    }
-                    let mut heading = String::new();
-                    collect_fallback_text(child_el, paragraphs, &mut heading);
-                    if !heading.trim().is_empty() {
-                        paragraphs.push(format!("{} {}", "#".repeat(level), heading.trim()));
-                    }
-                    continue;
-                }
-                // Block elements: flush, recurse, flush
-                if PARAGRAPH_BREAK_TAGS.contains(&name) {
-                    if !current.trim().is_empty() {
-                        paragraphs.push(std::mem::take(current).trim().to_string());
-                    }
-                    let mut inner = String::new();
-                    collect_fallback_text(child_el, paragraphs, &mut inner);
-                    if !inner.trim().is_empty() {
-                        paragraphs.push(inner.trim().to_string());
-                    }
-                } else {
-                    // Inline: recurse without flush
-                    collect_fallback_text(child_el, paragraphs, current);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Honest stub for PDFs that could not be parsed.
@@ -1083,61 +927,97 @@ pub fn probe_render(text: &str, pattern: &str, is_regex: bool) -> String {
         }
     };
 
-    if is_regex {
-        match regex::RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .size_limit(1 << 20)
-            .build()
-        {
-            Ok(re) => {
-                let hits: Vec<(usize, usize)> = re
-                    .find_iter(text)
-                    .map(|m| (m.start(), m.end()))
-                    .take(50)
-                    .collect();
-                report(Some(hits))
-            }
-            Err(_) => report(None),
-        }
+    // Both modes go through one case-insensitive regex so every hit
+    // is a byte offset into `text` itself. The old substring path
+    // searched a separately lowercased copy, whose offsets drift
+    // from the real text as soon as case folding changes a byte
+    // length ('İ' -> "i̇"); and both paths then fed those BYTE
+    // offsets to a context window that treated them as CHAR indices,
+    // so on any page with non-ASCII text before the hit the excerpt
+    // landed after the match and did not contain it.
+    let source = if is_regex {
+        std::borrow::Cow::Borrowed(pattern)
     } else {
-        // Case-insensitive substring: lowercase both sides on
-        // ASCII (the dominant case) without allocating a regex.
-        let hay = text.to_lowercase();
-        let needle = pattern.to_lowercase();
-        let mut hits = Vec::new();
-        let mut from = 0;
-        while let Some(pos) = hay[from..].find(&needle) {
-            hits.push((from + pos, from + pos + needle.len()));
-            from += pos + needle.len().max(1);
-            if hits.len() >= 50 {
-                break;
-            }
+        std::borrow::Cow::Owned(regex::escape(pattern))
+    };
+    match regex::RegexBuilder::new(&source)
+        .case_insensitive(true)
+        .size_limit(1 << 20)
+        .build()
+    {
+        Ok(re) => {
+            let hits: Vec<(usize, usize)> = re
+                .find_iter(text)
+                .map(|m| (m.start(), m.end()))
+                .take(50)
+                .collect();
+            report(Some(hits))
         }
-        report(Some(hits))
+        // A literal can only fail to build by blowing the size
+        // limit (a multi-KB pattern under (?i) expands into Unicode
+        // classes); it is never "invalid", so search it as bytes
+        // instead. ASCII case-insensitive is the honest fallback:
+        // non-ASCII bytes must match exactly, which also keeps every
+        // hit on a char boundary.
+        Err(_) if !is_regex => report(Some(literal_hits(text, pattern))),
+        Err(_) => report(None),
     }
 }
 
-/// One-line context window around a match, ellipsized and
-/// whitespace-collapsed.
-fn context_around(text: &str, start: usize, end: usize, pad: usize) -> String {
-    let char_count = text.chars().count();
-    let lo = start.saturating_sub(pad);
-    let hi = (end + pad).min(char_count);
-    // Convert char indices to byte indices safely.
-    let byte_lo = char_to_byte(text, lo);
-    let byte_hi = char_to_byte(text, hi);
-    let window = &text[byte_lo..byte_hi];
-    let collapsed: String = window.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prefix = if lo > 0 { "…" } else { "" };
-    let suffix = if hi < char_count { "…" } else { "" };
-    format!("{prefix}{collapsed}{suffix}")
+/// Byte-window search for a literal `needle` in `text`, ASCII
+/// case-insensitive. Non-ASCII bytes compare exactly, so a match
+/// start is always a char boundary (a UTF-8 lead byte or ASCII, never
+/// a continuation byte) and `start + needle.len()` is too.
+fn literal_hits(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    let (hay, nb) = (text.as_bytes(), needle.as_bytes());
+    if nb.is_empty() || nb.len() > hay.len() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while from + nb.len() <= hay.len() {
+        match hay[from..]
+            .windows(nb.len())
+            .position(|w| w.eq_ignore_ascii_case(nb))
+        {
+            Some(pos) => {
+                let start = from + pos;
+                hits.push((start, start + nb.len()));
+                from = start + nb.len();
+                if hits.len() >= 50 {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    hits
 }
 
-fn char_to_byte(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(text.len())
+/// One-line context window around a match, ellipsized and
+/// whitespace-collapsed. `start`/`end` are BYTE offsets into `text`
+/// (char boundaries, as regex matches are); `pad` is in chars.
+fn context_around(text: &str, start: usize, end: usize, pad: usize) -> String {
+    let byte_lo = if pad == 0 {
+        start
+    } else {
+        text[..start]
+            .char_indices()
+            .rev()
+            .nth(pad - 1)
+            .map(|(b, _)| b)
+            .unwrap_or(0)
+    };
+    let byte_hi = text[end..]
+        .char_indices()
+        .nth(pad)
+        .map(|(b, _)| end + b)
+        .unwrap_or(text.len());
+    let window = &text[byte_lo..byte_hi];
+    let collapsed: String = window.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prefix = if byte_lo > 0 { "…" } else { "" };
+    let suffix = if byte_hi < text.len() { "…" } else { "" };
+    format!("{prefix}{collapsed}{suffix}")
 }
 
 /// One-line accounting of what the focus filter dropped: block
@@ -1282,4 +1162,29 @@ fn ceil_char_boundary(text: &str, mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Count case-insensitive ASCII occurrences of `needle` in `hay`,
+/// stopping at `max` (the detectors only compare against a small
+/// threshold). No allocation: was a whole-document to_lowercase() just
+/// to count three `aria-busy` markers (L9).
+fn count_ascii_ci(hay: &str, needle: &str, max: usize) -> usize {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return 0;
+    }
+    let first_low = n[0].to_ascii_lowercase();
+    let first_high = n[0].to_ascii_uppercase();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + n.len() <= h.len() && count < max {
+        if (h[i] == first_low || h[i] == first_high) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            count += 1;
+            i += n.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
 }

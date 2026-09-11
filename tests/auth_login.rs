@@ -9,7 +9,7 @@ use std::net::TcpListener;
 
 use donsetch::auth::{self, AuthRegistry};
 use donsetch::ghost::cache::{
-    CookieRecord, clear_session_cookies_for, is_session_worthy, load_session_cookies,
+    CookieRecord, GhostState, clear_session_cookies_for, is_session_worthy, load_session_cookies,
     store_session_cookies,
 };
 
@@ -400,4 +400,64 @@ async fn probe_domain_does_not_panic_inside_a_tokio_runtime() {
     // panic = "abort", never by aborting the process).
     let result = auth::probe_domain("127.0.0.1", &cookies, Some(1));
     assert!(result.is_err(), "expected a connection-refused Err, got Ok");
+}
+
+/// Tier-1 jar echo hygiene (v4 phase 1.4, issue #173): the logout
+/// sweep owns every persisted copy. Two cookie records and two
+/// rendered pages, one of each matching the domain, one of each for
+/// another host. The rendered-DOM cache is a fourth copy of the
+/// session's fruit (a page fetched behind the session is stored
+/// whole in `renders`, RENDER_TTL = 5 min, and served by the tier-2
+/// fetch shortcut); a logout that leaves it hands back the logged-in
+/// DOM with no network hop for up to five minutes.
+///
+/// One test carries both echoes on purpose: the suite shares one
+/// on-disk state via the static cache dir, so a second concurrent
+/// writer would race the whole-file save under `cargo test`.
+#[test]
+fn logout_wipes_the_tier1_echo() {
+    isolate_state();
+    let mut reg = AuthRegistry::load();
+    let _ = reg.remove("alpha.test");
+    // Keep this hermetic: no tier-2 browser, just sync the jar
+    // records the same way sync_warm_cookies would.
+    {
+        let mut state = GhostState::load();
+        state.sync_tier1_cookies(&[
+            cookie(".alpha.test", "session_cookie", "a", None),
+            cookie("beta.test", "other_cookie", "b", None),
+        ]);
+        state.record_render(
+            "https://app.alpha.test/dashboard",
+            "<html><body>logged-in dashboard</body></html>",
+        );
+        state.record_render("https://beta.test/page", "<html>public</html>");
+        state.save();
+    }
+    assert!(clear_session_cookies_for("alpha.test"));
+    let _ = clear_session_cookies_for("alpha.test"); // idempotent revisit
+    let state = GhostState::load();
+    let tiers: Vec<&str> = state
+        .tier1_cookies
+        .iter()
+        .map(|c| c.domain.as_str())
+        .collect();
+    assert!(
+        !tiers.iter().any(|d| d.ends_with("alpha.test")),
+        "session-echo leak after logout"
+    );
+    assert!(
+        tiers.iter().any(|d| d.ends_with("beta.test")),
+        "background housekeeping must keep unrelated domains"
+    );
+    assert!(
+        state
+            .render_for("https://app.alpha.test/dashboard")
+            .is_none(),
+        "the rendered DOM of a logged-out domain must not survive logout"
+    );
+    assert!(
+        state.render_for("https://beta.test/page").is_some(),
+        "logout must not evict renders of unrelated domains"
+    );
 }

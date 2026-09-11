@@ -18,7 +18,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
 
-[Install](#-install) · [Quickstart](#-quickstart) · [The 3 tools](#-the-3-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
+[Install](#-install) · [Quickstart](#-quickstart) · [The 6 tools](#-the-6-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
 
 </div>
 
@@ -47,6 +47,8 @@ reqwest; the core paths that run on every fetch do not.)
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes)
 and as a standalone CLI.
 
+> **V4 is coming. And it's not just any upgrade.**
+
 ## ✨ What makes it different
 
 | | What it does |
@@ -59,6 +61,40 @@ and as a standalone CLI.
 | 📄 **Pixel-fusion PDF** | Glyphs + rendered pixels from the same stream, fused deterministically. Per-region trust audit. Scanned PDFs auto-OCR'd. |
 | 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
 | 🪶 **~2k tokens** | Three tools, ~2.0k tokens of total schema (tools/list, measured). Every token earns its place. |
+
+## 🧭 Pick the right tool for the job
+
+DonSeTch is a **rapid-fire research tool**: search, read, verify. A
+search, a fetch or two, a docs page, one PDF. Its speed is the point,
+and that speed is its stealth for one-shot reads.
+
+It is NOT built for tasks where an agent "works through" a defended
+site the way a person would. That class includes:
+
+- **Bulk document harvesting**: discovering and downloading many PDFs
+  or files from one repository in a single run.
+- **Long sessions against one site**: page after page, click by click,
+  at machine speed, same IP, no human pauses.
+- **Mass extraction**: mirroring a file library, dataset collection,
+  systematic downloads.
+
+DonSeTch will *probably work* on those too, and nothing stops it.
+But every request fires hundreds of times faster than a human, and
+defended sites read that pattern itself as a bot, not just the
+fingerprint. The realistic risk is an IP-level block: restricted
+access, a captcha wall, or a ban on your whole network mid-run. When
+that happens, it is the task shape, not a fetch-layer failure. The
+same page fetched once, as a research read, is fine.
+
+For those workflows, use
+**[Bladebro](https://github.com/dondai44423/bladebro)**. It is the
+next step up, built exactly for that shape of work: a real browser
+doing what a human does, page by page, download by download, at a
+human's pace. Slower than DonSeTch by design, because over a long
+session against a defended site, looking human beats being fast.
+
+**Rule of thumb: one-shot research = DonSeTch. Working a defended
+site like a person to collect things = Bladebro.**
 
 ## 🆕 v3, the agent-first upgrade
 
@@ -121,7 +157,7 @@ brew tap dondai44423/donsetch && brew install donsetch
 pi install npm:donsetch
 ```
 
-Registers the 3 tools as native pi tools, spawns the binary at session
+Registers the agent tools as native pi tools, spawns the binary at session
 start, self-updates with `pi update --extensions`.
 
 **DeepSeek Harness (`dsh`, first-class plugin):**
@@ -262,6 +298,33 @@ connect to `http://localhost:8765/mcp`. Sessions, cancellation,
 `/health`, token auth via `DONSETCH_HTTP_TOKEN`, per-request timeout,
 all documented in `donsetch mcp --help`.
 
+**One-surface clients (the `[meta]` fold):** if your agent reports tool
+metadata but no page text, or gets the page text but can't cite a URL
+behind an `S3` handle, can't paginate, and never sees an error code,
+the client is rendering only one of the two MCP result surfaces and
+dropping the other. DonSeTch's default shape is split on purpose:
+`content` carries the document markdown, `structuredContent` carries
+compact actionable state (raw URLs behind the handles, `next_offset`,
+resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP
+never specified which surface a client shows, so both halves of that
+split get dropped in the wild — Claude Code and VS Code keep
+`structuredContent` and discard `content`; OpenCode v1 (tested on
+1.18.3) keeps `content` and discards `structuredContent`. Either way
+the fix is the same fold: a compact leading `[meta]` text block carries
+the state, the markdown stays a clean text block behind it, and
+`structuredContent` is omitted.
+
+Those three are detected at the handshake by `clientInfo.name`, matched
+exactly and case-insensitively against a hardcoded list, so a wrapper
+or fork under any other name — `claude-code-proxy`, say — is *not*
+detected and silently keeps the split shape. That is what
+`DONSETCH_MCP_TEXT_ONLY=1` is for: it forces the fold for every client
+regardless of the handshake, so an unlisted host is fixable today
+rather than at the next release. Fail-closed, like the other env flags
+— only an explicitly true value turns it on; `=false` leaves the
+handshake in charge. Every other client keeps the default token-optimal
+split shape.
+
 **2. CLI (for humans and scripts).** Same engine as MCP, thin adapter:
 
 ```bash
@@ -272,9 +335,33 @@ donsetch crawl https://docs.python.org --mode map --topic asyncio
 
 ## 🔀 HTTP Proxy
 
-Optional proxies for search and crawl only. The fetch system always
-uses the main home IP: proxied fetches burn the Stealth guarantee and
-the fetch tier gets no config path for them by design.
+**Search and crawl**: configure rotating proxies with `donsetch proxy add`
+or `DONSEEK_PROXIES`. Their egress lanes are reported per request
+(via= labels on the wire view).
+
+**Fetch**: no proxy by default: direct dials keep the stealth
+guarantee intact. But fetch follows the curl/openssl convention when
+the environment asks for it:
+
+- `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (uppercase or lowercase)
+  route fetches through that proxy, `NO_PROXY` exempts.
+- `DONSETCH_NO_ENV_PROXY=1` disables the convention entirely
+  (privacy purists, environment hygiene).
+- HTTP CONNECT proxies get an interception-safe handshake: no
+  GREASE/ALPS/ECH/compress-cert, because TLS-terminating middleboxes
+  (corporate MITM, cloud sandboxes) re-sign with their own stack and
+  some reset on exotic ClientHellos. SOCKS5 proxies keep the
+  Chrome-true handshake (TLS rides end-to-end).
+- `SSL_CERT_FILE` / `SSL_CERT_DIR` are loaded into the trust store:
+  in an intercepting network that bundle is the only way re-signed
+  certificates verify, exactly like curl.
+- `donsetch doctor` reports your egress posture: resolved env proxy,
+  kill-switch state, system + environment trust stores, and a live
+  network check that names the interception fix when it fails.
+
+A proxy you configured is your egress: an intercepting proxy sees
+plaintext by definition, which is the same tradeoff curl and reqwest
+make.
 
 ```bash
 donsetch proxy add <url>            # rotate-able proxy entry
@@ -313,13 +400,16 @@ The CLI is a thin adapter over the same engine the MCP server uses:
 | `donsetch update` / `rollback` | Self-update from GitHub Releases, revert |
 | `donsetch tools` | Tool schemas as JSON (same as MCP `tools/list`) |
 
-## 🎯 The 3 tools
+## 🎯 The 6 tools
 
 | Tool | What it does |
 |---|---|
 | 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to headless browser on bot walls. PDFs with OCR + per-page confidence, `focus`/`toc`/`section`, pagination, `actions` for in-page control, `must_contain` probes, `archive` resurrection. |
 | 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus + semantic reranking, query-aware official-source placement. Returns ranked URLs + snippets. |
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap + frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
+| 💡 **`web_answer`** | Terminal synthesis over 2-9 fetched sources when enough authority exists; otherwise it answers with the exact gap and no fluff. |
+| 🧠 **`web_memory`** | Local-only vector memory the agent writes to as it works (performant: one batch = one embed pass + one disk write, async off the answer path). Search by semantic proximity, cap-bounded, on-device model. |
+| 📸 **`web_screenshot`** | Rendered PNG of any URL through the same tier-2 browser. URL goes through the usual safety guards; CLI twin: `donsetch screenshot URL [--out PATH]`. |
 
 Tool schemas: `donsetch tools`. Every tool returns structured errors
 with stable codes + `next_action`. v3.6 compact contracts: the model
@@ -478,16 +568,24 @@ Disable with `DONSEEK_NO_DISK_STATE=1`.
 
 ## 🔎 Keyless search
 
-No API key, no account. 5 keyless engines across 4 independent index
+No API key, no account. 6 keyless engines across 4 independent index
 families + 8 official verticals run in parallel on your machine, merged,
 deduped, ranked.
 
-- **Backends:** Bing-family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek
+- **Backends:** Bing-family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google
   + keyless verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv,
   StackExchange, MDN, Google News).
+- **Native Google:** browser-free HTTP via the legacy mobile endpoint, using
+  the existing Rust transport. Seven selectable, experimentally verified Nokia
+  profiles; the default is `6230-03.15`. No paid API or CAPTCHA solver.
+  Successful profiles remain preferred per egress in memory; CAPTCHA advances
+  circularly through the profiles. Retry, pacing and quarantine use the same
+  policy as other engines, with no per-profile cooldowns. Selection resets on
+  restart. Rate limits do not advance the profile cursor.
+  Availability depends on Google and the network; see [configuration and limits](docs/google-wml.md).
 - **Ghost SERP cascade lane:** if the plain fan-out and its retry wave
-  leave the merge thin (<3 lanes or <15 hits), one headless render
-  unlocks Google's 2026 JS-shell SERP as a 4th consensus family. Costs
+  leave the merge thin (<3 lanes or <15 hits) and native Google failed,
+  one headless render can recover Google's desktop SERP. Costs
   nothing when healthy (only fires under underdelivery); reports itself
   honestly as `google_ghost`.
 - **Semantic reranking**: local ONNX cross-encoder
@@ -667,8 +765,14 @@ inventory), then Governor-paced frontier walk with extraction per page.
 - **Focus-ranked frontier**: `focus="query"` ranks pages by BM25
   relevance, crawls only matches.
 - **Adaptive pacing**: the Governor paces per (host, lane).
-  429/503 → exponential backoff. Dwell-time variance proportional to
-  page size breaks metronome fingerprints.
+  429/503 → backoff on host signals; host-declared waits
+  (`Retry-After`, robots `Crawl-delay`) honored in full; everything
+  self-inferred caps at ~7s. Zero artificial dwell on the fetch path
+  (stealth through truth, never time).
+- **Crawl-shape**: frontier pops get a seeded reader-like jitter, so
+  repeated crawls never replay one identical, score-eager fetch
+  order to server logs. Ordering only (every page still fetched,
+  payloads untouched). Kill switch: `DONSETCH_NO_CRAWL_SHAPE=1`.
 - **Resume tokens**: stopped crawls resume with one call; valid 30
   min, survive restarts.
 - **Near-dup detection**: title + first 200 chars hashed.
@@ -726,7 +830,7 @@ Every layer in Rust. No dependency on existing OSS web tooling.
 | 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25 + consensus + semantic reranking | `src/search/` |
 | 🕷️ **DonTread** | Crawl engine, sitemap, focus frontier, Governor pacing, resume tokens | `src/crawl/` |
 | 📄 **DonSheet** | PDF extraction, PDFium FFI, pixel-truth fusion, OCR cascade, forms | `src/pdf/` |
-| 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, 3 tools, crash-only supervisor | `src/mcp/` |
+| 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, 6 tools, crash-only supervisor | `src/mcp/` |
 
  **727 tests. Zero clippy warnings.**
 `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law.
@@ -829,7 +933,7 @@ search speed, mainstream source authority, no-sitemap discovery.
 | Search rate-limits without a proxy | Keyless search hits engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
 | Rerank in a CPU-limited container | Auto-clamped to cgroup parallelism on Linux. `DONSEEK_RERANK_THREADS` to override. |
 | Windows needs DirectML.dll | In-box since Windows 10 1903. Only trimmed Server Core/Nano images need the NuGet copy beside the binary. |
-| Not built for mass scraping | Agentic research, not bulk extraction. |
+| Not built for mass scraping | Agentic research, not bulk extraction. See "Pick the right tool" above. |
 
 ## 🧱 Honest limits
 
@@ -883,6 +987,24 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run
 `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` and
 `cargo test --features ocr,rerank` before submitting. AGPL v3: all
 contributions under the same license.
+
+## 💛 Sponsors
+
+DonSeTch is open source and free to use. If you want to support development, consider sponsoring.
+
+| Tier | Price | What you get |
+|---|---|---|
+| 🥉 Bronze | $10/mo | Name + link in Sponsors section |
+| 🥈 Silver | $25/mo | Small logo + link in Sponsors section |
+| 🥇 Gold | $49/mo | Large logo + link, pinned at top of Sponsors section |
+
+One-time sponsorships are also welcome at any amount.
+
+Pricing will increase as the project grows. Right now DonSeTch is early (small but growing), so sponsorship is cheap. A Gold tier at $49/mo is high reward, near zero investment for any company that relies on web research for AI agents. Lock in the current rate before it goes up.
+
+If your product is part of this space (proxy platforms, search infrastructure, BYO providers, anything a DonSeTch user would plug in), Gold goes one step further: if your tool fits natively within DonSeTch, you get the banners and the link plus an official native integration shipped in the binary itself.
+
+Email bhandaribishesh879@gmail.com to become a sponsor.
 
 ## 📄 License
 

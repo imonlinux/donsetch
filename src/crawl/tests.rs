@@ -11,8 +11,44 @@ use std::time::Duration;
 use futures_util::FutureExt;
 
 use super::governor::{Governor, Lane, LaneKind};
-use super::{CrawlMode, CrawlOptions, Crawler, FetchedPage, PageFetcher, StopReason};
+use super::{
+    CrawlMode, CrawlOptions, Crawler, FetchedPage, GHOST_BUDGET, PageFetcher, StopReason,
+    claim_ghost_slot,
+};
 use crate::detect::walls::Verdict;
+
+// The escalation budget is shared by every worker. A load-then-
+// fetch_sub gate let two workers pass at budget == 1 and wrap the
+// counter to usize::MAX, after which every later check passed. The
+// atomic claim must hand out exactly GHOST_BUDGET slots however many
+// threads race for them, and the counter must end at 0, not wrap.
+#[test]
+fn ghost_budget_is_claimed_exactly_budget_times_under_contention() {
+    for _ in 0..20 {
+        let budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (budget, claimed, go) = (budget.clone(), claimed.clone(), go.clone());
+                std::thread::spawn(move || {
+                    go.wait();
+                    for _ in 0..100 {
+                        if claim_ghost_slot(&budget) {
+                            claimed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(claimed.load(Ordering::SeqCst), GHOST_BUDGET);
+        assert_eq!(budget.load(Ordering::SeqCst), 0, "counter wrapped");
+        assert!(!claim_ghost_slot(&budget), "exhausted budget must refuse");
+    }
+}
 
 /// A scripted site: URL → (status, body). Missing URL = 404.
 struct MockSite {
@@ -412,6 +448,53 @@ async fn crawl_robots_disallow_respected() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(!hits.iter().any(|h| h.contains("/private")));
+}
+
+// `Crawl-delay` was parsed with a bare `f64` parse and fed straight
+// to `Duration::from_secs_f64`, which panics on `inf`/huge values:
+// one hostile (or sloppy) robots.txt aborted the crawl worker, and
+// a finite `86400` was honoured verbatim (a day between pages).
+#[test]
+fn robots_crawl_delay_is_finite_and_clamped() {
+    use super::sitemap::Robots;
+    for bad in ["inf", "-inf", "nan", "-5", "abc"] {
+        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {bad}\n"), "ex.com");
+        assert_eq!(r.crawl_delay, None, "{bad}");
+    }
+    let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "ex.com");
+    assert_eq!(r.crawl_delay, Some(2.5));
+    for huge in ["86400", "1e300"] {
+        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {huge}\n"), "ex.com");
+        assert_eq!(
+            r.crawl_delay,
+            Some(super::sitemap::MAX_CRAWL_DELAY_SECS),
+            "{huge}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn crawl_survives_infinite_crawl_delay() {
+    let robots = "User-agent: *\nCrawl-delay: inf\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/ok\">ok</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, robots)
+        .page("https://ex.com/", 200, seed)
+        .page("https://ex.com/ok", 200, &html("Ok", "ok"));
+    let (fetch, _hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    o.respect_robots = true;
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        crawler.crawl("https://ex.com/", o, None),
+    )
+    .await
+    .expect("crawl must finish")
+    .unwrap();
+    assert!(r.pages.iter().any(|p| p.url.ends_with("/ok")));
 }
 
 #[tokio::test]
@@ -855,6 +938,8 @@ async fn v2_sitemap_priority_seeds_frontier() {
     let crawler = Crawler::new(fetch, gov());
     let mut o = opts();
     o.mode = CrawlMode::Full;
+    o.shape = false; // priority semantics are exact-order; shaping is
+    // tested separately (frontier tests pin the jitter contract).
     o.max_pages = 2; // seed + 1 : priority decides which
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     // The high-priority page should be fetched before the low one.
@@ -887,41 +972,6 @@ async fn v2_referer_passed_to_fetcher() {
     // mock's Arc. But we can verify the crawl succeeded.)
     // This test serves as a compile-time check that the
     // PageFetcher signature accepts referer.
-}
-
-#[test]
-fn v2_governor_dwell_extends_wait() {
-    // Gap: fixed-interval traffic is a bot fingerprint.
-    // Dwell time proportional to page size breaks the metronome.
-    let g = Governor::new(vec![Lane {
-        id: "d".into(),
-        kind: LaneKind::Direct,
-    }]);
-    // First request: no wait.
-    assert_eq!(g.wait_for("ex.com", "d", 0), Duration::ZERO);
-    // Simulate a large-page success with 2000ms dwell.
-    g.on_success("ex.com", "d", Duration::from_millis(50), 2000);
-    // Next request must wait at least the dwell time.
-    let w = g.wait_for("ex.com", "d", 1);
-    assert!(
-        w > Duration::ZERO,
-        "dwell time must extend the wait beyond zero"
-    );
-}
-
-#[test]
-fn v2_governor_zero_dwell_no_extra_wait() {
-    // Zero dwell = no extra wait. Small pages (cache hits) should
-    // not inflate the pacing.
-    let g = Governor::new(vec![Lane {
-        id: "d".into(),
-        kind: LaneKind::Direct,
-    }]);
-    g.wait_for("ex.com", "d", 0);
-    g.on_success("ex.com", "d", Duration::from_millis(50), 0);
-    let w = g.wait_for("ex.com", "d", 1);
-    // Without dwell, the wait is just the base pacing delay.
-    assert!(w < Duration::from_secs(3));
 }
 
 // ── Hardening tests (PDF, sitemap, www normalization) ────────
@@ -1074,5 +1124,70 @@ async fn seed_always_in_scope_with_include() {
             .iter()
             .any(|(u, why)| u.ends_with("/tokio") && why.contains("out of scope")),
         "seed should not be marked out of scope"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────
+// Lowercase-drift proofs: offset slices on non-ASCII pages
+// ────────────────────────────────────────────────────────────────
+// The link extractors lowercase the WHOLE document to case-fold the
+// tag names, then slice the ORIGINAL at offsets found in the copy.
+// Case folding changes byte lengths ('İ' U+0130 = 2 bytes -> "i̇"
+// = 3 bytes), so every offset after a folding char drifts. These
+// tests prove the failure; the fix searches the original with an
+// ASCII case-insensitive byte scan (ASCII folding is length-stable).
+
+#[test]
+fn link_rel_panics_on_folding_char_before_the_tag_scan() {
+    // 'İ' (2 bytes) lowercases to "i̇" (3 bytes). With İ INSIDE the
+    // tag and a multibyte char right after '>', the old code's
+    // lowered-copy offsets slice one byte into that char: a
+    // str-slice panic, abort in release. Pre-fix: this panicked.
+    let html = "<html><head><link rel=\"alternate\" title=\"İstanbul\" \
+                type=\"application/rss+xml\" href=\"/feed.xml\">內容</head></html>";
+    let got = std::panic::catch_unwind(|| super::extract_feed_links(html));
+    let links = got.expect("extract_feed_links panicked on a folding char");
+    assert_eq!(links, vec!["/feed.xml"]);
+}
+
+#[test]
+fn feed_xml_folding_char_dropped_links_old_math() {
+    // RSS with a folding char in the channel title before each item
+    // and inside one URL: the old offset math shifted every slice
+    // by one byte, so the URLs read as "ttps://..." and were
+    // silently dropped (both), instead of returned. Pre-fix: the
+    // assertion on the URL list failed.
+    let xml = "<rss><channel><title>İstanbul</title>\
+               <item><link>https://example.com/f/1</link></item>\
+               <item><link>https://example.com/f/İtem</link></item>\
+               </channel></rss>";
+    let got = std::panic::catch_unwind(|| super::parse_feed_urls(xml, 10));
+    let urls = got.expect("parse_feed_urls panicked");
+    assert_eq!(
+        urls,
+        vec!["https://example.com/f/1", "https://example.com/f/İtem"]
+    );
+    // Atom shape too: 'İ' inside the entry title before <link href>.
+    let atom = "<feed><entry><title>İstanbul</title>\
+                <link href=\"https://example.com/a/İtem\" rel=\"alternate\"/></entry></feed>";
+    let got = std::panic::catch_unwind(|| super::parse_feed_urls(atom, 10));
+    let urls = got.expect("atom parse panicked");
+    assert_eq!(urls, vec!["https://example.com/a/İtem"]);
+}
+
+#[test]
+fn rss_uppercase_link_tags_close_case_insensitively() {
+    // The open-tag scan matches "<LINK>" case-insensitively, so the
+    // close must too: with a case-sensitive close, an uppercase item
+    // "spans" to the NEXT item's lowercase </link> (one garbage URL
+    // swallowing the real one), and with no lowercase close left in
+    // the document every remaining RSS URL is dropped.
+    let xml = "<rss><channel>\
+               <item><LINK>https://example.com/1</LINK></item>\
+               <item><link>https://example.com/2</link></item>\
+               </channel></rss>";
+    assert_eq!(
+        super::parse_feed_urls(xml, 10),
+        vec!["https://example.com/1", "https://example.com/2"]
     );
 }

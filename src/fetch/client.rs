@@ -5,12 +5,10 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use url::Url;
-
 use crate::detect::walls::{self, Verdict};
 use crate::error::FetchError;
 use crate::ghost::cache::CookieRecord;
-use crate::profile::BrowserProfile;
+use crate::profile::{BrowserProfile, RequestClass};
 use crate::transport::pool::Pool;
 use crate::transport::{h1, h2::conn::H2Conn, proxy, tcp, tls};
 
@@ -45,9 +43,19 @@ pub struct FetchOutcome {
     pub elapsed: Duration,
 }
 
+struct RequestIdentity<'a> {
+    class: RequestClass,
+    legacy_user_agent: Option<&'a str>,
+}
+
 pub struct Fetcher {
     profile: BrowserProfile,
     connector: boring::ssl::SslConnector,
+    /// The interception-safe connector used for HTTP CONNECT proxy
+    /// hops: TLS-intercepting middleboxes re-terminate with a second
+    /// stack and some reset on GREASE/ALPS/compress_cert ClientHellos.
+    /// SOCKS5 tunnels do TLS end-to-end and keep Chrome-true.
+    connector_compat: boring::ssl::SslConnector,
     sessions: tls::SessionStore,
     pool: Mutex<Pool>,
     jar: Mutex<CookieJar>,
@@ -66,10 +74,12 @@ impl Fetcher {
 
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
         let sessions = tls::new_session_store();
-        let connector = tls::build_connector(&profile, sessions.clone())?;
+        let connector = tls::build_connector(&profile)?;
+        let connector_compat = tls::build_connector_compat(&profile)?;
         Ok(Self {
             profile,
             connector,
+            connector_compat,
             sessions,
             pool: Mutex::new(Pool::new()),
             jar: Mutex::new(CookieJar::new()),
@@ -104,6 +114,14 @@ impl Fetcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         jar.reset(cookies);
+    }
+
+    /// Whole-jar export for the tier-1 cookie vault (v4 phase 1.4):
+    /// the browser cookie store view that makes a returning agent
+    /// replay like a returning device across process restarts.
+    pub async fn jar_all_snapshot(&self) -> Vec<CookieRecord> {
+        let jar = self.jar.lock().unwrap_or_else(|e| e.into_inner());
+        jar.snapshot_all()
     }
 
     /// Export all cookies for a host with their expiry, for
@@ -146,6 +164,15 @@ impl Fetcher {
         self.fetch_via_jar_ref(url_str, proxy, use_jar, None).await
     }
 
+    /// Evidence-grade cold probe (v4 phase 0.2): no shared cookie
+    /// jar (a true cold client) and the revalidation cache bypassed
+    /// (a cached page is not evidence about the wall RIGHT NOW).
+    /// Used only by the background route-memory prober.
+    pub async fn fetch_cold_probe(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
+        self.fetch_via_jar_opts(url_str, None, false, None, true)
+            .await
+    }
+
     /// Same as `fetch_via_jar` but with a referer header. The
     /// referer is sent on the initial request only (not redirect
     /// hops), matching browser behavior. `sec-fetch-site` is
@@ -159,21 +186,42 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
-        // Centralized URL safety gate (fetch tier). Every fetch target,
-        // including explicit proxy lanes, env proxies, and every
-        // redirect hop, is validated via the async DNS-aware gate.
-        // Rejects non-http(s), credentials, localhost/private literals
-        // and DNS-resolved private addresses before any network.
-        crate::fetch::guards::ensure_url_safe(url_str).await?;
+        self.fetch_via_jar_opts(url_str, proxy, use_jar, referer, false)
+            .await
+    }
+
+    /// Full-knobs variant: `skip_cache` bypasses the revalidation
+    /// cache entirely (probe path only; everything else keeps it).
+    pub async fn fetch_via_jar_opts(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        skip_cache: bool,
+    ) -> Result<FetchOutcome, FetchError> {
+        // Centralized URL safety gate (fetch tier). The synchronous
+        // literal checks run here (scheme, credentials, localhost and
+        // private literals: no dial can follow a cached return). The
+        // async DNS-aware tier runs exactly once per request, inside
+        // fetch_once_via; this outer gate used to resolve DNS too,
+        // doubling resolver RTT and load on every fetch (L7).
+        crate::fetch::guards::validate_url_basic(url_str)?;
         let started = Instant::now();
 
         // Fresh-window cache hit: no request at all (browser-true).
+        // Probes (v4 phase 0.2) skip this: a cached page is not
+        // evidence about the wall RIGHT NOW.
         let check = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.check(url_str)
+            if skip_cache {
+                CacheCheck::None
+            } else {
+                cache.check(url_str)
+            }
         };
         let conditional = match check {
             CacheCheck::Fresh(body, status, headers) => {
@@ -206,38 +254,43 @@ impl Fetcher {
         // Resolve env-var proxy (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
         // when no explicit proxy lane is passed. This follows the
         // curl/wget convention so users can route all DonSeTch
-        // traffic through a proxy with a single env var. Resolved
-        // once here and reused across redirect hops for consistency.
+        // traffic through a proxy with a single env var. Re-resolved
+        // for the CURRENT url at every hop (curl parity, E15: a
+        // redirect to a NO_PROXY-covered host dials direct instead of
+        // riding the env proxy for the rest of the chain). Explicit
+        // proxy lanes stay pinned for the whole chain by design.
         // Proxies are NOT used for single-URL fetch by default:
         // one request to one URL does not rate-limit, and routing
         // through a proxy wastes bandwidth and hurts the TLS
         // fingerprint (residential proxies don't use our Chrome-true
         // BoringSSL stack). Proxies belong on search (many engines)
         // and crawl (many pages, same host) where rate limits bite.
-        let env_proxy = if proxy.is_none() {
-            crate::transport::proxy::from_env_for(url_str)
-        } else {
-            None
-        };
-        let effective_proxy = proxy.or(env_proxy.as_ref());
 
         loop {
-            let host = host_of(&current)?;
+            let env_proxy = if proxy.is_none() && !crate::config::env_flag("DONSETCH_NO_ENV_PROXY")
+            {
+                crate::transport::proxy::from_env_for(&current)
+            } else {
+                None
+            };
+            let effective_proxy = proxy.or(env_proxy.as_ref());
             // Referer applies to the initial request only.
             // Redirects get no referer (avoids cross-origin leak).
             let ref_arg = if first_request { referer } else { None };
+            // Revalidation conditionals were minted for the ORIGINAL
+            // url's cache entry. Carrying them onto redirect hops lets
+            // a colliding ETag on the target produce a false 304 and
+            // merge the wrong cached body (B2). Only the first hop
+            // sends them.
+            let hop_conditional: &[(String, String)] =
+                if first_request { &conditional } else { &[] };
             let mut out = self
-                .fetch_once_via(&current, &conditional, effective_proxy, use_jar, ref_arg)
+                .fetch_once_via(&current, hop_conditional, effective_proxy, use_jar, ref_arg)
                 .await?;
-            {
-                let mut jar = self
-                    .jar
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let current_is_https =
-                    Url::parse(&current).is_ok_and(|u| u.scheme().eq_ignore_ascii_case("https"));
-                jar.store_from_headers(&host, &out.headers, current_is_https);
-            }
+            // Cookie store for this hop lives in fetch_once_via_class
+            // (v4 phase 2.1): the primitive owns the jar-write, so the
+            // cookie-warm retry below can already ride cookies this
+            // hop just set.
 
             // 304: merge body from cache.
             if out.status == 304
@@ -280,8 +333,10 @@ impl Fetcher {
                     // Centralized redirect SSRF guard : validates scheme,
                     // credentials and host, and rejects private literals.
                     // Non-http(s) redirects are returned honestly, not followed.
-                    // Every redirect hop also passes through the async DNS-aware
-                    // gate so private DNS results fail closed even on redirects.
+                    // The async DNS-aware gate for the new target runs once,
+                    // inside fetch_once_via (it re-gates every URL it is
+                    // handed); a second call here would resolve DNS twice
+                    // per hop for the same verdict.
                     let next = match crate::fetch::guards::validate_redirect_url(&base, &loc) {
                         Ok(u) => u,
                         Err(e) => {
@@ -295,8 +350,6 @@ impl Fetcher {
                             return Err(e);
                         }
                     };
-                    // DNS-aware validation for the redirect target (fail-closed).
-                    crate::fetch::guards::ensure_url_safe(next.as_str()).await?;
                     current = next.to_string();
                 }
                 _ => {
@@ -307,7 +360,7 @@ impl Fetcher {
                     // otherwise be re-served fresh as "content" on
                     // every later fetch (hardcoded ContentOk made it
                     // worse). Walls are never cacheable.
-                    if matches!(out.verdict, Verdict::ContentOk) {
+                    if !skip_cache && matches!(out.verdict, Verdict::ContentOk) {
                         let mut cache = self
                             .cache
                             .lock()
@@ -324,15 +377,8 @@ impl Fetcher {
                             .fetch_once_via(&current, &[], effective_proxy, use_jar, ref_arg)
                             .await
                     {
-                        {
-                            let mut jar = self
-                                .jar
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let current_is_https = Url::parse(&current)
-                                .is_ok_and(|u| u.scheme().eq_ignore_ascii_case("https"));
-                            jar.store_from_headers(&host, &retry.headers, current_is_https);
-                        }
+                        // The retry's Set-Cookie was stored by the
+                        // one-hop primitive itself.
                         retry.verdict = walls::detect(retry.status, &retry.headers, &retry.body);
                         if matches!(retry.verdict, Verdict::ContentOk) {
                             let mut cache = self
@@ -365,6 +411,84 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_once_via_class(
+            url_str,
+            conditional,
+            proxy,
+            use_jar,
+            referer,
+            RequestClass::Navigation,
+        )
+        .await
+    }
+
+    /// Class-aware variant (v4 phase 1.2): subresource fetches
+    /// carry the per-class header set, not the navigation set.
+    pub async fn fetch_once_via_class(
+        &self,
+        url_str: &str,
+        conditional: &[(String, String)],
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        class: RequestClass,
+    ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_once_via_identity(
+            url_str,
+            conditional,
+            proxy,
+            use_jar,
+            referer,
+            RequestIdentity {
+                class,
+                legacy_user_agent: None,
+            },
+        )
+        .await
+    }
+
+    /// One cookie-less hop with a request-local legacy User-Agent.
+    /// Reuses TLS, connection pooling and URL guards; does not mutate the
+    /// shared browser profile or follow redirects with this identity.
+    pub async fn fetch_once_via_user_agent(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        user_agent: &str,
+    ) -> Result<FetchOutcome, FetchError> {
+        if user_agent.is_empty()
+            || !user_agent.is_ascii()
+            || user_agent.bytes().any(|b| b.is_ascii_control())
+        {
+            return Err(FetchError::Http("invalid User-Agent".into()));
+        }
+        self.fetch_once_via_identity(
+            url_str,
+            &[],
+            proxy,
+            false,
+            None,
+            RequestIdentity {
+                class: RequestClass::Navigation,
+                legacy_user_agent: Some(user_agent),
+            },
+        )
+        .await
+    }
+
+    async fn fetch_once_via_identity(
+        &self,
+        url_str: &str,
+        conditional: &[(String, String)],
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        identity: RequestIdentity<'_>,
+    ) -> Result<FetchOutcome, FetchError> {
+        let RequestIdentity {
+            class,
+            legacy_user_agent: user_agent,
+        } = identity;
         // Centralized gate ensures credentials/host checks even for
         // direct fetch_once calls (e.g. tests, internal callers).
         // Includes DNS resolution : every target, including proxy
@@ -399,7 +523,20 @@ impl Fetcher {
         };
 
         // Header set from profile (Chrome order, coherence) + cookie + conditionals.
-        let mut req_headers = self.profile.h1_headers(&authority, &path);
+        let mut req_headers = self.profile.h1_headers_for_class(&authority, &path, class);
+        if let Some(ua) = user_agent {
+            // These browser metadata headers do not describe a legacy client.
+            req_headers.retain(|(n, _)| {
+                !n.starts_with("sec-ch-ua")
+                    && !n.starts_with("sec-fetch-")
+                    && n != "upgrade-insecure-requests"
+            });
+            for (name, value) in &mut req_headers {
+                if name == "user-agent" {
+                    *value = ua.to_owned();
+                }
+            }
+        }
         if use_jar {
             let jar = self
                 .jar
@@ -468,6 +605,62 @@ impl Fetcher {
             ));
         }
 
+        // 0) h3 lane (v4 phase 5.1). Direct egress only (UDP does not
+        // tunnel through CONNECT): the h1/h2 path stays the fallback
+        // there. Route memory + kill switch gate it. The attempt's
+        // transport failure drops the route (Chrome semantics: a served
+        // alt-svc that fails vanishes until a header re-vouches).
+        if is_https
+            && proxy.is_none()
+            && !crate::config::env_flag("DONSETCH_NO_H3")
+            && crate::config::env_flag("DONSETCH_H3")
+            && let Some(h3port) = crate::transport::routes::h3_route(&origin, "direct")
+        {
+            match crate::transport::h3::h3_fetch_direct(
+                host,
+                h3port,
+                &path,
+                &authority,
+                req_headers.clone(),
+                None,
+            )
+            .await
+            {
+                Ok((h3out, _stats)) => {
+                    if let Some(alt) = h3out.altsvc.as_ref() {
+                        crate::transport::routes::absorb_alt_svc(&origin, alt, "direct");
+                    }
+                    if h3out.status == 0 || h3out.status < 200 {
+                        crate::transport::routes::drop_h3(&origin);
+                        // fall through to h1/h2
+                    } else {
+                        self.store_hop_cookies(use_jar, host, is_https, &h3out.headers);
+                        // Same exit as every other transport: finish()
+                        // decompresses and scores walls::detect, so a
+                        // challenge served over h3 escalates instead of
+                        // masquerading as ContentOk. An undecodable h3
+                        // payload is a transport failure: drop the
+                        // vouch, let h1/h2 answer.
+                        match finish(
+                            url_str.to_string(),
+                            "h3",
+                            h3out.status,
+                            h3out.headers,
+                            h3out.body,
+                            false,
+                        ) {
+                            Ok(out) => return Ok(out),
+                            Err(_) => crate::transport::routes::drop_h3(&origin),
+                        }
+                    }
+                }
+                Err(_) => {
+                    crate::transport::routes::drop_h3(&origin);
+                    // fall through to h1/h2 below
+                }
+            }
+        }
+
         // 1) Try a pooled h2 connection for this origin.
         let pooled = self
             .pool
@@ -479,8 +672,19 @@ impl Fetcher {
                 .h2_request(&mut conn, &authority, &path, &req_headers, true)
                 .await
             {
-                Ok(mut out) => {
-                    out.verdict = walls::detect(out.status, &out.headers, &out.body);
+                Ok(out) => {
+                    // verdict already scored by finish()
+                    self.store_hop_cookies(use_jar, host, is_https, &out.headers);
+                    // Alt-svc absorb (v4 phase 5.1): only on a direct
+                    // https lane; proxies naturally exempt. It lets a
+                    // later connection on the same origin take h3, for
+                    // exactly the ma= lifetime the server vouched.
+                    if is_https
+                        && proxy.is_none()
+                        && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
+                    {
+                        crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
+                    }
                     self.pool
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -507,8 +711,19 @@ impl Fetcher {
                 )
                 .await
             {
-                Ok(mut out) => {
-                    out.verdict = walls::detect(out.status, &out.headers, &out.body);
+                Ok(out) => {
+                    // verdict already scored by finish()
+                    self.store_hop_cookies(use_jar, host, is_https, &out.headers);
+                    // Alt-svc absorb (v4 phase 5.1): only on a direct https
+                    // lane; refreshed per response so the ma= lifetime stays
+                    // current (the server's own ma=, never a constant). h3
+                    // only when the server announced it for the same origin.
+                    if is_https
+                        && proxy.is_none()
+                        && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
+                    {
+                        crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
+                    }
                     return Ok(out);
                 }
                 Err(e) => {
@@ -520,6 +735,34 @@ impl Fetcher {
             }
         }
         Err(last_err)
+    }
+
+    /// One jar-write owner (v4 phase 2.1): every use_jar hop both
+    /// ATTACHES stored cookies (above, before dialing) and STORES the
+    /// response's Set-Cookie (here, on success). Before this, only the
+    /// redirect-loop wrapper in fetch_via_jar_opts stored, so one-hop
+    /// jar riders (search prewarm, shadow subresources) read like a
+    /// browser but learned nothing back: the jar stayed empty and the
+    /// next request went out cookie-less. Real browsers store
+    /// subresource Set-Cookie too, so the store lives in the shared
+    /// primitive, not the callers. The primitive is strictly one-hop,
+    /// so keying on the request host/scheme is per-hop correct for
+    /// redirect chains.
+    fn store_hop_cookies(
+        &self,
+        use_jar: bool,
+        host: &str,
+        is_https: bool,
+        headers: &[(String, String)],
+    ) {
+        if !use_jar {
+            return;
+        }
+        let mut jar = self
+            .jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        jar.store_from_headers(host, headers, is_https);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -534,10 +777,14 @@ impl Fetcher {
         req_headers: &[(String, String)],
         proxy: Option<&proxy::Proxy>,
     ) -> Result<FetchOutcome, FetchError> {
+        // Dial: https through an HTTP proxy goes through a CONNECT
+        // tunnel; plaintext http:// through an HTTP proxy goes RAW
+        // with an absolute-form request line (RFC 9112 3.2.2) —
+        // CONNECT is for https only. SOCKS5 tunnels both; direct
+        // dials use Happy Eyeballs.
         let tcp = match proxy {
+            Some(p) if !is_https && p.is_http_connect() => p.connect_tcp().await?,
             Some(p) => p.connect(host, port).await?,
-            // Warm = a cached TLS session for this origin: Chrome's
-            // repeat-navigation signal, and it flips TFO on (Linux).
             None => tcp::happy_connect_with(host, port, self.sessions_has(origin)).await?,
         };
 
@@ -546,8 +793,35 @@ impl Fetcher {
         // no session resumption, no ALPN.
         if !is_https {
             let mut stream = tcp;
+            // Plaintext http:// through a raw HTTP-proxy hop uses
+            // absolute-form request targets (RFC 9112 3.2.2): the
+            // proxy needs the full origin in the request line to
+            // route it. ONLY that hop : a SOCKS5 tunnel is
+            // transparent, so the ORIGIN reads this line, and no
+            // browser sends an origin absolute-form (fingerprint;
+            // same condition as the dial above).
+            let raw_http_proxy = proxy.filter(|p| p.is_http_connect());
+            let target = if raw_http_proxy.is_some() {
+                url_of("http", authority, path)
+            } else {
+                path.to_string()
+            };
+            // The raw hop has no CONNECT to carry credentials : a
+            // credentialed proxy needs Proxy-Authorization on the
+            // request itself (consumed by the proxy, never
+            // forwarded to the origin).
+            let with_auth: Vec<(String, String)>;
+            let req_headers = match raw_http_proxy.and_then(|p| p.proxy_authorization()) {
+                Some(auth) => {
+                    let mut h = req_headers.to_vec();
+                    h.push(("proxy-authorization".to_string(), auth));
+                    with_auth = h;
+                    &with_auth[..]
+                }
+                None => req_headers,
+            };
             let resp =
-                tokio::time::timeout(RESPONSE_TIMEOUT, h1::get(&mut stream, path, req_headers))
+                tokio::time::timeout(RESPONSE_TIMEOUT, h1::get(&mut stream, &target, req_headers))
                     .await
                     .map_err(|_| FetchError::Timeout)??;
             return finish(
@@ -564,15 +838,31 @@ impl Fetcher {
             Some(p) => format!("{}|{}", p.id(), host),
             None => host.to_string(),
         };
+        // Http CONNECT hops get the interception-safe handshake:
+        // they are almost always TLS-terminating middleboxes whose
+        // second stack can reset on GREASE/ALPS/compress_cert, and
+        // stealth is moot there (the proxy holds the plaintext).
+        // SOCKS5 keeps the TLS end-to-end tunnel transparent, so it
+        // keeps the Chrome-true wire profile.
+        let through_http_proxy = proxy.is_some_and(|p| p.is_http_connect());
+        let (connector, handshake) = if through_http_proxy {
+            (
+                &self.connector_compat,
+                tls::HandshakeProfile::InterceptionSafe,
+            )
+        } else {
+            (&self.connector, tls::HandshakeProfile::ChromeTrue)
+        };
         let mut tls_stream = tokio::time::timeout(
             Duration::from_secs(15),
             tls::connect(
                 &self.profile,
-                &self.connector,
+                connector,
                 host,
                 tcp,
                 &self.sessions,
                 &session_key,
+                handshake,
             ),
         )
         .await
@@ -657,6 +947,10 @@ fn finish(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     let body = decompress::decompress(&encoding, &body)?;
+    // Wall classification lives here: every caller used to score the
+    // finished outcome with walls::detect right after the call; one
+    // site of truth instead of N re-detections (Q4).
+    let verdict = walls::detect(status, &headers, &body);
     Ok(FetchOutcome {
         url,
         status,
@@ -666,16 +960,9 @@ fn finish(
         redirects: 0,
         cache: CacheState::None,
         used_pool,
-        verdict: Verdict::ContentOk,
+        verdict,
         elapsed: Duration::ZERO,
     })
-}
-
-fn host_of(url_str: &str) -> Result<String, FetchError> {
-    let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
-    url.host_str()
-        .map(|h| h.to_string())
-        .ok_or_else(|| FetchError::InvalidUrl(url_str.into()))
 }
 
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
@@ -731,5 +1018,64 @@ fn referer_value(referer: &str, target: &str) -> String {
         format!("{}://{host}{port}/", r.scheme())
     } else {
         referer.to_string()
+    }
+}
+
+#[cfg(test)]
+mod transport_exit_tests {
+    use super::*;
+
+    // The h3 lane used to hand back a literal Verdict::ContentOk for
+    // any status >= 200: a Cloudflare challenge served over h3 (403 +
+    // cf-mitigated) looked like clean content — no tier-2 escalation,
+    // and compressed bodies skipped decompression entirely. Every
+    // transport must leave through finish(), the one site of truth
+    // for decompress + walls::detect. This pins the contract the h3
+    // exit now rides.
+    #[test]
+    fn finish_scores_walls_and_decompresses_for_the_h3_exit() {
+        let headers = vec![
+            ("server".to_string(), "cloudflare".to_string()),
+            ("cf-mitigated".to_string(), "challenge".to_string()),
+        ];
+        let out = finish(
+            "https://walled.test/".into(),
+            "h3",
+            403,
+            headers,
+            b"<html><head><title>Just a moment...</title></head></html>".to_vec(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(out.verdict, Verdict::Challenge(_)),
+            "a cf-mitigated 403 must classify as a challenge on every transport, got {:?}",
+            out.verdict
+        );
+        assert_eq!(out.alpn, "h3");
+
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(b"<html><body>real content</body></html>")
+                .unwrap();
+            enc.finish().unwrap();
+        }
+        let out = finish(
+            "https://ok.test/".into(),
+            "h3",
+            200,
+            vec![("content-encoding".to_string(), "gzip".to_string())],
+            gz,
+            false,
+        )
+        .unwrap();
+        assert!(
+            out.body
+                .windows(b"real content".len())
+                .any(|w| w == b"real content"),
+            "the h3 exit must decompress like every other transport"
+        );
     }
 }

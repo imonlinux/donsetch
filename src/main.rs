@@ -7,9 +7,32 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
+    // CLI convention (rg, curl): a closed stdout pipe is normal,
+    // not an error. Rust masks SIGPIPE by default, so every pipe-
+    // tiled run (donsetch --help | head) turned the write into an
+    // EPIPE panic with a full backtrace after head quit. Restoring
+    // the default disposition makes the kill silent with exit 141,
+    // exactly what the shell expects.
+    //
+    // NOT for `mcp`, though : SIG_DFL is process-wide, and in the
+    // daemon it turns every EPIPE into an instant kill. That
+    // bypasses stdio.rs's clean broken-transport shutdown (ghost
+    // cleanup included; macOS Chrome has no pdeathsig to fall
+    // back on), lets a BYOK plugin that exits without reading its
+    // stdin take the whole daemon down through the request write,
+    // and kills the supervisor exactly when its crashed child's
+    // stdin comes back EPIPE : the hold-restart-replay contract
+    // (supervisor.rs) depends on seeing that as an error.
+    #[cfg(unix)]
+    if cmd != "mcp" {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
-        "fetch" | "search" | "crawl" => {
+        "fetch" | "search" | "answer" | "crawl" | "memory" | "screenshot" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);
         }
@@ -80,6 +103,10 @@ async fn main() {
         "login" => cli::login::run(&args).await,
         "proxy" => cli::proxy::run(&args).await,
         "status" => cli::status::run().await,
+        "adapters" => match args.get(2).map(String::as_str) {
+            Some("--help" | "-h") => cli::adapters::help(),
+            _ => cli::adapters::run(),
+        },
         "stop" => cli::stop::run(),
         "doctor" | "--doctor" => cli::doctor::run().await,
         "update" | "-u" | "--update" => cli::update::run().await,
@@ -115,7 +142,7 @@ async fn main() {
 /// Falls back to top-level help for unknown commands.
 async fn route_help(cmd: &str) {
     match cmd {
-        "fetch" | "search" | "crawl" => {
+        "fetch" | "search" | "answer" | "crawl" | "memory" | "screenshot" => {
             // Re-invoke with --help (clap handles the output).
             let help_args = vec!["--help".to_string()];
             let _ = cli::tool::run(cmd, &help_args).await;
@@ -123,6 +150,7 @@ async fn route_help(cmd: &str) {
         "keys" => {
             cli::keys::run(&["donsetch".into(), "keys".into(), "help".into()]).await;
         }
+        "adapters" => cli::adapters::help(),
         "proxy" => {
             // proxy::run is async, but print_help is sync.
             // Just call the help directly.

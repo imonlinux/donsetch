@@ -10,6 +10,34 @@ pub enum Intent {
     Entity,
 }
 
+impl Intent {
+    /// Stable u8 code for disk-backed keys (query cache). Debug strings
+    /// coupled the disk format to variant names: renaming a variant
+    /// silently remapped or orphaned old entries.
+    pub fn code(self) -> u8 {
+        match self {
+            Intent::Web => 0,
+            Intent::Code => 1,
+            Intent::Paper => 2,
+            Intent::News => 3,
+            Intent::Entity => 4,
+        }
+    }
+
+    /// Inverse of `code`; unknown values fall back to Web. Legacy
+    /// Debug-string entries (one TTL generation) are remapped by
+    /// `from_legacy_debug` at load time.
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            1 => Intent::Code,
+            2 => Intent::Paper,
+            3 => Intent::News,
+            4 => Intent::Entity,
+            _ => Intent::Web,
+        }
+    }
+}
+
 /// Intent is ADVISORY, never a gate: it selects bonus
 /// priors and which verticals join the fan-out. Wrong
 /// intent must never ruin a query : so signals split
@@ -126,12 +154,30 @@ pub fn is_conceptual(query: &str) -> bool {
     CONCEPT.iter().any(|s| q.contains(s))
 }
 
+/// Query tokens: alphanumeric runs, keeping '+' so "c++" survives.
+fn tokens(q: &str) -> Vec<&str> {
+    q.split(|c: char| !c.is_alphanumeric() && c != '+')
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Does `signal` (one or more words) occur as a contiguous run of
+/// whole tokens? Substring matching lit "war" up on "software",
+/// "paper" on "wallpaper", "stock" on "stockholm", "dies" on
+/// "diesel" -- and a false News/Paper label drops two of the five
+/// engines and applies the stale-date penalty. The TECH list was
+/// already token-matched for exactly this reason; the other signal
+/// lists were not.
+fn has_phrase(toks: &[&str], signal: &str) -> bool {
+    let want = tokens(signal);
+    !want.is_empty() && toks.windows(want.len()).any(|w| w == want.as_slice())
+}
+
 pub fn detect(query: &str) -> Intent {
     let q = query.to_lowercase();
-    let score = |signals: &[&str]| signals.iter().filter(|s| q.contains(**s)).count();
-    let tech = q
-        .split(|c: char| !c.is_alphanumeric() && c != '+')
-        .any(|w| TECH.contains(&w));
+    let toks = tokens(&q);
+    let score = |signals: &[&str]| signals.iter().filter(|s| has_phrase(&toks, s)).count();
+    let tech = toks.iter().any(|w| TECH.contains(w));
     // Ambiguous utility words need tech context; strong
     // signals never do.
     // Asymmetric by design: a false Code label on
@@ -172,16 +218,16 @@ pub fn detect(query: &str) -> Intent {
 
 /// Engines to fan out per intent. Order = trust prior.
 /// Bing family (bing/ddg/yahoo) + independent indexes
-/// (mojeek/brave) for consensus diversity.
+/// (mojeek/brave/google) for consensus diversity.
 /// DDG and Brave are PROXY_AVERSE : they prefer the direct
 /// lane because proxy IPs get CAPTCHA'd/429'd.
 pub fn engines_for(intent: Intent) -> &'static [&'static str] {
     match intent {
-        // 5 engines, 3 index families (bing, mojeek, brave).
+        // 6 engines, 4 index families (bing, mojeek, brave, google).
         Intent::Web | Intent::Code | Intent::News | Intent::Entity => {
-            &["bing", "ddg", "mojeek", "yahoo", "brave"]
+            &["bing", "ddg", "mojeek", "yahoo", "brave", "google"]
         }
-        Intent::Paper => &["bing", "ddg", "mojeek"],
+        Intent::Paper => &["bing", "ddg", "mojeek", "google"],
     }
 }
 
@@ -382,5 +428,37 @@ mod tests {
             detect("retrieval augmented generation paper"),
             Intent::Paper
         );
+    }
+
+    // Signals used to be matched as raw substrings, so "software"
+    // lit up on "war", "wallpaper" on "paper", "stockholm" on
+    // "stock", "diesel" on "dies" -- and the News/Paper label
+    // dropped two of the five engines and applied the stale-date
+    // penalty to a query about socks. Only whole tokens count.
+    #[test]
+    fn signals_match_whole_words_not_substrings() {
+        for q in [
+            "software architecture patterns",
+            "hardware wallet comparison",
+            "warm socks for winter",
+            "stockholm travel guide",
+            "diesel engine maintenance",
+            "feature selection algorithm",
+            "how to change wallpaper on android",
+            "wallpaper ideas living room",
+            "case studies in urban planning",
+        ] {
+            assert_eq!(detect(q), Intent::Web, "{q}");
+        }
+        // The real signals still fire as whole words / phrases.
+        assert_eq!(detect("breaking news ukraine war"), Intent::News);
+        assert_eq!(detect("stock market crash today"), Intent::News);
+        assert_eq!(detect("arxiv paper on attention"), Intent::Paper);
+        assert_eq!(detect("null pointer in c"), Intent::Code);
+        assert_eq!(detect("what is a monad"), Intent::Entity);
+        // A multi-word phrase must be contiguous tokens, not a
+        // substring across a word boundary ("show tools" is not
+        // "how to").
+        assert_ne!(detect("show tools for woodworking"), Intent::Code);
     }
 }

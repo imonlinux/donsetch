@@ -428,7 +428,11 @@ fn contains_block(el: ElementRef<'_>) -> bool {
     false
 }
 
-fn list_items(
+/// Items of a `<ul>`/`<ol>`, nested lists flattened to indented
+/// entries ("  " per level, up to 4 deep). Shared with the docs
+/// and Wikipedia adapters so nested lists render the same way
+/// everywhere.
+pub(crate) fn list_items(
     list: ElementRef<'_>,
     base: &str,
     opts: &super::ExtractOptions,
@@ -444,7 +448,15 @@ fn list_items(
         if li.value().name() != "li" || crate::extract::junk::skip(li) {
             continue;
         }
-        let (md, ld) = inline::markdown(li, base, opts);
+        // Below the cap the nested lists are rendered as indented
+        // items (so the item's own line must not include them); at
+        // the cap they are flattened into the line instead, never
+        // dropped.
+        let (md, ld) = if depth < 4 {
+            inline::item_markdown(li, base, opts)
+        } else {
+            inline::markdown(li, base, opts)
+        };
         let md = md.trim().to_string();
         if !md.is_empty() {
             items.push(format!("{}{}", "  ".repeat(depth as usize), md));
@@ -558,18 +570,31 @@ fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
             truncated = true;
             break;
         }
-        let cells: Vec<String> = tr
-            .select(&scraper::Selector::parse("th").unwrap())
-            .map(|c| inline::plain(c).replace('|', "\\|"))
+        // One select over both cell kinds, in document order: a
+        // row's <th scope="row"> label has to stay in its column.
+        // Selecting <th> and <td> separately (the old shape) only
+        // ever used <th> for the header row, so every data row's
+        // label vanished and its remaining cells shifted left.
+        let cells: Vec<(bool, String)> = tr
+            .select(&scraper::Selector::parse("th, td").unwrap())
+            .map(|c| {
+                let is_th = c.value().name() == "th";
+                let t = inline::plain(c).replace('|', "\\|"); // unescaped pipes break md tables
+                (is_th, t)
+            })
             .collect();
-        if !cells.is_empty() && headers.is_empty() && rows.is_empty() {
-            headers = cells;
+        // The header row is the first row made only of <th>.
+        if headers.is_empty()
+            && rows.is_empty()
+            && !cells.is_empty()
+            && cells.iter().all(|(is_th, _)| *is_th)
+        {
+            headers = cells.into_iter().map(|(_, t)| t).collect();
             continue;
         }
-        let row: Vec<String> = tr
-            .select(&scraper::Selector::parse("td").unwrap())
-            .map(|c| {
-                let t = inline::plain(c).replace('|', "\\|"); // unescaped pipes break md tables
+        let row: Vec<String> = cells
+            .into_iter()
+            .map(|(_, t)| {
                 // Char-based truncation: byte-based cuts CJK at ~40
                 // chars (3 bytes/char). 120 chars is the real limit.
                 if t.chars().count() > 120 {

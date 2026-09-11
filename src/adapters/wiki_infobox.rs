@@ -204,24 +204,16 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                 }
             }
             "ul" | "ol" => {
-                let li_sel = Selector::parse("li").unwrap();
-                for (i, li) in el.select(&li_sel).enumerate() {
-                    let (m, _) = crate::extract::inline::markdown(li, url, &opts);
-                    if !m.trim().is_empty() {
-                        let bullet = if el.value().name() == "ol" {
-                            format!("{}. ", i + 1)
-                        } else {
-                            "- ".to_string()
-                        };
-                        out.push_str(&format!("{bullet}{}\n", m.trim()));
-                    }
+                let (items, _) = crate::extract::blocks::list_items(el, url, &opts, 0);
+                if !items.is_empty() {
+                    crate::extract::render::push_list(&mut out, &items, el.value().name() == "ol");
                 }
-                out.push('\n');
             }
             "pre" => {
                 let code = plain_text(el);
                 if !code.is_empty() {
-                    out.push_str(&format!("```\n{code}\n```\n\n"));
+                    let fence = crate::extract::render::code_fence(&code);
+                    out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
                 }
             }
             "table" => {
@@ -331,5 +323,41 @@ mod tests {
         // No infobox → no adapter.
         let plain = "<html><body><div class='mw-parser-output'><p>text</p></div></body></html>";
         assert!(extract(plain, "https://en.wikipedia.org/wiki/Plain", &opts()).is_none());
+    }
+
+    #[test]
+    fn pre_containing_a_fence_gets_a_longer_fence() {
+        // e.g. the Markdown article's own syntax example.
+        let html = WIKI.replace(
+            "<h2>History</h2>",
+            "<pre>```python\nprint(1)\n```</pre><h2>History</h2>",
+        );
+        let ex = extract(&html, "https://en.wikipedia.org/wiki/Markdown", &opts()).unwrap();
+        assert!(
+            ex.markdown
+                .contains("````\n```python\nprint(1)\n```\n````\n"),
+            "{}",
+            ex.markdown
+        );
+    }
+
+    // `el.select("li")` matched nested items too, so each one
+    // appeared fused into its parent's line and again as its own
+    // top-level bullet (and nested numbering restarted the count).
+    #[test]
+    fn nested_list_items_are_indented_not_duplicated() {
+        let html = WIKI.replace(
+            "<h2>History</h2>",
+            "<ul><li>Outer one<ul><li>Inner a</li><li>Inner b</li></ul></li><li>Outer two</li></ul>\
+             <ol><li>First<ol><li>Sub</li></ol></li><li>Second</li></ol><h2>History</h2>",
+        );
+        let ex = extract(&html, "https://en.wikipedia.org/wiki/Lists", &opts()).unwrap();
+        let md = &ex.markdown;
+        assert_eq!(md.matches("Inner a").count(), 1, "{md}");
+        assert!(
+            md.contains("- Outer one\n  - Inner a\n  - Inner b\n- Outer two\n"),
+            "{md}"
+        );
+        assert!(md.contains("1. First\n  - Sub\n2. Second\n"), "{md}");
     }
 }

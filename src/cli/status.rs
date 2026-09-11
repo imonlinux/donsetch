@@ -85,16 +85,33 @@ pub async fn run() {
 
     // ── Proxies ──────────────────────────────────────────────
 
-    let proxies = proxy::load_config();
+    let (proxies, skipped_proxy_lines) = proxy::load_config_verbose();
     if proxies.is_empty() {
-        cli::print_kv(
-            "proxies",
-            &format!("{} (direct connection)", cli::dim("none")),
-        );
+        if skipped_proxy_lines > 0 {
+            cli::print_kv(
+                "proxies",
+                &format!(
+                    "{} ({} invalid line(s) ignored in {})",
+                    cli::yellow("warn"),
+                    skipped_proxy_lines,
+                    cli::dim("proxies.txt")
+                ),
+            );
+        } else {
+            cli::print_kv(
+                "proxies",
+                &format!("{} (direct connection)", cli::dim("none")),
+            );
+        }
     } else {
         let n = proxies.len();
         let word = if n == 1 { "proxy" } else { "proxies" };
-        cli::print_kv("proxies", &format!("{} {} configured", n, word));
+        let skipped = if skipped_proxy_lines > 0 {
+            format!(", {} invalid line(s) ignored", skipped_proxy_lines)
+        } else {
+            String::new()
+        };
+        cli::print_kv("proxies", &format!("{} {} configured{}", n, word, skipped));
     }
 
     // ── Cache ────────────────────────────────────────────────
@@ -148,6 +165,69 @@ pub async fn run() {
         )
     };
     cli::print_kv("health", &health);
+
+    // v4 phase 0: route-memory visibility (the self-improvement
+    // loop must be observable, never magic).
+    let route_line = if crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY") {
+        "off (DONSETCH_NO_ROUTE_MEMORY)".to_string()
+    } else {
+        let state = crate::ghost::cache::GhostState::load();
+        let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
+        let ro = if crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
+            " · read-only"
+        } else {
+            ""
+        };
+        if hosts == 0 {
+            format!("learning (no hosts yet){ro}")
+        } else {
+            let mut line = format!("{hosts} hosts · {walled} walled · {warm} warm");
+            if !state.personas.is_empty() {
+                line.push_str(&format!(" · {} personas", state.personas.len()));
+            }
+            if state.probes_total > 0 {
+                line.push_str(&format!(" · {} probes", state.probes_total));
+            }
+            if state.tier1_cookie_count() > 0 {
+                line.push_str(&format!(" · {} vaulted", state.tier1_cookie_count()));
+            }
+            if state.shadowed_assets_total > 0 {
+                line.push_str(&format!(" · {} shadowed", state.shadowed_assets_total));
+            }
+            if state.prewarmed_served_total > 0 {
+                line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
+            }
+            if state.pool_served_total > 0 {
+                line.push_str(&format!(" · {} warm", state.pool_served_total));
+            }
+            if state.answered_packs_total > 0 {
+                line.push_str(&format!(" · {} answered", state.answered_packs_total));
+            }
+            if cooldowns > 0 {
+                line.push_str(&format!(" · {cooldowns} in cooldown"));
+            }
+            if flaky > 0 {
+                line.push_str(&format!(" · {flaky} flaky-wall"));
+            }
+            line.push_str(ro);
+            line
+        }
+    };
+    cli::print_kv("route memory", &route_line);
+    // v4 phase 5.2: local web memory receipt. status for every
+    // subsystem, kill switch honored, non-rerank build says so.
+    #[cfg(not(feature = "rerank"))]
+    let mem_line = "unavailable (this build lacks the rerank feature)".to_string();
+    #[cfg(feature = "rerank")]
+    let mem_line = if crate::memory::kill_switch() {
+        "off (DONSETCH_NO_WEB_MEMORY)".to_string()
+    } else {
+        match crate::memory::rows() {
+            0 => "empty; ingests from fetch/search/crawl".to_string(),
+            rows => format!("{rows} rows · cap {}", crate::memory::cap()),
+        }
+    };
+    cli::print_kv("web memory", &mem_line);
     cli::print_kv(
         "deep fingerprint",
         "not probed (run `donsetch doctor --deep`)",

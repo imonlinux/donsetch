@@ -5,6 +5,540 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+V4 work in progress on `master`. Nothing below ships through a release
+channel until the v4.0.0 release train.
+
+### Added
+- `web_screenshot` MCP tool: a rendered PNG of a page through the
+  existing tier-2 browser (url, full_page, wait_ms). The capture is
+  in-process only; the MCP result carries an image content block and
+  a text note. Verified live against a real render (PNG header,
+  image/png). The CLI ships the same render now that it was wired up:
+  `donsetch screenshot URL [--full-page|--wait-ms N]` prints the
+  receipt and, with the CLI-only `--out PATH`, writes the PNG with
+  honest failure paths (bad path or missing path = stderr + exit 1).
+- h3 lane hardening (mnaza, PR #169): every transport now exits
+  through one point, so decompression and wall detection also apply
+  to HTTP/3 responses (a challenge served over h3 no longer reports
+  as clean content); alt-svc routes honor the server's own `ma=`
+  lifetime instead of a constant; the HTTP/3 body reader stops at
+  the shared 64 MiB cap before allocating; `routes.json` carries
+  serialized TLS session material and lands owner-only (0600).
+- Experimental HTTP/3 lane (opt-in via `DONSETCH_H3=1`) on a quiche
+  0.29.3 fork that shares one BoringSSL build with tier-1. An h3
+  route is learned from `alt-svc` response headers (same-origin
+  only, proxies exempt) and persisted in the cache dir under
+  `routes.json` together with the serialized QUIC TLS session. The
+  lane stays off by default: on repeat visits the v1 one-shot
+  connection shape measures slower than our reused h2 pool, and
+  `DONSETCH_NO_H3` kills the whole path regardless. The h3 Client
+  Hello reuses the same Chrome-true TLS builder as h1/h2.
+  Transport parity verified live against curl --http3 on a
+  1.4 MB page (852 ms vs 825 ms) and 0-RTT resumption arms and
+  is accepted on repeat visits; the default stays on our reused
+  h2 pool, which still measurably wins the same-or-faster gate.
+
+- Local web memory for agents (`web_memory` tool + `donsetch memory`
+  query): a bounded on-device index of pages this machine fetched.
+  all-MiniLM-L6-v2 quantized runs locally on the same onnxruntime
+  the search reranker uses; the model + tokenizer download once,
+  sha256-pinned, into the cache dir and nothing ever leaves the box
+  after that. Fetches, crawl pages and search snippets ingest
+  automatically; `DONSETCH_NO_WEB_MEMORY` disables ingest and search;
+  `DONSETCH_WEB_MEMORY_CAP` bounds the index (default 4000 rows,
+  oldest-first eviction). Unavailable on builds without the rerank
+  feature: the release builds all carry it.
+
+- Adapter registry v1 (`donsetch adapters`): the named rewrite and
+  extract adapters are now a registry, and operators can add more
+  fetch-level rewrites as pure-data JSON plugins in
+  `cache_dir()/adapters/` (one file per rule: hosts, optional path
+  prefix, an https target template with one `{path}` placeholder;
+  no executables or scripts, the fetcher's egress guards still
+  apply). Bad files are skipped with a receipt and never break
+  fetching; `DONSETCH_NO_ADAPTERS=1` stays the master kill switch.
+
+
+- Native keyless Google search via the legacy mobile endpoint, using
+  DonShadow without a browser or paid API. Seven selectable Nokia
+  profiles (`DONSETCH_GOOGLE_PROFILE`, default `6230-03.15`), observed
+  working in local tests; availability is not guaranteed. An explicit
+  CAPTCHA permits one next-profile attempt in the existing thin-merge
+  retry wave; successful profiles remain preferred per egress in
+  memory, with circular advancement on CAPTCHA and no profile cooldowns.
+  Profile selection resets on restart. HTTP 429 and other walls do
+  not rotate. Native and
+  browser Google share one ranking family but keep separate health.
+- Route memory: fetches learn route health per tier (EWMA latency by
+  route, failure classes, LRU-bounded store). Tier 1 rides healthy
+  routes only; persistent failures quarantine and a background probe
+  re-heals them when the block lifts; a replaced route never re-enters
+  while still marked failed. Kill switches + `donsetch status` line.
+- Persona store: long-lived per-domain identity records (fingerprint
+  class, headers, session state) ride inside ghost pages across runs,
+  with a coherence checker and a `donsetch status` line.
+- Stealth scorecard: `doctor --stealth` grades the tier-1 battery
+  (TLS/H2/header classes) with conflict codes; `--parity` diffs the
+  live fingerprint against real local Chromium (JA4/JA3/H2/vector
+  agreement). Weekly `stealth.yml` CI alarm on profile drift.
+- Tier-1 request realism: navigation-class header sets per request
+  class (document/rpc/embed), subresource shadow-fetching that
+  reproduces real page-load traffic (assets behind the primary fetch),
+  and tier-1 cookie persistence replaying returning-device sessions
+  across runs. Each subsystem carries a kill switch.
+- Prewarm: search hands a warm tier-1 pipe to the first-result fetch
+  that follows it (hot-path time drops from roughly 550 ms wire
+  build-up to about 25 ms served from RAM). Served/wire split is
+  visible in `donsetch status`.
+- `web_answer`: evidence-pack answer tool for chat-first MCP clients
+  (query + token budget, up to a handful of pages, ranked citation
+  graph, one-line answer). Kill switch `DONSETCH_NO_ANSWER_TOOL`.
+- Crawl dataset mode: `--json` renders one JSON object per page
+  (url/title/kind/markdown/chars/fetched_at/lastmod/parent), sorted by
+  URL, deduped; skipped pages carry reasons. Best for machine-ready
+  exports; plain text stays the default.
+- Crawl delta recrawl: `--since-last` re-fetches pages and compares
+  content fingerprints against crawl history; unchanged pages refresh
+  history but drop out of results and budgets with skip reason
+  "unchanged since last crawl". Replaces the old fixed 24 h window
+  that silently missed quiet mutations.
+- Crawl-shape: seeded reader-like frontier ordering (head-window
+  jitter over the top ranks, topology preserved), so repeated crawls
+  of one site stop replaying an identical mechanical order to access
+  logs. Kill switch `DONSETCH_NO_CRAWL_SHAPE`.
+- Adapters reach the crawl fetch path: the same rewrite pass
+  `web_fetch` uses rides inside crawl fetches; the canonical URL stays
+  the dedup/history key.
+- Ghost browser pool: up to 16 warm browser slots keyed by persona
+  identity and host affinity; a repeat hit on the same host lands on
+  the browser that already carries that site's session state, and a
+  persona switch inside a slot relaunches instead of inheriting
+  another identity's fingerprint state. `donsetch status` shows the
+  warm-serve receipt; `DONSETCH_GHOST_POOL_SLOTS` sizes the pool
+  (default 3), `DONSETCH_NO_GHOST_POOL` reverts to the old
+  single-slot path.
+- MCP compat folding applies to `web_search` too: structured-content-
+  only clients receive raw result URLs through the folded metadata
+  block instead of losing them; the model-facing contract text now
+  states it. (#165)
+- Clarify compact search labels: counts describe search-index families
+  that returned a URL, not independent sources corroborating its
+  claims. The weak results message now refers to cross-index
+  agreement. Ranking is unchanged. (#166)
+
+### Changed
+
+- Crawl pacing cleanup: the vestigial 0-100 ms skim dwell is deleted;
+  self-inferred waits cap at 7 s while host-declared waits (Retry-
+  After) stay uncapped and honored. All pacing lives in the crawl
+  governor, pressure-adaptive.
+- Dependencies: tokenizers 0.23.2, encoding_rs 0.8.40, brotli 9.0.0,
+  zstd 0.14.0, psl 2.1.231, actions/checkout 4 -> 7.
+
+### Fixed
+
+- `site:` queries no longer leak off-domain results through BYOK
+  providers (issue #190): both BYOK exits (provider-first and the
+  local-first fallback) sweep results through the same post-merge
+  domain filter the local engine uses; goto/redirect proxies drop
+  (fail closed), and the warm body prewarm runs on the rows that
+  survive the filter.
+- `donsetch login --logout DOMAIN` now also wipes the rendered-DOM
+  cache of the logged-out domain (Mart-Bogdan, PR #188): a page
+  fetched behind the session was a fourth persisted copy of the
+  session, served back with no network hop for up to five minutes
+  after logout. Unrelated domains' renders stay.
+- Repeat BYOK searches now ride the same TTL'd disk cache as keyless
+  results instead of re-billing the provider (issue #195): same query
+  + intent replays from cache under a separate byok namespace, capped
+  at 500 entries like the local path (mnaza, #197).
+- The web-memory index persist stages to a PID+sequence-unique
+  file per write (PR #191): overlapping persists (a crawl fires
+  one per 256-row chunk and one on completion) can no longer tear
+  `index.json` through a shared tmp inode and parse-fail the next
+  recall to an empty index.
+- Subresource shadow-fetching no longer aborts the daemon on a page
+  containing `İ`, `K` or `Ω`. The scanner searched a `to_lowercase()`
+  copy of the document for tag offsets and then sliced the original
+  string at them, but `to_lowercase` is not byte-length preserving, so
+  one such character shifted every later offset: assets silently
+  dropped where the shift landed on ASCII, a mid-codepoint slice panic
+  where it did not : and the release profile's `panic = "abort"` turns
+  that into a daemon kill. Folding is `to_ascii_lowercase` now, which
+  is byte-length and char-boundary preserving, and is also what the
+  HTML standard specifies for tag and attribute names. `attr()` had
+  the same latent pattern and is fixed with it.
+- MCP text-only fold now covers OpenCode v1 (tested on 1.18.3):\
+  unlike Claude Code / VS Code, OpenCode renders the `content` array
+  and drops `structuredContent` entirely, so agents previously lost
+  every compact state field (URL handles, `next_offset`, verdicts,
+  error codes). Handshake detection now matches `opencode` and folds
+  the state into the leading `[meta]` text block, same as the other
+  text-only clients.
+- A corrupt local embedding model no longer wedges every subsequent
+  fetch. `ensure_file` recursed into itself with identical arguments
+  when the file on disk failed its SHA/size pin, never removing it, so
+  the same bad bytes were read forever : a stack overflow, or an
+  infinite loop if the recursion was optimized into a tail call. The
+  bad file is removed and the existing atomic download path takes
+  over; a concurrent remover is tolerated with a receipt, any other
+  removal failure is honest and immediate.
+- Default-feature builds compile again (Mart-Bogdan, PR #174): the
+  web-memory status receipt tested the rerank feature with a runtime
+  `cfg!` so no-rerank builds failed the compile on three symbols
+  behind the feature gate.
+- `donsetch login --logout` now wipes the tier-1 echo of the vault
+  from ghost-state.json, not only the registries the sessions
+  replays through on the next start (issue #173).
+- `routes.json` was rewritten on every alt-svc sighting, could grow
+  without bound, and had no switch: re-vouches with nothing
+  materially new (under a 60 s grace) are skipped before the disk
+  write, expired rows never survive a persist, the row count caps at
+  512, and `DONSETCH_NO_ALT_SVC` shuts the bookkeeping off (issue
+  #175).
+- Web memory re-embedded and rewrote its whole index once per row,
+  putting up to one 20MB+ write on the answer path per hit: batch
+  ingest embeds in one pass and persists once, the crawl path chunks
+  at 256 rows, and ingestion runs on the blocking pool so a recall
+  never holds a response past its deadline (issue #178).
+- CI runs now concurrency-cancel per pull request only, never on
+  master (Mart-Bogdan, PR #181).
+- The alt-svc kill-switch test no longer excludes Windows
+  (Mart-Bogdan, PR #189): the env-var mutations in it are not
+  Windows-specific, so the guard was dead weight.
+
+- Xvfb reuse gate now demands a bounded real-protocol answer
+  (xdpyinfo within 2s) before handing a display to the pool, so a
+  SIGKILLed Xvfb's tombstone socket can no longer wedge every
+  tier-2 escalation behind an honest "devtools ws timeout".
+- Ghost pool spill fix (mnaza): a same-persona pool previously
+  funneled every distinct host into slot 0, since "any warm
+  same-persona slot" outranked free slots and the daemon always runs
+  one persona. Slot claims (persona key + host) are now stamped and
+  visible to concurrent selectors at pick time under the meta lock,
+  before the seconds-long browser launch, so a second in-flight host
+  claims a free slot and a same-host job joins the in-flight claim
+  and warm-serves it. An exhausted pool reuses our coldest own
+  browser before evicting a stranger's. Their contribution lives as
+  its own rebased commit on master (af13034).
+- Search pacing uses cancellation-safe per-engine/egress admission;
+  waiting is included in attempt deadlines and cancelled waiters
+  leave no future-slot debt. Google HTTP health is isolated from
+  legacy browser health; Google follows common failure and quarantine rules.
+- Search retries retain completed peers when another retry times out
+  and report retry timeouts explicitly, with the attempted Google
+  profile when available. At most one retry per engine per search. Ordinary
+  retries, including Google, keep a three-second budget including pacing.
+- **#164 audit wave (S1-S6 in the search/fetch stack):**
+  S1: version matching is boundary-aware; "5.2" no longer matches
+  "15.2" or "5.20" but still matches "5.2.1" and "v5.2".
+  S2: empty vertical results report no-results instead of success;
+  engine OK counts and retry/cache gates were inflated.
+  S3: plugin-hit truncation before URL dedup dropped, so oversize
+  plugin output can no longer shrink the final unique count.
+  S4: cache entries keep engine reports; cache hits return real
+  engine evidence (old 4-tuple caches still load).
+  S5: single-URL fetch with `budget_tokens` runs under
+  `run_with_budget`: `deadline_ms` and MCP cancellation apply, and
+  the budget bounds the page like batch mode.
+  S6: BYOK plugin error envelopes cap at 600 chars, matching the
+  stderr trim.
+- Storage guard: bounded target-dir growth and pinned the cargo
+  profile on every nextest run.
+- Ghost-state counters now merge against the state on disk at every
+  save, so a late save with a stale in-memory snapshot can no longer
+  rewind lifetime counters (caught live: the pool warm-serve receipt).
+
+## [3.6.7] - 2026-09-07
+
+### Fixed
+
+**Audit wave (2026-09-07): every finding from the post-3.6.6 refactor
+audit, verified live before fixing, discriminating tests on the fixes.**
+
+- **S1 (security):** the certificate-decompression callback reserved
+  the SERVER-declared uncompressed length upfront; a hostile origin
+  could declare 4 GiB and trigger the reservation before any byte
+  arrived. Refused above 16 MiB (far past any real chain),
+  discriminator-tested with the callback directly.
+- **B2:** conditional revalidation headers (If-None-Match/If-Modified-
+  Since) minted for the original URL rode every redirect hop; a
+  colliding ETag on the target produced a false 304. Fixed + proven
+  with an E2E rig: pre-fix the second hop carries the stale validator
+  and the caller merges the wrong cached body; post-fix the redirect
+  target answers a real 200. Reverting the fix fails the test.
+- **B6:** the cookie export (`snapshot_for`) hard-coded `path: "/"`,
+  widening path-scoped cookies on the export/import cycle. The real
+  path is carried now (regression test).
+- **B1:** the search single-flight follower read the cache mutex with
+  a poison-panic; one transient panic mid-lock would outage every
+  search in the daemon. Poison-safe like every other access.
+- **E15 (curl parity):** the env proxy is re-evaluated per redirect
+  hop against NO_PROXY; a redirect to a NO_PROXY-covered host dials
+  direct instead of riding the proxy for the rest of the chain.
+  Discriminator test: post-fix the second hop arrives origin-form at
+  the direct server, pre-fix it arrives absolute-form at the proxy.
+- **E4 (RFC 9112 6.3):** differing Content-Length values on one
+  response are rejected as invalid (request-smuggling class); the
+  same value repeated stays tolerated (HTTP/1.0 proxy reality).
+- **E14:** the cookie `Expires=` date form is parsed now (IMF-fixdate
+  + RFC 850 + asctime, RFC 6265 5.1.1 tolerance); date-expired
+  cookies no longer live as session cookies or leak into the vault
+  export. Max-Age keeps precedence. Canonical-vector tested.
+- **E13:** an unparseable cookie Max-Age is IGNORED (RFC 6265 5.2.2:
+  session cookie), not turned into a 1-second cookie.
+- **E12:** `Vary: *` responses are never stored in the revalidation
+  cache (Chrome parity; a stored variant would serve stale forever).
+- **E11:** revalidation-cache eviction is FIFO by insert order, not
+  an arbitrary HashMap victim.
+- **E10:** layered `Content-Encoding` (`gzip, br`) peels both layers
+  instead of a hard fetch error.
+- **E1 (curl 7.86 parity):** NO_PROXY understands bracketed IPv6 and
+  bare IPv6 literals, CIDR networks (`192.168.0.0/16`) and
+  `host:port` entries.
+- **E5:** unsupported proxy schemes (`socks4://`, `https://` upstream
+  proxies...) are rejected at parse with a clear message instead of
+  parsing as HTTP and dying at dial time with a confusing error.
+- **E9:** the query-cache recency window for year mentions is
+  generated from the clock ([current-2, current+1]); the hardcoded
+  2024-2027 list would have made every 2028 query cache as evergreen.
+- **E7:** the query-cache key embeds a stable u8 intent code instead
+  of the Intent Debug string (renaming a variant used to remap or
+  orphan old cache entries).
+- **E16:** the BMP magic check now requires the declared file-size
+  field to be plausible against the body length; a plain-text
+  document starting with "BM" no longer classifies as binary.
+- **E19:** the raw-text fallback thresholds are named shared consts.
+- **L1:** the SSL_CERT_FILE/SSL_CERT_DIR bundle is cached keyed on
+  (path, size, mtime); was re-read and re-parsed on every connector
+  build (every fetch) in interception networks.
+- **L7:** the async DNS-aware SSRF gate runs exactly once per
+  request (inside the request path); the outer gate kept only the
+  synchronous literal checks for cache-fresh returns, and the
+  redirect hop's duplicate pre-gate is gone. Was 2x resolver RTT
+  per fetch and per hop.
+- **L2:** h1's naive `windows().position()` scans replaced by
+  memmem (sublinear); the old loop was quadratic on slow-drip
+  header responses.
+- **L4:** the engine-health disk save is debounced by a dirty flag;
+  was a clone + serialize + write on every uncached search.
+- **L9:** the SPA-shape detector counts `aria-busy` markers with an
+  ASCII-case-insensitive scan instead of lowercasing the whole
+  document.
+- **Q1:** unparseable proxy lines are counted and surfaced in
+  `donsetch status` ("N invalid line(s) ignored") instead of being
+  dropped silently.
+- **Q3/Q4:** the wall-classification verdict is scored inside the
+  response-finalizer (one site of truth instead of every caller
+  re-detecting), and the egress label chain is a mapping function.
+
+### Added
+
+- **Structured-content compat for Claude Code / VS Code (issue #27,
+  thanks Mart-Bogdan + maykura):** those harnesses show the model only
+  `structuredContent` and drop the `content` array, so agents saw
+  fetch/crawl metadata but never the page markdown. DonSeTch now
+  detects them at the MCP handshake (`clientInfo.name`, matched
+  case-insensitively against a known list; Claude Code's object-shaped
+  `version` is tolerated) and, for those sessions, merges the two
+  surfaces: the full structured state folds into a compact leading
+  `[meta]` text block, the document stays a clean markdown text block,
+  and `structuredContent` is omitted. web_search is exempt (its
+  structuredContent is the richer surface). Every other client keeps
+  the unchanged token-optimal split. Manual override:
+  `DONSETCH_MCP_TEXT_ONLY=1` forces the compat shape for any client,
+  which is also the escape hatch for newly discovered broken hosts.
+  Compat mode is per-session on the HTTP transport; error results
+  carry their stable code + escalation trace through the same
+  `[meta]` fold. Verified end to end over both stdio and streamable
+  HTTP against the real binary (default shape, compat shape, error
+  path, search exemption, per-session isolation, env override).
+
+
+
+### Fixed
+
+- **The supervisor crash-recovery outlived the 3.6.6 SIGPIPE
+  restoration** (mnaza, #163): pinning SIG_DFL process-wide killed the
+  `mcp --supervised` parent exactly when a crashed child's stdin write
+  returned EPIPE (the signal it exists to survive), and bypassed the
+  stdio transport's graceful broken-pipe shutdown and the BYOK
+  plugin's tolerant child-write path. CLI commands keep the quiet
+  exit-141 pipe convention; `mcp` and the supervisor pin SIG_IGN for
+  themselves. Discriminating test: on 3.6.6 the test process dies by
+  signal 13, with the fix it passes.
+
+## [3.6.6] - 2026-09-06
+
+### Fixed
+
+- **Crawl robots.txt `Crawl-delay: inf` aborted the crawl worker:**
+  `Duration::from_secs_f64` panics on infinite or overflowing values,
+  so a host declaring an absurd delay killed the lane. Delay is now
+  clamped (finite + capped 60s) at every setter and re-clamped in the
+  pacing math. Credit: mnaza (#155).
+- **Sitemap `<loc>` URLs were used with XML entities intact:**
+  `&`, numeric/char codes (`&#x27;`, `&#39;`) and CDATA wrappers
+  stayed raw in every fetched URL, breaking query-string pages. Own
+  minimal entity decoder with bounds; CDATA stripped inside `<loc>`.
+  Credit: mnaza (#156).
+- **MathML table-of-parts shapes were invisible in extraction:**
+  layout tags (mtable/mtd/msup etc.) were absent from the recursion
+  guard's tag list. Credit: mnaza (#157).
+- **HTTP/1.1 1xx interim responses returned as the final response:**
+  100 Continue/103 Early Hints from CDNs got mistaken for the real
+  status, handing callers a hint block with an unframed body. Interim
+  blocks skipped (a 1xx-class counter caps the stream; unexpected
+  101 upgrades refused). Credit: mnaza (#158).
+- **RSS/Atom close tags were matched case-sensitively** while the
+  open already wasn't: `<LINK>` left a row half-parsed. Close scans
+  are case-insensitive ASCII now (the open already were). Credit:
+  mnaza (#159).
+- **`tls.egress` was dead code:** the TLS classifier's two hints share
+  the substring `SSL_CERT_FILE`, and the egress arm ran behind the
+  cert-trust arm, so every intercepted-transport error landed on the
+  cert guidance. The classifier's own opening sentences now drive the
+  split, and the test composes both through the real function so the
+  pair can't drift. Credit: mnaza (#160).
+- **Plaintext HTTP via an authenticating proxy sent no
+  Proxy-Authorization, and SOCKS5 tunnels carried absolute-form
+  request lines to the target server** instead of origin-form. Both
+  fixed with one shared `proxy_authorization()` builder + correct
+  in-tunnel form. Credit: mnaza (#161).
+- **One non-UTF-8 line in Chrome's stderr failed the whole ghost
+  launch.** stderr is scanned lossy now (byte-level scan for wall
+  markers), only the real failure paths depend on exact text.
+  Credit: mnaza (#162).
+- **`donsetch --help | head` printed a panic backtrace after head
+  closed the pipe** (Rust masks SIGPIPE; the write's EPIPE panics).
+  The default disposition is restored at start: silent exit 141 like
+  rg/curl. The MCP daemon inherits it: a broken transport pipe means
+  the client is gone, so an instant exit beats a stack dump.
+- **The 3 tool subcommands leaked the agent-facing MCP description
+  into `--help`** (LLM-voice paragraphs). Each now carries a short
+  human description of its own: same facts, terminal voice.
+
+## [3.6.5] - 2026-09-06
+
+### Added
+
+- **Fetch now survives TLS-intercepting egress networks (issue #154,
+  thanks maykura):** cloud sandboxes and corporate networks often
+  force all traffic through an HTTP proxy that re-terminates TLS with
+  its own CA. Three fixes close the whole class: (1) `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` bundles are loaded into the trust store on every
+  connector build (PEM bundles, DER files, directory scans), the one
+  thing that makes re-signed certificates verifiable; (2) requests
+  routed through an HTTP CONNECT proxy switch to an
+  interception-safe handshake (no GREASE/permute/ECH/ALPS/cert
+  compression/OCSP/SCT), because the middlebox's second TLS stack is
+  what resets exotic ClientHellos, and stealth is moot behind a MITM
+  anyway (SOCKS5 keeps the Chrome-true profile, TLS rides
+  end-to-end); (3) the env-proxy convention is documented with a
+  kill switch: HTTPS_PROXY/HTTP_PROXY/ALL_PROXY + NO_PROXY are
+  honored, DONSETCH_NO_ENV_PROXY=1 disables them, and plaintext
+  http:// through an HTTP proxy now uses raw dial + absolute-form
+  request targets (the previous CONNECT-then-relative-form path was
+  broken).
+- Handshake failures now classify instead of dumping raw
+  MidHandshakeSslStream debug fields: egress resets and cert
+  verification failures each get a one-line message naming the exact
+  fix (export the proxy, export the CA bundle), with matching
+  `tls.egress` / `tls.verify` error codes and operator-level
+  next_action text.
+- `donsetch doctor` adds a "Fetch egress" check: resolved env proxy,
+  kill-switch state, system + environment trust-store counts, and
+  SSL_CERT_FILE loadability. The network check, when it fails while
+  proxy env vars are set, now says the interception fix instead of
+  "check your connection".
+- E2E MITM test battery (tests/egress_proxy.rs): in-process HTTP
+  CONNECT proxy with a re-signing TLS server proves trusted-CA
+  success, untrusted-CA honest failure, and absolute-form plaintext,
+  on the real Fetcher.
+
+### Fixed
+
+- **Crawl link/feed extraction could panic or drop URLs on pages
+  with case-folding characters:** the extractors lowercase the whole
+  document to fold tag names, then index the ORIGINAL at offsets
+  measured on the copy. Unicode folding is not length-stable ('İ' U+0130
+  = 2 bytes but lowercases to "i̇" = 3), so links after the first
+  folding char were sliced mid-character (a str-slice panic: daemon
+  abort in release) or one byte late (wrong span: RSS/Atom feed URLs
+  silently dropped). Canonical/base/feed extraction now scans the
+  original bytes with ASCII case-insensitive matching (tag and
+  attribute names are ASCII, and ASCII folding is length-stable),
+  which also removes the per-page whole-document lowercase
+  allocation. Two discriminating tests: pre-fix one panicked and
+  one dropped both feed URLs; post-fix both correct.
+
+- **h1 chunked reader no longer allocates unboundedly:** a server
+  that never sends the chunk terminator (or keeps the size line
+  growing) drove an unbounded buffer in the response path. Chunk
+  size lines and trailer sections are now capped. Credit: mnaza
+  (#144).
+- **MathML serialization could overflow the stack:** deeply nested
+  XML structure recursed per node in extraction; a pathological page
+  overflowed the stack and aborted the daemon. Iterative fallback
+  on deep nesting instead. Credit: mnaza (#145).
+- **Markdown links with `)` in the URL were cut off:**
+  `[Mercury (planet)](https://en.wikipedia.org/wiki/Mercury_(planet))`
+  truncated at the first `)`. A balanced-close scan now finds the
+  real end of the destination. Credit: mnaza (#146).
+- **Search intent matching fired on substrings:** the word
+  "software" matched the `war` news marker (and similar accidents),
+  silently downgrading engines and freshness weights. Intent
+  markers now match on whole tokens. Credit: mnaza (#147).
+- **A single non-UTF-8 byte on the MCP stdin killed the daemon:** the
+  line loop exited on the parse error as if the client had closed.
+  A malformed line now receives a -32700 parse-error response and
+  the session continues. Credit: mnaza (#148).
+- **`<pre>` code blocks closed their own fence:** content showing a
+  nested ``` block (e.g. a Markdown syntax example) broke the
+  outer fence and spilled the rest of the page into the code block.
+  Fences now extend to at least the longest run of backticks in the
+  content. Credit: mnaza (#149).
+- **Docs-infobox adapter duplicated nested list items:** a nested
+  `<li>` matched both the outer list's selector and its own,
+  appearing twice and restarting ordered-list numbering. Nested
+  matches are skipped and lists render through the shared nested
+  list helper instead. Credit: mnaza (#150).
+- **String JSON-RPC ids could never be cancelled:** cancellation
+  keyed on an `i64`, while the JSON-RPC spec allows string ids
+  (UUIDs etc.), so requests from such clients ignored `notifications/
+  cancelled` forever. Cancellation keys now cover both id shapes,
+  with `7` and `"7"` kept distinct. Credit: mnaza (#151).
+- **Supervised mode dropped in-flight responses on client EOF:** a
+  one-shot client that closed stdin right after the request got
+  nothing back, because the supervisor exited on EOF and the exit
+  killed the stdout forwarder mid-response (and skipped the
+  daemon's own graceful shutdown). EOF now waits for the daemon to
+  drain and answer, with a bounded timeout, forwarding all output;
+  and the rapid-restart counter forgives old crashes. Credit: mnaza
+  (#153).
+
+## [3.6.4] - 2026-09-05
+
+### Fixed
+
+- **News freshness treated future-dated items as stale:** a negative
+  days-since count fell through every freshness arm to the stale 0.85
+  weight, and the freshness test used hardcoded dates that would rot.
+  A future date is a skewed clock and deserves the freshest weight;
+  the test now walks the tier boundaries relative to today.
+  Credit: mnaza (#143).
+- **Char-boundary slice panics (panic=abort means daemon death):** the JSON-LD metadata search, the `\u` escape decoder, PDF date parsing, `doctor`'s key masking, and the Xvfb stderr-diagnostic path all sliced/truncated at raw byte positions, which panics inside a multibyte character on any non-ASCII input. All cuts now pull back onto `floor_char_boundary` or go char-based. Credit: mnaza (#133, #141).
+- **BYOK transport errors leaked the request URL, SerpApi keys included:** a failed DNS/refused/TLS call rendered the full `reqwest` error, which for SerpApi embeds the key in the query string, into the model-visible `last_error`, CLI stderr and debug log. All ten providers now go through one `from_transport` mapping that uses `without_url()`, with a test proving the key is gone. Credit: mnaza (#134).
+- **`keys export`/`proxy export` wrote credentials world-readable:** files were created at the umask default (0644) and tightened only afterwards, with the chmod failure silently ignored. New `write_private` opens owner-only (0600) from the moment the file exists and re-tightens an existing file. Credit: mnaza (#139).
+- **Self-update left a stale `libonnxruntime.so` beside new binaries:** `-u` swapped only the binary, so Linux self-updaters kept the old runtime (e.g. one needing GLIBC_2.38) and OCR/rerank stayed dead while `doctor`'s presence check said fine. The update now stages, backs up and atomically swaps sibling runtime libs, and `--rollback` pairs the previous binary with its previous lib. Credit: mnaza (#136).
+- **`--rollback` could destroy the previous version:** the current binary was copied over `.bak` before the final atomic rename, so a rename failure (sticky-bit dir, immutable file) discarded the only copy of the version being rolled back to; the Windows path also returned exit 0 when its copy failed. The swap now stages everything first and keeps `.bak` untouched until the rename has succeeded. Credit: mnaza (#137).
+- **`must_contain`/regex probe excerpts missed the match on non-ASCII pages:** the substring path searched a separately lowercased copy (offsets drift when case folding changes byte lengths) and both paths fed byte offsets into a char-indexed window, so on any page with non-ASCII text before the hit the excerpt landed past it. Everything now goes through one case-insensitive regex with a byte-window literal fallback. Credit: mnaza (#140).
+- **Data tables lost their row labels:** `<th scope="row">` cells were collected per-row from a `<td>`-only select, so every label vanished and the remaining cells shifted one column left. One select over `th, td` in document order keeps the column alignment. Credit: mnaza (#135).
+- **Proxy passwords containing `@` broke parsing:** auth split at the first `@`, so `p@ss` became user `alice`, host `p`. The address cannot contain `@`, so splitting at the last one is the only correct point. Credit: mnaza (#138).
+- **Ghost escalation budget could wrap to `usize::MAX` under concurrent workers:** a load-then-decrement race let two workers both pass the budget check, wrapping the counter and deleting the crawl's cost ceiling. `fetch_update` makes the decrement atomic. Credit: mnaza (#142).
+
 ## [3.6.3] - 2026-09-05
 
 ### Added

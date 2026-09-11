@@ -19,6 +19,7 @@ pub mod cdp;
 pub mod cloak;
 pub mod manager;
 pub mod ops;
+pub mod probe;
 pub mod proc;
 pub mod xvfb;
 
@@ -730,15 +731,11 @@ impl Ghost {
             .stderr
             .take()
             .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
-        let mut lines = BufReader::new(stderr).lines();
-        let ws_url = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(i) = line.find("ws://") {
-                    return Some(line[i..].trim().to_string());
-                }
-            }
-            None
-        })
+        let mut reader = BufReader::new(stderr);
+        let ws_url = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            scan_for_ws_url(&mut reader),
+        )
         .await
         .map_err(|_| FetchError::ghost("devtools ws timeout"))?
         .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
@@ -1302,6 +1299,25 @@ impl Ghost {
         std::fs::write(&dest, bytes).map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
     }
 
+    /// PNG capture as in-memory bytes (web_screenshot tool, issue
+    /// #171). `full_page` asks CDP to capture beyond the viewport;
+    /// everything else is the same capture as [`Self::screenshot`].
+    pub async fn screenshot_bytes(&self, full_page: bool) -> Result<Vec<u8>, FetchError> {
+        let data = self
+            .cdp
+            .call(
+                Some(&self.session),
+                "Page.captureScreenshot",
+                json!({ "format": "png", "captureBeyondViewport": full_page }),
+            )
+            .await?
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FetchError::ghost("no screenshot data"))?
+            .to_string();
+        Ok(b64decode(data.as_bytes()))
+    }
+
     /// One trusted click with a human-ish pre-move path.
     /// CDP input events are isTrusted=true; detection is
     /// behavioral, so the path curves and overshoots.
@@ -1839,10 +1855,79 @@ fn b64decode(s: &[u8]) -> Vec<u8> {
     out
 }
 
+const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Minimal base64 encoder (the sibling of `b64decode`, same
+/// no-new-dependency rule). Input is raw PNG bytes, output feeds
+/// the MCP image content block (issue #171).
+pub fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHA[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHA[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHA[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHA[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Scan Chrome's stderr for the "DevTools listening on ws://…"
+/// endpoint line. Lossy per line : Chrome's pre-DevTools chatter
+/// can carry raw non-UTF-8 bytes (fontconfig/library paths on odd
+/// locales), and `Lines::next_line()` returns Err on those, which
+/// used to end the scan and fail the launch with a misleading
+/// "no devtools ws line" while Chrome was actually up. The ws line
+/// itself is pure ASCII, so lossy decoding can never corrupt it.
+async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<String> {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(i) = line.find("ws://") {
+            return Some(line[i..].trim().to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    // Chrome's pre-DevTools stderr chatter can carry raw non-UTF-8
+    // bytes (fontconfig/library paths on odd locales). Lines::
+    // next_line() returns Err on such a line, and the old
+    // `while let Ok(Some(..))` scan treated that as end-of-stream:
+    // the launch failed with a misleading "no devtools ws line"
+    // while Chrome was actually up. Same bug class as the fixed MCP
+    // stdio loop (#148); this is the only reader of Chrome's stderr.
+    #[tokio::test]
+    async fn ws_scan_survives_non_utf8_stderr_lines() {
+        let wire: &[u8] = b"Fontconfig warning: \xff\xfe/bad/path\n\
+                            DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc\n";
+        let mut r = BufReader::new(wire);
+        assert_eq!(
+            scan_for_ws_url(&mut r).await.as_deref(),
+            Some("ws://127.0.0.1:9222/devtools/browser/abc"),
+            "a non-UTF-8 stderr line must not end the scan"
+        );
+    }
 
     #[test]
     fn default_args_do_not_contain_no_sandbox() {

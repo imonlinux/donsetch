@@ -502,6 +502,31 @@ fn block_code_pre() {
     assert!(r.markdown.contains("println!"));
 }
 
+// A <pre> that itself contains a markdown fence (every "how to
+// write markdown" page, every README rendered in a docs site)
+// used to be wrapped in a bare ``` fence: the inner ``` closed
+// the block early and the rest of the code spilled out as prose.
+#[test]
+fn block_code_containing_backtick_fence_is_wrapped_in_a_longer_fence() {
+    let html = "<html><body><article>
+<pre><code>Use a fence:
+
+```rust
+fn main() {}
+```
+
+Then prose.</code></pre>
+</article></body></html>";
+    let r = extract_html(html);
+    let md = &r.markdown;
+    let open = md.find("````\n").expect("longer opening fence");
+    let close = md.rfind("\n````\n").expect("longer closing fence");
+    assert!(open < close);
+    let inside = &md[open..close];
+    assert!(inside.contains("```rust\nfn main() {}\n```"), "{md}");
+    assert!(inside.contains("Then prose."), "{md}");
+}
+
 #[test]
 fn block_code_whitespace_preserved() {
     let html = r#"<html><body><article>
@@ -568,6 +593,53 @@ fn block_nested_list() {
     let r = extract_html(html);
     assert!(r.markdown.contains("Top level"));
     assert!(r.markdown.contains("Nested item"));
+}
+
+// The outer <li>'s inline render used to descend into the nested
+// <ul> as well, so every nested item appeared twice: fused into
+// its parent's line ("Has nested Nested item") and again as its
+// own indented bullet.
+#[test]
+fn block_nested_list_items_are_not_duplicated() {
+    let html = r#"<html><body><article>
+<p>Intro paragraph long enough to keep the article.</p>
+<ul>
+<li>Top level</li>
+<li>Has nested
+  <ul>
+    <li>Nested item</li>
+    <li>Second nested</li>
+  </ul>
+</li>
+<li>Last</li>
+</ul>
+</article></body></html>"#;
+    let r = extract_html(html);
+    let md = &r.markdown;
+    assert_eq!(md.matches("Nested item").count(), 1, "{md}");
+    assert_eq!(md.matches("Second nested").count(), 1, "{md}");
+    assert!(
+        md.contains("- Has nested\n  - Nested item\n  - Second nested\n- Last"),
+        "{md}"
+    );
+}
+
+// Past the indentation cap the nested list is flattened into its
+// parent's line (as before), never dropped; and text on either
+// side of a nested list keeps its word boundary.
+#[test]
+fn block_nested_list_deep_levels_and_trailing_text_survive() {
+    let html = r#"<html><body><article>
+<p>Intro paragraph long enough to keep the article.</p>
+<ul><li>L0<ul><li>L1<ul><li>L2<ul><li>L3<ul><li>L4<ul><li>L5 deep text<ul><li>L6 deeper</li></ul></li></ul></li></ul></li></ul></li></ul></li></ul></li>
+<li>Before<ul><li>Inner</li></ul>After text</li>
+</ul>
+</article></body></html>"#;
+    let r = extract_html(html);
+    let md = &r.markdown;
+    assert!(md.contains("        - L4 L5 deep text L6 deeper\n"), "{md}");
+    assert_eq!(md.matches("deep text").count(), 1, "{md}");
+    assert!(md.contains("- Before After text\n  - Inner\n"), "{md}");
 }
 
 #[test]
@@ -1661,6 +1733,57 @@ fn table_without_th_promotes_first_row() {
 }
 
 // ════════════════════════════════════════════════════════════
+// 24b. TABLE ROW HEADERS (<th scope="row">) ARE KEPT
+// ════════════════════════════════════════════════════════════
+
+// The standard accessible markup for a data table labels each row
+// with a <th scope="row">. table_block collected <th> and <td> with
+// two separate selects and only ever used <th> cells for the single
+// header row, so every later row silently lost its label and its
+// remaining cells shifted one column left.
+#[test]
+fn table_row_header_cells_are_kept_in_data_rows() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th></th><th>2022</th><th>2023</th></tr>
+<tr><th scope="row">Revenue</th><td>10</td><td>20</td></tr>
+<tr><th scope="row">Costs</th><td>7</td><td>9</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(
+        r.markdown.contains("| Revenue | 10 | 20 |"),
+        "row label dropped:\n{}",
+        r.markdown
+    );
+    assert!(r.markdown.contains("| Costs | 7 | 9 |"));
+}
+
+// A first row that mixes <th> and <td> is a data row, not a header
+// row; its <td> cells must not be thrown away.
+#[test]
+fn table_mixed_first_row_keeps_td_cells() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Language</th><td>Rust</td></tr>
+<tr><th>License</th><td>MIT</td></tr>
+<tr><th>Since</th><td>2015</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(
+        r.markdown.contains("Rust") && r.markdown.contains("MIT") && r.markdown.contains("2015"),
+        "td cells dropped:\n{}",
+        r.markdown
+    );
+    assert!(
+        r.markdown.contains("| License | MIT |"),
+        "label/value pairing lost:\n{}",
+        r.markdown
+    );
+}
+
+// ════════════════════════════════════════════════════════════
 // 25. TABLE CELL TRUNCATION : CHAR-BASED (CJK)
 // ════════════════════════════════════════════════════════════
 
@@ -2095,6 +2218,61 @@ fn must_contain_probe_applies_to_plain_text_passthrough() {
     // a handful of lines, the raw passthrough would carry the full
     // document text.
     assert!(out.markdown.len() < 400, "len {}", out.markdown.len());
+}
+
+// Hits were BYTE offsets (regex m.start(), or offsets into a
+// separately lowercased haystack), but context_around treated them
+// as CHAR indices. On any page with non-ASCII text before the match
+// the excerpt window landed after the real hit -- "MATCH: 1 hit"
+// followed by an excerpt that doesn't contain the pattern.
+fn probe_excerpt(text: &str, pattern: &str) -> String {
+    let opts = ExtractOptions {
+        must_contain: Some(pattern.into()),
+        ..Default::default()
+    };
+    let out = probe_render(text, opts.probe_pattern(), opts.probe_is_regex());
+    assert!(out.starts_with("probe: MATCH"), "{out}");
+    out.lines()
+        .find(|l| l.starts_with("[1]"))
+        .unwrap_or_else(|| panic!("no excerpt line:\n{out}"))
+        .to_string()
+}
+
+#[test]
+fn probe_excerpt_points_at_the_hit_on_non_ascii_pages() {
+    let prefix = "Асинхронная среда выполнения для языка Rust. ".repeat(6);
+    let text = format!("{prefix}The tokio runtime schedules tasks. {prefix}");
+    let sub = probe_excerpt(&text, "tokio runtime");
+    assert!(sub.contains("tokio runtime"), "substring excerpt: {sub}");
+    let re = probe_excerpt(&text, "/tokio\\s+runtime/");
+    assert!(re.contains("tokio runtime"), "regex excerpt: {re}");
+}
+
+#[test]
+fn probe_excerpt_survives_case_folding_that_changes_byte_length() {
+    // 'İ' (2 bytes) lowercases to "i̇" (3 bytes): the old lowercased
+    // haystack drifted further from the real text with every one.
+    let prefix = "İSTANBUL İZMİR İÇEL ".repeat(40);
+    let text = format!("{prefix}Needle here. {prefix}");
+    let sub = probe_excerpt(&text, "needle");
+    assert!(sub.contains("Needle"), "excerpt: {sub}");
+}
+
+// A multi-KB substring pattern expands past the regex size limit
+// under (?i); it must still be searched as a literal, not reported
+// as an "invalid regex".
+#[test]
+fn probe_substring_longer_than_the_regex_size_limit_still_matches() {
+    let needle = "проверка ".repeat(800); // ~14 KB, Cyrillic
+    let text = format!("intro {needle} outro");
+    let out = probe_render(&text, needle.trim_end(), false);
+    assert!(
+        out.starts_with("probe: MATCH : 1 hit"),
+        "{}",
+        &out[..out.len().min(120)]
+    );
+    let miss = probe_render("nothing here", needle.trim_end(), false);
+    assert!(miss.starts_with("probe: NO MATCH"), "{miss}");
 }
 
 /// Issue #49: links and formatting nested inside em/strong were

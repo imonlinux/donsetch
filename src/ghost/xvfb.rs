@@ -334,13 +334,23 @@ mod linux {
         if read.is_err() && total.is_empty() {
             return None;
         }
-        let text = String::from_utf8_lossy(&total);
+        tail_line(&String::from_utf8_lossy(&total))
+    }
+
+    /// Last non-blank line of `text`, trimmed, cut to ~300 bytes.
+    /// The cut is pulled back onto a char boundary: Xvfb's stderr is
+    /// lossy-decoded bytes, and `&line[..297]` inside a multibyte
+    /// char (a localized X error, or the U+FFFD replacement the
+    /// lossy decode itself inserts) was a str-slice panic on the
+    /// one path that only runs when the display already failed.
+    pub(super) fn tail_line(text: &str) -> Option<String> {
         let line = text
             .lines()
             .rfind(|l| !l.trim().is_empty())
             .map(|l| l.trim().to_string())?;
         if line.len() > 300 {
-            Some(format!("{}…", &line[..297]))
+            let cut = line.floor_char_boundary(297);
+            Some(format!("{}…", &line[..cut]))
         } else {
             Some(line)
         }
@@ -368,7 +378,67 @@ mod linux {
         }
         // Socket exists: is anyone listening? Try connecting. If it
         // fails, the socket is stale.
-        std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            return false;
+        }
+        // A tombstone socket left behind by a zombie'd Xvfb (kill
+        // -9 mid-session) can still answer a bare connect, and a
+        // Chromium client handed that socket will never open CDP
+        // (devtools ws timeout on every tier-2 escalation). A
+        // bounded real-protocol probe settles it: only a server
+        // that answers xdpyinfo within 2 seconds is healthy.
+        if !xdpyinfo_probe().await {
+            return false;
+        }
+        true
+    }
+
+    /// Real X-protocol probe. False when xdpyinfo is missing (the
+    /// cheaper connect-only semantics still apply) or the display
+    /// does not answer within the budget.
+    async fn xdpyinfo_probe() -> bool {
+        static PROBE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        const PRESENT: u8 = 1;
+        const MISSING: u8 = 2;
+        let state = PROBE_STATE.load(std::sync::atomic::Ordering::Relaxed);
+        let present = if state == PRESENT {
+            true
+        } else if state == MISSING {
+            false
+        } else {
+            let ok = tokio::process::Command::new("which")
+                .arg("xdpyinfo")
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            PROBE_STATE.store(
+                if ok { PRESENT } else { MISSING },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            ok
+        };
+        if !present {
+            return true; // xdpyinfo absent: trust the connect check
+        }
+        let display = format!(":{}", display_num());
+        let child = tokio::process::Command::new("xdpyinfo")
+            .arg("-display")
+            .arg(&display)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(_) => return true, // spawn failed: do not veto on tooling
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(status)) => status.success(),
+            _ => {
+                let _ = child.kill().await;
+                false
+            }
+        }
     }
 }
 
@@ -418,6 +488,27 @@ mod tests {
     /// Serialize them within this binary (nextest runs one process).
     static SYNC_SERIAL: Mutex<()> = Mutex::new(());
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // A long final stderr line of multibyte chars must be cut on a
+    // char boundary, not sliced at byte 297 (a panic on the failure
+    // path, i.e. exactly when the diagnostic is needed).
+    #[test]
+    fn stderr_tail_cuts_long_multibyte_line_on_a_char_boundary() {
+        // 3-byte chars: byte 297 is a boundary (297 = 3*99), so
+        // shift by one ASCII byte to land inside a char.
+        let long = format!("x{}", "終".repeat(150));
+        let text = format!("first line\n\n{long}\n   \n");
+        let tail = x::tail_line(&text).expect("a non-blank line");
+        assert!(tail.ends_with('…'), "{tail}");
+        assert!(tail.len() <= 297 + '…'.len_utf8());
+        assert!(tail.starts_with("x終"));
+        // Short lines pass through trimmed and untouched.
+        assert_eq!(
+            x::tail_line("a\n  cannot open display :99  \n").as_deref(),
+            Some("cannot open display :99")
+        );
+        assert_eq!(x::tail_line("\n  \n"), None);
+    }
 
     #[test]
     fn gate_conflicts_and_recovers() {

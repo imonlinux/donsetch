@@ -95,6 +95,9 @@ pub struct CrawlPage {
     pub score: f64,
     /// Sitemap `<lastmod>` if available (ISO 8601 date string).
     pub lastmod: Option<String>,
+    /// Unix epoch seconds when this page was fetched (dataset
+    /// mode: per-row freshness that survives crawl resumes).
+    pub fetched_at: u64,
 }
 
 /// Why the crawl stopped. Agents MUST see this to decide
@@ -136,8 +139,9 @@ pub struct CrawlResult {
 
 /// v3: (done, queued) : fired per completed page, throttled by the caller.
 pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
-/// v3: true = skip the URL entirely (recorded fingerprint still fresh).
-pub type SkipFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// v4 phase 3 delta crawl: (url, new_fingerprint) -> true when the
+/// page is unchanged since the last crawl (fingerprint on file matches).
+pub type UnchangedFn = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
 pub type OnPageFn = std::sync::Arc<dyn Fn(&str, Option<&str>, &str, Option<&str>) + Send + Sync>;
 
@@ -170,12 +174,29 @@ pub struct CrawlOptions {
     /// v3: progress callback (done, queued) : fired per completed
     /// page, throttled by the caller.
     pub progress: Option<ProgressFn>,
-    /// v3: delta crawl : URLs for which this returns true are
-    /// skipped entirely (recorded fingerprint still fresh).
-    pub skip_unchanged: Option<SkipFn>,
+    /// v4 phase 3 delta crawl: called after extraction with the
+    /// page's fresh fingerprint; true = unchanged since the last
+    /// crawl. Unchanged pages are re-verified (history refreshed),
+    /// their outlinks still harvested, but they are excluded from
+    /// results and consume no page/char budgets. Replaces the old
+    /// presence-only pre-fetch skip, which could never see changes.
+    pub delta_unchanged: Option<UnchangedFn>,
     /// v3: record a fetched page's fingerprint (url, fingerprint,
     /// markdown, title) : the delta-crawl memory feed.
     pub on_page: Option<OnPageFn>,
+    /// v4 phase 3 dataset mode: render one JSON object per page
+    /// (JSON Lines) instead of a markdown document. Output-format
+    /// only; traversal, budgets, and pacing are unchanged.
+    pub dataset: bool,
+    /// v4 phase 3 crawl-shape: reader-like pop jitter in the frontier
+    /// (default true). False restores exact score-order traversal.
+    /// Zero latency cost; DONSETCH_NO_CRAWL_SHAPE flips it at runtime
+    /// without any rebuild (belt for operators, env wins over the
+    /// option).
+    pub shape: bool,
+    /// Overrides the automatic shape seed (tests pin ordering; prod
+    /// derives it from the seed URL + clock). None = auto.
+    pub shape_seed: Option<u64>,
     /// Map hard cap.
     pub map_cap: usize,
     /// Minimum content quality (0.0-1.0). Pages below this
@@ -198,9 +219,12 @@ impl Default for CrawlOptions {
             deadline: Duration::from_secs(120),
             concurrency: 1,
             respect_robots: true,
+            dataset: false,
+            shape: true,
+            shape_seed: None,
             cancel: None,
             progress: None,
-            skip_unchanged: None,
+            delta_unchanged: None,
             on_page: None,
             map_cap: 120,
             min_quality: 0.05,
@@ -269,6 +293,24 @@ impl ResumeFile {
         self.entries
             .retain(|_, (_, at)| now.saturating_sub(*at) < 120 * 60);
     }
+}
+
+/// Tier-2 (real browser) escalations allowed per crawl: each one is
+/// a 20-40s headless-browser cycle, so the cap is the crawl's cost
+/// ceiling, not a tuning knob.
+const GHOST_BUDGET: usize = 3;
+
+/// Claim one ghost escalation from the shared budget. Atomic
+/// check-and-decrement: workers used to `load() > 0` then
+/// `fetch_sub(1)` as two steps, so two workers seeing budget == 1
+/// both passed the check, the second `fetch_sub` wrapped the counter
+/// to `usize::MAX`, and every later check passed for the rest of the
+/// crawl -- the cost cap gone. Only reachable with `concurrency > 1`
+/// (the default is 1), but that is a public `CrawlOptions` field.
+fn claim_ghost_slot(budget: &AtomicUsize) -> bool {
+    budget
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 pub struct Crawler {
@@ -425,7 +467,20 @@ impl Crawler {
         }
 
         // ── Frontier seeding ───────────────────────────────
-        let mut queue = FrontierQueue::new();
+        let mut queue = FrontierQueue::with_shaper(
+            opts.shape && !crate::config::env_flag("DONSETCH_NO_CRAWL_SHAPE"),
+            opts.shape_seed.unwrap_or_else(|| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seed.as_str().hash(&mut h);
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    .hash(&mut h);
+                h.finish()
+            }),
+        );
         // Budgets are PER-CALL: a resume continues from the saved
         // position but the caller's page/char budgets apply to
         // the NEW work. (Run 2 must not instantly exhaust itself
@@ -534,7 +589,7 @@ impl Crawler {
         let focus = Arc::new(opts.focus.clone());
 
         let workers = opts.concurrency.max(1);
-        let ghost_budget = Arc::new(AtomicUsize::new(3));
+        let ghost_budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
         let mut handles = Vec::new();
         for wid in 0..workers {
             let queue = Arc::clone(&sh_queue);
@@ -560,7 +615,6 @@ impl Crawler {
             let max_pages = opts.max_pages;
             // Sitemap found ⇒ link discovery does not depend on the
             // seed fetch ⇒ even the seed is skippable in delta mode.
-            let sitemap_found = !sitemap_entries.is_empty();
             let max_total = opts.max_total_chars;
             let max_depth = opts.max_depth;
 
@@ -681,18 +735,6 @@ impl Crawler {
                     // The seed is always fetched (entry point for
                     // link discovery) but its content is scope-gated
                     // post-extraction. Non-seed URLs are filtered here.
-                    // v3 delta crawl: skip pages with a fresh recorded
-                    // fingerprint. Counted as skipped, not fetched.
-                    if let Some(should_skip) = &opts_worker.skip_unchanged
-                        && (item.url != seed_norm_w || sitemap_found)
-                        && should_skip(&item.url)
-                    {
-                        skipped
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((item.url.clone(), "unchanged (since_last)".into()));
-                        continue 'work;
-                    }
                     let is_seed = item.url == seed_norm_w;
                     if !is_seed
                         && !scope_allowed(
@@ -777,19 +819,13 @@ impl Crawler {
                     } else {
                         match (page.status, &page.verdict) {
                             (200, Verdict::ContentOk) => {
-                                // Skim dwell: proportional to page size,
-                                // capped at 300ms. v1 used up to 2s/page
-                                // ("a human reads a 50KB article") : but
-                                // an agent skims for extraction, not
-                                // reading, and the dwell's real job is
-                                // anti-metronome entropy, which jitter +
-                                // this small size-proportional term
-                                // already provide. 2s/page of pure sleep
-                                // was the single biggest crawl latency
-                                // cost (6.29s median in the 50-case
-                                // benchmark).
-                                let dwell = (page.body.len() / 64).min(100) as u64;
-                                governor.on_success(host, &lane.id, page.latency, dwell)
+                                // No dwell: pacing is the governor's
+                                // rung/jitter ladder alone (law 11, v4
+                                // phase 3). The old size-proportional
+                                // skim dwell was a vestigial
+                                // human-reading simulation that only
+                                // bought latency.
+                                governor.on_success(host, &lane.id, page.latency)
                             }
                             (429, _) | (503, _) => {
                                 governor.on_throttled(host, &lane.id);
@@ -826,10 +862,7 @@ impl Crawler {
                         && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25)
-                            && ghost_budget.load(Ordering::SeqCst) > 0
-                        {
-                            ghost_budget.fetch_sub(1, Ordering::SeqCst);
+                        if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
                             match ghost_hook(item.url.clone()).await {
                                 Ok(gp) => ghost_html = Some(gp.html),
                                 Err(why) => {
@@ -992,10 +1025,7 @@ impl Crawler {
                         && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25)
-                            && ghost_budget.load(Ordering::SeqCst) > 0
-                        {
-                            ghost_budget.fetch_sub(1, Ordering::SeqCst);
+                        if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
                             match ghost_hook(item.url.clone()).await {
                                 Ok(gp) => {
                                     if let Ok(r2) = extract::extract(
@@ -1086,6 +1116,17 @@ impl Crawler {
 
                     let chars = md.chars().count();
 
+                    // v4 phase 3 delta recrawl: compare the freshly
+                    // extracted fingerprint with page history. An
+                    // unchanged page is re-verified (history timestamp
+                    // refreshed) and its outlinks are still harvested
+                    // below, so changed descendants remain reachable;
+                    // it just never enters the result set or the
+                    // page/char budgets.
+                    let unchanged = opts_worker.delta_unchanged.as_ref().is_some_and(|f| {
+                        r.fingerprint.as_deref().is_some_and(|fp| f(&page.url, fp))
+                    });
+
                     if !in_scope {
                         // Navigation-only: don't add to results,
                         // don't count against page budget. Still
@@ -1094,6 +1135,14 @@ impl Crawler {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
+                    } else if unchanged {
+                        if let Some(rec) = &opts_worker.on_page {
+                            rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
+                        }
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((page.url.clone(), "unchanged since last crawl".into()));
                     } else {
                         let done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
                         if let Some(cb) = &opts_worker.progress {
@@ -1125,6 +1174,10 @@ impl Crawler {
                                 parent: item.parent.clone(),
                                 score: item.score,
                                 lastmod: None, // filled after worker loop from sitemap
+                                fetched_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
                             });
                         if duplicate {
                             skipped
@@ -1533,6 +1586,27 @@ impl Crawler {
     }
 }
 
+/// Case-insensitive ASCII byte search. Every pattern this file
+/// scans for is ASCII (<tag, rel="...", href...), and ASCII case
+/// folding never changes byte lengths, so a match start is always
+/// a char boundary of the ORIGINAL string (ASCII bytes cannot
+/// occur inside a multi-byte UTF-8 sequence). This replaces the
+/// old whole-document `to_lowercase()` scan: Unicode folding is
+/// NOT length-stable ('İ' == 2 bytes lowercases to "i̇" == 3), so
+/// offsets measured on the lowered copy drifted when applied to
+/// the original and sliced mid-character or past the end.
+fn find_ascii_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || from >= h.len() || n.len() > h.len().saturating_sub(from) {
+        return None;
+    }
+    h[from..]
+        .windows(n.len())
+        .position(|w| w.eq_ignore_ascii_case(n))
+        .map(|p| from + p)
+}
+
 /// Extract `<link rel="canonical" href="...">` from HTML.
 /// Byte-scan, no DOM parse. Handles both attribute orders
 /// (`rel` before `href` and `href` before `rel`).
@@ -1543,25 +1617,25 @@ fn extract_canonical(html: &str) -> Option<String> {
 /// Extract all href values from `<link>` tags with a given `rel`
 /// attribute value. Byte-scan, no DOM parse.
 fn extract_link_rel(html: &str, rel: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
-    let rel_pat = format!("rel=\"{rel}\"");
+    let rel_pat1 = format!("rel=\"{rel}\"");
     let rel_pat2 = format!("rel='{rel}'");
     let rel_pat3 = format!("rel={rel}");
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some(link_start) = lower[pos..].find("<link") {
-        let abs = pos + link_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<link", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !(tag.contains(&rel_pat) || tag.contains(&rel_pat2) || tag.contains(&rel_pat3)) {
+        if !(find_ascii_ci(tag, &rel_pat1, 0).is_some()
+            || find_ascii_ci(tag, &rel_pat2, 0).is_some()
+            || find_ascii_ci(tag, &rel_pat3, 0).is_some())
+        {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        if let Some(href) = extract_href(orig_tag) {
+        if let Some(href) = extract_href(tag) {
             out.push(href);
         }
     }
@@ -1570,21 +1644,18 @@ fn extract_link_rel(html: &str, rel: &str) -> Vec<String> {
 
 /// Extract `<base href="...">` from HTML. First one wins.
 fn extract_base_href(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
     let mut pos = 0usize;
-    while let Some(base_start) = lower[pos..].find("<base") {
-        let abs = pos + base_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<base", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !tag.contains("href") {
+        if find_ascii_ci(tag, "href", 0).is_none() {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        return extract_href(orig_tag);
+        return extract_href(tag);
     }
     None
 }
@@ -1593,28 +1664,27 @@ fn extract_base_href(html: &str) -> Option<String> {
 /// `<link rel="alternate" type="application/rss+xml" href="...">`
 /// or `type="application/atom+xml"`.
 fn extract_feed_links(html: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some(link_start) = lower[pos..].find("<link") {
-        let abs = pos + link_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<link", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !tag.contains("rel=\"alternate\"")
-            && !tag.contains("rel='alternate'")
-            && !tag.contains("rel=alternate")
+        if !(find_ascii_ci(tag, "rel=\"alternate\"", 0).is_some()
+            || find_ascii_ci(tag, "rel='alternate'", 0).is_some()
+            || find_ascii_ci(tag, "rel=alternate", 0).is_some())
         {
             continue;
         }
-        if !tag.contains("application/rss+xml") && !tag.contains("application/atom+xml") {
+        if find_ascii_ci(tag, "application/rss+xml", 0).is_none()
+            && find_ascii_ci(tag, "application/atom+xml", 0).is_none()
+        {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        if let Some(href) = extract_href(orig_tag) {
+        if let Some(href) = extract_href(tag) {
             out.push(href);
         }
     }
@@ -1627,48 +1697,47 @@ fn extract_feed_links(html: &str) -> Vec<String> {
 /// Skips `rel="self"` and `rel="enclosure"` (feed metadata).
 fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     let mut urls = Vec::new();
-    let lower = xml.to_lowercase();
     // RSS: <link>URL</link>
     let mut pos = 0usize;
     while urls.len() < cap {
-        let Some(open) = lower[pos..].find("<link>") else {
+        let Some(open) = find_ascii_ci(xml, "<link>", pos) else {
             break;
         };
-        let abs = pos + open;
-        let after = abs + 6;
-        let Some(close_rel) = lower[after..].find("</link>") else {
+        let after = open + 6;
+        // Case-insensitive like the open-tag scan above : a
+        // case-sensitive close made "<LINK>u</LINK>" span to the
+        // next item's lowercase </link>.
+        let Some(close) = find_ascii_ci(xml, "</link>", after) else {
             break;
         };
-        let text = xml[after..after + close_rel].trim();
+        let text = xml[after..close].trim();
         if text.starts_with("http") {
             urls.push(text.to_string());
         }
-        pos = after + close_rel + 7;
+        pos = close + 7;
     }
     // Atom: <link href="URL" .../>
     if urls.len() < cap {
         pos = 0;
         while urls.len() < cap {
-            let Some(link_start) = lower[pos..].find("<link ") else {
+            let Some(abs) = find_ascii_ci(xml, "<link ", pos) else {
                 break;
             };
-            let abs = pos + link_start;
-            let Some(tag_end) = lower[abs..].find('>') else {
+            let Some(tag_end) = xml[abs..].find('>') else {
                 break;
             };
             let tag_end_abs = abs + tag_end + 1;
-            let tag = &lower[abs..tag_end_abs];
+            let tag = &xml[abs..tag_end_abs];
             pos = tag_end_abs;
             // Skip non-content links.
-            if tag.contains("rel=\"self\"")
-                || tag.contains("rel='self'")
-                || tag.contains("rel=\"enclosure\"")
-                || tag.contains("rel='enclosure'")
+            if find_ascii_ci(tag, "rel=\"self\"", 0).is_some()
+                || find_ascii_ci(tag, "rel='self'", 0).is_some()
+                || find_ascii_ci(tag, "rel=\"enclosure\"", 0).is_some()
+                || find_ascii_ci(tag, "rel='enclosure'", 0).is_some()
             {
                 continue;
             }
-            let orig_tag = &html_orig(xml, abs, tag_end_abs);
-            if let Some(href) = extract_href(orig_tag)
+            if let Some(href) = extract_href(tag)
                 && href.starts_with("http")
             {
                 urls.push(href);
@@ -1678,15 +1747,9 @@ fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     urls
 }
 
-/// Safe slice of the original XML (not lowered) for href extraction.
-fn html_orig(xml: &str, from: usize, to: usize) -> &str {
-    &xml[from..to.min(xml.len())]
-}
-
 /// Extract the `href` attribute value from an HTML tag string.
 fn extract_href(tag: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let href_pos = lower.find("href")?;
+    let href_pos = find_ascii_ci(tag, "href", 0)?;
     let after = &tag[href_pos + 4..];
     // Skip whitespace and =.
     let after = after.trim_start();

@@ -89,6 +89,24 @@ impl KeyError {
             Self::ServerError(_) | Self::NetworkError | Self::UnknownError(_) => None,
         }
     }
+
+    /// The one place a transport failure becomes a KeyError.
+    ///
+    /// `reqwest::Error`'s Display includes the full request URL,
+    /// query string and all. SerpApi's API takes the key as
+    /// `?api_key=`, so rendering that error verbatim put the whole
+    /// key into `last_error`, and from there into the MCP search
+    /// error the model sees, the CLI's stderr and the DONSEEK_DEBUG
+    /// log on any non-timeout transport failure (DNS, refused, TLS).
+    /// The URL adds nothing here anyway: the provider name is
+    /// prepended by the caller and the endpoint is a constant.
+    pub(crate) fn from_transport(e: reqwest::Error) -> Self {
+        if e.is_timeout() {
+            Self::NetworkError
+        } else {
+            Self::UnknownError(format!("network: {}", e.without_url()))
+        }
+    }
 }
 
 impl std::fmt::Display for KeyError {
@@ -230,6 +248,7 @@ impl ByokSearcher {
                     let results = to_merged(outcome.hits, &provider, max);
                     let report = vec![EngineReport {
                         engine: provider.clone(),
+                        profile: None,
                         status: if outcome.degraded {
                             "degraded".into()
                         } else {
@@ -379,6 +398,37 @@ mod tests {
         assert_eq!(KeyError::UnknownError("x".into()).to_key_state(), None);
     }
 
+    // A real transport error from a refused loopback connect, with the
+    // key where SerpApi's API puts it (the query string). The raw
+    // reqwest error renders the full URL, so this is exactly the path
+    // that used to put the key into the model-visible search error.
+    #[tokio::test]
+    async fn transport_errors_never_carry_the_request_url() {
+        const KEY: &str = "SUPERSECRETKEY123";
+        // no_proxy: a reachable HTTP_PROXY in the environment would
+        // turn the refused connect into a 502 *response*.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let err = client
+            .get("http://127.0.0.1:1/search")
+            .query(&[("q", "hello"), ("api_key", KEY)])
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(!err.is_timeout(), "connection refused, not a timeout");
+        // Sanity: the unredacted error really does carry the key,
+        // otherwise this test proves nothing.
+        assert!(err.to_string().contains(KEY));
+        let mapped = KeyError::from_transport(err);
+        assert!(
+            !mapped.to_string().contains(KEY),
+            "key leaked into KeyError: {mapped}"
+        );
+        assert!(matches!(mapped, KeyError::UnknownError(_)));
+    }
+
     #[test]
     fn to_merged_preserves_order_and_scores() {
         let hits = vec![
@@ -471,5 +521,41 @@ mod tests {
             .collect();
         let merged = to_merged(hits, "exa", 3);
         assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn to_merged_caps_after_dedup() {
+        // #164: duplicate-heavy provider output must still deliver the
+        // requested number of unique results: dedup runs BEFORE the
+        // cap, so duplicates cannot eat the max budget. (The old
+        // parse-time truncate let plugins return fewer unique hits
+        // than requested.)
+        let hits = vec![
+            SearchHit {
+                title: "a".into(),
+                url: "https://a.com".into(),
+                snippet: "s".into(),
+                score: 1.0,
+            },
+            SearchHit {
+                title: "dup of a".into(),
+                url: "https://a.com/".into(), // trailing slash = same norm_key
+                snippet: "s".into(),
+                score: 0.9,
+            },
+            SearchHit {
+                title: "b".into(),
+                url: "https://b.com".into(),
+                snippet: "s".into(),
+                score: 0.8,
+            },
+        ];
+        let merged = to_merged(hits, "exa", 2);
+        assert_eq!(merged.len(), 2, "dedup must not shrink the max budget");
+        assert_eq!(merged[0].title, "a");
+        assert_eq!(
+            merged[1].title, "b",
+            "second slot goes to the next unique hit"
+        );
     }
 }
