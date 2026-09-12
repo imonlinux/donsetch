@@ -11,6 +11,11 @@ V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
 ### Added
+- `just win-check`: type-checks the crate for `x86_64-pc-windows-gnu`
+  from Linux (clippy, no linkage), both `--no-default-features` and
+  the full feature set, so `#[cfg(windows)]` breakage from a
+  Linux-only change surfaces before the push instead of in Windows
+  CI. Needs mingw-w64; see CONTRIBUTING.md.
 - `web_screenshot` MCP tool: a rendered PNG of a page through the
   existing tier-2 browser (url, full_page, wait_ms). The capture is
   in-process only; the MCP result carries an image content block and
@@ -139,6 +144,23 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Crawl resume tokens survive concurrent crawlers. The store was
+  one shared JSON map saved with load-modify-save, so two
+  processes issuing tokens at the same time (the daemon plus a
+  CLI run, parallel test processes) wrote stale copies over each
+  other and fresh tokens read back as expired or unknown. Tokens
+  are now one immutable file each under the cache dir; the legacy
+  single-file store migrates on first touch, retires only after
+  every entry lands, and the consume-on-resume semantics are
+  unchanged. Caught by the Windows CI run while it beat on the
+  shared store in parallel.
+- `donsetch doctor --deep` no longer reports a valid Bright Data
+  dynamic-IP unlocker (Web Access API zones and friends) as broken:
+  the free zone probe costs nothing, and where the zone has no
+  static route pool Bright Data answers 403 "Static routes not
+  found". That answer no longer reads as a failed check: the
+  probe skips with an honest, zero-credit note instead (reported
+  by tripflex on #200). A 401 always stays a failure.
 - `site:` queries no longer leak off-domain results through BYOK
   providers (issue #190): both BYOK exits (provider-first and the
   local-first fallback) sweep results through the same post-merge
