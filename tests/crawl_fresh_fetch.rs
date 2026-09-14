@@ -54,7 +54,7 @@ async fn recrawl_never_serves_the_fresh_window() {
     let hits = std::sync::Arc::new(AtomicUsize::new(0));
     serve(origin, hits.clone());
 
-    let profile = BrowserProfile::chrome_150(Platform::Linux);
+    let profile = BrowserProfile::chrome_153(Platform::Linux);
     let fetcher = Fetcher::new(profile).expect("fetcher");
     let url = format!("http://127.0.0.1:{port}/a");
 

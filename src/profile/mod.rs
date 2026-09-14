@@ -76,9 +76,12 @@ pub struct BrowserProfile {
 }
 
 impl BrowserProfile {
-    /// Chrome 150 on the given platform. Ground truth: Chromium 150 capture, 2026-07-30.
-    pub fn chrome_150(platform: Platform) -> Self {
-        Self::chrome(150, platform, true)
+    /// Chrome 153 on the given platform. TLS/H2 ground truth is still
+    /// the Chromium 150 capture (stable across adjacent versions);
+    /// the pin was moved 150 -> 153 on 2026-09-14 after the weekly
+    /// chrome-bump alarm fired at GAP 3.
+    pub fn chrome_153(platform: Platform) -> Self {
+        Self::chrome(153, platform, true)
     }
 
     /// Chrome `major` on the given platform. The TLS/H2 tables are
@@ -101,7 +104,7 @@ impl BrowserProfile {
             format!("\"Chromium\";v=\"{major}\", \"Not=A?Brand\";v=\"99\"")
         };
         Self {
-            name: "chrome-150",
+            name: "chrome-153",
             tls: TlsProfile {
                 // 4865-4866-4867 then 49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53
                 ciphers_12: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
@@ -152,7 +155,7 @@ impl BrowserProfile {
         };
         match major {
             Some(major) => Self::chrome(major, Platform::host(), branded),
-            None => Self::chrome_150(Platform::host()),
+            None => Self::chrome_153(Platform::host()),
         }
     }
 

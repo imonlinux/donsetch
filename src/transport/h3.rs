@@ -542,7 +542,7 @@ pub async fn h3_fetch_direct(
     if crate::config::cfg().debug.ghost {
         eprintln!("[h3] attempt {host}:{port}{path}");
     }
-    let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::host());
+    let profile = crate::profile::BrowserProfile::chrome_153(crate::profile::Platform::host());
     let timeout = timeout.unwrap_or(Duration::from_secs(15));
     let accept = user_headers
         .iter()

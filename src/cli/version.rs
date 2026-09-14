@@ -27,7 +27,7 @@ pub async fn run() {
         "target",
         option_env!("DONSHEET_TARGET").unwrap_or("unknown"),
     );
-    cli::print_kv("profile", "chrome-150");
+    cli::print_kv("profile", "chrome-153");
     cli::print_kv(
         "features",
         option_env!("DONSHEET_FEATURES").unwrap_or("(none)"),

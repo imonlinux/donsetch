@@ -169,7 +169,7 @@ async fn fetch_via_intercepting_proxy_succeeds_with_trusted_ca() {
         std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -202,7 +202,7 @@ async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
         std::env::set_var("SSL_CERT_FILE", &ca_path);
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -230,7 +230,7 @@ async fn plaintext_http_through_env_proxy_uses_absolute_form() {
     let mitm = spawn_mitm().await;
     set_env_https_proxy(&mitm);
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -264,7 +264,7 @@ async fn plaintext_http_through_credentialed_proxy_sends_proxy_authorization() {
         std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -377,7 +377,7 @@ async fn plaintext_http_through_socks5_uses_origin_form() {
         std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");

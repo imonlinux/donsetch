@@ -334,7 +334,7 @@ mod parity_tests {
     /// capture, never by hand.
     #[test]
     fn settings_match_chromium() {
-        let h2 = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::Linux).h2;
+        let h2 = crate::profile::BrowserProfile::chrome_153(crate::profile::Platform::Linux).h2;
         // SETTINGS id/value pairs, in Chromium's exact order.
         assert_eq!(h2.header_table_size, 65536); // 0x1
         assert_eq!(h2.enable_push, 0); // 0x2
