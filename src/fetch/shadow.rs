@@ -35,10 +35,17 @@ use super::client::Fetcher;
 
 /// Max subresources per page (a real page-load burst is 5-15).
 const MAX_ASSETS: usize = 15;
-/// Total byte budget for one page's burst.
+/// Total byte budget for one page's burst (counted as bodies land).
+/// Per-asset in-flight size is bounded by the shared transport cap
+/// (the same 64 MiB ceiling any concurrent fetch runs under; the
+/// burst concurrency of 6 is the same exposure web_fetch's 12-URL
+/// batch already accepts). The deadline below is the real time bound.
 const MAX_TOTAL_BYTES: usize = 2 << 20;
 /// Hard wall clock for the whole burst.
 const BURST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// One asset that dribbles must not eat the whole burst window: the
+/// per-asset attempt gets a slice of the deadline.
+const ASSET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Concurrent asset fetches (browser-ish; h2 multiplexes anyway).
 const BURST_CONCURRENCY: usize = 6;
 /// Tolerated failures before the burst abandons (a broken page
@@ -46,12 +53,12 @@ const BURST_CONCURRENCY: usize = 6;
 const MAX_FAILURES: usize = 3;
 
 fn deadline() -> std::time::Duration {
-    std::env::var("DONSETCH_SHADOW_DEADLINE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(BURST_DEADLINE)
+    let ms = crate::config::cfg().fetch.shadow_deadline_ms;
+    if ms == 0 {
+        BURST_DEADLINE
+    } else {
+        std::time::Duration::from_millis(ms)
+    }
 }
 
 /// Should this host get page-load realism? Route memory policy:
@@ -59,11 +66,10 @@ fn deadline() -> std::time::Duration {
 /// or mixed tier-1 history) marks the host defended enough to be
 /// worth the bytes. Open hosts stay fast and document-only.
 pub fn policy_shadows(state: &GhostState, host: &str) -> bool {
-    if crate::config::env_flag("DONSETCH_NO_SHADOW_FETCH") {
-        return false;
-    }
-    if crate::config::env_flag("DONSETCH_SHADOW_FETCH") {
-        return true;
+    match crate::config::cfg().fetch.shadow_fetch {
+        crate::config::ShadowFetch::Never => return false,
+        crate::config::ShadowFetch::Always => return true,
+        crate::config::ShadowFetch::Auto => {}
     }
     let Some(p) = state.profiles.get(host) else {
         return false;
@@ -123,7 +129,14 @@ pub async fn maybe_shadow(
             st.note_shadow(fetched);
         }
     });
-    pending().lock().await.push(handle);
+    // Reap finished handles before pushing: daemons never drain, so
+    // an ever-growing Vec of dead JoinHandles was a slow leak (one
+    // per shadowed page for process lifetime).
+    {
+        let mut pend = pending().lock().await;
+        pend.retain(|h| !h.is_finished());
+        pend.push(handle);
+    }
 }
 
 /// In-flight bursts, tracked so short-lived processes (one-shot
@@ -174,15 +187,24 @@ async fn shadow_burst(
                     {
                         return;
                     }
-                    let out = fetcher
-                        .fetch_once_via_class(&asset_url, &[], None, true, Some(page_url), class)
-                        .await;
+                    let out = tokio::time::timeout(
+                        ASSET_DEADLINE,
+                        fetcher.fetch_once_via_class(
+                            &asset_url,
+                            &[],
+                            None,
+                            true,
+                            Some(page_url),
+                            class,
+                        ),
+                    )
+                    .await;
                     match out {
-                        Ok(o) => {
+                        Ok(Ok(o)) => {
                             total_bytes.fetch_add(o.body.len(), Ordering::Relaxed);
                             fetched.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(_) => {
+                        Ok(Err(_)) | Err(_) => {
                             failures.fetch_add(1, Ordering::Relaxed);
                         }
                     }

@@ -23,6 +23,7 @@ Thumbs.db
 bench/results.json
 bench/results/
 bench/battle-corpus/
+bench/improve/out/
 
 # Vendored PDFium static libraries (build.rs auto-downloads)
 vendor/

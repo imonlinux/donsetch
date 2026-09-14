@@ -417,4 +417,20 @@ mod tests {
         );
         assert!(h.entries.len() <= MAX_URLS);
     }
+
+    #[test]
+    fn matches_fingerprint_is_exact_per_url() {
+        // The delta-crawl contract: a changed page must NOT match its
+        // stored fingerprint, an unchanged one must, and an unseen URL
+        // must never match anything. This is the RUN2/RUN3 battery
+        // law: mutate leg reports the change, repeat leg reports none.
+        let mut h = PageHistory::default();
+        h.record("http://r/alpha/p1", "8826b1cd1035", 72, Some("p1"), "amber");
+        h.record("http://r/alpha/p2", "731605c1f239", 50, Some("p2"), "two");
+        assert!(h.matches_fingerprint("http://r/alpha/p1", "8826b1cd1035"));
+        assert!(!h.matches_fingerprint("http://r/alpha/p1", "2e73125a552c"));
+        assert!(h.matches_fingerprint("http://r/alpha/p2", "731605c1f239"));
+        assert!(!h.matches_fingerprint("http://r/alpha/p3", "2e73125a552c"));
+        assert!(!h.matches_fingerprint("http://r/alpha/p1", ""));
+    }
 }

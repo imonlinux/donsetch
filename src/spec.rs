@@ -358,46 +358,6 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
 
 // ── web_crawl ────────────────────────────────────────────────
 
-/// `web_answer` params.
-const ANSWER_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "query",
-        flag: "",
-        kind: ParamKind::Str,
-        cli: CliKind::PositionalJoined,
-        required: true,
-        help: "Factual question to collect cited evidence for.",
-        mcp_help: None,
-    },
-    ParamSpec {
-        name: "budget_tokens",
-        flag: "budget-tokens",
-        kind: ParamKind::Usize,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Token budget for the whole evidence pack (200-8000, default 2000).",
-        mcp_help: Some("Token budget for the whole evidence pack (200-8000, default 2000)."),
-    },
-    ParamSpec {
-        name: "max_pages",
-        flag: "max-pages",
-        kind: ParamKind::Usize,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Max pages to read evidence from (1-5, default 3).",
-        mcp_help: Some("Max pages to read evidence from (1-5, default 3)."),
-    },
-    ParamSpec {
-        name: "deadline_ms",
-        flag: "deadline-ms",
-        kind: ParamKind::Usize,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang.",
-        mcp_help: None,
-    },
-];
-
 const CRAWL_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "url",
@@ -546,31 +506,6 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
     },
 ];
 
-/// Local web memory (v4 phase 5.2): semantic search over pages this
-/// machine already fetched, stored on-device only.
-const MEMORY_PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "query",
-        flag: "query",
-        kind: ParamKind::Str,
-        cli: CliKind::PositionalJoined,
-        required: true,
-        help: "Semantic query over pages this machine already fetched.",
-        mcp_help: Some(
-            "Natural-language query over the local page memory. Describe what you are looking for; hits come from pages this machine fetched before.",
-        ),
-    },
-    ParamSpec {
-        name: "limit",
-        flag: "limit",
-        kind: ParamKind::Usize,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Max hits, default 6.",
-        mcp_help: Some("Maximum hits to return, 1..=50. Default 6."),
-    },
-];
-
 // ── The table ────────────────────────────────────────────────
 
 const SCREENSHOT_PARAMS: &[ParamSpec] = &[
@@ -622,7 +557,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_search",
         cli_cmd: "search",
-        summary: "Web search : 5 keyless engines merged + reranked, or your API keys",
+        summary: "Web search : 10+ keyless engines merged + reranked, or your API keys",
         description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. Weak or degraded retrieval remains explicitly labeled. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically.\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content[0].text is the ranked evidence list. structuredContent contains weak plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Engine health, score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant.",
         mcp_description: "Discover ranked candidate sources. Use this before fetch when you do not already have a URL; it returns titles and snippets, not page contents. A snippet supports only claims it states explicitly. Treat weak or degraded results as incomplete, and fetch a candidate when its full text is required. Search handles resolve directly in fetch; cite source URLs from the result metadata accompanying the ranked list.",
         params: SEARCH_PARAMS,
@@ -631,19 +566,6 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch search \"exact phrase\" --intent code",
             "donsetch search site:github.com tokio --max-results 10",
             "donsetch search \"rust async trait patterns\" --query-variant \"async fn in trait rust\"",
-        ],
-    },
-    ToolSpec {
-        name: "web_answer",
-        cli_cmd: "answer",
-        summary: "Evidence pack for a factual question : search + read top pages, passages with sources",
-        description: "One-call research for a factual question : DonSeTch searches the web, reads the top pages, and returns a compact pack of relevant passages, each tied to its source URL with a freshness stamp.\n\nNo prose answer is invented: you get verbatim cited evidence to reason over. Dead or walled pages are skipped and reported, never silently dropped. Duplicate mirrors are collapsed.\n\nbudget_tokens caps the whole pack; max_pages caps how many sources are read; deadline_ms caps the wall clock (honest deadline error, never a hang).\n\nResponse: content[0].text is the markdown evidence pack. structuredContent contains query, empty, truncated, tokens_est, per-source citations and skipped pages with reasons. Search and per-page timing diagnostics live in _meta.",
-        mcp_description: "Factual question -> cited evidence in one call: searches the web, reads top pages, returns verbatim passages tied to source URLs with freshness stamps. No prose answer invented; you synthesize. Dead/walled pages are skipped and reported.",
-        params: ANSWER_PARAMS,
-        examples: &[
-            "donsetch answer \"when did Rust 1.0 release\"",
-            "donsetch answer \"capital of Bhutan\" --budget-tokens 1000",
-            "donsetch answer \"tokio select macro\" --max-pages 4",
         ],
     },
     ToolSpec {
@@ -658,18 +580,6 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch crawl https://docs.site.com --mode map",
             "donsetch crawl https://docs.site.com --max-pages 25 --deadline 300",
             "donsetch crawl https://docs.site.com --dataset > site.jsonl",
-        ],
-    },
-    ToolSpec {
-        name: "web_memory",
-        cli_cmd: "memory",
-        summary: "Search pages this machine already fetched (local, on-device)",
-        description: "One-call semantic search over your local page history. DonSeTch keeps a bounded on-device index of pages it fetched (URL, title, markdown digest) with all-MiniLM-L6-v2 embeddings computed locally by the vendored onnxruntime. Nothing leaves the box: the model runs here, the index lives under the cache dir, no cloud call.\n\nHits are ranked by cosine similarity (score 0..1). Kill switch: DONSETCH_NO_WEB_MEMORY (when set, web_memory returns nothing and ingest is disabled). The index is capped at 4000 rows (DONSETCH_WEB_MEMORY_CAP) with oldest-first eviction.",
-        mcp_description: "Search pages this machine fetched before with a natural-language query. Results come from a bounded local index that DonSeTch maintains itself; the model runs on-device. Ranked hits (url, title, snippet, score). To read beyond the snippet fetch the URL with web_fetch.",
-        params: MEMORY_PARAMS,
-        examples: &[
-            "donsetch memory \"quic congestion control\"",
-            "donsetch memory \"the alt-svc cache\" --limit 10",
         ],
     },
     ToolSpec {
@@ -799,17 +709,17 @@ tiers; the output tells you what happened at every step. \
 Use --focus to narrow the content, --must-contain for a cheap \
 probe, and a result handle from a search result (donsetch fetch \
 @10hd73d) to fetch a result directly. \
---browser-actions sends clicks/typing to a headless browser for \
+--actions sends clicks/typing to a headless browser for \
 sites that need interaction. \
 --archive serves a Wayback snapshot when the live page is dead."
         }
         "search" => {
-            "Search the web across 5 keyless engines, merged with \
+            "Search the web across 10+ keyless engines, merged with \
 consensus ranking (no API keys needed). \
 Every result carries a short handle: donsetch fetch @<handle> \
 fetches it directly. \
 Use --max-results to cap the list and --intent to pick a vertical \
-(web|news|code|docs|pdf|paper|hashun); the default auto-detects. \
+(web|news|code|paper|entity); the default auto-detects. \
 --json gives the full result envelope (titles, snippets, scores, \
 engine health)."
         }

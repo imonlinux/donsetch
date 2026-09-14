@@ -26,11 +26,11 @@ const PROBE_PORT: u16 = 80;
 const SLOW_THRESHOLD: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-struct ProbeResult {
-    alive: bool,
-    exit_ip: Option<String>,
-    latency: Duration,
-    error: Option<String>,
+pub(crate) struct ProbeResult {
+    pub(crate) alive: bool,
+    pub(crate) exit_ip: Option<String>,
+    pub(crate) latency: Duration,
+    pub(crate) error: Option<String>,
 }
 
 // ── Dispatch ──────────────────────────────────────────────────
@@ -672,7 +672,7 @@ async fn probe_proxy(px: &Proxy) -> ProbeResult {
 }
 
 /// Probe all proxies in parallel.
-async fn probe_all(proxies: &[Proxy]) -> Vec<ProbeResult> {
+pub(crate) async fn probe_all(proxies: &[Proxy]) -> Vec<ProbeResult> {
     let futures: Vec<_> = proxies.iter().map(probe_proxy).collect();
     futures_util::future::join_all(futures).await
 }

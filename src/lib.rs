@@ -17,7 +17,7 @@
 pub mod adapters;
 pub mod auth;
 pub mod cli;
-mod config;
+pub mod config;
 pub mod cpu;
 pub mod crawl;
 pub mod detect;
@@ -31,7 +31,6 @@ pub mod fetch;
 pub mod ghost;
 pub mod handles;
 pub mod mcp;
-pub mod memory;
 pub mod onnx;
 pub mod pages;
 pub mod paths;

@@ -72,7 +72,13 @@ pub async fn search(
         if lower.contains("invalid") && lower.contains("key") {
             return Err(KeyError::InvalidKey);
         }
-        return Err(KeyError::UnknownError(format!("HTTP {status}: {text}")));
+        // The error body rides to the agent surface: an uncapped
+        // HTML error page from a burned proxy lands in the model's
+        // context. Same 600-char class as the plugin adapters.
+        return Err(KeyError::UnknownError(format!(
+            "HTTP {status}: {}",
+            super::err_body(&text)
+        )));
     }
 
     let json: Value = serde_json::from_str(&text)

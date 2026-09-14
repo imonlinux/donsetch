@@ -397,6 +397,62 @@ async fn crawl_resume_continues() {
     }
 }
 
+// Resume WITHOUT a url (the resume-only flow the MCP surface
+// documents: the seed comes from the token). The old shape took the
+// token file once to recover the seed and AGAIN for the frontier
+// restore, so every resume-only call failed with "resume token
+// expired or unknown" AND destroyed the saved state in the process.
+#[tokio::test]
+async fn crawl_resume_only_loads_seed_from_token() {
+    let iso = std::env::temp_dir().join(format!("ds-resume-only-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&iso);
+    unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &iso) };
+
+    let seed = format!(
+        "<html><body><article><p>content words for the extractor to accept this page yes</p>{}</article></body></html>",
+        (0..10)
+            .map(|i| format!("<a href=\"/p{i}\">p{i}</a>"))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    let mut site = MockSite::new().page("https://ex.com/", 200, &seed);
+    for i in 0..10 {
+        site = site.page(
+            &format!("https://ex.com/p{i}"),
+            200,
+            &html(&format!("P{i}"), "body"),
+        );
+    }
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 3;
+    let r1 = crawler
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    let tok = r1.resume.expect("resume token");
+
+    // Resume-only: empty url + the token must WORK and continue
+    // where run 1 stopped (no refetch of run 1's pages).
+    let r2 = crawler.crawl("", o.clone(), Some(&tok)).await.unwrap();
+    assert!(
+        r2.seed.contains("ex.com"),
+        "the seed must come from the token, got {}",
+        r2.seed
+    );
+    let seen1: std::collections::HashSet<&str> = r1.pages.iter().map(|p| p.url.as_str()).collect();
+    for p in &r2.pages {
+        assert!(!seen1.contains(p.url.as_str()), "refetched {}", p.url);
+    }
+
+    // The token is consumed: a third resume with the SAME token
+    // fails honestly (and the failure must not be a state restore).
+    let r3 = crawler.crawl("", o, Some(&tok)).await;
+    assert!(r3.is_err(), "a consumed token must fail honestly");
+}
+
 #[tokio::test]
 async fn crawl_same_host_enforced() {
     let seed = "<html><body><article><p>content words for the extractor threshold acceptance test</p><a href=\"https://other.com/x\">off</a><a href=\"/on\">on</a></article></body></html>";
@@ -1272,6 +1328,51 @@ fn legacy_store_migrates_and_the_token_survives() {
     assert!(
         !iso.join("crawl-resumes").join("cabc123.json").exists(),
         "token consumed on take"
+    );
+    let _ = std::fs::remove_dir_all(&iso);
+}
+
+// The resume token is agent-supplied and joined into a filesystem
+// path (<cache>/crawl-resumes/<tok>.json). A traversal token
+// (`../../…`) must be refused before it can read-then-delete a
+// `.json` file outside the store. resume_store_take rejects any
+// non-alphanumeric token, and the planted victim file survives.
+#[test]
+fn resume_token_traversal_is_refused() {
+    // Format validity itself (no FS, deterministic).
+    assert!(super::is_valid_resume_token("c16a9a0f"));
+    for bad in [
+        "",
+        "../secret",
+        "..\\secret",
+        "a/b",
+        "a.b",
+        "tok\0",
+        "c16 a9",
+    ] {
+        assert!(!super::is_valid_resume_token(bad), "must reject {bad:?}");
+    }
+
+    // End to end: a planted valid-ResumeState `.json` OUTSIDE the
+    // store must not be consumed by a traversal token.
+    let iso = std::env::temp_dir().join(format!("ds-resume-trav-{}", std::process::id()));
+    let store = iso.join("crawl-resumes");
+    let _ = std::fs::create_dir_all(&store);
+    unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &iso) };
+    let victim = iso.join("victim.json");
+    std::fs::write(
+        &victim,
+        serde_json::json!({"seed":"https://evil.example/","queue":[],"seen":[]}).to_string(),
+    )
+    .unwrap();
+    // <store>/../victim.json resolves to the planted file.
+    match super::resume_store_take("../victim") {
+        Err(e) => assert!(e.contains("expired or unknown"), "{e}"),
+        Ok(_) => panic!("a traversal token must be refused, not consumed"),
+    }
+    assert!(
+        victim.exists(),
+        "a traversal token must not delete an outside file"
     );
     let _ = std::fs::remove_dir_all(&iso);
 }

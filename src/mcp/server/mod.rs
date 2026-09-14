@@ -11,13 +11,10 @@ use tokio::sync::{Mutex, mpsc};
 
 use futures_util::FutureExt;
 
-mod answer_tool;
 mod crawl_tool;
 mod errors;
 mod fetch_tool;
 mod search_tool;
-#[cfg(feature = "rerank")]
-mod web_memory_tool;
 mod web_screenshot_tool;
 
 use crate::crawl::real as crawl_real;
@@ -68,8 +65,11 @@ pub struct Daemon {
 impl Daemon {
     pub async fn new() -> Result<Self, crate::error::FetchError> {
         let profile = BrowserProfile::host_default();
-        let fetcher = Arc::new(Fetcher::new(profile.clone())?);
-        let proxies = crate::transport::proxy::load_all();
+        // One egress fabric for search, crawl, and fetch (v4 A2).
+        let egress = std::sync::Arc::new(EgressPool::from_env());
+        crate::search::egress::install_global(std::sync::Arc::clone(&egress));
+        let fetcher =
+            Arc::new(Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)));
         let ghost_mgr = GhostManager::new().await;
         let state = Arc::new(Mutex::new(GhostState::load()));
 
@@ -81,7 +81,7 @@ impl Daemon {
             let sessions = crate::ghost::cache::load_session_cookies();
             fetcher.import_cookies(&sessions).await;
             // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
-            if !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") {
+            if crate::config::cfg().state.cookie_vault {
                 let jar = state.lock().await.tier1_cookies.clone();
                 fetcher.import_cookies(&jar).await;
             }
@@ -109,12 +109,16 @@ impl Daemon {
             true,
         );
 
-        let (crawler, _gov) = crawl_real::build(Arc::clone(&fetcher), proxies);
+        let (crawler, _gov) =
+            crawl_real::build(Arc::clone(&fetcher), std::sync::Arc::clone(&egress));
         let crawler = crawler.with_ghost(ghost_hook);
 
         let searcher = Arc::new(
-            Searcher::new(Fetcher::new(profile.clone())?, EgressPool::from_env())
-                .with_ghost(search_ghost),
+            Searcher::new_shared(
+                Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)),
+                egress,
+            )
+            .with_ghost(search_ghost),
         );
         searcher.preflight();
 
@@ -140,7 +144,7 @@ impl Daemon {
     /// Called once the daemon is inside its runtime; one-shot CLI
     /// paths never call it, so short-lived processes stay clean.
     pub fn start_prober(self: &Arc<Self>) {
-        if crate::config::env_flag("DONSETCH_NO_ROUTE_PROBES") {
+        if !crate::config::cfg().browser.route_probes {
             return;
         }
         let handle = crate::ghost::probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
@@ -186,7 +190,7 @@ impl Daemon {
             // Reset is wholesale: keep the tier-1 jar (device /
             // analytics cookies the browser-real daemon already
             // holds) so a login resync does not erase the session.
-            if !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") {
+            if crate::config::cfg().state.cookie_vault {
                 cookies.extend(self.state.lock().await.tier1_cookies.clone());
             }
             self.fetcher.reset_to(&cookies).await;
@@ -480,16 +484,8 @@ pub(crate) async fn call_tool_ctx(
     match name {
         "web_fetch" => Ok(fetch_tool::fetch_tool(daemon, &args, ctx).await),
         "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
-        "web_answer" => Ok(answer_tool::answer_tool(daemon, &args, ctx).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
         "web_screenshot" => Ok(web_screenshot_tool::web_screenshot_tool(daemon, &args, ctx).await),
-        #[cfg(feature = "rerank")]
-        "web_memory" => Ok(web_memory_tool::web_memory_tool(daemon, &args, ctx).await),
-        #[cfg(not(feature = "rerank"))]
-        "web_memory" => Err((
-            -32603,
-            "web_memory requires the rerank feature (a release build); this binary was built without it".to_string(),
-        )),
         _ => Err((-32602, format!("unknown tool: {name}"))),
     }
 }

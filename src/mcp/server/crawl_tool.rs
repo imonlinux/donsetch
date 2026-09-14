@@ -93,17 +93,8 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                 .matches_fingerprint(url, fp)
         }));
     }
-    // Local web memory rows for this crawl: pages pile up in a
-    // bounded batch (chunked flush at 256) and land on the blocking
-    // pool after the run, so the response never carries the memory
-    // bill (issue #178).
-    #[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-    let mem_rows: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let hist = Arc::clone(&daemon.history);
-        #[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-        let mem_rows = Arc::clone(&mem_rows);
         opts.on_page = Some(Arc::new(
             move |url: &str, fp: Option<&str>, md: &str, title: Option<&str>| {
                 if let Some(fp) = fp {
@@ -111,21 +102,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     h.record(url, fp, md.len(), title, md);
-                }
-                // The crawl's page lands in the local web memory too.
-                #[cfg(feature = "rerank")]
-                if !crate::memory::kill_switch() {
-                    let mut rows = mem_rows
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    rows.push((
-                        url.to_string(),
-                        title.unwrap_or("").to_string(),
-                        md.to_string(),
-                    ));
-                    if rows.len() >= 256 {
-                        crate::memory::ingest_async(std::mem::take(&mut *rows));
-                    }
                 }
             },
         ));
@@ -188,16 +164,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .flush();
-            // Remaining web-memory pages from a short crawl that
-            // never reached the 256-row chunk flush.
-            #[cfg(feature = "rerank")]
-            {
-                let batch: Vec<(String, String, String)> = mem_rows
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                crate::memory::ingest_async(batch);
-            }
             r
         }
         Err(e) => {
@@ -387,7 +353,17 @@ pub(super) fn render_crawl_dataset(
     let mut structured = json!({
         "seed": result.seed,
         "dataset": true,
+        // Schema marker (v4 F). Row shape: url/title/kind/markdown/
+        // chars/fetched_at/lastmod/parent. Bump on any row-field change
+        // so downstream parsers can fail closed.
+        "dataset_version": 1,
         "rows": rows.len(),
+        // Summed row chars so CLI/MCP summaries report real volume in
+        // dataset mode (the JSON mode's pages[] is absent here).
+        "chars": rows
+            .iter()
+            .filter_map(|r| r.get("chars").and_then(|c| c.as_u64()))
+            .sum::<u64>(),
         "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
         "stop": format!("{:?}", result.stop),
     });
@@ -605,6 +581,7 @@ mod crawl_output_contract_tests {
         assert_eq!(row0["fetched_at"], 1_770_000_000u64);
         assert_eq!(out["structuredContent"]["rows"], 2);
         assert_eq!(out["structuredContent"]["dataset"], true);
+        assert_eq!(out["structuredContent"]["dataset_version"], 1);
         assert_eq!(out["structuredContent"]["complete"], true);
         // Skipped pages surface in debug, never as rows.
         assert_eq!(

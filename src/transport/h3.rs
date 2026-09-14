@@ -78,12 +78,72 @@ fn accept_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), FetchError>
     Ok(())
 }
 
-fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, FetchError> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|_| FetchError::Http(format!("dns resolve failed for {host}")))?
-        .next()
-        .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {host}")))
+/// Blocking libc resolver, run OFF the reactor with the same 10s
+/// bound the h1/h2 dial path uses: to_socket_addrs() can block for
+/// the resolver's full timeout chain, and the h3 lane runs its loop
+/// on a tokio worker.
+async fn resolve_host_async(host: String, port: u16) -> Result<SocketAddr, FetchError> {
+    // `label` answers the timeout arm; the closure moves `host` and
+    // clones its own copy for its two error labels.
+    let label = host.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let label = host.clone();
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| FetchError::Http(format!("dns resolve failed for {label}")))?
+            .collect();
+        // Same connect-time SSRF filter the h1/h2 dial path applies
+        // in tcp::happy_connect_with: resolve, then drop private /
+        // loopback resolved IPs (unless the private-egress escape
+        // hatch is on) before dialing. ensure_url_safe already
+        // rejected private hosts at request time, but a DNS rebind
+        // between that check and this dial would otherwise reach an
+        // internal address over QUIC — h1/h2 re-filter here, h3 did
+        // not. This closes the parity gap.
+        select_dial_addr(
+            addrs,
+            crate::fetch::guards::private_egress_allowed(),
+            &label,
+        )
+    });
+    match tokio::time::timeout(Duration::from_secs(10), task).await {
+        Ok(joined) => joined.map_err(|_| FetchError::Http("dns resolve task aborted".into()))?,
+        Err(_) => Err(FetchError::Http(format!(
+            "dns resolve timed out for {label}"
+        ))),
+    }
+}
+
+/// Pick the address to dial from a resolved set, applying the same
+/// SSRF filter the h1/h2 path uses at connect time. With private
+/// egress allowed (the DONSETCH_ALLOW_PRIVATE_EGRESS escape hatch)
+/// the first address is used as-is; otherwise the first PUBLIC
+/// address is chosen, and a host that resolves ONLY to private /
+/// loopback addresses is refused (a rebind at dial time cannot reach
+/// an internal service over QUIC). Pure, so the filter is unit-tested
+/// without a resolver.
+fn select_dial_addr(
+    addrs: Vec<SocketAddr>,
+    allow_private: bool,
+    label: &str,
+) -> Result<SocketAddr, FetchError> {
+    if allow_private {
+        return addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {label}")));
+    }
+    if addrs.is_empty() {
+        return Err(FetchError::Http(format!("dns resolve empty for {label}")));
+    }
+    addrs
+        .into_iter()
+        .find(|a| !crate::fetch::guards::is_ssrf_resolved_ip(&a.ip()))
+        .ok_or_else(|| {
+            FetchError::Http(format!(
+                "dns: {label} resolves to a private/loopback address : SSRF guard"
+            ))
+        })
 }
 
 /// All the quiche quoting for one connection: our Chrome-true builder
@@ -149,7 +209,7 @@ async fn h3_fetch_inner(
     timeout: Duration,
 ) -> Result<(H3Out, QuicStats), FetchError> {
     let mut cfg = quic_config(profile)?;
-    let peer = resolve_host(host, port)?;
+    let peer = resolve_host_async(host.to_string(), port).await?;
     let socket = if peer.is_ipv4() {
         UdpSocket::bind("0.0.0.0:0").await?
     } else {
@@ -163,7 +223,7 @@ async fn h3_fetch_inner(
     // packet leaves.
     let resumed = crate::transport::routes::load_h3_session(authority, egress);
     if let Some(bytes) = &resumed {
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!("[h3] session resume armed ({} bytes)", bytes.len());
         }
         cfg.enable_early_data();
@@ -306,7 +366,8 @@ async fn h3_fetch_inner(
                         });
                         if is_informational {
                             for hdr in &list {
-                                if hdr.name() == b"alt-svc" {
+                                let name = String::from_utf8_lossy(hdr.name()).to_ascii_lowercase();
+                                if name == "alt-svc" {
                                     altsvc =
                                         Some(String::from_utf8_lossy(hdr.value()).into_owned());
                                 }
@@ -314,21 +375,24 @@ async fn h3_fetch_inner(
                             continue;
                         }
                         for hdr in &list {
-                            if hdr.name() == b":status" && status == 0 {
-                                status = std::str::from_utf8(hdr.value())
-                                    .ok()
-                                    .and_then(|x| x.trim().parse::<u16>().ok())
-                                    .unwrap_or(0);
+                            // HTTP/3 field names are lowercase on the
+                            // wire; normalize a nonconforming peer's
+                            // mixed-case names like the h1 reader does,
+                            // so the downstream content-encoding /
+                            // alt-svc lookups cannot be dodged.
+                            let name = String::from_utf8_lossy(hdr.name()).to_ascii_lowercase();
+                            let value = String::from_utf8_lossy(hdr.value()).into_owned();
+                            if name == ":status" && status == 0 {
+                                status = value.trim().parse::<u16>().unwrap_or(0);
                                 continue;
                             }
-                            if hdr.name() == b"alt-svc" {
-                                altsvc = Some(String::from_utf8_lossy(hdr.value()).into_owned());
+                            if name == "alt-svc" {
+                                altsvc = Some(value);
                                 continue;
                             }
-                            resp_headers.push((
-                                String::from_utf8_lossy(hdr.name()).into_owned(),
-                                String::from_utf8_lossy(hdr.value()).into_owned(),
-                            ));
+                            if !name.starts_with(':') {
+                                resp_headers.push((name, value));
+                            }
                         }
                     }
                     h3::Event::Data => {
@@ -398,11 +462,11 @@ async fn h3_fetch_inner(
             }
             let _ = conn.close(true, 0, b"");
             if let Some(sess) = conn.session() {
-                if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                if crate::config::cfg().debug.ghost {
                     eprintln!("[h3] session saved {} bytes", sess.len());
                 }
                 crate::transport::routes::save_h3_session(authority, egress, sess);
-            } else if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            } else if crate::config::cfg().debug.ghost {
                 eprintln!("[h3] no session ticket before close");
             }
             QUIC_TOTAL_CONN.fetch_add(1, Ordering::Relaxed);
@@ -424,28 +488,21 @@ async fn h3_fetch_inner(
             ));
         }
 
-        // Give up when the QUIC shuts down pre-response.
+        // Give up when the QUIC shuts down pre-response, or after
+        // headers but before the stream Finished. `stream_done` is
+        // the only honest completion: a connection that closed or
+        // drained early (idle timeout, hostile CONNECTION_CLOSE,
+        // server death) carries a PARTIAL body, and returning it as
+        // success once scored a truncated page clean and stored it
+        // into the cache. Drop the route; h1/h2 answer instead.
         if conn.is_closed() || conn.is_draining() {
             if status != 0 {
                 QUIC_TOTAL_CONN.fetch_add(1, Ordering::Relaxed);
-                return Ok((
-                    H3Out {
-                        status,
-                        headers: resp_headers,
-                        body: std::mem::take(&mut body),
-                        altsvc,
-                    },
-                    QuicStats {
-                        handshake_ms,
-                        early_data: rtt_landed,
-                        resumed: conn.is_resumed(),
-                        pkts_in,
-                        pkts_out,
-                        total_ms: started.elapsed().as_millis(),
-                    },
-                ));
             }
-            return Err(FetchError::Http("h3: quic closed before response".into()));
+            return Err(FetchError::Http(format!(
+                "h3: quic closed before stream finished (status {status}, {} body bytes)",
+                body.len()
+            )));
         }
 
         let now = Instant::now();
@@ -482,7 +539,7 @@ pub async fn h3_fetch_direct(
     user_headers: Vec<(String, String)>,
     timeout: Option<Duration>,
 ) -> Result<(H3Out, QuicStats), FetchError> {
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         eprintln!("[h3] attempt {host}:{port}{path}");
     }
     let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::host());
@@ -505,7 +562,7 @@ pub async fn h3_fetch_direct(
         authority,
         headers: user_headers
             .iter()
-            .filter(|(n, _)| n != "user-agent" && n != "accept" && n != "accept-encoding")
+            .filter(|(n, _)| n != "user-agent" && n != "accept")
             .cloned()
             .collect(),
         user_agent: user_agent.as_str(),
@@ -513,7 +570,7 @@ pub async fn h3_fetch_direct(
         timeout,
     };
     let (out, stats) = h3_fetch_heat(&req, &profile).await?;
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         eprintln!(
             "[h3] stats {}:{} early={} resumed={} hs_ms={} total_ms={} pkts_in={} pkts_out={}",
             host,
@@ -532,6 +589,33 @@ pub async fn h3_fetch_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The h3 dial path must apply the same connect-time SSRF filter
+    // as h1/h2: a host that resolves to a private/loopback address
+    // (a DNS rebind after the request-time check) must not be dialed
+    // over QUIC. Pins the resolved-address selection.
+    #[test]
+    fn select_dial_addr_filters_private_resolved_ips() {
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let meta: SocketAddr = "169.254.169.254:443".parse().unwrap();
+        let loop_: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+        // A public address is chosen even when a private one is listed first.
+        assert_eq!(
+            select_dial_addr(vec![meta, public], false, "h").unwrap(),
+            public
+        );
+        // Resolves only to private/loopback -> refused (SSRF guard).
+        assert!(select_dial_addr(vec![meta, loop_], false, "h").is_err());
+        // Empty resolution -> the honest empty error, not a guard error.
+        let err = select_dial_addr(vec![], false, "h").unwrap_err();
+        assert!(format!("{err:?}").contains("empty"));
+        // The escape hatch takes the first address as-is (local egress).
+        assert_eq!(
+            select_dial_addr(vec![loop_, public], true, "h").unwrap(),
+            loop_
+        );
+    }
 
     // The h1 reader learned this the hard way (#144): a hostile
     // origin streaming an unbounded body must hit the shared cap,

@@ -24,6 +24,13 @@ jobs:
   scorecard:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Alert-only by design (v4.md E4): the scorecard measures the
+    # LIVE fingerprint against the recorded baseline, and the runner
+    # ships its own chromium version (150 today vs the 151 the
+    # baseline was recorded with). Cross-version drift is a
+    # re-capture task, never a build break: a red scorecard may not
+    # gate merges, but it must still alarm loudly in the UI.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 

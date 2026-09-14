@@ -95,9 +95,15 @@ pub fn text_fallback(
     })
 }
 
+// Non-content tags only. header/footer/nav/aside deliberately
+// NOT skipped: on SPA profile pages (instagram, twitter) the main
+// content lives inside them, and the fallback is the LAST resort
+// - prefer over-collecting (some boilerplate) over failing with
+// "no real content" on a page that renders perfectly (live case:
+// instagram's 972-visible-char profile page, 45 collected).
 const SKIP_FALLBACK_TAGS: &[&str] = &[
-    "script", "style", "noscript", "template", "svg", "canvas", "iframe", "object", "embed", "nav",
-    "aside", "footer", "header", "form", "button", "input", "select", "textarea", "option",
+    "script", "style", "noscript", "template", "svg", "canvas", "iframe", "object", "embed",
+    "form", "button", "input", "select", "textarea", "option",
 ];
 
 const PARAGRAPH_BREAK_TAGS: &[&str] = &[
@@ -177,5 +183,49 @@ fn collect_fallback_text(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod fallback_live {
+    use super::*;
+
+    /// LIVE receipt: instagram's rendered profile page (dumped by
+    /// the ghost debug path on this box). Skips silently when the
+    /// dump is absent so gates stay green elsewhere. Discriminating:
+    /// the old skip-list dropped <header> entirely, so a page with
+    /// 972 visible chars collected 45.
+    #[test]
+    fn instagram_profile_dump_extracts_profile_content() {
+        let Ok(entries) = std::fs::read_dir("/tmp/fresh2/ghost-debug") else {
+            return;
+        };
+        let Some(path) = entries
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains("instagram"))
+        else {
+            return;
+        };
+        let html = std::fs::read_to_string(&path).unwrap();
+        let doc = scraper::Html::parse_document(&html);
+        let body_sel = scraper::Selector::parse("body").unwrap();
+        let mut paragraphs = Vec::new();
+        let mut current = String::new();
+        collect_fallback_text(
+            doc.select(&body_sel).next().unwrap(),
+            &mut paragraphs,
+            &mut current,
+        );
+        if !current.trim().is_empty() {
+            paragraphs.push(current.trim().to_string());
+        }
+        let all = paragraphs.join("\n");
+        assert!(
+            all.contains("679M followers") || all.contains("cristiano") || all.len() >= 200,
+            "the profile card content must be collected (got {} chars: {:?})",
+            all.len(),
+            &all[..all.len().min(160)]
+        );
     }
 }

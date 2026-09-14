@@ -14,6 +14,17 @@ use super::rank::Merged;
 use crate::detect::walls::Verdict;
 use crate::error::FetchError;
 
+/// B3 quality observation from one enrich prefetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QualityObs {
+    /// Real content page (parked body, usable metadata).
+    Clean,
+    /// Dead link / soft-404.
+    Dead,
+    /// Wall, timeout, or live-but-not-enrichable. Never a quality fact.
+    Neutral,
+}
+
 /// v3 F1: search→fetch warm handoff store.
 pub struct PrewarmCache {
     entries: HashMap<String, PrewarmEntry>,
@@ -87,10 +98,11 @@ impl Searcher {
         const ENRICH_TOP: usize = 5;
         const ENRICH_TIMEOUT: Duration = Duration::from_secs(4);
 
-        // Kill switch (v4 phase 2.1): with DONSETCH_NO_PREWARM=1 no
-        // prewarm fetch ever goes on the wire, so servers see no
-        // burst at all. The honest-off state of the layer.
-        if crate::config::env_flag("DONSETCH_NO_PREWARM") {
+        // Kill switch (v4 phase 2.1): with prewarm disabled ([fetch]
+        // prewarm = false; historically DONSETCH_NO_PREWARM) no prewarm
+        // fetch ever goes on the wire, so servers see no burst at all.
+        // The honest-off state of the layer.
+        if !crate::config::cfg().fetch.prewarm {
             return;
         }
         let n = results.len().min(ENRICH_TOP);
@@ -102,8 +114,9 @@ impl Searcher {
         let fetcher = &self.fetcher;
         type EnrichFut<'a> = std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = (usize, Option<String>, Option<String>)>
-                    + Send
+                dyn std::future::Future<
+                        Output = (usize, Option<String>, Option<String>, QualityObs),
+                    > + Send
                     + 'a,
             >,
         >;
@@ -126,9 +139,11 @@ impl Searcher {
                     // Outer timeout / transport timeout = a slow but
                     // alive page. Demoting it as dead would punish
                     // anything slow, so stay neutral.
-                    Err(_) | Ok(Err(FetchError::Timeout)) => (i, None, Some(String::new())),
+                    Err(_) | Ok(Err(FetchError::Timeout)) => {
+                        (i, None, Some(String::new()), QualityObs::Neutral)
+                    }
                     // Refused / DNS-dead / nothing recovered = dead.
-                    Ok(Err(_)) => (i, None, None),
+                    Ok(Err(_)) => (i, None, None, QualityObs::Dead),
                     Ok(Ok(o)) => {
                         // Wall-family verdicts first: a gated page is
                         // alive, never a dead link. Challenge walls
@@ -145,17 +160,17 @@ impl Searcher {
                                 | Verdict::Paywall
                                 | Verdict::Blocked
                         ) {
-                            return (i, None, Some(String::new()));
+                            return (i, None, Some(String::new()), QualityObs::Neutral);
                         }
                         // Dead link (4xx/5xx, incl. a 200 dressed as a
                         // soft 404) -> demote.
                         if o.status >= 400 || matches!(o.verdict, Verdict::SoftNotFound) {
-                            return (i, None, None);
+                            return (i, None, None, QualityObs::Dead);
                         }
                         // Anything else not clean content: live page we
                         // can't enrich cheaply. Neutral.
                         if !matches!(o.verdict, Verdict::ContentOk) {
-                            return (i, None, Some(String::new()));
+                            return (i, None, Some(String::new()), QualityObs::Neutral);
                         }
                         let ct = o
                             .headers
@@ -175,19 +190,47 @@ impl Searcher {
                         // still alive: return the neutral marker, never
                         // the dead-link (None, None) signal.
                         if title.is_none() && desc.is_none() {
-                            return (i, None, Some(String::new()));
+                            return (i, None, Some(String::new()), QualityObs::Clean);
                         }
-                        (i, title, desc)
+                        (i, title, desc, QualityObs::Clean)
                     }
                 }
             }));
         }
 
-        let enriched = futures_util::future::join_all(futures).await;
+        // Batch deadline: the enrich pass never holds the SERP
+        // hostage past its budget. Pages that finish inside the
+        // window enrich and score; stragglers are dropped and the
+        // SERP snippet stays as the fallback. Without this one slow
+        // top page inflated every cold search by up to its whole
+        // 4s per-item timeout while every other result was ready.
+        const ENRICH_BATCH_DEADLINE_MS: u64 = 700;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(ENRICH_BATCH_DEADLINE_MS);
+        let mut set: futures_util::stream::FuturesUnordered<_> = futures.into_iter().collect();
+        let mut enriched: Vec<(usize, Option<String>, Option<String>, QualityObs)> = Vec::new();
+        while let Ok(Some(out)) =
+            tokio::time::timeout_at(deadline, futures_util::StreamExt::next(&mut set)).await
+        {
+            enriched.push(out);
+        }
 
-        for (i, title, desc) in enriched {
+        for (i, title, desc, obs) in enriched {
             if i >= results.len() {
                 continue;
+            }
+            // B3: density from real enrich outcomes. Walls and
+            // timeouts never enter the map.
+            match obs {
+                QualityObs::Clean => {
+                    let host = super::rank::host_of(&results[i].url);
+                    self.observe_quality(&host, true);
+                }
+                QualityObs::Dead => {
+                    let host = super::rank::host_of(&results[i].url);
+                    self.observe_quality(&host, false);
+                }
+                QualityObs::Neutral => {}
             }
             let r = &mut results[i];
             match (&title, &desc) {
@@ -216,6 +259,9 @@ impl Searcher {
             }
         }
 
+        // Persist quality only when something was recorded.
+        self.save_quality_if_dirty();
+
         // Re-sort after enrichment (dead links demoted).
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
@@ -229,7 +275,7 @@ impl Searcher {
     /// design (the provider's own ranking stands); parking is the
     /// point. Same kill switch as the inline pass.
     pub fn spawn_prewarm(self: &std::sync::Arc<Self>, results: &[Merged]) {
-        if results.is_empty() || crate::config::env_flag("DONSETCH_NO_PREWARM") {
+        if results.is_empty() || !crate::config::cfg().fetch.prewarm {
             return;
         }
         let mut owned = results.to_vec();

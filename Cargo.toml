@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "3.6.7"
+version = "4.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
@@ -26,6 +26,7 @@ scraper = "0.27.0"
 encoding_rs = "0.8.35"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+config = { version = "0.15", default-features = false, features = ["toml"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 # HTTP server for MCP HTTP transport (axum, SSE). Optional: gates
@@ -84,7 +85,7 @@ rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/b
 http = ["dep:axum", "dep:tower-http"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Pipes"] }
 
 [dev-dependencies]
 rcgen = "0.14"

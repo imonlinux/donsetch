@@ -110,19 +110,17 @@ impl BrowserProfile {
                              ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
                              AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA",
                 groups: "X25519MLKEM768:X25519:P-256:P-384",
-                // NOTE (v4 parity finding, 2026-09-08): the floor's
-                // real Chromium 151 also pads sig-algs with three
-                // GREASE codes (0x0904/05/06) at the front. boring's
-                // public set_sigalgs_list validates against known
-                // algorithms and refuses them ([INVALID_SIGNATURE_
-                // ALGORITHM], live-proven), and upstream boringssl
-                // has NO sig-alg grease hook (its grease indexes:
-                // cipher/group/ext1/ext2/version/ticket/ech). Raw
-                // ClientHello extension injection would be needed:
-                // documented as the L1 evergreen work item in
-                // design/v4.md, doctor --stealth --parity surfaces
-                // the exact delta meanwhile.
-                sigalgs: "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
+                // Chrome 151 ClientHello pads signature_algorithms with
+                // ML-DSA 44/65/87 (IANA 0x0904/05/06) at the front. Those
+                // codes used to be rejected by boring's set_sigalgs_list
+                // (INVALID_SIGNATURE_ALGORITHM); boring/boring-sys 5.2.0
+                // names them mldsa44/65/87 and ships the ML-DSA verify
+                // crypto, so the ChromeTrue wire finally matches. Kill
+                // switch: tls.mldsa_sigalgs=false / DONSETCH_NO_MLDSA_
+                // SIGALGS strips them (InterceptionSafe never sends them:
+                // a corporate MITM re-terminates without ML-DSA certs).
+                sigalgs: "mldsa44:mldsa65:mldsa87:\
+                          ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
                           ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
                           rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
                 alpn: b"\x02h2\x08http/1.1",
@@ -319,6 +317,41 @@ pub fn accept_language_for(host: &str, path: &str) -> &'static str {
     "en-US,en;q=0.9"
 }
 
+/// Persona-coherent Accept-Language (v4 E2). Real Chrome sends the
+/// user's configured languages, not a TLD guess. The persona locale
+/// is primary; a different TLD/script signal is kept as a lower-q
+/// preference so localized content still lands, without the classic
+/// "en-US browser speaking perfect ru-RU" JA4H tell.
+pub fn accept_language_with_persona(host: &str, path: &str, persona_locale: &str) -> String {
+    let base = accept_language_for(host, path);
+    // Fail-closed: the full locale is interpolated into a header.
+    // CR/LF would be rejected later by the header guard (and turn
+    // every fetch into a hard error); commas and JS must never get
+    // that far.
+    let persona_locale = crate::persona::sanitize_locale(persona_locale);
+    let persona_locale = persona_locale.as_str();
+    let plang = persona_locale
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if plang.len() < 2 || plang.len() > 3 || !plang.chars().all(|c| c.is_ascii_alphabetic()) {
+        return base.to_string();
+    }
+    // Persona already matches the TLD default: ship that exact string.
+    let primary = persona_locale.split('-').next().unwrap_or("");
+    if base.starts_with(primary) || base.starts_with(&persona_locale.to_ascii_lowercase()) {
+        return format!("{persona_locale},{plang};q=0.9,en-US;q=0.8,en;q=0.7");
+    }
+    // Persona en-US on a .ru page: en first, TLD second.
+    let tld = accept_language_for(host, path);
+    let tld_primary = tld.split(',').next().unwrap_or(tld);
+    if tld_primary.is_empty() {
+        return format!("{persona_locale},{plang};q=0.9");
+    }
+    format!("{persona_locale},{plang};q=0.9,{tld_primary};q=0.8")
+}
+
 /// Probe the installed browser's major version. Cached after first call.
 ///
 /// Two strategies, tried in order:
@@ -363,8 +396,9 @@ fn probe_installed() -> Option<(u32, bool)> {
 /// Windows: read the major version + brand truth from the browser's
 /// own `BLBeacon\version` registry value. The key family decides the
 /// brand: `Software\Google\Chrome` = Google-branded; Chromium/Edge/
-/// Thorium report their own (non-Google) brands. Honours `DONGHOST_CHROME`
-/// by probing the browser family it names first.
+/// Thorium report their own (non-Google) brands. Honours the configured
+/// `browser.chromium_path` (legacy `DONGHOST_CHROME`) by probing the
+/// browser family it names first.
 #[cfg(windows)]
 fn probe_registry() -> Option<(u32, bool)> {
     use windows_sys::Win32::System::Registry as reg;
@@ -376,10 +410,13 @@ fn probe_registry() -> Option<(u32, bool)> {
         ("Software\\Microsoft\\Edge\\BLBeacon", false),
         ("Software\\Thorium\\BLBeacon", false),
     ];
-    // Sort DONGHOST_CHROME's family to the front if it doesn't already
-    // lead : cheap, and makes the explicit choice authoritative.
-    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        let p = p.to_string_lossy().to_lowercase();
+    // Sort the configured browser's family to the front if it doesn't
+    // already lead : cheap, and makes the explicit choice authoritative.
+    // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
+    // env var, so the config value is the single source here.
+    let configured = &crate::config::cfg().browser.chromium_path;
+    if !configured.is_empty() {
+        let p = configured.to_lowercase();
         for (family, key, branded) in [
             ("thorium", "Software\\Thorium\\BLBeacon", false),
             ("chrome", "Software\\Google\\Chrome\\BLBeacon", true),
@@ -545,72 +582,12 @@ fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
     spawn_probe_with_timeout(cmd)
 }
 
-/// Run the built `--version` command, read its stdout, and return it.
-/// Never runs longer than `PROBE_SPAWN_TIMEOUT`; on timeout, kills the
-/// whole process tree.
-fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Result<String, String> {
-    use std::io::Read;
+mod version_probe;
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn browser version probe: {e}"))?;
-
-    // Read stdout on a side thread so we can still enforce the timeout
-    // if the browser never exits (the read would otherwise block us).
-    let pid = child.id();
-    let pipe = match child.stdout.take() {
-        Some(p) => p,
-        None => {
-            // Can't happen (stdout is always piped above), but never
-            // leave a spawned child running on the early-out path.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("browser version probe had no stdout pipe".into());
-        }
-    };
-    let stdout = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut rd = pipe;
-        let _ = rd.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = std::time::Instant::now() + PROBE_SPAWN_TIMEOUT;
-    let mut reaped: Option<std::process::ExitStatus> = None;
-    while reaped.is_none() {
-        match child.try_wait() {
-            Ok(Some(status)) => reaped = Some(status),
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if reaped.is_none() && std::time::Instant::now() >= deadline {
-            // Wedged browser : kill the whole tree, not just the parent.
-            kill_probe_tree(Some(pid));
-            let _ = child.kill();
-            reaped = child.wait().ok();
-            break;
-        }
-        if reaped.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-    if reaped.is_none() {
-        // Err branch above killed nothing; be safe.
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let out = stdout.join().unwrap_or_default();
-    match reaped {
-        Some(status) if status.success() => {
-            // "Chromium 151.0.7922.108\n" -> "151.0.7922.108".
-            // The banner word varies per build (Chromium, Chrome,
-            // Edge, CloakBrowser); the dotted token is the truth.
-            parse_version_string(&out)
-                .ok_or_else(|| format!("browser version probe returned no version token: {out:?}"))
-        }
-        Some(status) => Err(format!("browser version probe exited with {status}")),
-        None => Err("browser version probe did not exit".into()),
-    }
+/// Capture stdout and process completion under one post-spawn deadline.
+/// OS spawn and teardown latency are not a hard real-time guarantee.
+fn spawn_probe_with_timeout(cmd: std::process::Command) -> Result<String, String> {
+    version_probe::run(cmd, PROBE_SPAWN_TIMEOUT)
 }
 
 /// Parse the first full dotted Chromium version from a version banner.
@@ -631,26 +608,6 @@ pub(crate) fn parse_version_string(line: &str) -> Option<String> {
         }
     })
 }
-/// Kill the probe process and its children (Windows: taskkill /T so
-/// the whole tree dies; Unix: kill the process group-less child : its
-/// renderers exit when the browser dies).
-fn kill_probe_tree(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    #[cfg(windows)]
-    {
-        // taskkill /T /F kills the process and all descendants.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(not(windows))]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-}
-
 /// Parse the first plausible major version out of a `<name> <major>` line.
 pub(crate) fn parse_version_major(line: &str) -> Option<u32> {
     let line = line.trim();
@@ -690,11 +647,58 @@ mod locale_tests {
             "en-US,en;q=0.9"
         );
     }
+
+    #[test]
+    fn persona_locale_is_primary_accept_language() {
+        use super::accept_language_with_persona;
+        // en-US persona on a .com page: same as the TLD default.
+        let al = accept_language_with_persona("example.com", "/docs", "en-US");
+        assert!(al.starts_with("en-US,en;q=0.9"), "{al}");
+        // en-US persona on a .ru page: persona first, TLD second.
+        let al = accept_language_with_persona("example.com.ru", "/", "en-US");
+        assert!(al.starts_with("en-US,en;q=0.9,"), "{al}");
+        assert!(al.contains("ru-RU"), "TLD signal kept: {al}");
+        // de-DE persona on a .de page: persona-shaped, not the raw TLD string.
+        let al = accept_language_with_persona("example.de", "/", "de-DE");
+        assert!(al.starts_with("de-DE,de;q=0.9"), "{al}");
+        // Invalid persona locale is sanitized to en-US, then the TLD
+        // signal is kept as a lower-q preference (not a raw fallthrough).
+        let al = accept_language_with_persona("example.ru", "/", "nope");
+        assert!(al.starts_with("en-US"), "{al}");
+        assert!(al.contains("ru-RU"), "TLD kept as secondary: {al}");
+        // Hostile locale is sanitized, never interpolated raw.
+        let al = accept_language_with_persona("example.com", "/", "en-US\r\nX: y");
+        assert!(
+            !al.contains('\r') && !al.contains('\n'),
+            "CR/LF must never reach the header: {al:?}"
+        );
+        assert!(al.starts_with("en-US"), "{al}");
+    }
 }
 
 #[cfg(test)]
 mod probe_tests {
     use super::{BrowserProfile, Platform, parse_version_major, parse_version_string};
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_kills_descendants_and_returns_bounded() {
+        use super::spawn_probe_with_timeout;
+        // A wedged browser's descendant holds the stdout pipe. Pre-fix
+        // this hung FOREVER: the timeout killed only the parent, the
+        // grandchild kept the pipe open, and the stdout join never saw
+        // EOF. Post-fix the whole group dies and the probe fails in
+        // ~PROBE_SPAWN_TIMEOUT. A wild sleep 300 guards the fixture.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & wait; echo never")
+            .stdout(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+        let out = spawn_probe_with_timeout(cmd);
+        assert!(out.is_err(), "a wedged probe must fail, not hang");
+        let secs = start.elapsed().as_secs();
+        assert!(secs < 15, "probe must be bounded, took {secs}s");
+    }
 
     #[test]
     fn brand_lists_match_chrome_151_capture() {

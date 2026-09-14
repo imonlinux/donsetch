@@ -155,6 +155,13 @@ pub struct DomainProfile {
     /// on connection-refused against port 80).
     #[serde(default)]
     pub origin_port: u16,
+    /// v4 B1: which egress class these cookies were learned on
+    /// (`"direct"` or `"proxy"`). Cookies never cross egress
+    /// classes: a Warm route is refused when the live lane's class
+    /// differs. `None` = pre-B1 / unstamped (treat as match until
+    /// the next success stamps the real class).
+    #[serde(default)]
+    pub egress_class: Option<String>,
 }
 
 fn default_scheme() -> String {
@@ -172,7 +179,8 @@ fn state_version_v1() -> u32 {
 /// Current on-disk state format. Bump when a load-time migration
 /// becomes historical; migrations gate on `version < N` so they
 /// run exactly once per state file.
-const STATE_VERSION: u32 = 2;
+/// v3 (B1): DomainProfile.egress_class; no destructive migration.
+const STATE_VERSION: u32 = 3;
 
 impl DomainProfile {
     /// Most recent signal of any kind; the LRU eviction key.
@@ -261,12 +269,6 @@ pub struct GhostState {
     /// network fetch.
     #[serde(default)]
     pub prewarmed_served_total: u64,
-    /// Lifetime count of web_answer evidence packs served with at
-    /// least one usable source (v4 phase 2.2), surfaced in
-    /// donsetch status. Empty packs (nothing usable found) are not
-    /// counted: a served pack means real evidence reached the agent.
-    #[serde(default)]
-    pub answered_packs_total: u64,
     /// v4 phase 3 ghost pool visibility: how many ghost acquires were
     /// served by an already-live pooled browser (thaw-and-go), as
     /// opposed to paying a browser launch. Sums across the daemon's
@@ -291,6 +293,34 @@ pub struct GhostState {
     pub profiles: HashMap<String, DomainProfile>,
     #[serde(default)]
     pub renders: HashMap<String, RenderCache>,
+    /// Vault epoch for cross-writer reconciliation: the session
+    /// vault has TWO writer classes (the load-modify-save helpers
+    /// store_session_cookies / clear_session_cookies_for, which
+    /// never touch a daemon's live in-memory snapshot, and the
+    /// snapshot's own sync_tier1_cookies). Every vault writer
+    /// stamps a strictly larger epoch before saving; save() adopts
+    /// the disk side's vault whenever disk carries a newer one, so
+    /// a helper's harvest survives the daemon's next save and a
+    /// logout's deletion is not resurrected by it.
+    #[serde(default)]
+    pub vault_epoch: u64,
+}
+
+/// Process-local bump source for vault epochs. load() seeds the
+/// state with the epoch persisted on disk, so a strictly larger
+/// local stamp is always newer than every disk state this process
+/// has seen.
+static VAULT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp `state` as a fresh vault write: strictly newer than the
+/// disk state it was loaded from (load() seeded the epoch from that
+/// file, and disk may already carry a higher stamp written by another
+/// process) and than every earlier in-process stamp.
+fn bump_vault_epoch(state: &mut GhostState) {
+    state.vault_epoch = state
+        .vault_epoch
+        .max(VAULT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        + 1;
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -328,11 +358,28 @@ fn ewma_update(cur: f32, samples: u32, ok: bool) -> f32 {
 /// persists). ROUTE_MEMORY_READONLY: consult on, record off (debug
 /// and A/B). Both fail closed through crate::config::env_flag.
 fn route_memory_enabled() -> bool {
-    !crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY")
+    crate::config::cfg().state.route_memory != crate::config::RouteMemory::Off
 }
 
 fn route_memory_readonly() -> bool {
-    crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY")
+    crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly
+}
+
+/// Live egress class for `host` (v4 B1): `"proxy"` when a sticky
+/// pool lane is a proxy exit, else `"direct"`. No pool / no sticky
+/// = direct (the historical default).
+pub fn current_egress_class(host: &str) -> &'static str {
+    let Some(pool) = crate::search::egress::global() else {
+        return "direct";
+    };
+    if !pool.has_proxies() || !crate::config::cfg().proxy.fetch_rotate {
+        return "direct";
+    }
+    if pool.sticky_is_proxy(host) {
+        "proxy"
+    } else {
+        "direct"
+    }
 }
 
 // ────────────────────────── constants ──────────────────────────
@@ -610,6 +657,7 @@ pub fn store_session_cookies(cookies: &[CookieRecord]) {
             excess -= drop;
         }
     }
+    bump_vault_epoch(&mut state);
     state.save();
 }
 
@@ -670,6 +718,10 @@ pub fn clear_session_cookies_for(domain: &str) -> bool {
     });
     removed |= state.renders.len() != before_r;
     if removed {
+        // Stamp the deletion so a live daemon snapshot (whose
+        // tier1_cookies / renders predate this logout) adopts the
+        // disk side on its next save instead of resurrecting them.
+        bump_vault_epoch(&mut state);
         state.save();
     }
     removed
@@ -924,13 +976,6 @@ impl GhostState {
         self.save();
     }
 
-    /// v4 phase 2.2 visibility: count an evidence pack served with
-    /// at least one usable source.
-    pub fn note_answer_served(&mut self) {
-        self.answered_packs_total = self.answered_packs_total.saturating_add(1);
-        self.save();
-    }
-
     /// v4 phase 3 visibility: count a fetch served from an
     /// already-warm pool browser (no launch, no thaw failure). With
     /// DONSETCH_NO_GHOST_POOL set, the pool is one slot but warm
@@ -1002,8 +1047,12 @@ impl GhostState {
 
     /// Burn a persona (detection event, operator request). The next
     /// ensure_persona mints a fresh identity with a bumped
-    /// generation; the burned one is never reused.
+    /// generation; the burned one is never reused. Also frees any
+    /// exclusive egress bind so the lane can serve a new mint.
     pub fn quarantine_persona(&mut self, host: &str, reason: &str) {
+        if let Some(pool) = crate::search::egress::global() {
+            pool.release_persona_lane(host);
+        }
         if !route_memory_enabled() || route_memory_readonly() {
             return;
         }
@@ -1011,6 +1060,52 @@ impl GhostState {
             p.quarantined_at = Some(now());
             p.quarantine_reason = Some(reason.to_string());
             self.save();
+        }
+    }
+
+    /// Stamp the persona's bound exit (v4 A2). Returns true when
+    /// the stamp changed. A burned or foreign-persona lane is never
+    /// assigned: the pool's pick_persona_lane already excludes them.
+    pub fn bind_persona_proxy(&mut self, host: &str, lane_id: Option<String>) -> bool {
+        if !route_memory_enabled() || route_memory_readonly() {
+            return false;
+        }
+        let Some(p) = self.personas.get_mut(host) else {
+            return false;
+        };
+        if p.proxy_id == lane_id {
+            return false;
+        }
+        p.proxy_id = lane_id;
+        self.save();
+        true
+    }
+
+    /// Ensure this host's persona is bound to a live exclusive
+    /// egress lane (pool present). Remints via quarantine when the
+    /// bound lane is burned or foreign. No-op when the pool is
+    /// empty or route memory is off.
+    pub fn ensure_persona_egress(&mut self, host: &str) {
+        let Some(pool) = crate::search::egress::global() else {
+            return;
+        };
+        if !pool.has_proxies() || !crate::config::cfg().proxy.fetch_rotate {
+            return;
+        }
+        let bound = self.personas.get(host).and_then(|p| p.proxy_id.clone());
+        if let Some(id) = bound {
+            let ok = pool.persona_lane_ok(host, &id) && !pool.is_dead(&id);
+            if ok {
+                return;
+            }
+            // Foreign or burned: burn the identity, free the lane,
+            // and let the next ensure mint generation+1.
+            pool.release_persona_lane(host);
+            self.quarantine_persona(host, "bound egress burned or foreign");
+        }
+        if let Some(eg) = pool.pick_persona_lane(host) {
+            pool.bind_persona_lane(host, &eg.id);
+            self.bind_persona_proxy(host, Some(eg.id));
         }
     }
 
@@ -1053,8 +1148,14 @@ impl GhostState {
     /// values. Does NOT save: the caller is already inside the
     /// state lock and the outcome record after it saves once.
     pub fn sync_tier1_cookies(&mut self, all: &[CookieRecord]) {
-        if crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT")
-            || crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY")
+        // This snapshot is now a tier-1 vault writer: stamp it newer
+        // than the disk state it came from, or a helper's concurrent
+        // logout deletion (disk epoch bump) and this sync could
+        // reorder. Writing without a stamp would also let the NEXT
+        // save adopt a stale disk tier-1 echo over this one.
+        bump_vault_epoch(self);
+        if !crate::config::cfg().state.cookie_vault
+            || crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off
         {
             return;
         }
@@ -1083,7 +1184,7 @@ impl GhostState {
     /// Cookie count for `donsetch status`: the vault must be
     /// observable, never magic.
     pub fn tier1_cookie_count(&self) -> usize {
-        !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") as usize * self.tier1_cookies.len()
+        crate::config::cfg().state.cookie_vault as usize * self.tier1_cookies.len()
     }
 
     pub fn save(&mut self) {
@@ -1111,7 +1212,7 @@ impl GhostState {
         {
             // Allow users to disable disk persistence entirely.
             // In-memory state still works during the session.
-            if std::env::var_os("DONSEEK_NO_DISK_STATE").is_some() {
+            if crate::config::cfg().state.no_disk_state {
                 return;
             }
             let p = path();
@@ -1131,9 +1232,8 @@ impl GhostState {
                     self.shadowed_assets_total.max(disk.shadowed_assets_total);
                 self.prewarmed_served_total =
                     self.prewarmed_served_total.max(disk.prewarmed_served_total);
-                self.answered_packs_total =
-                    self.answered_packs_total.max(disk.answered_packs_total);
                 self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
+                self.merge_vault_from_disk(&disk);
             }
             if let Ok(s) = serde_json::to_string(self) {
                 let tmp = p.with_extension("json.tmp");
@@ -1170,6 +1270,43 @@ impl GhostState {
         }
     }
 
+    /// Adopt the disk state's session vault into this snapshot.
+    /// Pure reconciliation over one loaded disk copy; called from
+    /// save() with the file as it exists RIGHT NOW.
+    ///
+    /// The vault (profiles[].session_cookies, tier1_cookies,
+    /// renders) has TWO writer classes: the load-modify-save
+    /// helpers (store_session_cookies / clear_session_cookies_for),
+    /// which never touch a live daemon snapshot, and the snapshot
+    /// itself (sync_tier1_cookies). Both stamp a strictly larger
+    /// vault epoch before saving, so the winner is the newer stamp.
+    /// A TIE means no helper wrote since this snapshot loaded, so
+    /// its copy is exactly what disk holds (load() read the same
+    /// file) and keeping it is correct. Without this reconciliation
+    /// a daemon save rewrote the file from its boot-era snapshot:
+    /// every harvest since was erased, and every logout deletion
+    /// came back (dead sessions replayed on the next launch).
+    pub fn merge_vault_from_disk(&mut self, disk: &GhostState) {
+        if disk.vault_epoch > self.vault_epoch {
+            for (host, dp) in disk.profiles.iter() {
+                match self.profiles.get_mut(host) {
+                    // Both sides know the host: disk's vault wins.
+                    Some(p) => p.session_cookies = dp.session_cookies.clone(),
+                    // Disk-only host: a helper harvested a host this
+                    // snapshot has never seen. Adopt the whole
+                    // profile (its wall-state rode along on disk;
+                    // dropping it here would strand the harvest).
+                    None => {
+                        self.profiles.insert(host.clone(), dp.clone());
+                    }
+                }
+            }
+            self.tier1_cookies = disk.tier1_cookies.clone();
+            self.renders = disk.renders.clone();
+            self.vault_epoch = disk.vault_epoch;
+        }
+    }
+
     // ── Decision ──
 
     /// Route decision for the next fetch to this host.
@@ -1181,6 +1318,16 @@ impl GhostState {
     }
 
     pub fn route_for(&self, host: &str) -> RouteDecision {
+        let class = current_egress_class(host);
+        self.route_for_class(host, class)
+    }
+
+    /// Route with an explicit egress class (v4 B1). A Warm cookie
+    /// vault learned on another class is never injected: clearance
+    /// bound to a home IP must not ride a proxy exit (and vice
+    /// versa). `None`/unstamped profiles stay usable until the next
+    /// success stamps the real class.
+    pub fn route_for_class(&self, host: &str, class: &str) -> RouteDecision {
         if !route_memory_enabled() {
             return RouteDecision::Cold;
         }
@@ -1202,16 +1349,21 @@ impl GhostState {
                 );
             }
         }
+        // Egress-class gate (B1): cookies never cross classes.
+        let class_ok = match &profile.egress_class {
+            None => true,
+            Some(c) => c == class,
+        };
         if profile.needs_tier2 {
             // Warm only when cookies are fresh AND tier-1 replay has
             // actually been verified to work for this domain. Vendors
             // that bind clearance to the browser fingerprint reject
             // tier-1 replay forever : serving Warm there just burns a
             // doomed roundtrip before every solve.
-            if cookies_fresh_at(profile, n) && profile.replay_ok {
+            if class_ok && cookies_fresh_at(profile, n) && profile.replay_ok {
                 return RouteDecision::Warm(profile.cookies.clone());
             }
-            // Cookies stale. Should we recheck cold?
+            // Cross-class or stale cookies. Should we recheck cold?
             if n - profile.last_cold_check > RECHECK_INTERVAL {
                 return RouteDecision::RecheckCold;
             }
@@ -1292,6 +1444,7 @@ impl GhostState {
             p.observed_lifetime = None;
             p.replay_ok = false;
         }
+        p.egress_class = Some(current_egress_class(host).to_string());
         self.save();
     }
 
@@ -1346,6 +1499,7 @@ impl GhostState {
                 p.cookies.push(new.clone());
             }
         }
+        p.egress_class = Some(current_egress_class(host).to_string());
         self.save();
     }
 
@@ -1513,6 +1667,115 @@ mod tests {
             http_only: false,
             same_site: "Lax".into(),
         }
+    }
+
+    // == vault epoch reconciliation ==
+
+    // A helper's fresh harvest must survive a live snapshot's next
+    // save: the helper stamped a newer epoch, so save() must NOT
+    // adopt disk here (memory IS the newer writer) and the harvest
+    // stands.
+    #[test]
+    fn newer_snapshot_keeps_its_vault() {
+        let mut mine = GhostState::default();
+        mine.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "fresh", ".ex.com", None)];
+        bump_vault_epoch(&mut mine);
+        // Disk carries an OLDER epoch with different cookies.
+        let mut disk = GhostState {
+            vault_epoch: 0,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "stale", ".ex.com", None)];
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(mine.profiles["ex.com"].session_cookies[0].value, "fresh");
+    }
+
+    // The core resurrection bug: a live daemon snapshot (boot-era
+    // vault) saving AFTER a helper deleted a domain's session must
+    // adopt the deletion, not rewrite the dead session back.
+    #[test]
+    fn newer_disk_vault_wins_so_logout_is_not_resurrected() {
+        // The daemon snapshot, loaded at boot (epoch 7).
+        let mut mine = GhostState {
+            vault_epoch: 7,
+            ..Default::default()
+        };
+        mine.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "dead-session", ".ex.com", None)];
+        mine.tier1_cookies = vec![cr("sid", "dead-session", ".ex.com", None)];
+        // The logout helper wrote disk: deletion, newer epoch.
+        // clear_session_cookies_for keeps the profile entry and
+        // empties its cookies, so disk carries ex.com with none.
+        let mut disk = GhostState {
+            vault_epoch: 8,
+            ..Default::default()
+        };
+        disk.profiles.entry("ex.com".into()).or_default();
+        mine.merge_vault_from_disk(&disk);
+        assert!(
+            mine.profiles["ex.com"].session_cookies.is_empty(),
+            "the logged-out session must stay deleted"
+        );
+        assert!(
+            mine.tier1_cookies.is_empty(),
+            "the logged-out tier-1 echo must stay deleted"
+        );
+    }
+
+    // A helper's harvest lands on disk with a newer epoch; the live
+    // snapshot's next save must ADOPT it, not erase it.
+    #[test]
+    fn newer_disk_harvest_is_adopted_by_the_snapshot() {
+        let mut mine = GhostState {
+            vault_epoch: 3,
+            ..Default::default()
+        };
+        // Boot-era: ex.com had nothing, other.com still does.
+        mine.profiles
+            .entry("other.com".into())
+            .or_default()
+            .session_cookies = vec![cr("o", "kept", ".other.com", None)];
+        let mut disk = GhostState {
+            vault_epoch: 4,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "harvested", ".ex.com", None)];
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(
+            mine.profiles["ex.com"].session_cookies[0].value, "harvested",
+            "the harvest must survive the snapshot's next save"
+        );
+        assert_eq!(mine.vault_epoch, 4, "the adopted epoch must ride along");
+    }
+
+    // A tie means no helper wrote since this snapshot loaded, so its
+    // copy is exactly what disk holds: keep it (this is what lets a
+    // helper's own save keep its in-memory mutation).
+    #[test]
+    fn epoch_tie_keeps_the_snapshot() {
+        let mut mine = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        mine.tier1_cookies = vec![cr("t1", "mine", ".ex.com", None)];
+        let mut disk = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        disk.tier1_cookies = vec![];
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(mine.tier1_cookies.len(), 1, "tie = snapshot stands");
     }
 
     // == v4 phase 0: route memory ==
@@ -1686,7 +1949,7 @@ mod tests {
         }
         state.version = STATE_VERSION;
         assert!(!state.profiles["walled.example"].needs_tier2);
-        assert_eq!(state.version, 2);
+        assert_eq!(state.version, STATE_VERSION);
 
         // Now the host legitimately re-earns its wall (a real
         // challenge verdict), gets saved at version 2, and the next
@@ -1702,6 +1965,70 @@ mod tests {
             panic!("v2 file must never enter the migration");
         }
         assert!(state2.profiles["walled.example"].needs_tier2);
+    }
+
+    /// B1 anti-amnesia: a pre-B1 (v2) state file loads without
+    /// wiping wall knowledge; egress_class starts unstamped (None).
+    #[test]
+    fn b1_egress_class_defaults_none_and_preserves_walls() {
+        let mut state = GhostState {
+            version: 2,
+            ..Default::default()
+        };
+        state.profiles.insert(
+            "cf.example".into(),
+            DomainProfile {
+                needs_tier2: true,
+                replay_ok: true,
+                solve_count: 3,
+                wall_vendor: Some("cloudflare".into()),
+                last_solved: now(),
+                ..Default::default()
+            },
+        );
+        // v2 file: no migration that touches walls (only the <2 gate).
+        assert!(state.version >= 2);
+        assert!(state.profiles["cf.example"].needs_tier2);
+        assert!(state.profiles["cf.example"].egress_class.is_none());
+    }
+
+    /// B1: Warm cookies learned on `direct` are never injected when
+    /// the live lane is `proxy` (and vice versa).
+    #[test]
+    fn warm_cookies_never_cross_egress_classes() {
+        let mut state = GhostState::default();
+        let n = now();
+        state.profiles.insert(
+            "bank.example".into(),
+            DomainProfile {
+                needs_tier2: true,
+                replay_ok: true,
+                last_solved: n,
+                cookies: vec![CookieRecord {
+                    name: "cf_clearance".into(),
+                    value: "tok".into(),
+                    domain: "bank.example".into(),
+                    path: "/".into(),
+                    expires_at: Some(n + 3600),
+                    secure: true,
+                    http_only: true,
+                    same_site: "None".into(),
+                }],
+                egress_class: Some("direct".into()),
+                ..Default::default()
+            },
+        );
+        match state.route_for_class("bank.example", "direct") {
+            RouteDecision::Warm(c) => assert_eq!(c.len(), 1, "same class must warm"),
+            other => panic!("expected Warm on matching class, got {other:?}"),
+        }
+        match state.route_for_class("bank.example", "proxy") {
+            RouteDecision::Warm(_) => {
+                panic!("cross-class warm is a cookie/IP link; must not serve")
+            }
+            RouteDecision::SkipToSolve | RouteDecision::RecheckCold | RouteDecision::Cold => {}
+            other => panic!("unexpected cross-class route: {other:?}"),
+        }
     }
 
     #[test]
@@ -1781,14 +2108,22 @@ mod tests {
     }
 
     #[test]
-    fn note_probe_counts_and_respects_switches() {
+    fn note_probe_counts() {
         let mut state = GhostState::default();
         state.note_probe();
         state.note_probe();
         assert_eq!(state.probes_total, 2);
+    }
+
+    // The readonly kill switch maps through the config layer
+    // (DONSETCH_ROUTE_MEMORY_READONLY); set before the first cfg() touch
+    // so the process-wide config sees it.
+    #[test]
+    fn note_probe_skips_when_readonly() {
         unsafe { std::env::set_var("DONSETCH_ROUTE_MEMORY_READONLY", "1") };
+        let mut state = GhostState::default();
         state.note_probe();
-        assert_eq!(state.probes_total, 2);
+        assert_eq!(state.probes_total, 0);
         unsafe { std::env::remove_var("DONSETCH_ROUTE_MEMORY_READONLY") };
     }
 
@@ -2583,15 +2918,31 @@ mod tests {
         // touched before the flood: it is the first evicted.
         assert!(st.tier1_cookies.iter().any(|c| c.name == "k599"));
         assert!(st.tier1_cookies.iter().all(|c| c.name != "k0"));
-        // Kill switch blocks the sync.
-        unsafe { std::env::set_var("DONSETCH_NO_COOKIE_VAULT", "1") };
-        st.sync_tier1_cookies(&[rec("post", "v", ".x.com", None)]);
-        assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
-        unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
         // Roundtrip through serde (persistence shape).
         let json = serde_json::to_string(&st).unwrap();
         let back: GhostState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tier1_cookies.len(), TIER1_COOKIE_MAX);
+    }
+
+    // The vault kill switch maps through the config layer
+    // (DONSETCH_NO_COOKIE_VAULT); set before the first cfg() touch.
+    #[test]
+    fn tier1_sync_honors_vault_kill_switch() {
+        unsafe { std::env::set_var("DONSETCH_NO_COOKIE_VAULT", "1") };
+        let mut st = GhostState::default();
+        let rec = CookieRecord {
+            name: "post".into(),
+            value: "v".into(),
+            domain: ".x.com".into(),
+            path: "/".into(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".into(),
+        };
+        st.sync_tier1_cookies(&[rec]);
+        assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
+        unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
     }
 
     #[test]

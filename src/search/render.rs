@@ -11,10 +11,10 @@ use super::rank;
 /// Snippet budget for the markdown list. 120 cut mid-phrase far
 /// too often : the detail that distinguishes two results sat just
 /// past the cut, and the agent paid a whole fetch to learn what the
-/// snippet nearly said. 200 is where a snippet reliably carries one
-/// complete claim; the 300 the JSON keeps is past diminishing
-/// returns at ~45 tokens per result.
-const SNIPPET_CHARS: usize = 200;
+/// snippet nearly said. 180 (v4 C token trim) is where a snippet
+/// still reliably carries one complete claim while saving ~3 tokens
+/// per result vs 200 across the default 7.
+const SNIPPET_CHARS: usize = 180;
 
 /// Below this fraction (4/5) of the budget, a word-boundary cut
 /// throws away more than it saves : see `clip_snippet`.
@@ -115,6 +115,26 @@ pub fn render_markdown(
     // Snippets carry just enough to decide : content is
     // the fetch tool's job.
     let mut md = format!("# Search: {query}\n\n");
+    // C5: instant answers sit ABOVE the organic list, never inside
+    // it. Source URL always present; text is byte-derived.
+    if let Some(ans) = &out.instant {
+        let kind = match ans.kind {
+            "knowledge" => "Knowledge",
+            "answer" => "Instant answer",
+            _ => "Featured snippet",
+        };
+        let title = if ans.title.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", ans.title)
+        };
+        md.push_str(&format!(
+            "## {kind} ({}){title}\n{}\n{}\n\n",
+            ans.engine,
+            clip_snippet(&ans.text, 400),
+            ans.url
+        ));
+    }
     for (i, r) in out.results.iter().enumerate() {
         let host = rank::host_of(&r.url);
         md.push_str(&format!("{}. **{}** : {}\n", i + 1, r.title, host));
@@ -223,6 +243,20 @@ pub fn render_compact_markdown(
         markdown.push_str(heading);
         markdown.push('\n');
     }
+    if let Some(ans) = &out.instant {
+        // Compact surface: one line. Full text lives in structuredContent.
+        let label = match ans.kind {
+            "knowledge" => "knowledge",
+            "answer" => "instant",
+            _ => "featured",
+        };
+        markdown.push_str(&format!(
+            "Instant ({label} via {}): {} · {}\n",
+            ans.engine,
+            clip_snippet(&ans.text, 160),
+            ans.url
+        ));
+    }
 
     for (index, result) in out.results.iter().enumerate() {
         let reference = handles
@@ -289,13 +323,37 @@ fn egress_label(raw: &str) -> String {
 }
 
 pub fn render_meta(out: &SearchOutcome) -> Value {
+    let instant = out.instant.as_ref().map(|ans| {
+        json!({
+            "kind": ans.kind,
+            "title": ans.title,
+            "text": ans.text,
+            "url": ans.url,
+            "engine": ans.engine,
+        })
+    });
     json!({
         "intent": format!("{:?}", out.intent),
         "weak": out.weak,
         "cached": out.cached,
         "elapsed_ms": out.elapsed.as_millis() as u64,
+        "stage_ms": if out.stage_ms.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(out
+                .stage_ms
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        serde_json::json!(*v as u64),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>())
+        },
         "provider": out.provider,
         "rerank": if out.reranked { "on" } else { "off (RRF+BM25 fallback)" },
+        "instant": instant,
         "results": out.results.iter().map(|r| {
             // Named sources (deduped: an engine surfacing a URL at
             // two ranks is one opinion for the list, exactly like

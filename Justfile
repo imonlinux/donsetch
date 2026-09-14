@@ -19,7 +19,7 @@
 # without bound across dep bumps (110G caught; ~99G was bloat). This
 # clears everything except the warm `ci` loop profile.
 clean-bloat:
-	rm -rf target/debug target/release fuzz/target
+	rm -rf target/debug target/release fuzz/target target/x86_64-pc-windows-gnu
 
 # Hard storage guard: the target dir never gets to blow past 25G.
 # One du + compare (~2s), prune-through only when bloat exists. The
@@ -27,7 +27,7 @@ clean-bloat:
 guard:
 	@if [ -d target ] && [ "$$(du -sm target | cut -f1)" -gt 25000 ]; then \
 		echo "guard: pruning bloat profiles (target > 25G)"; \
-		rm -rf target/debug target/release fuzz/target; \
+		rm -rf target/debug target/release fuzz/target target/x86_64-pc-windows-gnu; \
 	fi
 
 # Instant size report: what each shell of target/ costs.

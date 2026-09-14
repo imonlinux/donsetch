@@ -7,6 +7,7 @@
 
 pub mod frontier;
 pub mod governor;
+pub mod host_pace;
 pub mod real;
 pub mod score;
 pub mod sitemap;
@@ -252,9 +253,9 @@ struct ResumeState {
 /// save stale copies over each other, so a token issued
 /// milliseconds ago reads back as "resume token expired or
 /// unknown". Token files are written exactly once; consumption
-/// deletes the file. Sweep = 120-minute mtime + a 50-token cap;
-/// the legacy single-file store migrates on first touch.
-const RESUME_TTL_SECS: u64 = 120 * 60;
+/// deletes the file. Sweep = mtime TTL (`fetch.resume_ttl_secs`,
+/// default 120 min) + a 50-token cap; the legacy single-file store
+/// migrates on first touch.
 const RESUME_CAP: usize = 50;
 
 fn resumes_dir() -> std::path::PathBuf {
@@ -269,6 +270,18 @@ fn token_path(dir: &std::path::Path, tok: &str) -> std::path::PathBuf {
     // Token ids are c<hex-micros><hex-seq>: filename-safe on every
     // platform, no traversal surface.
     dir.join(format!("{tok}.json"))
+}
+
+/// A resume token is only ever ISSUED as `c<hex><hex>`, but the value
+/// consumed on resume is agent-supplied, and it is joined into a
+/// filesystem path (`<cache>/crawl-resumes/<tok>.json`). Reject
+/// anything that is not plain ASCII alphanumeric so a crafted token
+/// (`../../etc/x`, an absolute path, a NUL) cannot escape the store
+/// directory to read-then-delete a `.json` file outside it. Matches
+/// the traversal rejection paths::resolve_screenshot_path already
+/// applies to the screenshot output path.
+fn is_valid_resume_token(tok: &str) -> bool {
+    !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// One-time migration: the v3 store kept every token in one JSON
@@ -322,7 +335,12 @@ fn write_token_file(dir: &std::path::Path, tok: &str, state: &ResumeState) -> bo
 
 /// Drop expired tokens and cap the store at 50, oldest first.
 /// Per-file mtime is the age signal: nothing else writes these.
+/// TTL is `fetch.resume_ttl_secs` (default 2h, clamped 5m..24h).
 fn resume_store_sweep(dir: &std::path::Path) {
+    let ttl = crate::config::cfg()
+        .fetch
+        .resume_ttl_secs
+        .clamp(300, 86_400);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -340,7 +358,7 @@ fn resume_store_sweep(dir: &std::path::Path) {
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| now.saturating_sub(t.as_secs()) < RESUME_TTL_SECS)
+            .map(|t| now.saturating_sub(t.as_secs()) < ttl)
             .unwrap_or(false);
         if age_ok {
             alive.push((
@@ -369,6 +387,12 @@ fn resume_store_sweep(dir: &std::path::Path) {
 /// its crawl actually resumes). Unknown, corrupt, or unreadable =
 /// the same honest error.
 fn resume_store_take(tok: &str) -> Result<ResumeState, String> {
+    // The token is agent-supplied and about to index the filesystem:
+    // refuse anything that is not a well-formed token before it can
+    // traverse out of the store directory (no FS touch on a bad one).
+    if !is_valid_resume_token(tok) {
+        return Err(format!("resume token expired or unknown: {tok}"));
+    }
     let dir = resumes_dir();
     migrate_legacy_store();
     resume_store_sweep(&dir);
@@ -451,10 +475,22 @@ impl Crawler {
     ) -> Result<CrawlResult, String> {
         let started = Instant::now();
 
+        // Resume state is taken from the store EXACTLY ONCE, up
+        // front: resume_store_take deletes the token file, and the
+        // old shape took it here for the empty-seed case and AGAIN
+        // below for the frontier restore, so every resume-only call
+        // aborted with "resume token expired or unknown" and the
+        // saved state was already destroyed. One take, two readers.
+        let resumed_state: Option<ResumeState> = match resume_token {
+            Some(tok) => Some(resume_store_take(tok)?),
+            None => None,
+        };
+
         // Resume without url: load the seed from the resume state.
         let (seed, seed_url, seed_host) = if seed.is_empty() {
-            let tok = resume_token.ok_or("resume token required when url is empty")?;
-            let state = resume_store_take(tok)?;
+            let state = resumed_state
+                .as_ref()
+                .ok_or("resume token required when url is empty")?;
             let u = Url::parse(&state.seed)
                 .map_err(|_| format!("bad seed in resume state: {}", state.seed))?;
             let h = u.host_str().ok_or("seed must have a host")?.to_string();
@@ -534,7 +570,8 @@ impl Crawler {
             }
         }
         if opts.respect_robots {
-            self.governor.set_crawl_delay(robots.crawl_delay);
+            self.governor
+                .set_host_crawl_delay(&seed_host, robots.crawl_delay);
         }
         if opts.mode == CrawlMode::Map {
             // Map-only crawl: cheap exit. Guide the agent when no
@@ -564,7 +601,7 @@ impl Crawler {
 
         // ── Frontier seeding ───────────────────────────────
         let mut queue = FrontierQueue::with_shaper(
-            opts.shape && !crate::config::env_flag("DONSETCH_NO_CRAWL_SHAPE"),
+            opts.shape && crate::config::cfg().fetch.crawl_shape,
             opts.shape_seed.unwrap_or_else(|| {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -584,15 +621,10 @@ impl Crawler {
         let fetched_pages = 0usize;
         let total_chars = 0usize;
         let seed_norm = frontier::normalize(&seed_url);
-        if let Some(tok) = resume_token {
-            match resume_store_take(tok) {
-                Ok(state) => {
-                    queue.restore_seen(state.seen);
-                    for (u, s, d, r, p) in state.queue {
-                        queue.push_to_heap(u, s, d, r, p);
-                    }
-                }
-                Err(e) => return Err(e),
+        if let Some(state) = resumed_state {
+            queue.restore_seen(state.seen);
+            for (u, s, d, r, p) in state.queue {
+                queue.push_to_heap(u, s, d, r, p);
             }
         }
         // Site-wide IDF for BM25-lite frontier scoring: built from
@@ -706,6 +738,9 @@ impl Crawler {
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
             let robots = robots.clone();
+            // The redirect recheck consults the host gate inside the
+            // worker: each iteration needs its own clone.
+            let host_ok = host_ok.clone();
             let max_pages = opts.max_pages;
             // Sitemap found ⇒ link discovery does not depend on the
             // seed fetch ⇒ even the seed is skippable in delta mode.
@@ -813,13 +848,20 @@ impl Crawler {
                         }
                     };
                     if item.depth > max_depth {
-                        let mut s = stop_flag
+                        // Skip the item and keep going: the old shape
+                        // aborted the whole crawl on the first
+                        // too-deep pop, discarding the shallower
+                        // frontier behind it (and DepthLimit never
+                        // persisted a resume token, so the work was
+                        // simply lost). Honest skip instead.
+                        skipped
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if s.is_none() {
-                            *s = Some(StopReason::DepthLimit);
-                        }
-                        break 'work;
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((
+                                item.url.clone(),
+                                format!("depth {} > max {max_depth}", item.depth),
+                            ));
+                        continue 'work;
                     }
                     let host = parsed.host_str().unwrap_or("");
                     if opts_worker.same_host && !host_matches(host, &seed_host2) {
@@ -995,6 +1037,44 @@ impl Crawler {
                             .push((item.url.clone(), why));
                         continue 'work;
                     }
+                    // ── Redirect recheck ──
+                    // Every scope/robots gate above ran on the QUEUED
+                    // url, but results, dataset and history key on the
+                    // POST-REDIRECT final URL. A same-host seed that
+                    // 302s across hosts (open redirect) or into a
+                    // robots-disallowed / out-of-scope path used to
+                    // land there unchecked. Re-gate the final URL.
+                    let final_parsed = match Url::parse(&page.url) {
+                        Ok(u) => u,
+                        Err(_) => {
+                            skipped
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((item.url.clone(), "redirect target unparseable".into()));
+                            continue 'work;
+                        }
+                    };
+                    if final_parsed != parsed {
+                        let host_ok_final = host_ok(&final_parsed);
+                        let scope_ok_final = scope_allowed(
+                            final_parsed.path(),
+                            &opts_worker.include_paths,
+                            &opts_worker.exclude_paths,
+                        );
+                        let robots_ok_final =
+                            !opts_worker.respect_robots || robots.allowed(final_parsed.path());
+                        if !host_ok_final || !scope_ok_final || !robots_ok_final {
+                            skipped
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((
+                                    item.url.clone(),
+                                    format!("redirected out of scope -> {}", page.url),
+                                ));
+                            continue 'work;
+                        }
+                    }
+
                     // Count every successful fetch (safety valve
                     // against sites full of low-quality pages).
                     total_fetched.fetch_add(1, Ordering::SeqCst);
@@ -1611,9 +1691,19 @@ impl Crawler {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Resume token only when stopped by budget (not frontier-empty).
+        // Resume token when stopped with work still queued:
+        // budget stops, a client cancellation, or the host's
+        // penalty box. The MCP surface promises both Cancelled
+        // ("resume with the token above") and ThrottledOut ("wait
+        // and resume") partial progress, so both must persist the
+        // frontier; only a drained frontier (FrontierEmpty) and a
+        // completed crawl have nothing to resume.
         let resume = match stop {
-            StopReason::MaxPages | StopReason::CharBudget | StopReason::Deadline => {
+            StopReason::MaxPages
+            | StopReason::CharBudget
+            | StopReason::Deadline
+            | StopReason::Cancelled
+            | StopReason::ThrottledOut => {
                 if !queued_entries.is_empty() {
                     let id = {
                         let n = self.token_seq.fetch_add(1, Ordering::Relaxed);

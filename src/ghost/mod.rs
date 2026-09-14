@@ -21,6 +21,7 @@ pub mod manager;
 pub mod ops;
 pub mod probe;
 pub mod proc;
+pub mod relay;
 pub mod xvfb;
 
 use std::path::PathBuf;
@@ -65,6 +66,44 @@ pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_s
 #[cfg(windows)]
 pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Set when the LAST ghost render returned Chrome's own network
+/// error page (a dead/broken egress lane renders as a stable,
+/// tiny-text DOM extraction cannot use: the old path scored it
+/// "rendered a 180KB DOM, no content" and failed the fetch).
+/// The fetch escalation reads it for one direct retry; per
+/// attempt, never sticky.
+static LAST_GHOST_CHROME_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Launch override: skip proxy lanes entirely (direct). Set for
+/// one ghost escalation retry when the previous render hit a
+/// Chrome error page.
+static GHOST_DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Chrome's own error pages (ERR_* rendered as HTML). A content
+/// page never contains these strings; an error page never
+/// contains real content.
+pub fn is_chrome_error_html(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    lower.contains("err_socks_connection_failed")
+        || lower.contains("err_proxy_connection_failed")
+        || lower.contains("err_tunnel_connection_failed")
+        || lower.contains("this site can't be reached")
+        || lower.contains("the proxy server is refusing connections")
+}
+
+pub fn note_last_ghost_chrome_error(on: bool) {
+    LAST_GHOST_CHROME_ERROR.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn last_ghost_chrome_error() -> bool {
+    LAST_GHOST_CHROME_ERROR.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn set_ghost_direct(on: bool) {
+    GHOST_DIRECT.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub struct Ghost {
     child: Child,
     proc: proc::Proc,
@@ -101,6 +140,56 @@ pub struct Ghost {
     /// Aborted in Drop, same as fetch_guard.
     #[cfg(windows)]
     winlock_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// Persona-coherent wire identity (v4 E2): viewport + locale used
+    /// for launch args, CDP languages, and device metrics.
+    wire: GhostWire,
+    /// Local credential relay when the egress lane requires auth
+    /// (Chrome cannot authenticate proxies itself). Owns the
+    /// listener: dropped with the Ghost.
+    #[allow(dead_code)] // held for its lifetime; Drop aborts the relay
+    relay: Option<relay::Relay>,
+}
+
+/// Per-persona ghost wire identity (v4 E2). Defaults are the old
+/// hardcoded 1920x1080 / en-US so callers that have no persona stay
+/// byte-identical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GhostWire {
+    pub viewport: (u32, u32),
+    pub locale: String,
+}
+
+impl Default for GhostWire {
+    fn default() -> Self {
+        Self {
+            viewport: (1920, 1080),
+            locale: "en-US".into(),
+        }
+    }
+}
+
+impl GhostWire {
+    pub fn from_persona(p: &crate::persona::Persona) -> Self {
+        let (w, h) = p.viewport;
+        // Coherence checker already bounds the viewport; clamp here so a
+        // corrupt on-disk persona can never pass a nonsense --window-size.
+        let w = w.clamp(800, 4000);
+        let h = h.clamp(600, 3000);
+        // Fail-closed: a hostile locale must never reach --lang or the
+        // CDP navigator.languages injection.
+        let locale = crate::persona::sanitize_locale(&p.locale);
+        Self {
+            viewport: (w, h),
+            locale,
+        }
+    }
+
+    /// Chrome --lang wants a BCP-47-ish tag; navigator.languages
+    /// wants the full list. Keep both derived from one locale.
+    pub fn languages_js(&self) -> String {
+        let lang = self.locale.split('-').next().unwrap_or("en");
+        format!("['{}', '{}']", self.locale, lang)
+    }
 }
 
 /// Persistent profile dir: aged state passes challenges
@@ -117,13 +206,23 @@ pub fn default_chrome_args(
     dir: &std::path::Path,
     profile: &crate::profile::BrowserProfile,
 ) -> Vec<String> {
+    default_chrome_args_wire(dir, profile, &GhostWire::default())
+}
+
+/// Launch args with a persona-coherent viewport and locale (v4 E2).
+pub fn default_chrome_args_wire(
+    dir: &std::path::Path,
+    profile: &crate::profile::BrowserProfile,
+    wire: &GhostWire,
+) -> Vec<String> {
+    let (vw, vh) = wire.viewport;
     vec![
         "--remote-debugging-port=0".into(),
         format!("--user-data-dir={}", dir.display()),
         format!("--user-agent={}", profile.user_agent),
-        "--window-size=1920,1080".into(),
+        format!("--window-size={vw},{vh}"),
         "--window-position=-32000,-32000".into(),
-        "--lang=en-US".into(),
+        format!("--lang={}", wire.locale),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-background-networking".into(),
@@ -153,7 +252,7 @@ pub fn default_chrome_args(
 /// Whether sandbox is disabled via explicit opt-in.
 /// Used for testing that default launch is safe.
 pub fn sandbox_opt_in_enabled() -> bool {
-    std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1")
+    crate::config::cfg().browser.no_sandbox
 }
 
 /// Resolve the Chromium-family binary used by DonGhost.
@@ -180,11 +279,18 @@ pub fn chrome_binary() -> Result<String, FetchError> {
 }
 
 fn chromium_binary() -> Result<String, String> {
-    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        let path = PathBuf::from(p);
+    // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
+    // env var, so the config value is the single explicit source here.
+    let configured = &crate::config::cfg().browser.chromium_path;
+    if crate::config::browser_string_is_supplied(
+        "browser.chromium_path",
+        configured,
+        "DONGHOST_CHROME",
+    ) {
+        let path = PathBuf::from(configured);
         if !is_executable(&path) {
             return Err(format!(
-                "DONGHOST_CHROME is not an executable: {}",
+                "browser.chromium_path (legacy DONGHOST_CHROME) is not an executable: {}",
                 path.display()
             ));
         }
@@ -307,8 +413,16 @@ fn playwright_entry_suffixes() -> &'static [&'static str] {
 /// Linux (Playwright honors XDG_CACHE_HOME when set).
 fn playwright_registry_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
-        roots.push(PathBuf::from(ov));
+    // The config knob wins when set; otherwise the ambient standard
+    // var still applies (mirror-when-set semantics).
+    let cfg_root = &crate::config::cfg().browser.playwright_path;
+    if let Some(root) = crate::config::mirrored_os(
+        "browser.playwright_path",
+        cfg_root,
+        "PLAYWRIGHT_BROWSERS_PATH",
+    ) && !root.is_empty()
+    {
+        roots.push(PathBuf::from(root));
     }
     #[cfg(not(windows))]
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -460,6 +574,15 @@ impl Ghost {
     pub async fn launch(
         profile: &BrowserProfile,
         display: Option<&str>,
+    ) -> Result<Self, FetchError> {
+        Self::launch_wire(profile, display, &GhostWire::default()).await
+    }
+
+    /// Launch with a persona-coherent viewport/locale (v4 E2).
+    pub async fn launch_wire(
+        profile: &BrowserProfile,
+        display: Option<&str>,
+        wire: &GhostWire,
     ) -> Result<Self, FetchError> {
         // Unused on macOS/Windows (Xvfb is Linux-only) : clippy -Dwarnings errors on it.
         #[cfg(not(linux_like))]
@@ -616,7 +739,7 @@ impl Ghost {
             }
         }
         let mut cmd = Command::new(bin);
-        let mut chrome_args: Vec<String> = default_chrome_args(&dir, profile);
+        let mut chrome_args: Vec<String> = default_chrome_args_wire(&dir, profile, wire);
         let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;
         if browser.backend == cloak::BrowserBackend::CloakBrowser {
             // Cloak's C++ patches own the extension/plugin and
@@ -639,22 +762,55 @@ impl Ghost {
         // unavailable (e.g. containers without user-namespace support
         // or AppArmor restrictions). Never enabled by default :
         // requires explicit env var and prints a loud warning.
-        if std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1") {
+        if crate::config::cfg().browser.no_sandbox {
             eprintln!(
                 "[ghost] WARNING: DONGHOST_NO_SANDBOX=1 : launching Chrome with --no-sandbox and --disable-setuid-sandbox. This disables the Chromium sandbox and is UNSAFE. Only use in isolated containers."
             );
             chrome_args.push("--no-sandbox".into());
             chrome_args.push("--disable-setuid-sandbox".into());
         }
-        // ── HTTP proxy (env var) ──
-        // If HTTP_PROXY/HTTPS_PROXY/ALL_PROXY is set, route the
-        // Ghost browser through the same proxy as tier 1. Chrome
-        // handles proxy auth via its own dialog (which we never see
-        // in headless/off-screen mode), so for authenticated proxies
-        // the user may need a proxy-auth extension. For unauthenticated
-        // proxies this just works.
-        if let Some(p) = crate::transport::proxy::from_env_for("https://ghost.local/") {
-            chrome_args.push(format!("--proxy-server={}", p.chrome_proxy_arg()));
+        // ── HTTP proxy ──
+        // Prefer a sticky lane from the shared egress pool (v4 A2)
+        // so the browser exit matches the rest of the fabric. Fall
+        // back to env/slot. Chrome CANNOT authenticate a proxy
+        // itself: --proxy-server carries no credentials and no
+        // dialog we can drive headless, so an authenticated lane
+        // made Chrome render its own ERR_SOCKS_CONNECTION_FAILED
+        // error page and the whole tier-2 attempt died. Authed
+        // lanes now ride a local relay: Chrome speaks plain socks5
+        // to 127.0.0.1, the relay performs the upstream handshake
+        // with the lane's own credentials (exactly what the tier-1
+        // client does) and pipes bytes.
+        let pool_proxy = if GHOST_DIRECT.load(std::sync::atomic::Ordering::SeqCst) {
+            // Direct retry after a Chrome error page: no lanes at
+            // all, direct is the only chance left.
+            None
+        } else {
+            crate::search::egress::global().and_then(|pool| {
+                if !pool.has_proxies() || !crate::config::cfg().proxy.fetch_rotate {
+                    return None;
+                }
+                pool.pick_fetch("ghost.local", true).and_then(|e| e.proxy)
+            })
+        };
+        let mut relay: Option<relay::Relay> = None;
+        if let Some(p) =
+            pool_proxy.or_else(|| crate::transport::proxy::from_env_for("https://ghost.local/"))
+        {
+            let authed = !p.user.is_empty() || !p.pass.is_empty();
+            let arg = if authed {
+                match relay::Relay::spawn(std::sync::Arc::new(p.clone())).await {
+                    Some(r) => {
+                        let arg = r.chrome_arg();
+                        relay = Some(r);
+                        arg
+                    }
+                    None => p.chrome_proxy_arg(),
+                }
+            } else {
+                p.chrome_proxy_arg()
+            };
+            chrome_args.push(arg);
         }
         // ── Stealth mode selection ──
         //
@@ -711,7 +867,16 @@ impl Ghost {
         // Own process group (Unix) / Job Object (Windows):
         // freeze/thaw/kill the whole browser tree.
         proc::Proc::prepare_cmd(&mut cmd);
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        // stdin MUST be null: a child inheriting the parent's
+        // controlling terminal gets SIGTTIN the moment it reads
+        // stdin (a daemon running attached to a tty), and the whole
+        // browser tree freezes in state T = the DevTools handshake
+        // never completes (live case: the daemon's chromiums sat in
+        // Tl for hours; every tier-2 attempt died with "devtools ws
+        // timeout").
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         // No orphans even if donsetch dies hard. Linux/Android:
         // prctl(PR_SET_PDEATHSIG). macOS has no prctl; Windows
         // uses the Job Object's KILL_ON_JOB_CLOSE.
@@ -822,19 +987,20 @@ impl Ghost {
         // the property undefined); --disable-blink-features=
         // AutomationControlled on the launch args handles the
         // headless-mode case without defining anything.
+        let langs_js = wire.languages_js();
         let _ = cdp
             .call(
                 Some(&session),
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({
-                    "source": "\
-                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });\
-                        if (!window.chrome) { window.chrome = {}; }\
-                        if (!window.chrome.runtime) { window.chrome.runtime = {}; }\
-                        if (navigator.plugins && navigator.plugins.length === 0) {\
-                            Object.defineProperty(navigator, 'plugins', { get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }, { name: 'Native Client' }] });\
-                        }\
-                    "
+                    "source": format!("\
+                        Object.defineProperty(navigator, 'languages', {{ get: () => {langs_js} }});\
+                        if (!window.chrome) {{ window.chrome = {{}}; }}\
+                        if (!window.chrome.runtime) {{ window.chrome.runtime = {{}}; }}\
+                        if (navigator.plugins && navigator.plugins.length === 0) {{\
+                            Object.defineProperty(navigator, 'plugins', {{ get: () => [{{ name: 'Chrome PDF Plugin' }}, {{ name: 'Chrome PDF Viewer' }}, {{ name: 'Native Client' }}] }});\
+                        }}\
+                    ")
                 }),
             )
             .await;
@@ -866,21 +1032,30 @@ impl Ghost {
 
         // Unknown platform fallback: headless mode with device
         // metrics override (no real screen geometry available).
-        #[cfg(not(any(linux_like, target_os = "macos", target_os = "windows")))]
+        // Also applied when the persona pins a non-default viewport
+        // so window-size and the layout viewport cannot disagree.
         {
-            cdp.call(
-                Some(&session),
-                "Emulation.setDeviceMetricsOverride",
-                json!({
-                    "width": 1920,
-                    "height": 1080,
-                    "deviceScaleFactor": 1,
-                    "mobile": false,
-                    "screenWidth": 1920,
-                    "screenHeight": 1080
-                }),
-            )
-            .await?;
+            let (vw, vh) = wire.viewport;
+            let needs_metrics = cfg!(not(any(
+                linux_like,
+                target_os = "macos",
+                target_os = "windows"
+            ))) || wire.viewport != (1920, 1080);
+            if needs_metrics {
+                cdp.call(
+                    Some(&session),
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": vw,
+                        "height": vh,
+                        "deviceScaleFactor": 1,
+                        "mobile": false,
+                        "screenWidth": vw,
+                        "screenHeight": vh
+                    }),
+                )
+                .await?;
+            }
         }
 
         // Session warmup : Debian 12 chromium 151 (observed): the
@@ -924,12 +1099,19 @@ impl Ghost {
             winlock,
             #[cfg(windows)]
             winlock_heartbeat,
+            wire: wire.clone(),
+            relay,
         })
     }
 
     #[allow(dead_code)] // useful accessor for debugging/agent surface
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// The wire identity this browser was launched with (v4 E2).
+    pub fn wire(&self) -> &GhostWire {
+        &self.wire
     }
 
     /// Freeze the whole process tree. CPU → 0, RAM goes
@@ -1073,7 +1255,11 @@ impl Ghost {
         // loop below, whose deadline runs concurrently. Real
         // failures surface via the poll loop, and the escalation-
         // level retry rides the warmed session.
-        if let Err(_e) = self
+        // A real Page.navigate error (SSRF guard answered
+        // BlockedByClient, DNS failure) is recorded: the poll loop
+        // below only knows "URL never advanced", which used to hide
+        // the actual cause behind a generic 20s timeout message.
+        let nav_err: Option<String> = match self
             .cdp
             .call_with_timeout(
                 Some(&self.session),
@@ -1082,7 +1268,13 @@ impl Ghost {
                 8,
             )
             .await
-        {}
+        {
+            Err(e) if !e.to_string().contains("cdp timeout") => Some(e.to_string()),
+            // Settle-window timeouts are the documented queue
+            // behavior above; the poll loop is the real referee.
+            _ => None,
+        };
+
         // Poll the target URL until it advances off the initial
         // blank page (about:blank is what createTarget starts at).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1102,9 +1294,12 @@ impl Ghost {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err(FetchError::ghost(
-                    "navigate: target URL never advanced past about:blank",
-                ));
+                return Err(FetchError::ghost(match &nav_err {
+                    Some(why) => {
+                        format!("navigate: target URL never advanced past about:blank ({why})")
+                    }
+                    None => "navigate: target URL never advanced past about:blank".into(),
+                }));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
@@ -2024,19 +2219,10 @@ mod sandbox_tests {
     }
 
     #[test]
-    fn sandbox_opt_in_requires_explicit_env() {
-        // Ensure default is safe without env var.
-        // Save and restore to avoid flakiness.
-        let prev = std::env::var_os("DONGHOST_NO_SANDBOX");
-        unsafe { std::env::remove_var("DONGHOST_NO_SANDBOX") };
+    fn sandbox_opt_in_is_config_driven() {
+        // The env mapping (DONGHOST_NO_SANDBOX=1) is covered by the
+        // config-layer tests; here only the runtime default contract.
         assert!(!sandbox_opt_in_enabled());
-        unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", "1") };
-        assert!(sandbox_opt_in_enabled());
-        unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", "0") };
-        assert!(!sandbox_opt_in_enabled());
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", v) },
-            None => unsafe { std::env::remove_var("DONGHOST_NO_SANDBOX") },
-        }
+        assert!(!crate::config::DonsetchConfig::default().browser.no_sandbox);
     }
 }

@@ -5,17 +5,231 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.1.0] - 2026-09-14
 
-V4 work in progress on `master`. Nothing below ships through a release
-channel until the v4.0.0 release train.
+The live-verification wave: every subsystem re-tested against the
+real binary on real sites, and the bugs the unit suites could not
+see are dead.
+
+### Fixed
+- Delta recrawls see the live page. The crawl fetch rode the
+  revalidation cache, so a fresh-window entry was served back
+  without dialing the origin and every recrawl compared the last
+  crawl's own body, reporting zero changes forever. The crawl fetch
+  path now bypasses the cache. Covered by an e2e test: the plain
+  path serves the stale body with zero dials, the crawl path dials
+  and sees the change.
+- A SOCKS5 relay that refuses a host remembers the refusal and
+  fails fast. Repeat-offender hosts ate a dial timeout per request
+  (the tiktok ladder went 40s to 21s).
+- Tier 1 follows redirects through the identity wrappers. The
+  persona/class/UA lanes had no redirect loop and reported
+  "blocked: returned HTTP 301" on sites that simply 301 to their
+  real URL. One shared bounded redirect driver now.
+- Chrome runs with stdin closed: a suspended SIGTTIN page could
+  hang the ghost render.
+- Wall detection classifies 200-class walls (the reddit nonce form,
+  the amazon gate, "please wait" interstitials, the instagram
+  AuthWall). A challenge page that arrives with HTTP 200 is not
+  content.
+- The last-resort DOM fallback is trusted: header/footer/nav/aside
+  blocks are skipped, ghost text is accepted at 40+ chars
+  non-login-only, and a final shell gate sits in front of the tool
+  result. Facebook now gets the honest "the site renders an app
+  shell without real content" instead of a success-looking blob.
+- The search enrich pass is bounded. One slow top page could stall
+  every cold search (2.0 to 4.4s observed). The enrich batch now
+  runs under a 700ms deadline; stragglers drop to the SERP snippet.
+  Per-stage timings (enrich/filters/topup) ride the search meta so
+  a cold-path regression names its phase. Cold search is steady at
+  2.0 to 2.3s.
+- The no-rerank build compiles again: the rerank-gated topup_ms
+  binding was consumed unconditionally, which killed the fuzz smoke
+  and windows jobs with E0425.
+- Stealth baseline re-captured for the current chromium 151.0.x:
+  the client-hello extension ordering moved; user agent and every
+  behavioral layer are unchanged.
+- Dataset crawl stderr summaries report real page and char counts
+  instead of "0 pages" while rows streamed on stdout.
+
+## [4.0.0] - 2026-09-13
+
+The agent web stack, rebuilt end to end. Same four tools, same
+zero-config `donsetch mcp` default. Faster, stealthier, more
+reliable, and honest about what it knows.
+
+### Removed
+- `web_answer` (the evidence pack) and `web_memory` (the local vector
+  store), by my call. A fixed search-then-read pipeline and a
+  memory-of-everything store strip the agent's control over the loop
+  (which link, which budget) and spend tokens on pages the agent
+  would not have picked. The agent owns search + fetch; DonSeTch just
+  makes each of those calls god-tier. The search prefetch that the
+  pack spawned is kept (web_fetch consumes it: a speed win with zero
+  new surface).
+
+### Fixed
+- Persona locale is fail-closed sanitized before it can reach Chrome
+  `--lang`, CDP `navigator.languages` injection, or an
+  Accept-Language header. A corrupt on-disk persona or hostile
+  `persona.locale` / LANG value can no longer break out of the JS
+  array or inject header bytes; invalid values become `en-US`.
+- A warm ghost whose viewport/locale no longer matches the incoming
+  persona (quarantine re-mint) now relaunches instead of silently
+  claiming the old identity. `web_screenshot` uses the same persona
+  wire as tier-1.
+- Cross-process host-pace rows are compared by host on read (FNV
+  collision no longer shares a floor) and stale `.tmp` files from
+  failed atomic writes are pruned.
+- PDF glyph walk no longer panics when the first glyph's font has no
+  PDFium-reportable name (Type3, missing BaseFont, over-long name).
+  The mono-font check now bounds-checks the family index like the
+  sibling dingbat flag; a crafted PDF can no longer abort the process
+  (release `panic = "abort"`) on fetch. (#221)
+- Search syndication dedup keeps punctuation in the title key, so
+  `C++ Tutorial` and `C# Tutorial` (and dotted versions like
+  `Rust 1.75`) no longer collapse into one result and silently drop
+  the other. Only titles that are identical after case/whitespace
+  normalization still dedup. (#222)
+- `web_screenshot` omitted `full_page` now defaults to viewport on
+  both CLI and MCP (MCP used to silently mean full-page).
+- Fetch CLI long-help cites `--actions`, not the dead
+  `--browser-actions`.
+
+### Changed
+- `donsetch config show` redacts bearer tokens and credential-bearing proxy
+  values, including proxy pools, while still showing whether each field is
+  configured and where its value came from.
+- Browser version probes now apply one deadline to process exit and bounded
+  stdout capture, terminate inherited-pipe descendants on Unix and Windows,
+  and cap captured output at 64 KiB.
+- Every runtime env read now flows through the typed config. The old
+  env names keep their exact historical trigger semantics and still
+  work in 4.0, but they are deprecated; `donsetch doctor` lists the
+  ones your shell still sets and maps each to its config key. The
+  hard cut lands in a later minor once the migration is done.
 
 ### Added
+- **Egress fabric (v4 A):** search, crawl, fetch, and ghost share one
+  process-wide proxy pool with durable lane health. Burned and dead
+  lines survive restarts in `egress-health.json` (kill:
+  `DONSETCH_NO_EGRESS_PERSIST`). When a pool is configured, `web_fetch`
+  sticks to one exit per host and rotates on 429 / 407 / connect-dead /
+  timeout; the lane stays pinned for the whole redirect chain (never
+  mid-200-session). Kill: `DONSETCH_NO_FETCH_ROTATE`. Personas get an
+  exclusive lane bind: a burned or foreign-persona exit is never
+  reused for a new mint, and quarantine frees the lane. Per-lane RTT
+  EWMA feeds search pacing and surfaces in `donsetch doctor --deep`
+  as one line per lane (ok / slow / burned / dead / auth) with a named
+  fix. Daemon preflight still benches dead proxies before the first
+  query; crawl skips benched lanes and reports outcomes into the same
+  health world.
+- **Learning engine v2 (v4 B, local only):** per-(engine, intent)
+  search trust EWMAs drive roster order (`search-trust.json` v2; empty
+  intent maps seed every intent from engine-global history so a
+  restart never re-learns a walled engine from zero). Domain profiles
+  stamp which egress class their cookies were learned on; a Warm
+  clearance vault is refused when the live lane is the other class
+  (home-IP cookies never ride a proxy exit). Crawl host ladders
+  (429 storms, robots delays) persist to `crawl-governor.json`
+  (cap ~2k hosts, 7d TTL). Enrich/prefetch success density feeds a
+  capped domain quality prior (`search-quality.json`, ±0.08 after
+  ≥3 samples; kill `DONSETCH_NO_QUALITY_PRIOR`; walls and timeouts
+  never count). Agent-outcome feedback (must_contain miss / thin /
+  SoftNotFound) soft-demotes `class|host` in `outcome-feedback.json`
+  (±0.05 after ≥2 misses; **default off** until the 24h soak proves
+  it; enable with `DONSETCH_OUTCOME_FEEDBACK=1`; never extra fetches).
+  `donsetch status` has an **improve** line
+  (warm-hits, walled, cooldowns, flaky, low-trust/quarantined,
+  quality hosts, outcome demotes) and `donsetch doctor --improve`
+  explains the loop in ~10 lines with live local receipts and kill
+  switches. No MCP tool, no telemetry, no cross-machine sharing.
+  A 24h soak battery still gates any public improve claim.
+- **Search v3:** adaptive early-return cancels stragglers once ≥3
+  independent index families already agree on a top-3 URL (kill
+  `DONSETCH_NO_SEARCH_EARLY`). Mojeek `empty-parse` (blocked as HTTP
+  200) burns engine trust harder so it leaves the default width
+  instead of occupying a slot every query. Compact snippets trim to
+  180 chars. Query compiler splits `site:` / `filetype:` / `intitle:`
+  out of the free text and only sends each operator to engines that
+  honor it (DDG lite strips them so BM25 never ranks the literal
+  token); post-merge filters enforce `site:` and `intitle:`, and
+  `filetype:` keeps matching URLs plus extensionless download
+  handlers (kill `DONSETCH_NO_QUERY_COMPILE`). `site:github.com`,
+  `site:stackoverflow.com`, and friends also join the fan-out as
+  that site's own API. A byte-derived SERP instant layer lifts
+  featured snippets / instant answers / knowledge panels out of the
+  organic list into their own slot with the source URL always
+  present (never invents text; not cached; kill
+  `DONSETCH_NO_SERP_INSTANT`). Code verticals are query-gated and
+  stress-aware: StackExchange only on Q&A/error language, MDN only
+  on web-platform tokens, HN only on release/announce; under pool
+  stress HN drops first.
+- **Doctor ultra (v4 D):** broader local coverage, same fast default.
+  New checks: config posture (`NO_CONFIG_FILE` + `DONSETCH_CONFIG`
+  conflict, missing explicit file, layer report), search health
+  (engine trust, quarantine, quality/outcome receipts, BYOK key
+  state counts, C kill-switch flags), clearance stores (routes.json
+  counts, handles, cookie vault), crawl stores (governor host
+  ladders, page-history size warning past 5MB), DNS resolution
+  (independent of HTTP, names AAAA presence), and a captive-portal
+  probe under `--deep` (`generate_204` must stay 204). State
+  permissions now cover every secret-bearing store
+  (`ghost-state.json`, `routes.json`, `byok-keys.json`) and
+  auto-tighten to 0600. All new checks carry unit tests; live
+  `doctor` on a real box is green with honest warnings.
+- **ML-DSA ClientHello parity (v4 E1):** Chrome 151 pads
+  `signature_algorithms` with ML-DSA 44/65/87 (IANA 0x0904/05/06).
+  boring 5.2.0 finally names and verifies those codes, so the
+  ChromeTrue wire advertises them (`mldsa44:mldsa65:mldsa87:` at
+  the front). InterceptionSafe never sends them (a corporate MITM
+  re-terminates without ML-DSA certs). Kill:
+  `tls.mldsa_sigalgs=false` / `DONSETCH_NO_MLDSA_SIGALGS`.
+- **Persona wire divergence (v4 E2):** per-domain personas now
+  actually drive the wire. Tier-1 Accept-Language is persona-locale
+  first (TLD/script kept as a lower-q preference so localized
+  content still lands, without the classic en-US browser speaking
+  perfect ru-RU JA4H tell). The ghost browser launches with the
+  persona's viewport and `--lang`, and CDP `navigator.languages`
+  matches. Quarantined personas fall back to the default wire.
+- **Crawl polish (v4 F):** dataset JSONL rows carry
+  `dataset_version: 1` in structuredContent; resume-token TTL is
+  `fetch.resume_ttl_secs` (default 7200, clamped 300..86400) instead
+  of a hardcoded 2h. Cross-process host politeness: crawls share a
+  per-host last-stamp file under `<cache>/host-pace/` so a daemon and
+  a CLI crawl of the same host respect one floor gap (kill:
+  `DONSETCH_NO_HOST_PACE_FILE`; corrupt file = ignore). Canonical/
+  binary skip and transient-vs-permanent retry were already on
+  master; reconfirmed with tests.
 - `just win-check`: type-checks the crate for `x86_64-pc-windows-gnu`
   from Linux (clippy, no linkage), both `--no-default-features` and
   the full feature set, so `#[cfg(windows)]` breakage from a
   Linux-only change surfaces before the push instead of in Windows
   CI. Needs mingw-w64; see CONTRIBUTING.md.
+- One typed runtime config (`src/config.rs`, issue #193): every knob
+  lives in a layered struct, defaults < `donsetch.toml`
+  (`DONSETCH_CONFIG` or `<config-dir>/donsetch/donsetch.toml`,
+  skippable via `DONSETCH_NO_CONFIG_FILE=1`) < `DONSETCH_<SECTION>__<KEY>`
+  env names. Values validate loudly at load; unknown TOML keys name
+  the offending file. `donsetch config show` prints each knob with
+  its value and origin (`--markdown` for the reference table,
+  `--legacy` for the old-name map); `donsetch doctor` warns about
+  deprecated env names active in the shell.
+- Resurrection reaches transport-dead URLs: a TLS handshake against
+  a parked domain, a dead DNS name and a refused port now gate
+  `archive=auto` resurrection the same way 404/410 do, while
+  timeouts, resets and protocol errors stay excluded (a snapshot
+  must never launder an unknown, and a reset can be an IP-level
+  block that an archived copy would paper over). The gate reads a
+  new `structuredContent.fetch_error` transport class recorded on
+  every status-0 fetch error.
+- Wayback snapshot serving survives wayback's own redirect
+  interstitials: a thin capture is re-checked against wayback stub
+  markers, and a stub chain-hops through up to 4 `<meta
+  http-equiv="refresh">` targets when (and only when) wayback
+  rewrote the target (`web.archive.org/web/<14-digit-ts>/...`); a
+  live-web refresh target is never followed, because the URL we
+  are resurrecting may still be dead, moved, or hostile.
 - `web_screenshot` MCP tool: a rendered PNG of a page through the
   existing tier-2 browser (url, full_page, wait_ms). The capture is
   in-process only; the MCP result carries an image content block and
@@ -144,6 +358,193 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Security review batch (#216-#219):
+  - `donsetch doctor` Bright Data zone probe hit `/zone/route_ips` twice
+    (a doubled path that 404'd every configured zone). The ship path now
+    passes the API root and builds the URL through one shared helper.
+  - h3/QUIC dial now applies the same connect-time SSRF filter as h1/h2:
+    a DNS rebind to a private/loopback address between the request-time
+    check and the dial is refused. `DONSETCH_ALLOW_PRIVATE_EGRESS` still
+    works as the explicit escape hatch.
+  - BYOK provider error bodies are capped at 600 chars before they reach
+    the agent, stderr, or the debug log (context DoS). serpapi additionally
+    scrubs the URL-borne `api_key` from a reflected error body (key leak).
+  - Crawl resume tokens that are not plain ASCII alphanumeric are refused
+    before they index the filesystem, closing a path-traversal read-then-
+    delete on agent-supplied `resume`.
+- Browser backend aliases now share the typed enum as their single registry
+  and normalize casing and surrounding whitespace across config sources.
+  Unknown effective legacy values fail closed instead of silently becoming
+  `auto`; a valid higher-precedence modern setting still overrides them.
+- The ONNX reranker now consumes the validated `search.rerank_threads` value
+  directly instead of leaking and reparsing a string, and reports configured
+  values as coming from the layered config. `0 = auto` behavior is unchanged.
+- Master hardening wave (overnight full-tree audit, every finding
+  reproduced before fixing):
+- h1: a connection that closes before Content-Length is satisfied now
+  fails the transport instead of returning the partial body as
+  success. The old reader scored truncated pages clean and stored
+  them in the revalidation cache as Fresh, so every later fetch of
+  that URL served the truncated page forever. The fix caught a lying
+  Content-Length in my own egress-proxy test rig live (it claimed 12
+  bytes and sent 10).
+- h3: a QUIC connection that closes or drains mid-body is an error,
+  same truncated-success class. The route drops and h1/h2 answer.
+- Cookies: a hostile `Set-Cookie` with a multibyte month token in
+  `Expires=` panicked the date parser, and with panic=abort in
+  release that is a one-request remote kill of the daemon. Date
+  tokens now parse by bytes. Cookie path matching uses the URI path
+  only (a path-scoped cookie used to stop attaching on query URLs,
+  against RFC 6265 and every browser). The jar enforces the RFC 6265
+  section 6.1 bounds (4096-byte cookies, 100 per domain, 3000 total,
+  4 KiB / 50-pair Cookie header), so a Set-Cookie flood can neither
+  grow the jar for process lifetime nor emit megabyte headers.
+- Ghost session vault: a live daemon's state save no longer erases
+  fresh harvests or resurrects logged-out sessions. Vault writers
+  (the logout clear, the session store, the tier-1 sync) stamp a
+  vault epoch, and every save adopts whichever side wrote last.
+- Crawl resume-only (empty url + resume token) consumed the token
+  twice, always failed with "resume token expired or unknown", and
+  destroyed the saved state in the process. One take, and the
+  resume-only flow works.
+- Search hot paths no longer initialize the reranker: the first
+  `rerank::active()` on the search path blocked a tokio worker on
+  the whole init chain, up to a 120-second model download. Report
+  stamps now read a non-initializing check; ranking still
+  initializes inside its own spawn_blocking.
+- h2: a bodyless response whose header block arrives fragmented
+  (END_STREAM on HEADERS, END_HEADERS on CONTINUATION) no longer
+  hangs to the 30s timeout; a missing or unparseable `:status` is a
+  transport error instead of a success with status 0; an
+  unfragmented header frame honors the same 256 KiB block cap as
+  continuations; response header names are lowercased like h1 so a
+  nonconforming peer's mixed-case `content-encoding` cannot skip
+  decompression and its `alt-svc` cannot skip h3 discovery.
+- TLS: brotli certificate decompression is bounded by a take() cap;
+  a hostile compress_certificate stream used to decompress to its
+  full (potentially gigabyte) end before the declared-length check
+  fired.
+- Wall detection: bare prose mentions of PerimeterX, Imperva,
+  Incapsula, Sucuri and Wordfence on healthy 200 pages no longer
+  score Challenge (each false positive burned a warm retry, route
+  memory and a paid bypass call). The challenge-specific markers and
+  error-status co-signals still fire, pinned by tests.
+- Revalidation cache: `Cache-Control: no-cache` is honored (stored,
+  never served fresh); entries are keyed by cookie lane, so a
+  jar-less search lane can never be served a logged-in fetch's body
+  or the reverse; a 304 whose entry was evicted mid-flight fails
+  honestly instead of scoring an empty body as Blocked.
+- Crawl: a redirect out of the seed's host, scope, or robots rules
+  is skipped instead of landing in results, dataset and history
+  under its final URL. Frontier normalization re-encodes query
+  strings (distinct URLs with encoded `&`/`=` collided in the
+  seen-set and one of them silently never fetched). A hostile
+  `<priority>NaN</priority>` can no longer poison a resume token.
+  Too-deep items are skipped with a reason instead of aborting the
+  whole crawl and discarding the frontier. A host's declared
+  Crawl-delay is honored in full above the 7s self-inferred cap (a
+  host declaring Crawl-delay: 30 actually sees 30s pacing), stored
+  per host so concurrent crawls stop cross-polluting each other's
+  pacing. The governor prunes idle per-(host, lane) clocks instead
+  of growing them forever.
+- MCP supervisor: a failed replay write followed by new client data
+  no longer drops the held bytes; the held request folds into the
+  new replay window.
+- MCP tools: the fetch batch honors cancellation (a cancelled
+  12-URL batch no longer runs every escalation to completion);
+  web_screenshot honors deadline and cancellation with a 60s
+  ceiling; an all-failed fetch batch classifies permanent vs
+  transient like the search batch instead of always claiming
+  "safe to retry"; a hostile multibyte wayback timestamp no longer
+  panics a byte slice; oversized stdin request lines are bounded
+  and answered with a parse error instead of growing the reader
+  without bound.
+- Search: SERP bodies cap at 3 MiB before the DOM parse (one broken
+  proxy answering 200 with tens of MB stalled the whole fan-out
+  past its deadline). BYOK results carry single-flight, so two
+  concurrent identical queries bill the metered provider once, and
+  the byok cache stores the provider's full top-12 (a first search
+  at max=2 no longer serves later max=10 calls a 2-row slice as
+  cached). Provider error bodies cap at 600 chars. `+` survives
+  cache-key normalization, so "rust vs c++ performance" and "rust
+  vs c performance" stop sharing one cache entry. The search cache
+  serializes to disk outside its lock. The ddg_html retry lane
+  reads its learned trust. Short API keys are never printed whole
+  by `keys list`.
+- Adapters: the JSON fast path honors focus/toc/must_contain/section
+  (must_contain on an adapter-shaped URL used to hand the agent the
+  full document against its own contract). PyPI normalization
+  follows PEP 503 separator runs. The plugin loader opens the file,
+  stats the handle and bounds the read: a swapped FIFO could hang
+  the first rewrite and a swapped file bypass the size cap.
+- h3 lane: DNS resolution runs off the reactor with the same 10s
+  bound as the h1/h2 path; the platform trust store parses once per
+  process instead of per request; the profile's accept-encoding
+  rides the h3 request (bodies arrive compressed and the wire
+  matches Chrome); a server-declared alt-svc ma= is capped at 30
+  days; TLS session warm detection uses the same key the session
+  store writes, so TFO actually arms on non-default ports and
+  proxied lanes.
+- Hygiene: handles.json is written owner-only (interned link URLs
+  can carry query-string credentials); finished shadow-burst
+  handles are reaped in daemons; timed-out CDP calls release their
+  pending slot (a wedged tab used to leak one sender per call); a
+  Page.navigate failure surfaces its real cause instead of a
+  generic 20s timeout; egress dead-proxy and auth-fail reports use
+  poison-recovery locks; config file-layer errors stop labeling
+  themselves "invalid env value"; a non-UTF-8 modern env value
+  warns instead of vanishing; `DONSETCH_CONFIG=""` is treated as
+  unset; `donsetch help` no longer routes the removed answer/memory
+  commands; the search help lists the real intent verticals.
+
+- HTTP bearer configuration now fails closed: modern TOML/env tokens reject
+  whitespace and non-visible bytes without echoing the secret, while legacy
+  text tokens retain their exact historical value instead of being trimmed
+  into disabled authentication. CORS/auth validation also runs before daemon
+  work.
+- `donsetch config show --markdown` now emits one complete Markdown table per
+  config section, so section labels no longer turn the following knob rows
+  into plain paragraphs.
+- Modern `DONSETCH_<SECTION>__<KEY>` variables now fail loudly when a
+  recognized value is not UTF-8 or when distinct names normalize to the same
+  config key. Diagnostics identify the variable names without exposing their
+  values, and collision handling no longer depends on environment iteration
+  order.
+- Typed config validation now rejects an out-of-policy TOML value with
+  file attribution even when a valid higher-precedence env value would
+  otherwise hide it; legacy out-of-range values remain warning-only.
+- Browser path overrides now preserve source presence across the typed config:
+  legacy empty values keep their historical override semantics, while modern
+  empty values reset to discovery or ambient defaults. Explicit Chromium,
+  CloakBrowser and Playwright paths remain literal.
+
+- Legacy route-memory and bypass-cache controls compose in their original
+  order under the typed config: the route-memory kill switch beats read-only,
+  while a valid legacy bypass TTL applied after `DONSETCH_BYPASS_CACHE=0`
+  re-enables the cache (and TTL zero disables it). TOML and modern env
+  overrides retain their higher precedence.
+
+- The supervisor's replay now survives a crash loop: the bytes
+  replayed into a replacement were cleared from the unacked
+  history, so a second silent death dropped them (reported by
+  mnaza in #202, discriminating two-death test included). The
+  live unacked history is also bounded to the same 1 MiB replay
+  window on every append (keep the tail), not only at death time.
+
+- The browser probe timeout now kills the whole process group, not
+  just the parent: a wedged browser whose descendant held the stdout
+  pipe used to hang `donsetch doctor` forever. The probe now fails
+  at the timeout, bounded, on every platform.
+
+
+- The MCP supervisor no longer loses a request buffered into a
+  child that dies before consuming it. The write succeeds while
+  the child is alive, so no EPIPE ever fires, and the death only
+  surfaces on the next idle poll: the supervisor now replays the
+  child's whole unacked history (bounded to 1 MiB, duplicated
+  delivery preferred over a lost request). Caught by the macOS CI
+  run timing the crash between a successful write and the idle
+  poll.
 - Crawl resume tokens survive concurrent crawlers. The store was
   one shared JSON map saved with load-modify-save, so two
   processes issuing tokens at the same time (the daemon plus a
@@ -161,6 +562,16 @@ channel until the v4.0.0 release train.
   found". That answer no longer reads as a failed check: the
   probe skips with an honest, zero-credit note instead (reported
   by tripflex on #200). A 401 always stays a failure.
+- Resurrection no longer claims "never archived" on shaky ground:
+  the availability API is lossy and scheme-strict (a capture
+  recorded under `http://` is invisible to an `https://` query), so
+  an empty answer now falls through to the complete CDX index
+  (scheme-canonical, `filter=statuscode:200`, last 5 captures)
+  before `archive=only` reports anything, an unreachable archive
+  answers `transient` with its own message instead of a false
+  `permanent`, and a found-but-unusable snapshot names itself and
+  its stage (`structuredContent.archive_stage`) instead of
+  collapsing into the live error.
 - `site:` queries no longer leak off-domain results through BYOK
   providers (issue #190): both BYOK exits (provider-first and the
   local-first fallback) sweep results through the same post-merge

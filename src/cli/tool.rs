@@ -410,10 +410,13 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
             format!("[{cmd}] ok · {}", parts.join(" · "))
         }
         "crawl" => {
+            // Dataset mode carries row counts in structured["rows"] and
+            // a summed "chars"; JSON mode carries pages[] (debug) arrays.
             let n = sc
                 .get("pages")
                 .and_then(|r| r.as_array())
                 .map(|a| a.len())
+                .or_else(|| sc.get("rows").and_then(|r| r.as_u64()).map(|v| v as usize))
                 .unwrap_or(0);
             let total: u64 = dbg
                 .get("pages")
@@ -423,7 +426,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
                         .filter_map(|p| p.get("chars").and_then(|c| c.as_u64()))
                         .sum()
                 })
-                .unwrap_or(0);
+                .unwrap_or_else(|| sc.get("chars").and_then(|c| c.as_u64()).unwrap_or(0));
             let elapsed = pick(&sc, &dbg, "elapsed_s")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
@@ -431,7 +434,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let mut parts = vec![
-                format!("{n} pages"),
+                format!("{n} page{}", if n == 1 { "" } else { "s" }),
                 format!("{total} chars"),
                 format!("{elapsed:.1}s"),
                 format!("stop {stop}"),
@@ -531,8 +534,10 @@ fn machine_meta(result: &Value, sc: &Value) -> Value {
         "cached",
         "elapsed_ms",
         "provider",
+        "instant",
         "results",
         "engines",
+        "stage_ms",
     ];
     let debug = result
         .get("_meta")

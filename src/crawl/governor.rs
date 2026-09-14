@@ -18,7 +18,14 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Persist learned host ladders across restarts (v4 B6). Cap + TTL
+/// bound the file; Instant never serializes (remaining secs only).
+const GOVERNOR_DISK_VERSION: u32 = 1;
+const GOVERNOR_HOST_CAP: usize = 2_000;
+const GOVERNOR_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// Base inter-request delay per lane when healthy.
 ///
@@ -97,6 +104,10 @@ struct HostPenalty {
     /// a long-lived daemon does not grow one struct per host it
     /// ever touched.
     last_seen: Option<Instant>,
+    /// Host-DECLARED pace (robots Crawl-delay), honored in full.
+    /// Per host: a process-global value let two concurrent crawls
+    /// of different hosts cross-pollute each other's pacing.
+    crawl_delay_secs: Option<f64>,
 }
 
 pub struct Governor {
@@ -106,42 +117,191 @@ pub struct Governor {
     hosts: Mutex<HashMap<String, HostPenalty>>,
     /// All lanes in the pool.
     pub lanes_all: Vec<Lane>,
-    /// Honors robots.txt crawl-delay when set (minimum pace).
-    crawl_delay: Mutex<Option<f64>>,
+    /// Set on host-ladder mutation; save swaps it off.
+    dirty: AtomicBool,
+}
+
+/// On-disk host row: (host, rung, boxed_remaining_secs,
+/// crawl_delay_secs, age_secs). `next_allowed` is process-local.
+type DiskHost = (String, u32, u64, Option<f64>, u64);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GovernorDisk {
+    #[serde(default = "governor_disk_version")]
+    version: u32,
+    #[serde(default)]
+    hosts: Vec<DiskHost>,
+}
+
+fn governor_disk_version() -> u32 {
+    1
+}
+
+fn governor_path() -> Option<std::path::PathBuf> {
+    Some(crate::paths::cache_dir().join("crawl-governor.json"))
+}
+
+fn persist_enabled() -> bool {
+    !crate::config::cfg().state.no_disk_state
+}
+
+fn remaining_secs(until: Option<Instant>) -> u64 {
+    match until {
+        None => 0,
+        Some(t) => {
+            let now = Instant::now();
+            if t <= now {
+                0
+            } else {
+                t.saturating_duration_since(now).as_secs()
+            }
+        }
+    }
 }
 
 impl Governor {
     pub fn new(lanes_all: Vec<Lane>) -> Self {
-        Self {
+        let g = Self {
             lanes: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
             lanes_all,
-            crawl_delay: Mutex::new(None),
+            dirty: AtomicBool::new(false),
+        };
+        g.load_disk();
+        g
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Load host ladders so a restart never re-learns a 429 storm
+    /// from zero. Corrupt/missing files are ignored (never block).
+    fn load_disk(&self) {
+        if !persist_enabled() {
+            return;
         }
-    }
-
-    pub fn set_crawl_delay(&self, d: Option<f64>) {
-        *self
-            .crawl_delay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = d;
-    }
-
-    /// Base delay honoring host-declared crawl-delay.
-    fn base(&self) -> Duration {
-        let cd = self
-            .crawl_delay
+        let Some(path) = governor_path() else { return };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(disk) = serde_json::from_str::<GovernorDisk>(&raw) else {
+            return;
+        };
+        if disk.version != GOVERNOR_DISK_VERSION {
+            return;
+        }
+        let now = Instant::now();
+        let mut hosts = self
+            .hosts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The setter is public: re-clamp here so no caller can
-        // hand `from_secs_f64` a value it panics on.
-        match *cd {
-            Some(s) if s.is_finite() && s > 0.0 => Duration::from_secs_f64(
-                s.min(super::sitemap::MAX_CRAWL_DELAY_SECS)
-                    .max(BASE_DELAY.as_secs_f64()),
-            ),
-            _ => BASE_DELAY,
+        let mut n = 0usize;
+        for (host, rung, boxed_rem, delay, age) in disk.hosts {
+            if n >= GOVERNOR_HOST_CAP {
+                break;
+            }
+            if age > GOVERNOR_TTL.as_secs() {
+                continue;
+            }
+            hosts.insert(
+                host,
+                HostPenalty {
+                    rung,
+                    boxed_until: if boxed_rem > 0 {
+                        Some(now + Duration::from_secs(boxed_rem.min(86_400)))
+                    } else {
+                        None
+                    },
+                    last_seen: None,
+                    crawl_delay_secs: delay.filter(|d| d.is_finite() && *d > 0.0),
+                },
+            );
+            n += 1;
         }
+    }
+
+    fn save_disk_if_dirty(&self) {
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if !persist_enabled() {
+            return;
+        }
+        let Some(path) = governor_path() else { return };
+        let hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rows: Vec<DiskHost> = hosts
+            .iter()
+            .map(|(host, h)| {
+                (
+                    host.clone(),
+                    h.rung,
+                    remaining_secs(h.boxed_until),
+                    h.crawl_delay_secs,
+                    0,
+                )
+            })
+            .collect();
+        // Newest lessons first when over cap: keep the highest rungs
+        // (the expensive discoveries) and drop quiet hosts.
+        if rows.len() > GOVERNOR_HOST_CAP {
+            rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+            rows.truncate(GOVERNOR_HOST_CAP);
+        }
+        drop(hosts);
+        let disk = GovernorDisk {
+            version: GOVERNOR_DISK_VERSION,
+            hosts: rows,
+        };
+        let Ok(json) = serde_json::to_string(&disk) else {
+            return;
+        };
+        if std::fs::create_dir_all(crate::paths::cache_dir()).is_err() {
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Record a host's robots Crawl-delay as the minimum pace for
+    /// THAT host. Per-host on purpose: the governor is shared by
+    /// every crawl in the process, and a global value let a
+    /// Crawl-delay: 60 crawl slow down an unrelated host's crawl
+    /// (and vice versa: the next crawl reset the first one's pace).
+    pub fn set_host_crawl_delay(&self, host: &str, d: Option<f64>) {
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The value comes from robots parsing: re-clamp here so no
+        // caller can hand `from_secs_f64` a value it panics on.
+        let clamped = d.filter(|s| s.is_finite() && *s > 0.0);
+        hosts.entry(host.to_string()).or_default().crawl_delay_secs = clamped;
+    }
+
+    /// The host-declared pace floor for `host`, honored in full
+    /// (the only cap is the robots parser's 60s clamp). Hosts with
+    /// no declared delay pace at the ladder, not at this floor.
+    fn crawl_delay_floor(&self, host: &str) -> Duration {
+        let hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hosts
+            .get(host)
+            .and_then(|h| h.crawl_delay_secs)
+            .map(|s| Duration::from_secs_f64(s.min(super::sitemap::MAX_CRAWL_DELAY_SECS)))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Base delay for the adaptive ladder (self-inferred only).
+    fn base(&self) -> Duration {
+        BASE_DELAY
     }
 
     /// Deterministic jitter: remaps a counter into [0.75, 1.25].
@@ -195,6 +355,7 @@ impl Governor {
             .lanes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_lanes(&mut lanes);
         let key = (host.to_string(), lane.to_string());
         let hl = lanes.entry(key).or_default();
         let now = Instant::now();
@@ -204,11 +365,16 @@ impl Governor {
         }
 
         // Compute the new next_allowed: base * 2^rung, jittered,
-        // capped at MAX_LADDER_WAIT (law 11).
+        // capped at MAX_LADDER_WAIT (law 11 : stealth through truth,
+        // never time). The cap bounds only the SELF-INFERRED ladder;
+        // the host-DECLARED crawl-delay floor is honored in full
+        // above it, so a host declaring Crawl-delay: 30 actually
+        // sees 30s pacing instead of the 7s ladder cap.
         let rung_mult = (1u64 << hl.rung.min(MAX_BACKOFF_RUNG)) as f64;
-        let delay = base
+        let ladder = base
             .mul_f64(rung_mult * self.jitter(seq))
             .min(MAX_LADDER_WAIT);
+        let delay = ladder.max(self.crawl_delay_floor(host));
         hl.next_allowed = now + delay;
         Duration::ZERO
     }
@@ -261,9 +427,15 @@ impl Governor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(h) = hosts.get_mut(host) {
             h.last_seen = Some(Instant::now());
+            let before = h.rung;
             h.rung = h.rung.saturating_sub(1);
             if h.rung == 0 {
                 h.boxed_until = None;
+            }
+            if h.rung != before {
+                drop(hosts);
+                self.mark_dirty();
+                self.save_disk_if_dirty();
             }
         }
     }
@@ -297,6 +469,11 @@ impl Governor {
         let host_rung_mult = (1u64 << h.rung) as f64;
         h.boxed_until =
             Some(Instant::now() + self.base().mul_f64(host_rung_mult * self.jitter(0xdead)));
+        drop(hosts);
+        // The expensive lesson: persist so a restart does not re-pay
+        // the same 429 storm (v4 B6).
+        self.mark_dirty();
+        self.save_disk_if_dirty();
     }
 
     /// Record a network error (timeout, reset): gentler than
@@ -347,6 +524,21 @@ impl Governor {
                 .unwrap_or(Duration::ZERO)
         })
     }
+}
+
+/// Prune per-(host, lane) pacing clocks the same way prune_hosts
+/// prunes host state: a long-lived daemon crawling many hosts grew
+/// one entry per (host, lane) forever (the "*" boxed-host lane
+/// included). Idle signal = next_allowed in the past by more than
+/// the idle window (no request waited on that clock recently).
+fn prune_lanes(lanes: &mut HashMap<(String, String), HostLane>) {
+    const CAP: usize = 4096;
+    const MAX_IDLE: Duration = Duration::from_secs(3600);
+    if lanes.len() <= CAP {
+        return;
+    }
+    let now = Instant::now();
+    lanes.retain(|_, hl| now.saturating_duration_since(hl.next_allowed) < MAX_IDLE);
 }
 
 /// Prune hosts untouched for over an hour once the map passes
@@ -418,11 +610,32 @@ mod tests {
     fn absurd_crawl_delay_never_panics_and_is_capped() {
         for d in [f64::INFINITY, f64::NAN, 1e300, -1.0, 86400.0] {
             let g = gov(&[LaneKind::Direct]);
-            g.set_crawl_delay(Some(d));
+            g.set_host_crawl_delay("ex.com", Some(d));
             g.wait_for("ex.com", "lane0", 0);
             let w = g.wait_for("ex.com", "lane0", 1);
             assert!(w <= Duration::from_secs(90), "{d}: {w:?}");
         }
+    }
+
+    // v4 law 11: a HOST-DECLARED Crawl-delay is honored in full,
+    // above the 7s self-inferred ladder cap. A host declaring
+    // Crawl-delay: 30 must actually see 30s pacing.
+    #[test]
+    fn declared_crawl_delay_is_honored_above_the_ladder_cap() {
+        let g = gov(&[LaneKind::Direct]);
+        g.set_host_crawl_delay("ex.com", Some(30.0));
+        g.wait_for("ex.com", "lane0", 0);
+        let w = g.wait_for("ex.com", "lane0", 1);
+        assert!(
+            w >= Duration::from_secs(22),
+            "Crawl-delay: 30 must pace at 30s (minus jitter floor), got {w:?}"
+        );
+        // A different host is NOT slowed by this one's declared pace.
+        let g2 = gov(&[LaneKind::Direct]);
+        g2.set_host_crawl_delay("slow.com", Some(30.0));
+        g2.wait_for("fast.com", "lane0", 0);
+        let w2 = g2.wait_for("fast.com", "lane0", 1);
+        assert!(w2 < Duration::from_secs(1), "per-host isolation: {w2:?}");
     }
 
     #[test]
@@ -544,5 +757,46 @@ mod tests {
             "stale hosts must be pruned, kept {}",
             hosts.len()
         );
+    }
+
+    /// B6: a throttled host ladder must survive process restart.
+    #[test]
+    fn throttled_host_ladder_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-gov-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+        {
+            let g = gov(&[LaneKind::Direct]);
+            g.on_throttled("storm.example", "direct");
+            g.on_throttled("storm.example", "direct");
+        }
+        assert!(
+            dir.join("crawl-governor.json").exists(),
+            "on_throttled must persist the host ladder"
+        );
+        let g2 = gov(&[LaneKind::Direct]);
+        {
+            let hosts = g2
+                .hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let h = hosts
+                .get("storm.example")
+                .expect("throttled host must survive restart");
+            assert!(h.rung >= 1, "rung must survive, got {}", h.rung);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
     }
 }

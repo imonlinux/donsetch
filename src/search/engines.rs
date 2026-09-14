@@ -120,7 +120,7 @@ fn base64url_decode(s: &str) -> Option<String> {
 /// These should never appear as search results : they leak
 /// through parsers when redirect decoding fails or when
 /// broad selectors match pagination/header links.
-fn is_serp_url(url: &str) -> bool {
+pub(crate) fn is_serp_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     let serp_patterns = [
         // General SERPs
@@ -148,6 +148,16 @@ fn is_serp_url(url: &str) -> bool {
 }
 
 pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
+    parse_with_instant(engine, html).0
+}
+
+/// One DOM parse feeds both the organic hit list and the C5
+/// instant layer. html5ever on a multi-MB SERP is the expensive
+/// part; doing it twice per engine was pure waste.
+pub fn parse_with_instant(
+    engine: &str,
+    html: &str,
+) -> (Vec<Hit>, Option<super::instant::InstantAnswer>) {
     let doc = Html::parse_document(html);
     let mut hits = match engine {
         "brave" => parse_brave(&doc),
@@ -168,7 +178,8 @@ pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
     // search.yahoo.com/search pagination links, undecoded
     // r.search.yahoo.com redirects, bing.com/ck/a stubs).
     hits.retain(|h| !is_serp_url(&h.url));
-    if hits.is_empty() && std::env::var_os("DONSEEK_DEBUG").is_some() {
+    let instant = super::instant::parse_instant_doc(engine, &doc);
+    if hits.is_empty() && crate::config::cfg().debug.search {
         let dump = std::env::temp_dir().join(format!("donseek_debug_{engine}.html"));
         let dump = dump.to_string_lossy().into_owned();
         let _ = std::fs::write(&dump, html);
@@ -177,7 +188,7 @@ pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
             len = html.len()
         );
     }
-    hits
+    (hits, instant)
 }
 
 /// Google URL unwrapping: Google wraps result URLs in

@@ -53,7 +53,6 @@ pub(super) async fn fetch_tool(
             || deadline_error(&url),
         )
         .await;
-        memory_ingest_result(&url, &result);
         return result;
     }
     let mut resolved: Vec<String> = Vec::with_capacity(urls.len());
@@ -88,33 +87,9 @@ pub(super) async fn fetch_tool(
             || deadline_error(&resolved[0]),
         )
         .await;
-        memory_ingest_result(&resolved[0], &result);
         return result;
     }
     fetch_multi(daemon, args, resolved, budget_tokens, deadline, ctx).await
-}
-
-/// Store a successful fetch result page into the local web memory.
-/// Additive (v4 law 5): ingest failure never touches the fetch result;
-/// its only surface is a stderr receipt.
-#[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-fn memory_ingest_result(url: &str, result: &Value) {
-    #[cfg(feature = "rerank")]
-    if !crate::memory::kill_switch() && result.get("isError").and_then(Value::as_bool) != Some(true)
-    {
-        let md = result
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if md.is_empty() {
-            return;
-        }
-        crate::memory::ingest_async(vec![(
-            url.to_string(),
-            crate::memory::title_of(md),
-            md.to_string(),
-        )]);
-    }
 }
 
 /// Honest deadline error (v3 D1): the tool respects the agent's
@@ -170,6 +145,12 @@ pub(super) async fn fetch_multi(
         call_args["max_chars"] = json!(b * 4);
     }
     let progress_parts = ctx.as_ref().map(|c| c.progress_parts());
+    // Cancellation must reach every sub-fetch: the batch used to
+    // drop the ctx entirely, so a cancelled 12-URL batch kept
+    // running every escalation (each holding pool slots) while the
+    // client had already moved on. Each sub-fetch watches a clone
+    // of the same cancel channel.
+    let cancel_rx = ctx.as_ref().map(|c| c.cancel_receiver());
     let n_total = urls.len();
     let futs: Vec<_> = urls
         .iter()
@@ -180,11 +161,22 @@ pub(super) async fn fetch_multi(
             let url = u.clone();
             let dl = deadline;
             let prog = progress_parts.clone();
+            let mut cancel = cancel_rx.clone();
             async move {
-                let v = run_with_budget(fetch_single(&d, &a, &url), dl, None, || {
-                    deadline_error(&url)
-                })
-                .await;
+                let v = match cancel.as_mut() {
+                    Some(rx) => tokio::select! {
+                        v = run_with_budget(fetch_single(&d, &a, &url), dl, None, || {
+                            deadline_error(&url)
+                        }) => v,
+                        _ = rx.changed() => tool_error("cancelled"),
+                    },
+                    None => {
+                        run_with_budget(fetch_single(&d, &a, &url), dl, None, || {
+                            deadline_error(&url)
+                        })
+                        .await
+                    }
+                };
                 if let Some(p) = &prog {
                     emit_progress(
                         p,
@@ -212,23 +204,6 @@ pub(super) async fn fetch_multi(
         .iter()
         .map(|r| if is_err(r) { None } else { Some(md_of(r)) })
         .collect();
-    // Store the successful fetches into the local web memory. The
-    // hook gets the FULL body before any budget slicing: the memory
-    // keeps the page whole and truncates on its own. One batch =
-    // one embed pass + one disk write (issue #178), and it runs on
-    // the blocking pool so it cannot hold the response past the
-    // deadline.
-    #[cfg(feature = "rerank")]
-    if !crate::memory::kill_switch() {
-        let mut rows = Vec::with_capacity(urls.len());
-        for (idx, url) in urls.iter().enumerate() {
-            let Some(md) = markdowns[idx].as_deref() else {
-                continue;
-            };
-            rows.push((url.clone(), crate::memory::title_of(md), md.to_string()));
-        }
-        crate::memory::ingest_async(rows);
-    }
     let mut sliced_flags = vec![false; results.len()];
     if let Some(budget_tok) = budget_tokens {
         let budget_chars = budget_tok * 4;
@@ -422,13 +397,27 @@ pub(super) fn render_fetch_batch(
     if ok_count == 0 {
         structured["next_action"] =
             json!("inspect the per-URL errors above; retry only transient failures individually");
+        // Classify like the search batch does: an all-permanent
+        // batch (12 SSRF-refused URLs) must not advertise "safe to
+        // retry immediately". No kind anywhere = stay conservative
+        // (transient).
+        let kinds: Vec<&str> = results
+            .iter()
+            .filter(|v| is_err(v))
+            .filter_map(|v| v.get("errorKind").and_then(Value::as_str))
+            .collect();
+        let kind = if kinds.is_empty() {
+            "transient"
+        } else {
+            super::errors::batch_failure_kind(kinds.into_iter())
+        };
         let mut error = tool_error_structured(
             format!(
                 "fetch: all {} urls failed\n\n{}",
                 results.len(),
                 text.trim_end()
             ),
-            "transient",
+            kind,
             Some(structured),
         );
         error["_meta"]["com.donsetch/fetch-batch-debug"] = debug;
@@ -452,24 +441,25 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     if archive == "only" {
         let no_live = tool_error(format!("archive=only : skipping live fetch for {url}"));
         return match try_resurrect(daemon, url, &no_live).await {
-            Some(v) => v,
-            None => tool_error_structured(
-                format!("archive: no Wayback snapshot found for {url}"),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "next_action": "the URL was never archived : try web_search for a live alternative",
-                })),
-            ),
+            Ok(v) => v,
+            Err(f) => resurrect_error(url, &f),
         };
     }
     let result = fetch_single_inner(daemon, args, url).await;
     if archive == "off" || result.get("isError") != Some(&json!(true)) {
         return result;
     }
-    // Resurreactable failures only: dead pages and hard walls.
-    // Transient network errors mean "maybe dead", not "dead" : a
-    // snapshot would launder an unknown into fake certainty.
+    // Resurrectable failures only: dead pages, hard walls, and
+    // transport-level death (TLS handshake against a parked domain,
+    // DNS gone, port closed) : the archetypal dead links. Ambiguous
+    // transients : timeouts, resets, protocol errors : stay
+    // excluded : a snapshot would launder an unknown into fake
+    // certainty, and a reset can be an IP-level block that a
+    // snapshot must never paper over.
+    let transport_dead = result
+        .pointer("/structuredContent/fetch_error")
+        .and_then(Value::as_str)
+        .is_some_and(|k| matches!(k, "tls" | "dns" | "refused"));
     let resurrectable = result
         .pointer("/structuredContent/verdict")
         .and_then(Value::as_str)
@@ -477,13 +467,68 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
         || result
             .pointer("/structuredContent/status")
             .and_then(Value::as_u64)
-            .is_some_and(|s| s == 404 || s == 410);
+            .is_some_and(|s| s == 404 || s == 410)
+        || transport_dead;
     if !resurrectable {
         return result;
     }
     match try_resurrect(daemon, url, &result).await {
-        Some(v) => v,
-        None => result,
+        Ok(v) => v,
+        Err(f) => {
+            // The original live error stands as the primary answer;
+            // the archive attempt is recorded as context so a silent
+            // snapshot-side failure is visible in the payload.
+            let mut result = result;
+            if let Some(obj) = result
+                .pointer_mut("/structuredContent")
+                .and_then(Value::as_object_mut)
+            {
+                obj.insert("archive_stage".into(), json!(f.stage.tag()));
+            }
+            result
+        }
+    }
+}
+
+/// Build the archive=only error from the exact stage resurrection
+/// gave up at. "Never archived" is claimed ONLY when both indexes
+/// (availability + CDX) were consulted and answered empty :
+/// unreachable archives and found-but-unusable snapshots get their
+/// own honest messages.
+fn resurrect_error(url: &str, f: &ResurrectError) -> Value {
+    let tag = f.stage.tag();
+    match &f.stage {
+        ResurrectStage::LookupUnreachable => tool_error_structured(
+            format!("archive: Wayback Machine unreachable for {url}"),
+            "transient",
+            Some(json!({
+                "url": url,
+                "archive_stage": tag,
+                "next_action": "the archive lookup failed : retry, or try web_search for a live alternative",
+            })),
+        ),
+        ResurrectStage::NoSnapshot => tool_error_structured(
+            format!("archive: no Wayback snapshot found for {url}"),
+            "permanent",
+            Some(json!({
+                "url": url,
+                "archive_stage": tag,
+                "next_action": "the URL was never archived : try web_search for a live alternative",
+            })),
+        ),
+        _ => {
+            let snap = f.snapshot_url.clone().unwrap_or_default();
+            tool_error_structured(
+                format!("archive: Wayback snapshot found but unusable ({tag}) for {url}"),
+                "permanent",
+                Some(json!({
+                    "url": url,
+                    "archive_stage": tag,
+                    "snapshot_url": snap,
+                    "next_action": format!("a snapshot exists but could not be served : inspect it at {snap} or try web_search for a live alternative"),
+                })),
+            )
+        }
     }
 }
 
@@ -682,7 +727,29 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         // re-mints automatically.
         let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
         state.ensure_persona(&host, &caps);
+        // v4 A2: bind an exclusive egress lane to this persona
+        // (no burned / foreign-persona reuse).
+        state.ensure_persona_egress(&host);
     }
+    // v4 E2: persona locale drives Accept-Language so tier-1 and
+    // the ghost claim one language identity. Viewport/locale for the
+    // browser itself are looked up again at acquire time.
+    let persona_al = {
+        let state = daemon.state.lock().await;
+        match state.personas.get(&host) {
+            Some(p) if p.quarantine_reason.is_none() => {
+                Some(crate::profile::accept_language_with_persona(
+                    &host,
+                    url::Url::parse(&url)
+                        .map(|u| u.path().to_string())
+                        .unwrap_or_else(|_| "/".into())
+                        .as_str(),
+                    &p.locale,
+                ))
+            }
+            _ => None,
+        }
+    };
     let route = if tier == "2" && !is_pdf_url && !adapter_host {
         RouteDecision::SkipToSolve
     } else if tier == "1" || is_pdf_url || adapter_host {
@@ -784,7 +851,11 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
 
     if !skip_tier1 && !prewarmed {
         let t0 = std::time::Instant::now();
-        let fetched = match daemon.fetcher.fetch(&url).await {
+        let fetched = match daemon
+            .fetcher
+            .fetch_persona(&url, persona_al.as_deref())
+            .await
+        {
             Ok(o) => o,
             Err(e) => {
                 if adapter_host && !no_adapter {
@@ -800,6 +871,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                     Some(json!({
                         "url": url,
                         "status": 0,
+                        "fetch_error": transport_class(&e),
                         "next_action": next_action_for(None, 0, fetch_error_kind(&e)),
                         "escalation": trace.value(),
                     })),
@@ -1079,14 +1151,40 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         })
         .unwrap_or(is_pdf_url);
     // Small 404 check: a small thin page is likely a 404/error.
-    // But a small PDF is still a PDF : DonSheet handles it.
-    let is_small_404 =
-        page_size > 0 && page_size < 5_000 && still_thin && !challenge && !is_pdf_content;
+    // But a small PDF is still a PDF : DonSheet handles it. And
+    // it is only a 404 when the STATUS says so: a 2xx that comes
+    // back with no content is a wall or a spinner shell, not a
+    // 404 (live case: tiktok's "Please wait..." 12-token fetch
+    // served as ok). Never escalate on a real error status.
+    let status_2xx = out
+        .as_ref()
+        .map(|o| (200..300).contains(&o.status))
+        .unwrap_or(false);
+    let is_small_404 = page_size > 0
+        && page_size < 5_000
+        && still_thin
+        && !challenge
+        && !is_pdf_content
+        && !status_2xx;
+    // Framework-junk shells (React server dumps leak identifiers
+    // as DOM text nodes): the extracted "content" is things like
+    // `# is_latency_sensitive_broadcast`, `FDSTooltipDef`,
+    // `[["low","normal"]]` with no prose (live case: facebook's
+    // tier-1 fetch served that as a successful result). Short,
+    // sentence-free, identifier-dominated text = a shell, not
+    // content: escalate instead of serving garbage.
+    let shell_text = status_2xx
+        && !is_pdf_content
+        && final_ex
+            .as_ref()
+            .map(|e| looks_like_shell_text(&e.markdown))
+            .unwrap_or(false);
     let need_ghost = !is_pdf_content
         && !adapter_host // adapter endpoints (reddit .json, registry APIs) are plain GETs
         && ((challenge && tier != "1" && !is_small_404)
             || skip_tier1
-            || (still_thin && tier == "auto" && !is_small_404));
+            || (still_thin && tier == "auto" && !is_small_404)
+            || (shell_text && tier == "auto"));
 
     if need_ghost {
         // Render-cache shortcut: a previously recovered DOM.
@@ -1129,17 +1227,41 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             }
         }
 
-        match ghost_escalate(
-            daemon,
-            &url,
-            &host,
-            &opts,
-            challenge || shell_warm || skip_tier1,
-            shot,
-            &mut trace,
-        )
-        .await
-        {
+        // Chrome renders ITS OWN error page (ERR_SOCKS_CONNECTION_
+        // FAILED etc.) when the egress lane is dead: the ghost stage
+        // fails with kind "walled" and a stable tiny-text DOM. One
+        // direct retry (no lane at all) usually just works; ride it
+        // before giving up. One-shot per fetch, never sticky.
+        let mut ghost_direct_tried = false;
+        let ghost_result = loop {
+            crate::ghost::note_last_ghost_chrome_error(false);
+            match ghost_escalate(
+                daemon,
+                &url,
+                &host,
+                &opts,
+                challenge || shell_warm || skip_tier1,
+                shot,
+                &mut trace,
+            )
+            .await
+            {
+                Ok(done) => break Ok(done),
+                Err((msg, kind)) => {
+                    if !ghost_direct_tried
+                        && kind == "walled"
+                        && crate::ghost::last_ghost_chrome_error()
+                    {
+                        crate::ghost::set_ghost_direct(true);
+                        ghost_direct_tried = true;
+                        continue;
+                    }
+                    break Err((msg, kind));
+                }
+            }
+        };
+        crate::ghost::set_ghost_direct(false);
+        match ghost_result {
             Ok((e, tier2, status, furl)) => {
                 final_ex = Some(e);
                 final_tier = tier2;
@@ -1277,6 +1399,26 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         );
     };
 
+    // Final shell gate: a framework dump (React server renders)
+    // must never ship as successful content regardless of the tier
+    // that produced it (live case: facebook's solve returned React
+    // internals as markdown with a clean verdict). Honest fail
+    // with the repair hint instead of garbage "success".
+    if looks_like_shell_text(&ex.markdown) {
+        return tool_error_structured(
+            format!(
+                "blocked at {url} : the site renders an app shell without real content for non-interactive clients"
+            ),
+            "permanent",
+            Some(json!({
+                "url": url,
+                "verdict": "Challenge(Generic)",
+                "next_action": "use an agent browser to browse sites like these; retry later",
+                "escalation": trace.value(),
+            })),
+        );
+    }
+
     // Small 404 page: if we didn't escalate to ghost (is_small_404)
     // and the extraction is still thin/empty, return "not found".
     // This is honest : the page exists (HTTP 200) but has no content.
@@ -1314,6 +1456,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         &trace,
         t0.elapsed().as_millis(),
     );
+    maybe_record_agent_outcome(daemon, &host, &opts, &ex, &final_verdict);
     if prewarmed {
         res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
     }
@@ -1485,9 +1628,19 @@ pub(super) async fn ghost_escalate(
     trace: &mut Trace,
 ) -> Result<(extract::Extracted, &'static str, u16, String), (String, &'static str)> {
     let t0 = std::time::Instant::now();
+    // v4 E2: ghost agrees with the persona pin (viewport + locale).
+    let wire = {
+        let state = daemon.state.lock().await;
+        state
+            .personas
+            .get(host)
+            .filter(|p| p.quarantine_reason.is_none())
+            .map(|p| p.ghost_wire())
+            .unwrap_or_default()
+    };
     let mut g = daemon
         .ghost_mgr
-        .acquire_for(&daemon.profile, Some(host))
+        .acquire_for_wire(&daemon.profile, Some(host), wire)
         .await
         .map_err(|e| (format!("browser launch failed: {e}"), "permanent"))?;
     trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
@@ -1498,7 +1651,7 @@ pub(super) async fn ghost_escalate(
             // CDP timeouts on first attempt are transient : the
             // browser was still warming up. Retry once before
             // conceding a permanent failure.
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[ghost_escalate] first attempt failed: {e}, retrying...");
             }
             ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
@@ -1512,7 +1665,7 @@ pub(super) async fn ghost_escalate(
         &format!("captcha={} dom={}KB", page.captcha, page.html.len() / 1024),
         t1.elapsed().as_millis(),
     );
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         let safe: String = host
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -1834,9 +1987,20 @@ pub(super) async fn ghost_escalate(
         let max_chars = opts.max_chars.unwrap_or(16_000).max(200);
         if let Some(fb) =
             crate::extract::fallback::text_fallback(&page.html, &meta, url, opts, max_chars)
-            && !fb.thin
         {
-            return Ok((fb, "ghost-text", 200, url.to_string()));
+            // The fallback is the LAST resort. A real page render
+            // whose useful text is short must still succeed (live
+            // case: instagram's profile card = 279 collectible
+            // chars, all of it the useful content; the old gate
+            // failed the whole fetch because the 800-char thin bar
+            // is tuned for articles). Only a login-only shell or a
+            // sub-sentence fragment stays a fail.
+            let login_only = fb.markdown.len() < 60
+                && (fb.markdown.to_ascii_lowercase().contains("log in")
+                    || fb.markdown.to_ascii_lowercase().contains("sign up"));
+            if !fb.thin || (fb.markdown.len() >= 40 && !login_only) {
+                return Ok((fb, "ghost-text", 200, url.to_string()));
+            }
         }
     }
 
@@ -1866,6 +2030,13 @@ pub(super) async fn ghost_escalate(
         ));
     }
     daemon.state.lock().await.record_wall_failed(host);
+    // Chrome's own network-error page (a dead/broken egress lane
+    // renders as a stable tiny-text DOM): note it so the caller
+    // can retry the whole ghost stage ONCE with no proxy lane
+    // (direct), which usually just works instead of lying.
+    if crate::ghost::is_chrome_error_html(&page.html) {
+        crate::ghost::note_last_ghost_chrome_error(true);
+    }
     Err((
         format!(
             "blocked at {url} : tier 2 rendered a {}KB DOM but no real content was extractable. Use an Agent browser to browse sites like these",
@@ -1879,6 +2050,50 @@ pub(super) async fn ghost_escalate(
 /// flow computes its own is_pdf_url). Covers both the .pdf
 /// suffix convention and the /pdf/ path convention (arXiv:
 /// arxiv.org/pdf/1706.03762 serves a PDF with no extension).
+/// Short, sentence-free, identifier-dominated extraction = a
+/// framework shell (React server dumps leak identifiers as DOM
+/// text nodes). Real prose has sentences.
+fn looks_like_shell_text(markdown: &str) -> bool {
+    if markdown.len() > 1500 {
+        return false;
+    }
+    let sentences = markdown
+        .split(['.', '!', '?', '\n'])
+        .filter(|s| s.split(' ').filter(|w| w.chars().count() > 3).count() >= 6)
+        .count();
+    if sentences >= 2 {
+        return false;
+    }
+    let tokens: Vec<&str> = markdown.split_whitespace().collect();
+    if tokens.len() < 8 {
+        // A tiny fragment is a shell only when it is a spinner
+        // prompt; a short real profile card ("cristiano / 679M
+        // followers") must not be killed by bare smallness.
+        let lower = markdown.to_ascii_lowercase();
+        return lower.contains("please wait") || lower.contains("one moment");
+    }
+    let ident = tokens
+        .iter()
+        .filter(|t| {
+            // A prose word = plain letters. Everything else (version
+            // strings, paths, bracket arrays, snake_case, camelCase,
+            // scheme:// tokens) is framework residue.
+            let t = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            !t.is_empty()
+                && (t.contains('_')
+                    || t.contains('/')
+                    || t.contains('[')
+                    || t.contains(':')
+                    || (t.chars().any(|c| c.is_ascii_digit())
+                        && t.chars().any(|c| !c.is_alphanumeric()))
+                    || t.char_indices().skip(1).any(|(i, ch)| {
+                        ch.is_uppercase() && t[..i].chars().last().is_some_and(|c| c.is_lowercase())
+                    }))
+        })
+        .count();
+    ident * 100 / tokens.len() >= 40
+}
+
 pub(super) fn is_pdf_url_like(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url).to_lowercase();
     if path.ends_with(".pdf") {
@@ -1913,9 +2128,18 @@ pub(super) async fn fetch_with_actions(
     trace.step("route", "actions", "browser-script", 0);
 
     let t0 = std::time::Instant::now();
+    let wire = {
+        let state = daemon.state.lock().await;
+        state
+            .personas
+            .get(host)
+            .filter(|p| p.quarantine_reason.is_none())
+            .map(|p| p.ghost_wire())
+            .unwrap_or_default()
+    };
     let mut g = match daemon
         .ghost_mgr
-        .acquire_for(&daemon.profile, Some(host))
+        .acquire_for_wire(&daemon.profile, Some(host), wire)
         .await
     {
         Ok(g) => g,
@@ -2139,6 +2363,7 @@ pub(super) async fn fetch_with_actions(
         &trace,
         t0.elapsed().as_millis(),
     );
+    maybe_record_agent_outcome(daemon, host, opts, &ex, "ContentOk");
     res["structuredContent"]["actions"] = Value::Array(steps_json);
     apply_link_handles(daemon, &mut res).await;
     if image_text {
@@ -2259,9 +2484,18 @@ pub(super) async fn anticloak_check(
     tier1_markdown: &str,
 ) -> Option<(f64, String)> {
     let host = crate::search::rank::host_of(url);
+    let wire = {
+        let state = daemon.state.lock().await;
+        state
+            .personas
+            .get(host.as_str())
+            .filter(|p| p.quarantine_reason.is_none())
+            .map(|p| p.ghost_wire())
+            .unwrap_or_default()
+    };
     let mut g = daemon
         .ghost_mgr
-        .acquire_for(&daemon.profile, Some(host.as_str()))
+        .acquire_for_wire(&daemon.profile, Some(host.as_str()), wire)
         .await
         .ok()?;
     let page = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
@@ -2312,75 +2546,312 @@ pub(super) async fn anticloak_check(
 /// the nearest snapshot : labeled ruthlessly so archived content
 /// can never masquerade as live. `archive: auto` (default) only on
 /// dead-end failures; `only` skips the live attempt; `off` never.
-pub(super) async fn try_resurrect(
-    daemon: &Arc<Daemon>,
-    url: &str,
-    live_error: &Value,
-) -> Option<Value> {
-    // 1. Availability lookup (keyless, public API).
+/// Err carries the exact stage that gave up, so the caller can
+/// never confuse "the URL was never archived" with "a snapshot
+/// exists but was unusable" or "the archive was unreachable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResurrectStage {
+    /// The availability/CDX endpoints could not be reached.
+    LookupUnreachable,
+    /// Both indexes were consulted and have no 200 capture.
+    /// (Non-200 captures never get this far: availability and CDX
+    /// are both probed until a 200 capture turns up or both answer
+    /// empty.)
+    NoSnapshot,
+    /// The snapshot page failed at the transport layer.
+    SnapshotFetch,
+    /// The snapshot page tripped the wall detector.
+    SnapshotVerdict,
+    /// The snapshot body is binary (PDF/image), not extractable HTML.
+    SnapshotBinary,
+    /// The snapshot extracted to too little text to serve.
+    SnapshotThin(usize),
+}
+
+impl ResurrectStage {
+    /// Machine-readable tag for structuredContent.archive_stage.
+    fn tag(&self) -> String {
+        match self {
+            Self::LookupUnreachable => "lookup_unreachable".into(),
+            Self::NoSnapshot => "no_snapshot".into(),
+            Self::SnapshotFetch => "snapshot_fetch_failed".into(),
+            Self::SnapshotVerdict => "snapshot_verdict_rejected".into(),
+            Self::SnapshotBinary => "snapshot_binary".into(),
+            Self::SnapshotThin(n) => format!("snapshot_extract_thin({n})"),
+        }
+    }
+}
+
+struct ResurrectError {
+    stage: ResurrectStage,
+    /// Nearest snapshot URL reached, when one was found : lets the
+    /// caller distinguish "never archived" from "archived but the
+    /// copy was unusable" (and hand over the URL for inspection).
+    snapshot_url: Option<String>,
+}
+
+/// What an archive index said about the URL.
+enum Avail {
+    /// A 200-status capture: (snapshot URL, capture timestamp).
+    Found((String, String)),
+    /// The index answered and has nothing usable.
+    Empty,
+    /// The index could not be reached (or answered with a server
+    /// error) : says nothing about the archive's contents.
+    Unreachable,
+}
+
+/// Availability API lookup (keyless, public).
+async fn availability_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
     let avail_url = format!(
         "https://archive.org/wayback/available?url={}",
         encode_query_value(url)
     );
-    let avail = tokio::time::timeout(
+    let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         daemon.fetcher.fetch(&avail_url),
     )
-    .await
-    .ok()?
-    .ok()?;
-    let v: Value = serde_json::from_slice(&avail.body).ok()?;
-    let closest = v.pointer("/archived_snapshots/closest")?.clone();
-    let snap_url = closest.get("url")?.as_str()?.to_string();
+    .await;
+    let Ok(Ok(out)) = fetched else {
+        return Avail::Unreachable;
+    };
+    if !(200..300).contains(&out.status) {
+        return Avail::Unreachable;
+    }
+    // A 200 whose body is not JSON (rate-limit HTML, an interstitial)
+    // says nothing definitive : the CDX fallback gets its shot.
+    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+        return Avail::Empty;
+    };
+    let Some(closest) = v.pointer("/archived_snapshots/closest") else {
+        return Avail::Empty;
+    };
+    let Some(snap_url) = closest.get("url").and_then(Value::as_str) else {
+        return Avail::Empty;
+    };
     let ts = closest
         .get("timestamp")
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     // The API returns status as a STRING ("200"); accept both.
     let snap_status = closest
         .get("status")
-        .map(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .map(|s| {
+            s.as_i64()
+                .or_else(|| s.as_str().and_then(|x| x.parse().ok()))
                 .unwrap_or(0)
         })
         .unwrap_or(0);
     if snap_status != 200 {
-        return None;
+        // A non-200 "closest" may have a 200 sibling the lossy
+        // availability view missed : let the complete index decide.
+        return Avail::Empty;
     }
+    Avail::Found((snap_url.to_string(), ts))
+}
 
-    // 2. Fetch the snapshot : wayback is plain HTTP-friendly.
-    let snap = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        daemon.fetcher.fetch(&snap_url),
+/// The complete CDX capture index. `url=` goes schemeless : CDX
+/// canonicalizes the scheme away, so a capture recorded under
+/// http:// answers an https:// query (the availability API is
+/// scheme-strict and misses those). limit=-5 keeps the LAST rows,
+/// i.e. the captures nearest the present.
+async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
+    let bare = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let cdx_url = format!(
+        "https://web.archive.org/cdx/search/cdx?url={}&output=json&filter=statuscode:200&limit=-5",
+        encode_query_value(bare)
+    );
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        daemon.fetcher.fetch(&cdx_url),
     )
-    .await
-    .ok()?
-    .ok()?;
-    if !matches!(snap.verdict, Verdict::ContentOk) {
+    .await;
+    let Ok(Ok(out)) = fetched else {
+        return Avail::Unreachable;
+    };
+    // CDX answers rate limits and abuse holds with HTML, not JSON :
+    // a transient condition, never evidence of "never archived".
+    if !(200..300).contains(&out.status) {
+        return Avail::Unreachable;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+        return Avail::Empty;
+    };
+    match cdx_latest(&v) {
+        // Rebuild from the row's `original` : it is the exact form
+        // wayback replayed and canonicalized (urlkey is computed on
+        // it, trailing slashes, :80 port and all). Rebuilding from
+        // the REQUESTED url instead mismatched the urlkey when the
+        // capture was recorded under a different path form, and
+        // wayback answered with its calendar page instead of the
+        // capture.
+        Some((ts, original)) => {
+            let target: &str = if original.is_empty() {
+                bare
+            } else {
+                original.as_str()
+            };
+            Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
+        }
+        None => Avail::Empty,
+    }
+}
+
+/// Pick the nearest-to-present 200 capture from a CDX json response.
+/// Rows are [["urlkey","timestamp","original", ...], ...] : row 0 is
+/// the header, the nearest capture is the last data row.
+fn cdx_latest(v: &Value) -> Option<(String, String)> {
+    let rows = v.as_array()?;
+    if rows.len() < 2 {
         return None;
     }
-    let ct = snap
-        .headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    if crate::fetch::guards::is_binary(&snap.body, &ct) {
-        return None;
+    let last = &rows[rows.len() - 1];
+    let ts = last.get(1)?.as_str()?.to_string();
+    let original = last
+        .get(2)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((ts, original))
+}
+
+async fn try_resurrect(
+    daemon: &Arc<Daemon>,
+    url: &str,
+    live_error: &Value,
+) -> Result<Value, ResurrectError> {
+    // 1. Lookup: the availability API first (cheap, "closest"
+    // semantics), then the complete CDX index when it comes back
+    // empty. The availability index is lossy and scheme-strict (a
+    // capture recorded under http:// is invisible to an https://
+    // query), so an empty answer alone never earns "never archived".
+    let mut transport_failed = false;
+    let mut found = match availability_lookup(daemon, url).await {
+        Avail::Found(pair) => Some(pair),
+        Avail::Empty => None,
+        Avail::Unreachable => {
+            transport_failed = true;
+            None
+        }
+    };
+    if found.is_none() {
+        found = match cdx_lookup(daemon, url).await {
+            Avail::Found(pair) => Some(pair),
+            Avail::Empty => None,
+            Avail::Unreachable => {
+                transport_failed = true;
+                None
+            }
+        };
     }
+    let (mut snap_url, mut ts) = match found {
+        Some(pair) => pair,
+        // "The archive is down" is not "the URL was never archived" :
+        // collapsing both into one message used to assert a fact the
+        // lookup never established.
+        None if transport_failed => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::LookupUnreachable,
+                snapshot_url: None,
+            });
+        }
+        None => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::NoSnapshot,
+                snapshot_url: None,
+            });
+        }
+    };
+
+    // 2. Fetch the snapshot : wayback is plain HTTP-friendly. A thin
+    // extraction gets a second look first: a dead domain's last
+    // capture is very often a meta-refresh stub ("parked → redirect")
+    // that extracts to zero text but chains to the capture holding
+    // the content. Browsers follow the refresh; so does resurrection,
+    // but ONLY when wayback rewrote the target : a live-web target
+    // would fetch a URL that may still be dead, moved, or hostile.
     let opts = ExtractOptions::default();
-    let mut ex = extract::extract(&snap.body, &ct, &snap_url, &opts).ok()?;
-    // Wayback serves the ORIGINAL server-rendered HTML : thinness
-    // here usually means a genuinely small page, not a JS shell.
-    // Only truly empty extractions are useless.
-    if ex.total_chars < 50 {
-        return None;
-    }
+    let mut hops: u8 = 0;
+    let (snap, mut ex) = loop {
+        let snap = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            daemon.fetcher.fetch(&snap_url),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotFetch,
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        };
+        if !matches!(snap.verdict, Verdict::ContentOk) {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotVerdict,
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+        let ct = snap
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        if crate::fetch::guards::is_binary(&snap.body, &ct) {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotBinary,
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+        let ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
+            Ok(ex) => ex,
+            Err(_) => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotThin(0),
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        };
+        // Wayback serves the ORIGINAL server-rendered HTML : thinness
+        // here usually means a genuinely small page, not a JS shell.
+        // But wayback's redirect interstitials carry enough IA nav
+        // chrome to pass any char threshold, so serving is gated on
+        // stub markers too : a stub hops (up to MAX), a real page
+        // serves, a true empty fails.
+        let stub = ex.thin || ex.total_chars < 50 || is_wayback_stub(&snap.body);
+        let chained = if hops < MAX_RESURRECT_HOPS && stub {
+            meta_refresh_target(&snap.body).filter(|t| wayback_ts_of(t).is_some())
+        } else {
+            None
+        };
+        match chained {
+            Some(target) => {
+                hops += 1;
+                if let Some(t) = wayback_ts_of(&target) {
+                    ts = t;
+                }
+                snap_url = target;
+            }
+            None if stub => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotThin(ex.total_chars),
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+            // No chain, but real-enough content : serve it.
+            None => break (snap, ex),
+        }
+    };
 
     // 3. Label everything: banner in content, fields in structure.
-    let date = wayback_date(ts);
-    let age_days = wayback_age_days(ts);
+    let date = wayback_date(&ts);
+    let age_days = wayback_age_days(&ts);
     let live_reason = live_error
         .pointer("/content/0/text")
         .and_then(Value::as_str)
@@ -2422,11 +2893,112 @@ pub(super) async fn try_resurrect(
         "live_error": live_reason,
         "escalation": trace.value(),
     });
-    Some(json!({
+    Ok(json!({
         "content": [{"type": "text", "text": format_fetch_markdown(&ex, &snap_url, url)}],
         "structuredContent": structured,
         "_meta": {"com.donsetch/fetch-debug": debug},
     }))
+}
+
+/// Redirect chains through wayback interstitials can run several
+/// captures deep (a dead domain's stub -> a host's redirect stub ->
+/// the real landing page). Bounded so a hostile chain cannot spin.
+const MAX_RESURRECT_HOPS: u8 = 4;
+
+/// Wayback's "Got an HTTP NNN at crawl time / Redirecting to... /
+/// Impatient?" interstitial and its capture-calendar page : both are
+/// wayback UI, not archived content, and both extract enough text to
+/// defeat char-count thinness checks.
+fn is_wayback_stub(body: &[u8]) -> bool {
+    // No 64KB head window: replay pages wrap captures in the full
+    // IA nav (megabytes of markup), and the interstitial markers sit
+    // AFTER it, near the redirect notice at the document's end.
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("response at crawl time")
+        || text.contains("impatient?")
+        || text.contains("redirecting to...")
+}
+
+/// Pull the refresh target out of `<meta http-equiv="refresh"
+/// content="[delay;] url=target">`. A dead domain's archived last
+/// capture is very often exactly this stub, and a browser would
+/// follow it : so does resurrection. Byte-scanned on an
+/// ASCII-lowercased copy (length-preserving, so spans index the
+/// original); the target keeps its original case because wayback
+/// capture paths are case-sensitive.
+fn meta_refresh_target(body: &[u8]) -> Option<String> {
+    let head = &body[..body.len().min(64 * 1024)];
+    let text = String::from_utf8_lossy(head).to_string();
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
+        from = end.max(start + 1);
+        let tag_lower = &lower[start..end];
+        let tag_orig = &text[start..end];
+        let is_refresh = attr_value_span(tag_lower, "http-equiv")
+            .and_then(|(s, e)| tag_lower.get(s..e))
+            .is_some_and(|v| v.trim() == "refresh");
+        if !is_refresh {
+            continue;
+        }
+        let Some((cs, ce)) = attr_value_span(tag_lower, "content") else {
+            continue;
+        };
+        let content_lower = tag_lower.get(cs..ce)?;
+        let content_orig = tag_orig.get(cs..ce)?;
+        // "[delay][;] *url=target" : find the url= part case-
+        // insensitively, keep the target's original bytes.
+        let Some(urel) = content_lower.find("url=") else {
+            continue;
+        };
+        let target = content_orig[urel + 4..].trim();
+        let target = target.trim_matches(|c| c == '\'' || c == '"').trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+    }
+    None
+}
+
+/// Byte span of `name="value"` (or single quotes) inside a tag.
+/// Offsets index the string given, so callers can slice the same
+/// spans out of the original-case text.
+fn attr_value_span(tag_lower: &str, name: &str) -> Option<(usize, usize)> {
+    let pat = format!("{name}=");
+    let bytes = tag_lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = tag_lower[from..].find(&pat) {
+        let at = from + rel;
+        let boundary_ok = at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
+        let after = at + pat.len();
+        if boundary_ok && after < bytes.len() && matches!(bytes[after], b'"' | b'\'') {
+            let quote = bytes[after] as char;
+            let vstart = after + 1;
+            let vend = tag_lower[vstart..]
+                .find(quote)
+                .map_or(tag_lower.len(), |e| vstart + e);
+            return Some((vstart, vend));
+        }
+        from = at + pat.len();
+    }
+    None
+}
+
+/// `https://web.archive.org/web/<14-digit-ts>/<...>` → Some(ts).
+/// Only wayback-rewritten refresh targets are followed : a target
+/// pointing at the live web would silently fetch a URL that may
+/// still be dead (or hostile).
+fn wayback_ts_of(target: &str) -> Option<String> {
+    let after_scheme = target.split_once("://")?.1;
+    let (host, path) = after_scheme.split_once('/')?;
+    if !host.eq_ignore_ascii_case("web.archive.org") {
+        return None;
+    }
+    let seg = path.strip_prefix("web/")?;
+    let ts: String = seg.chars().take(14).collect();
+    (ts.len() == 14 && ts.bytes().all(|b| b.is_ascii_digit())).then_some(ts)
 }
 
 /// Percent-encode a value for a query string: everything outside
@@ -2446,7 +3018,11 @@ pub(super) fn encode_query_value(s: &str) -> String {
 
 /// Wayback timestamp (YYYYMMDDhhmmss) → "YYYY-MM-DD".
 pub(super) fn wayback_date(ts: &str) -> String {
-    if ts.len() >= 8 && ts[..8].chars().all(|c| c.is_ascii_digit()) {
+    // Byte slicing via get(): a hostile archive response carrying a
+    // multibyte char across byte 8 used to panic the slice (and a
+    // panic in a tool task hangs the caller's request with no
+    // response and leaks the cancel-registry entry).
+    if ts.len() >= 8 && ts.as_bytes()[..8].iter().all(|b| b.is_ascii_digit()) {
         format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8])
     } else {
         ts.to_string()
@@ -2659,6 +3235,37 @@ pub(super) fn format_fetch_markdown(
     markdown
 }
 
+/// B4 agent-outcome feedback (default off). Soft-demote the
+/// (class, host) when the agent's own verification failed:
+/// must_contain returned NO MATCH, or the page was unreadable
+/// (thin / SoftNotFound). Walls never count: a challenge is a
+/// routing fact, not a quality fact. Never fetches anything.
+fn maybe_record_agent_outcome(
+    daemon: &Daemon,
+    host: &str,
+    opts: &ExtractOptions,
+    ex: &extract::Extracted,
+    verdict: &str,
+) {
+    if !crate::config::cfg().search.outcome_feedback {
+        return;
+    }
+    // Wall family (Debug format carries the vendor): routing, not
+    // quality. SoftNotFound is a real content failure and falls through.
+    if verdict.starts_with("Challenge") || matches!(verdict, "AuthWall" | "Paywall" | "Blocked") {
+        return;
+    }
+    let class = crate::search::outcome_class(
+        opts.must_contain.is_some(),
+        opts.focus.is_some() || opts.toc || opts.section.is_some(),
+    );
+    let probe_miss = opts.must_contain.is_some() && ex.markdown.starts_with("probe: NO MATCH");
+    let unreadable = ex.thin || verdict == "SoftNotFound";
+    if probe_miss || unreadable {
+        daemon.searcher.observe_outcome_miss(class, host);
+    }
+}
+
 pub(super) fn finish_result(
     ex: &extract::Extracted,
     tier: &str,
@@ -2852,6 +3459,36 @@ mod fetch_output_contract_tests {
             .contains("# Actual first section")
         );
     }
+
+    // Framework-junk shells must never ship as successful content:
+    // the classifier that gates the tier-2 escalation (live case:
+    // facebook's tier-1 markdown was React internals).
+    #[test]
+    fn shell_text_classifier_rejects_react_dumps_and_flags_spinners() {
+        let fb = "# is_latency_sensitive_broadcast\n# Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36\nFDSTooltipDef\n\
+[[\"low\",\"normal\"]]\n__isReceiptEnd\nfdi_dispatch\npage_logging_framework";
+        assert!(
+            super::looks_like_shell_text(fb),
+            "identifier-dominated junk must classify as a shell"
+        );
+        assert!(
+            super::looks_like_shell_text("Please wait..."),
+            "a spinner fragment must classify as a shell"
+        );
+        let real = "Cristiano Ronaldo is a Portuguese footballer who has won the \
+Champions League five times. He remains the most followed athlete \
+across every major social platform today.";
+        assert!(
+            !super::looks_like_shell_text(real),
+            "real prose must never classify as a shell"
+        );
+        let hn = "1. Rust 2.0 released (crates.io)\n2. Show HN: my parser (github.com)\n";
+        assert!(
+            !super::looks_like_shell_text(hn),
+            "short legit listings must not classify as a shell"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2937,5 +3574,220 @@ mod batch_output_contract_tests {
         assert_eq!(flagged_state["next_offset"], 16000);
         assert_eq!(flagged_state["cloak_suspected"], true);
         assert_eq!(flagged_state["archived"]["age_days"], 3);
+    }
+}
+
+#[cfg(test)]
+mod resurrect_tests {
+    use super::{
+        ResurrectStage, attr_value_span, cdx_latest, is_wayback_stub, meta_refresh_target,
+        wayback_ts_of,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn meta_refresh_follows_wayback_rewrite() {
+        let html = b"<html><head><script>x</script>\
+            <meta http-equiv=\"refresh\" content=\"0; url=http://web.archive.org/web/20190613084634/https://smallbusiness.yahoo.com/webhosting?source=geocities\"/>\
+            </head><body></body></html>";
+        let t = meta_refresh_target(html).expect("refresh target extracted");
+        assert!(t.starts_with("http://web.archive.org/web/20190613084634/"));
+        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20190613084634"));
+    }
+
+    #[test]
+    fn meta_refresh_is_case_insensitive_but_case_preserving() {
+        // Match must survive any case in the markup ; the target's
+        // case must survive the match (wayback paths are sensitive).
+        let html = b"<META HTTP-EQUIV='Refresh' CONTENT=\"5; URL=http://web.archive.org/web/20200101000000/HTTP://Example.COM/Page\">";
+        let t = meta_refresh_target(html).expect("refresh target extracted");
+        assert!(t.contains("Example.COM/Page"), "original case lost: {t}");
+        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20200101000000"));
+    }
+
+    #[test]
+    fn meta_refresh_unquoted_and_delayed_forms() {
+        let html = b"<meta http-equiv=refresh content=30;url=http://web.archive.org/web/19990101000000/http://a.example/>";
+        assert!(
+            meta_refresh_target(html).is_none(),
+            "unquoted attr values are not misparsed"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_off_wayback_or_missing_is_none() {
+        let live =
+            b"<meta http-equiv=\"refresh\" content=\"0; url=https://parking.example/for-sale\">";
+        assert_eq!(
+            meta_refresh_target(live).as_deref(),
+            Some("https://parking.example/for-sale")
+        );
+        assert_eq!(wayback_ts_of("https://parking.example/for-sale"), None);
+        assert_eq!(meta_refresh_target(b"<html><body>hi</body></html>"), None);
+        assert_eq!(
+            meta_refresh_target(b"<meta http-equiv=\"refresh\" content=\"3\">"),
+            None
+        );
+    }
+
+    #[test]
+    fn wayback_ts_rejects_non_wayback_and_malformed() {
+        assert_eq!(
+            wayback_ts_of("https://web.archive.org/web/notatime/http://x.example"),
+            None
+        );
+        assert_eq!(
+            wayback_ts_of("http://web.archive.org/other/20200101000000/x"),
+            None
+        );
+        assert_eq!(
+            wayback_ts_of("https://spoof.example/web/20200101000000/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn attr_value_span_respects_boundaries() {
+        let tag = "meta data-content=\"a\" content=\"real value\" x";
+        let (s, e) = attr_value_span(tag, "content").expect("span");
+        assert_eq!(&tag[s..e], "real value");
+        assert_eq!(attr_value_span(tag, "missing"), None);
+    }
+
+    #[test]
+    fn stage_tags_are_stable_machine_strings() {
+        assert_eq!(
+            ResurrectStage::LookupUnreachable.tag(),
+            "lookup_unreachable"
+        );
+        assert_eq!(ResurrectStage::NoSnapshot.tag(), "no_snapshot");
+        assert_eq!(ResurrectStage::SnapshotFetch.tag(), "snapshot_fetch_failed");
+        assert_eq!(
+            ResurrectStage::SnapshotVerdict.tag(),
+            "snapshot_verdict_rejected"
+        );
+        assert_eq!(ResurrectStage::SnapshotBinary.tag(), "snapshot_binary");
+        assert_eq!(
+            ResurrectStage::SnapshotThin(12).tag(),
+            "snapshot_extract_thin(12)"
+        );
+    }
+    #[test]
+    fn cdx_latest_picks_last_data_row() {
+        let v = json!([
+            [
+                "urlkey",
+                "timestamp",
+                "original",
+                "mimetype",
+                "statuscode",
+                "digest",
+                "length"
+            ],
+            [
+                "com,geocities)/",
+                "20010615131644",
+                "http://www.geocities.com/",
+                "text/html",
+                "200",
+                "AAA",
+                "1000"
+            ],
+            [
+                "com,geocities)/",
+                "20190613084634",
+                "http://www.geocities.com/",
+                "text/html",
+                "200",
+                "BBB",
+                "900"
+            ]
+        ]);
+        let (ts, original) = cdx_latest(&v).expect("capture picked");
+        assert_eq!(ts, "20190613084634", "nearest-to-present capture wins");
+        assert_eq!(original, "http://www.geocities.com/");
+    }
+
+    #[test]
+    fn cdx_latest_handles_header_only_empty_and_garbage() {
+        assert_eq!(
+            cdx_latest(&json!([["urlkey", "timestamp", "original"]])),
+            None
+        );
+        assert_eq!(cdx_latest(&json!([])), None);
+        assert_eq!(cdx_latest(&json!("not an array")), None);
+        assert_eq!(
+            cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_classes_separate_death_from_ambiguity() {
+        use super::super::transport_class;
+        use crate::error::FetchError;
+        // Resurrectable: the site is gone.
+        assert_eq!(
+            transport_class(&FetchError::Tls("certificate verify failed".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Tls("handshake failure".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "Name or service not known"
+            ))),
+            "dns"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("connection refused"))),
+            "refused"
+        );
+        // Excluded: ambiguous or IP-level; a snapshot would lie.
+        assert_eq!(transport_class(&FetchError::Timeout), "timeout");
+        assert_eq!(
+            transport_class(&FetchError::Tls("connection reset by peer".into())),
+            "reset"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "connection timed out"
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Http("parser died".into())),
+            "protocol"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Ghost("no browser".into())),
+            "ghost"
+        );
+    }
+
+    #[test]
+    fn resurrectable_transport_classes_are_exactly_tls_dns_refused() {
+        let resurrectable: fn(&str) -> bool = |k| matches!(k, "tls" | "dns" | "refused");
+        assert!(resurrectable("tls"));
+        assert!(resurrectable("dns"));
+        assert!(resurrectable("refused"));
+        assert!(!resurrectable("timeout"));
+        assert!(!resurrectable("reset"));
+        assert!(!resurrectable("network"));
+        assert!(!resurrectable("protocol"));
+    }
+    #[test]
+    fn wayback_stub_markers_do_not_catch_real_pages() {
+        let interstitial = b"<html><body>Got an HTTP 301 response at crawl time.             Redirecting to... <a href=\"/web/20100101/http://x.example\">x</a>             <b>Impatient?</b></body></html>";
+        assert!(is_wayback_stub(interstitial));
+        assert!(!is_wayback_stub(
+            b"<html><body>Welcome to my Geocities page. Under construction.</body></html>"
+        ));
+        // An archived page ABOUT the wayback machine must not be
+        // misread as chrome : the calendar phrase differs from prose.
+        let article = b"<html><body><h1>History of the Wayback Machine</h1>            It preserves redirects and their targets.</body></html>";
+        assert!(!is_wayback_stub(article));
     }
 }

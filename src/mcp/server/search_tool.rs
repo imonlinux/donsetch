@@ -117,7 +117,26 @@ pub(super) fn make_ghost_hook(
                 }
             }
             let g_host = crate::search::rank::host_of(&url);
-            let mut g = match ghost_mgr.acquire_for(&profile, Some(g_host.as_str())).await {
+            // v4 E2: the ghost render must agree with the persona pin
+            // (viewport + locale) for this host, exactly as the tier-1
+            // fetch paths and web_screenshot do — otherwise the SERP
+            // render goes out on the default en-US/default-viewport
+            // wire while the persona's HTTP fetches use its own, an
+            // incoherent fingerprint (and a relaunch thrash when a
+            // default-wire and a persona-wire acquire alternate on one
+            // pool slot).
+            let wire = {
+                let s = state.lock().await;
+                s.personas
+                    .get(&g_host)
+                    .filter(|p| p.quarantine_reason.is_none())
+                    .map(|p| p.ghost_wire())
+                    .unwrap_or_default()
+            };
+            let mut g = match ghost_mgr
+                .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
+                .await
+            {
                 Ok(g) => g,
                 Err(e) => return Err(format!("browser launch: {e}")),
             };
@@ -173,28 +192,11 @@ pub(super) async fn search_inner(
 ) -> Value {
     match search_outcome(daemon, query, max, intent).await {
         Ok(out) => {
-            memory_ingest_outcome(&out);
             let top = out.results.first().map(|r| r.url.as_str());
             maybe_pre_solve(daemon, top);
             render_search_outcome(daemon, &out).await
         }
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
-    }
-}
-
-/// Remember snippets of the top search hits before rendering. The
-/// memory's body cap truncates us so this stays small, and the
-/// kill switch short-circuits everything.
-#[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-fn memory_ingest_outcome(out: &crate::search::SearchOutcome) {
-    #[cfg(feature = "rerank")]
-    if !crate::memory::kill_switch() {
-        let rows: Vec<(String, String, String)> = out
-            .results
-            .iter()
-            .map(|r| (r.url.clone(), r.title.clone(), r.snippet.clone()))
-            .collect();
-        crate::memory::ingest_async(rows);
     }
 }
 
@@ -233,7 +235,21 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             item
         })
         .collect::<Vec<_>>();
-    json!({"weak": out.weak, "results": results})
+    let mut item = json!({
+        "weak": out.weak,
+        "results": results,
+    });
+    // Instant answers are decision aids, not ranked evidence: they
+    // ride structuredContent (not the organic list) with their source.
+    if let Some(ans) = &out.instant {
+        item["instant"] = json!({
+            "kind": ans.kind,
+            "text": ans.text,
+            "url": ans.url,
+            "engine": ans.engine,
+        });
+    }
+    item
 }
 
 pub(super) fn search_debug_meta(out: &crate::search::SearchOutcome) -> Value {
@@ -264,9 +280,6 @@ pub(super) async fn search_batch_inner(
         .iter()
         .map(|query| search_outcome(daemon, query, max, intent));
     let outcomes = futures_util::future::join_all(futures).await;
-    for out in outcomes.iter().flatten() {
-        memory_ingest_outcome(out);
-    }
     if let Some(Ok(first)) = outcomes.first() {
         let top = first.results.first().map(|r| r.url.as_str());
         maybe_pre_solve(daemon, top);
@@ -402,7 +415,7 @@ pub(super) async fn search_outcome(
         match byok_search_cached(daemon, query, max, intent).await {
             Ok(out) => return Ok(out),
             Err(e) => {
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                if crate::config::cfg().debug.search {
                     eprintln!("[byok] all providers exhausted, falling back to local: {e}");
                 }
                 // Fall through to local search.
@@ -417,7 +430,7 @@ pub(super) async fn search_outcome(
             // Local failed : if BYOK is configured and we're in
             // local-first mode, try BYOK as a last resort.
             if byok_configured && local_first {
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                if crate::config::cfg().debug.search {
                     eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
                 match byok_search_cached(daemon, query, max, intent).await {
@@ -456,15 +469,36 @@ async fn byok_search_cached(
     if let Some(hit) = daemon.searcher.byok_cache_get(query, resolved, max) {
         return Ok(hit);
     }
-    let mut out = daemon.byok.search(query, max, intent).await?;
-    // Store the provider's own top slice before site: filtering, so a
-    // later hit filters on serve exactly as the miss path does.
-    daemon.searcher.byok_cache_put(query, &out);
-    // Issue #190: site: queries reach BYOK results too, and prewarm
-    // only the rows that survive the filter (law 5: zero added latency).
-    crate::search::site_filter(query, &mut out.results);
-    daemon.searcher.spawn_prewarm(&out.results);
-    Ok(out)
+    // Single-flight on the byok cache key: two concurrent identical
+    // queries share one provider round-trip instead of both missing
+    // the cache and both billing the metered provider.
+    let key = daemon.searcher.byok_flight_key(query, resolved);
+    let d2 = Arc::clone(daemon);
+    let q2 = query.to_string();
+    daemon
+        .searcher
+        .byok_flight(key, query, resolved, max, async move {
+            let daemon = d2;
+            let query = q2.as_str();
+            // Fetch the provider's FULL top slice (12) regardless of
+            // the caller's ask, cache that, then truncate: caching
+            // the truncated outcome meant a first search at max=2
+            // served every later larger request a 2-row slice as
+            // cached: true (the local path fixed this same bug).
+            let mut out = daemon.byok.search(query, 12, intent).await?;
+            // Store the provider's own top slice before site:
+            // filtering, so a later hit filters on serve exactly as
+            // the miss path does.
+            daemon.searcher.byok_cache_put(query, &out);
+            // Issue #190: site: queries reach BYOK results too, and
+            // prewarm only the rows that survive the filter (law 5:
+            // zero added latency).
+            crate::search::site_filter(query, &mut out.results);
+            out.results.truncate(max.clamp(1, 12));
+            daemon.searcher.spawn_prewarm(&out.results);
+            Ok(out)
+        })
+        .await
 }
 
 /// Search failure → structured error: every engine (and BYOK if
@@ -506,16 +540,28 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 return; // not a known wall: the search prewarm covers it
             }
         }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[pre-solve] kicking background solve for {} ({})",
                 host_str, url_str
             );
         }
         let t0 = std::time::Instant::now();
+        // v4 E2: pre-solve on the host's persona wire, like the fetch
+        // paths — a default-wire pre-solve would render incoherently
+        // with the persona and thrash the pool slot against a
+        // persona-wire fetch.
+        let wire = {
+            let s = d.state.lock().await;
+            s.personas
+                .get(&host_str)
+                .filter(|p| p.quarantine_reason.is_none())
+                .map(|p| p.ghost_wire())
+                .unwrap_or_default()
+        };
         let Ok(mut g) = d
             .ghost_mgr
-            .acquire_for(&d.profile, Some(host_str.as_str()))
+            .acquire_for_wire(&d.profile, Some(host_str.as_str()), wire)
             .await
         else {
             return;
@@ -551,7 +597,7 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 replay_ok,
             );
         }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[pre-solve] done for {} in {}ms",
                 host_str,
@@ -648,6 +694,8 @@ mod search_output_contract_tests {
             elapsed: Duration::from_millis(10),
             provider: None,
             reranked: true,
+            instant: None,
+            stage_ms: Vec::new(),
         };
         let state = search_model_meta(&output, &["S1".into()]);
         assert_eq!(state["results"][0]["rank"], 1);

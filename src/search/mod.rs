@@ -8,7 +8,9 @@ pub mod byok;
 pub mod coverage;
 pub mod egress;
 pub mod engines;
+pub mod instant;
 pub mod intent;
+pub mod query;
 pub mod rank;
 pub mod rerank;
 pub mod verticals;
@@ -19,10 +21,19 @@ mod persist;
 mod render;
 mod tasks;
 
+pub use persist::load_for_status as persist_load_for_status;
+pub use persist::load_outcome_for_status as persist_load_outcome_for_status;
+pub use persist::load_quality_for_status as persist_load_quality_for_status;
+pub use persist::outcome_class;
+
 pub use render::{render_compact_markdown, render_markdown, render_meta};
 
 use enrich::PrewarmCache;
-use persist::{load_cache_disk, load_health_disk, save_cache_disk, save_health_disk_if_dirty};
+use persist::{
+    OutcomeMap, QualityMap, load_cache_disk, load_health_disk, load_outcome_disk,
+    load_quality_disk, save_cache_disk, save_health_disk_if_dirty, save_outcome_disk_if_dirty,
+    save_quality_disk_if_dirty,
+};
 use tasks::{EngineResult, TaskFut, engine_task, ghost_engine_task, vertical_task};
 
 use std::collections::HashMap;
@@ -108,8 +119,12 @@ fn norm_query(q: &str) -> String {
         "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at", "to", "for", "and",
         "or", "what", "which", "how", "do", "does", "i", "you", "it",
     ];
+    // '+' is kept (as the intent tokenizer does): stripping it made
+    // "rust vs c++ performance" and "rust vs c performance" share
+    // one cache key, serving the first query's results to the
+    // second as cached.
     q.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric() && c != '+')
         .filter(|w| !w.is_empty() && !STOP.contains(w))
         .collect::<Vec<_>>()
         .join(" ")
@@ -126,10 +141,10 @@ fn byok_cache_key(query: &str, intent: Intent) -> String {
 /// Whether a failure `status` reflects the engine actually behaving
 /// badly (worth quarantining via `record_outcome` and eroding trust
 /// via `bump_trust`), as opposed to infra noise -- a dead egress
-/// (`"dead-proxy"`), a BYOK key problem (`"auth-fail"`), or simply no
-/// results (`"no-results"`) -- none of which are the engine's fault.
-/// A single predicate so quarantine and trust tracking can't drift
-/// out of sync with each other again.
+/// (`"dead-proxy"`), a BYOK key problem (`"auth-fail"`), or simply
+/// no results (`"no-results"`). Everything else (blocked, empty-parse,
+/// timeout, net) erodes trust. A single predicate so quarantine and
+/// trust tracking can't drift out of sync with each other again.
 fn is_engine_fault(status: &str) -> bool {
     !status.starts_with("dead")
         && status != "auth-fail"
@@ -138,15 +153,56 @@ fn is_engine_fault(status: &str) -> bool {
         && status != "pacing-timeout"
 }
 
+/// C1 roster hygiene: Mojeek answers blocked traffic with HTTP 200
+/// and a parse that yields <3 hits (`empty-parse`). That is a
+/// CHRONIC signal, not a one-off — burn trust harder so it drops
+/// out of the default width instead of occupying a slot every
+/// query. The parser stays; proxy paths still fan out to it.
+fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
+    if ok {
+        return 1.2;
+    }
+    if engine == "mojeek" && status == "empty-parse" {
+        return 0.15;
+    }
+    0.3
+}
+
+/// C4: enough independent families already agree on a top-3 URL
+/// that waiting for the stragglers cannot change the answer.
+fn early_consensus_enough(outcomes: &[(String, EngineResult)]) -> bool {
+    use std::collections::{HashMap, HashSet};
+    let mut url_families: HashMap<String, HashSet<&str>> = HashMap::new();
+    let mut families_ok: HashSet<&str> = HashSet::new();
+    for (label, result) in outcomes {
+        let Ok((hits, _, _, _, _)) = result else {
+            continue;
+        };
+        let fam = rank::engine_family(engine_name(label));
+        families_ok.insert(fam);
+        for h in hits.iter().take(3) {
+            let key = rank::norm_key(&h.url);
+            url_families.entry(key).or_default().insert(fam);
+        }
+    }
+    families_ok.len() >= 3 && url_families.values().any(|fams| fams.len() >= 3)
+}
+
 pub struct Searcher {
     fetcher: Fetcher,
-    pool: EgressPool,
+    /// Shared with crawl + fetch (v4 A2): one health world for
+    /// every proxied path. Clone of the daemon's Arc.
+    pool: std::sync::Arc<EgressPool>,
     google: engines::google_wml::ProfileSelector,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
     /// Persisted to disk: an engine that learned "this walled me"
     /// keeps that memory across daemon restarts instead of
     /// re-paying the same failure every boot.
     trust: Mutex<HashMap<String, f64>>,
+    /// B2: per-intent trust (`engine|intent_code` -> EWMA). Roster
+    /// order prefers the intent sample; engine-global is the
+    /// fallback and still moves on every outcome.
+    trust_intent: Mutex<HashMap<String, f64>>,
     /// Set on any health-map mutation; the disk save swaps it off
     /// and skips the write entirely when nothing changed (was: a
     /// clone + serialize + write on every uncached search).
@@ -169,6 +225,10 @@ pub struct Searcher {
     /// leader's result. Stampedes are an agent reality
     /// (parallel tool calls love the same query).
     inflight: Mutex<std::collections::HashSet<String>>,
+    /// BYOK single-flight: a metered provider is not re-billed by a
+    /// concurrent identical query (the local fan-out has `inflight`
+    /// for the same reason). Keyed on the byok cache key.
+    byok_inflight: Mutex<std::collections::HashSet<String>>,
     /// v3 warm handoff: enrichment bodies cached for the
     /// subsequent `web_fetch` of a top result (search → fetch
     /// is THE agent pipeline). One-shot, TTL'd, bounded.
@@ -178,6 +238,15 @@ pub struct Searcher {
     /// headless Chrome: live-proven). Used ONLY by the
     /// thinness-gated cascade lane; None in test builds.
     ghost: Option<crate::crawl::GhostHook>,
+    /// B3: learned host quality (www-stripped host -> EWMA).
+    /// Filled by enrich/prefetch outcomes; nudges ranking
+    /// slightly after enough samples. Kill: search.quality_prior.
+    quality: Mutex<QualityMap>,
+    quality_dirty: std::sync::atomic::AtomicBool,
+    /// B4: agent-outcome demotes (`class|host` -> EWMA).
+    /// Default off (`search.outcome_feedback`); never extra fetches.
+    outcome: Mutex<OutcomeMap>,
+    outcome_dirty: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "rerank")]
@@ -226,23 +295,45 @@ pub struct SearchOutcome {
     pub provider: Option<String>,
     /// Cross-encoder reranking applied (feature on + model loaded).
     pub reranked: bool,
+    /// C5: byte-derived featured snippet / instant / knowledge.
+    /// Never merged into `results`. None when absent.
+    pub instant: Option<instant::InstantAnswer>,
+    /// Post-fan-out phase timings for the search-debug meta:
+    /// (stage, ms). Empty for the cache/BYOK paths.
+    pub stage_ms: Vec<(&'static str, u128)>,
 }
 
 impl Searcher {
     pub fn new(fetcher: Fetcher, pool: EgressPool) -> Self {
-        let (trust, failures) = load_health_disk();
+        Self::new_shared(fetcher, std::sync::Arc::new(pool))
+    }
+
+    /// Share one process-wide pool (daemon path).
+    pub fn new_shared(fetcher: Fetcher, pool: std::sync::Arc<EgressPool>) -> Self {
+        let (trust, trust_intent, failures) = load_health_disk();
         Self {
             fetcher,
             pool,
             google: engines::google_wml::ProfileSelector::from_env(),
             trust: Mutex::new(trust),
+            trust_intent: Mutex::new(trust_intent),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(load_cache_disk()),
             failures: Mutex::new(failures),
             inflight: Mutex::new(std::collections::HashSet::new()),
+            byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
             ghost: None,
+            quality: Mutex::new(load_quality_disk()),
+            quality_dirty: std::sync::atomic::AtomicBool::new(false),
+            outcome: Mutex::new(load_outcome_disk()),
+            outcome_dirty: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The shared egress pool (crawl/fetch attach the same Arc).
+    pub fn egress_pool(&self) -> &std::sync::Arc<EgressPool> {
+        &self.pool
     }
 
     /// Attach the browser-render capability (cascade lane).
@@ -288,6 +379,8 @@ impl Searcher {
             .cloned()
             .collect();
         site_filter(query, &mut results);
+        query::intitle_filter(query, &mut results);
+        query::filetype_filter(query, &mut results);
         Some(SearchOutcome {
             results,
             // BYOK results are provider-ranked and never flagged weak,
@@ -299,12 +392,61 @@ impl Searcher {
             elapsed: t0.elapsed(),
             provider,
             reranked: false,
+            // BYOK providers do not surface a byte-derived SERP
+            // instant layer; keep the slot honest.
+            instant: None,
+            stage_ms: Vec::new(),
         })
     }
 
     /// Issue #195: persist a fresh BYOK outcome under the BYOK key
     /// namespace, TTL'd like the local cache. Skips an empty result
     /// set (the provider path errors on empty, so this is defensive).
+    /// The single-flight key for a BYOK query: the byok cache key,
+    /// deliberately NOT carrying max_results (the leader publishes
+    /// the provider's full top-12, so a max=2 caller and a max=10
+    /// caller share one provider round-trip).
+    pub fn byok_flight_key(&self, query: &str, intent: Intent) -> String {
+        byok_cache_key(query, intent)
+    }
+
+    /// BYOK single-flight: a concurrent identical query JOINS the
+    /// leader's provider round-trip instead of double-billing the
+    /// metered provider. Followers poll the byok cache (the leader
+    /// publishes there before filtering); a leader that dies or
+    /// stalls past 12s computes itself, exactly like the local
+    /// fan-out flight above.
+    pub async fn byok_flight(
+        &self,
+        key: String,
+        query: &str,
+        intent: Intent,
+        max: usize,
+        compute: impl std::future::Future<Output = Result<SearchOutcome, String>>,
+    ) -> Result<SearchOutcome, String> {
+        let leader = {
+            let mut m = self
+                .byok_inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            m.insert(key.clone())
+        };
+        if !leader {
+            for _ in 0..120 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Some(hit) = self.byok_cache_get(query, intent, max) {
+                    return Ok(hit);
+                }
+            }
+            // Leader died or stalled : compute ourselves.
+        }
+        let _guard = InflightGuard {
+            map: &self.byok_inflight,
+            key,
+        };
+        compute.await
+    }
+
     pub fn byok_cache_put(&self, query: &str, out: &SearchOutcome) {
         if out.results.is_empty() {
             return;
@@ -332,7 +474,8 @@ impl Searcher {
     /// Proxy preflight: probe every proxy at startup so
     /// dead lines are benched BEFORE a query ever gets
     /// assigned to them. Runs in the background; the first
-    /// queries just use healthy lanes.
+    /// queries just use healthy lanes. Successful probes also
+    /// seed the per-lane RTT EWMA (v4 A2).
     pub fn preflight(self: &Arc<Self>) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
@@ -341,6 +484,7 @@ impl Searcher {
             let mut dead = 0usize;
             for proxy in proxies {
                 let id = proxy.id();
+                let started = Instant::now();
                 let probe = this.fetcher.fetch_once_via(
                     "https://api.ipify.org/",
                     &[],
@@ -349,7 +493,9 @@ impl Searcher {
                     None,
                 );
                 match tokio::time::timeout(Duration::from_secs(6), probe).await {
-                    Ok(Ok(o)) if o.status == 200 => {}
+                    Ok(Ok(o)) if o.status == 200 => {
+                        this.pool.observe_rtt(&id, started.elapsed());
+                    }
                     Ok(Err(e)) if format!("{e}").contains("CONNECT -> 407") => {
                         this.pool.report_auth_fail(&id);
                     }
@@ -434,6 +580,8 @@ impl Searcher {
                     let weak = rank::is_weak(&cached, total);
                     let mut results = cached.iter().take(max_results).cloned().collect();
                     site_filter(query, &mut results);
+                    query::intitle_filter(query, &mut results);
+                    query::filetype_filter(query, &mut results);
                     return Ok(SearchOutcome {
                         results,
                         weak,
@@ -442,7 +590,11 @@ impl Searcher {
                         cached: true,
                         elapsed: started.elapsed(),
                         provider: None,
-                        reranked: crate::search::rerank::active(),
+                        reranked: crate::search::rerank::loaded(),
+                        // Instant is not cached: a stale featured
+                        // snippet presented as fresh would lie.
+                        instant: None,
+                        stage_ms: Vec::new(),
                     });
                 }
             }
@@ -479,6 +631,8 @@ impl Searcher {
             let weak = rank::is_weak(cached, *total);
             let mut results = cached.iter().take(max_results).cloned().collect();
             site_filter(query, &mut results);
+            query::intitle_filter(query, &mut results);
+            query::filetype_filter(query, &mut results);
             return Ok(SearchOutcome {
                 results,
                 weak,
@@ -487,12 +641,29 @@ impl Searcher {
                 cached: true,
                 elapsed: started.elapsed(),
                 provider: None,
-                reranked: crate::search::rerank::active(),
+                reranked: crate::search::rerank::loaded(),
+                // Instant is not cached: a stale featured
+                // snippet presented as fresh would lie.
+                instant: None,
+                stage_ms: Vec::new(),
             });
         }
 
         let engines = intent::engines_for(intent);
-        let verticals = intent::verticals_for(intent, query);
+        // C2: compile operators once; each engine gets the form it
+        // actually honors (DDG lite strips site: so BM25 is not
+        // polluted with the literal token).
+        let compiled = query::compile(query);
+        let mut verticals = intent::verticals_for(intent, query);
+        // site:github.com / site:stackoverflow.com / etc. join the
+        // fan-out as the site's own API.
+        if let Some(site) = &compiled.site
+            && let Some(sv) = query::site_vertical(site)
+            && !verticals.contains(&sv)
+        {
+            verticals.push(sv);
+        }
+        let verticals = intent::trim_verticals_for_stress(verticals, self.pool.stress());
 
         // Fan out: engines each get their own egress
         // (spreading is the anti-rate-limit move).
@@ -510,19 +681,26 @@ impl Searcher {
             .copied()
             .collect();
         // Rank engines by learned trust so width cuts drop
-        // the weakest first.
+        // the weakest first. Per-intent sample wins; engine-global
+        // is the fallback (B2).
         {
+            let key = |e: &str| persist::trust_intent_key(engine_health_key(e), intent);
             let trust = self
                 .trust
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            live.sort_by(|a, b| {
-                trust
-                    .get(engine_health_key(b))
+            let trust_i = self
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let score = |e: &str| -> f64 {
+                trust_i
+                    .get(&key(e))
+                    .or_else(|| trust.get(engine_health_key(e)))
                     .copied()
                     .unwrap_or(1.0)
-                    .total_cmp(&trust.get(engine_health_key(a)).copied().unwrap_or(1.0))
-            });
+            };
+            live.sort_by(|a, b| score(b).total_cmp(&score(a)));
         }
         // ── Adaptive fan-out width: the governor. Under
         // stress the system shrinks its appetite instead of
@@ -532,7 +710,7 @@ impl Searcher {
         live.truncate(width);
         let mut assignments: Vec<(String, String)> = live
             .iter()
-            .map(|e| (e.to_string(), query.to_string()))
+            .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
         // Recall variants spend lanes : only when the
         // governor did NOT cut the roster (healthy pool).
@@ -553,14 +731,18 @@ impl Searcher {
         // is shared, not exclusive.
         let context = tasks::EngineContext {
             fetcher: &self.fetcher,
-            pool: &self.pool,
+            pool: self.pool.as_ref(),
             google: &self.google,
         };
-        for (engine, q, eg) in assign_egresses(&self.pool, assignments, &mut used_egresses) {
+        for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
+        {
             futures.push(Box::pin(engine_task(engine, q, eg.id, eg.proxy, context)));
         }
         // Verticals: direct, friendly APIs.
-        let verticals: Vec<&&str> = verticals.iter().filter(|v| !self.quarantined(v)).collect();
+        let verticals: Vec<&str> = verticals
+            .into_iter()
+            .filter(|v| !self.quarantined(v))
+            .collect();
         for v in verticals {
             futures.push(Box::pin(vertical_task(
                 v.to_string(),
@@ -570,7 +752,28 @@ impl Searcher {
             )));
         }
 
-        let outcomes = futures_util::future::join_all(futures).await;
+        // C4 adaptive early-return: collect completions as they
+        // land; once ≥3 independent families agree on a top-3 URL,
+        // drop the stragglers (their futures are cancelled). Kill:
+        // search.search_early=false / DONSETCH_NO_SEARCH_EARLY.
+        let early = crate::config::cfg().search.search_early;
+        let outcomes: Vec<(String, EngineResult)> = if early {
+            use futures_util::stream::{FuturesUnordered, StreamExt};
+            let mut futs = FuturesUnordered::new();
+            for f in futures {
+                futs.push(f);
+            }
+            let mut acc: Vec<(String, EngineResult)> = Vec::new();
+            while let Some(outcome) = futs.next().await {
+                acc.push(outcome);
+                if early_consensus_enough(&acc) {
+                    break;
+                }
+            }
+            acc
+        } else {
+            futures_util::future::join_all(futures).await
+        };
 
         // ── Retry wave: failed engines get one more shot
         // through a fresh egress : but ONLY when the first
@@ -580,7 +783,7 @@ impl Searcher {
         let ok_hits: usize = outcomes
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
-            .map(|(h, _, _, _)| h.len())
+            .map(|(h, _, _, _, _)| h.len())
             .sum();
         let merge_thin = ok_engines < 3 || ok_hits < 15;
         let failed: Vec<String> = if merge_thin {
@@ -673,15 +876,15 @@ impl Searcher {
             + retry_outcomes
                 .iter()
                 .filter_map(|(_, r)| r.as_ref().ok())
-                .map(|(h, _, _, _)| h.len())
+                .map(|(h, _, _, _, _)| h.len())
                 .sum::<usize>();
-        let force_lane = std::env::var_os("DONSEEK_FORCE_GHOST_LANE").is_some();
+        let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
         let google_http_ok = outcomes
             .iter()
             .chain(&retry_outcomes)
             .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
         let lane_permitted = self.ghost.is_some()
-            && std::env::var_os("DONSEEK_NO_GHOST_LANES").is_none()
+            && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
             && !self.quarantined("google_ghost");
         let lane_outcomes: Vec<(String, EngineResult)> = if lane_permitted
             && google_ghost_wanted(force_lane, google_http_ok, retry_ok, retry_hits)
@@ -701,6 +904,9 @@ impl Searcher {
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
+        // C5: best instant answer across lanes (first non-empty wins
+        // by engine trust order, which outcomes already respect).
+        let mut instant: Option<instant::InstantAnswer> = None;
         let all: Vec<(String, EngineResult)> = outcomes
             .into_iter()
             .chain(retry_outcomes)
@@ -711,7 +917,7 @@ impl Searcher {
             let engine = engine_name(&label).to_string();
             let ghost_lane = engine == "google_ghost";
             match outcome {
-                Ok((hits, ms, egress_id, was_engine)) => {
+                Ok((hits, ms, egress_id, was_engine, lane_instant)) => {
                     let base = engine_health_key(&engine);
                     self.record_outcome(base, true);
                     if was_engine && !ghost_lane {
@@ -721,7 +927,12 @@ impl Searcher {
                         self.pool.report_ok(&engine, &egress_id);
                     }
                     if was_engine || ghost_lane {
-                        self.bump_trust(base, true);
+                        self.bump_trust(base, intent, true);
+                    }
+                    if instant.is_none()
+                        && let Some(ans) = lane_instant
+                    {
+                        instant = Some(ans);
                     }
                     report.push(EngineReport {
                         engine: engine.clone(),
@@ -751,7 +962,7 @@ impl Searcher {
                         }
                     }
                     if (was_engine || ghost_lane) && is_engine_fault(&status) {
-                        self.bump_trust(base, false);
+                        self.bump_trust_status(base, intent, false, &status);
                     }
                     report.push(EngineReport {
                         engine,
@@ -771,11 +982,15 @@ impl Searcher {
                     .trust
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ti = self
+                    .trust_intent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let f = self
                     .failures
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                save_health_disk_if_dirty(self, &t, &f);
+                save_health_disk_if_dirty(self, &t, &ti, &f);
             }
             return Err(FetchError::Http(format!(
                 "search: all engines failed : {}",
@@ -814,6 +1029,26 @@ impl Searcher {
         };
         #[cfg(not(feature = "rerank"))]
         let mut results = rank::merge(&per_engine, query, intent, &trust, 12);
+        // B3: learned host quality nudge. After merge (and its
+        // diversity cap) so it only reorders survivors with a
+        // small weight; consensus still dominates.
+        {
+            let quality = self
+                .quality
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::apply_quality_prior(&mut results, &quality);
+        }
+        // B4: soft demote hosts that chronically failed agent
+        // outcomes (default off).
+        {
+            let outcome = self
+                .outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::apply_outcome_demote(&mut results, &outcome);
+        }
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         let weak = rank::is_weak(&results, total);
 
         // ── Result enrichment: prefetch top results to extract
@@ -821,56 +1056,81 @@ impl Searcher {
         // pages. Richer than SERP snippets, filters dead links.
         // The genius feature: results carry the page's own title
         // and description, not the SERP's truncated version.
+        let enrich_t = std::time::Instant::now();
         self.enrich_results(&mut results).await;
+        let enrich_ms = enrich_t.elapsed().as_millis();
 
-        // ── site: operator enforcement: engines don't strictly
-        // respect `site:domain.com` : some results leak through
-        // from other domains. Filter them out post-merge so the
-        // agent only gets results from the requested domain.
+        // ── site:/intitle:/filetype: post-merge enforcement:
+        // engines don't strictly respect operators : some results
+        // leak through. Filter them out post-merge so the agent
+        // only sees what it asked for.
+        let filters_t = std::time::Instant::now();
         site_filter(query, &mut results);
+        query::intitle_filter(query, &mut results);
+        query::filetype_filter(query, &mut results);
+        let filters_ms = filters_t.elapsed().as_millis();
 
         // Post-enrichment top-up: the cross-encoder now sees the
         // real page titles/descriptions on the top slice, not the
         // SERP fragments. Bounded additive nudge, then re-sort.
         // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
         #[cfg(feature = "rerank")]
-        if std::env::var_os("DONSEEK_NO_TOPUP").is_none() {
-            let q = query.to_string();
-            let mut owned = std::mem::take(&mut results);
-            results = run_blocking_ranking(move || {
-                crate::search::rerank::topup(&q, &mut owned, 8);
-                owned
-            })
-            .await?;
-        }
+        let topup_ms: u128 = {
+            if crate::config::cfg().search.rerank_topup {
+                let t = std::time::Instant::now();
+                let q = query.to_string();
+                let mut owned = std::mem::take(&mut results);
+                let r = run_blocking_ranking(move || {
+                    crate::search::rerank::topup(&q, &mut owned, 8);
+                    owned
+                });
+                let ms = t.elapsed().as_millis();
+                results = r.await?;
+                ms
+            } else {
+                0
+            }
+        };
+        // Without the rerank feature the stage is a no-op: report a
+        // flat zero so stage_ms stays schema-stable on all feature
+        // halves of the build matrix.
+        #[cfg(not(feature = "rerank"))]
+        let topup_ms: u128 = 0;
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
         let cacheable = ok_engines >= 2 && total >= 8;
         if cacheable {
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // LRU-ish cap: drop oldest when full.
-            if cache.len() >= 500
-                && let Some(oldest) = cache
-                    .iter()
-                    .max_by_key(|(_, (at, _, _, _))| at.elapsed())
-                    .map(|(k, _)| k.clone())
-            {
-                cache.remove(&oldest);
-            }
-            cache.insert(
-                cache_key,
-                (
-                    Instant::now(),
-                    results.iter().take(12).cloned().collect(),
-                    total,
-                    report.clone(),
-                ),
-            );
-            save_cache_disk(&cache);
+            let snapshot = {
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // LRU-ish cap: drop oldest when full.
+                if cache.len() >= 500
+                    && let Some(oldest) = cache
+                        .iter()
+                        .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                        .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+                cache.insert(
+                    cache_key,
+                    (
+                        Instant::now(),
+                        results.iter().take(12).cloned().collect(),
+                        total,
+                        report.clone(),
+                    ),
+                );
+                cache.clone()
+                // Serialize + write with NO lock held: the save is a
+                // 1-2MB JSON write, and holding the cache mutex
+                // across it queued every cache hit and every
+                // single-flight follower poll behind one disk write.
+            };
+            save_cache_disk(&snapshot);
         }
 
         // Persist learned engine health once per search (single
@@ -881,12 +1141,22 @@ impl Searcher {
                 .trust
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ti = self
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let f = self
                 .failures
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            save_health_disk_if_dirty(self, &t, &f);
+            save_health_disk_if_dirty(self, &t, &ti, &f);
         }
+
+        let stages = vec![
+            ("enrich", enrich_ms),
+            ("filters", filters_ms),
+            ("topup", topup_ms),
+        ];
 
         Ok(SearchOutcome {
             results: results.into_iter().take(max_results).collect(),
@@ -896,20 +1166,107 @@ impl Searcher {
             cached: false,
             elapsed: started.elapsed(),
             provider: None,
-            reranked: crate::search::rerank::active(),
+            reranked: crate::search::rerank::loaded(),
+            instant,
+            stage_ms: stages,
         })
     }
 
-    fn bump_trust(&self, base_engine: &str, ok: bool) {
-        let mut trust = self
+    fn bump_trust(&self, base_engine: &str, intent: Intent, ok: bool) {
+        self.bump_trust_status(base_engine, intent, ok, "");
+    }
+
+    /// C1: Mojeek `empty-parse` (blocked:200) burns trust harder so
+    /// it leaves the default width instead of occupying a slot.
+    fn bump_trust_status(&self, base_engine: &str, intent: Intent, ok: bool, status: &str) {
+        let target = trust_target_for(base_engine, status, ok);
+        {
+            let mut trust = self
+                .trust
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let t = trust.entry(base_engine.to_string()).or_insert(1.0);
+            *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
+        }
+        {
+            let mut trust_i = self
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = persist::trust_intent_key(base_engine, intent);
+            let t = trust_i.entry(key).or_insert(1.0);
+            *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
+        }
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Engine-global + per-intent trust for receipts / status.
+    pub fn trust_snapshot(&self) -> (usize, usize, usize) {
+        let trust = self
             .trust
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let t = trust.entry(base_engine.to_string()).or_insert(1.0);
-        let target = if ok { 1.2 } else { 0.3 };
-        *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
-        self.health_dirty
+        let trust_i = self
+            .trust_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let low = trust.values().filter(|&&t| t < 0.5).count()
+            + trust_i.values().filter(|&&t| t < 0.5).count();
+        (trust.len(), trust_i.len(), low + failures.len())
+    }
+
+    /// B3: record one enrich/prefetch outcome for a host.
+    /// Clean content raises density; dead/soft-404 lowers it.
+    /// No-op when the quality prior is killed.
+    pub(crate) fn observe_quality(&self, host: &str, ok: bool) {
+        if !crate::config::cfg().search.quality_prior {
+            return;
+        }
+        {
+            let mut quality = self
+                .quality
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::observe_quality(&mut quality, host, ok);
+        }
+        self.quality_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Persist quality map if it changed since the last save.
+    pub(crate) fn save_quality_if_dirty(&self) {
+        let quality = self
+            .quality
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        save_quality_disk_if_dirty(self, &quality);
+    }
+
+    /// B4: record one agent-outcome miss. No-op unless
+    /// `search.outcome_feedback` is on. Never fetches anything.
+    pub fn observe_outcome_miss(&self, class: &str, host: &str) {
+        if !crate::config::cfg().search.outcome_feedback {
+            return;
+        }
+        {
+            let mut outcome = self
+                .outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            persist::observe_outcome_miss(&mut outcome, class, host);
+        }
+        self.outcome_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        save_outcome_disk_if_dirty(self, &outcome);
     }
 }
 
@@ -1130,6 +1487,8 @@ mod tests {
             elapsed: Duration::ZERO,
             provider: Some(provider.to_string()),
             reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
         }
     }
 
@@ -1353,6 +1712,61 @@ mod tests {
     }
 
     #[test]
+    fn mojeek_empty_parse_burns_trust_harder() {
+        assert_eq!(trust_target_for("mojeek", "empty-parse", false), 0.15);
+        assert_eq!(trust_target_for("bing", "empty-parse", false), 0.3);
+        assert_eq!(trust_target_for("mojeek", "blocked:429", false), 0.3);
+        assert_eq!(trust_target_for("mojeek", "ok", true), 1.2);
+    }
+
+    #[test]
+    fn early_consensus_needs_three_families_on_a_shared_top3() {
+        use crate::search::engines::Hit;
+        let hit = |url: &str, rank: usize| Hit {
+            title: "t".into(),
+            url: url.into(),
+            snippet: "s".into(),
+            rank,
+            published: None,
+        };
+        let ok = |engine: &str, urls: &[&str]| {
+            (
+                engine.to_string(),
+                Ok((
+                    urls.iter()
+                        .enumerate()
+                        .map(|(i, u)| hit(u, i + 1))
+                        .collect::<Vec<_>>(),
+                    10u64,
+                    "direct".to_string(),
+                    true,
+                    None,
+                )),
+            )
+        };
+        // Two families only: not enough.
+        let two = vec![
+            ok("brave", &["https://a.com/x", "https://b.com/y"]),
+            ok("bing", &["https://a.com/x", "https://b.com/y"]),
+        ];
+        assert!(!early_consensus_enough(&two));
+        // Three families, shared top URL: enough.
+        let three = vec![
+            ok("brave", &["https://a.com/x", "https://b.com/y"]),
+            ok("bing", &["https://a.com/x", "https://c.com/z"]),
+            ok("mojeek", &["https://a.com/x", "https://d.com/w"]),
+        ];
+        assert!(early_consensus_enough(&three));
+        // Three families but no shared top-3 URL: not enough.
+        let disjoint = vec![
+            ok("brave", &["https://a.com/x"]),
+            ok("bing", &["https://b.com/y"]),
+            ok("mojeek", &["https://c.com/z"]),
+        ];
+        assert!(!early_consensus_enough(&disjoint));
+    }
+
+    #[test]
     fn google_ghost_is_its_own_family_for_ranking_math() {
         assert_eq!(rank::engine_family("google_ghost"), "google");
         assert_eq!(rank::engine_family("google"), "google");
@@ -1410,15 +1824,56 @@ mod tests {
         let mut trust = HashMap::new();
         trust.insert("brave".to_string(), 1.8);
         trust.insert("bing".to_string(), 0.42);
+        let trust_intent = HashMap::new();
         let mut failures = HashMap::new();
         failures.insert("google".to_string(), (3, Instant::now()));
-        crate::search::persist::save_health_disk(&trust, &failures);
+        crate::search::persist::save_health_disk(&trust, &trust_intent, &failures);
 
-        let (t, f) = load_health_disk();
+        let (t, ti, f) = load_health_disk();
         assert_eq!(t["brave"], 1.8, "high trust survives");
         assert_eq!(t["bing"], 0.42, "low trust survives");
         assert_eq!(f.get("google").map(|(n, _)| *n), Some(3));
+        // v1-shaped write (no trust_intent) still loads; migration
+        // seeds every intent from the engine-global EWMA.
+        assert!(
+            ti.contains_key(&super::persist::trust_intent_key("brave", Intent::Web)),
+            "v1 trust must migrate into per-intent keys"
+        );
 
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B2 discriminator: a News-intent demotion of an engine must
+    /// not crush the same engine's Web-intent trust (and vice versa).
+    #[test]
+    fn per_intent_trust_is_scoped_not_global() {
+        let dir = std::env::temp_dir().join(format!(
+            "donseek-intent-trust-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let searcher = Searcher::new(fetcher, EgressPool::new(Vec::new()));
+        for _ in 0..8 {
+            searcher.bump_trust("bing", Intent::News, false);
+            searcher.bump_trust("bing", Intent::Web, true);
+        }
+        {
+            let ti = searcher
+                .trust_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let news = ti[&super::persist::trust_intent_key("bing", Intent::News)];
+            let web = ti[&super::persist::trust_intent_key("bing", Intent::Web)];
+            assert!(
+                news < 0.6 && web > 1.0,
+                "news demotion must stay scoped: news={news} web={web}"
+            );
+        }
         unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1636,6 +2091,8 @@ mod tests {
             elapsed: Duration::from_millis(10),
             provider: None,
             reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
         }
     }
 

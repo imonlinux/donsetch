@@ -232,20 +232,136 @@ pub fn engines_for(intent: Intent) -> &'static [&'static str] {
 }
 
 /// Verticals to fan out per intent (keyless JSON APIs).
-pub fn verticals_for(intent: Intent, query: &str) -> &'static [&'static str] {
+/// Returns a Vec: code verticals are now query-gated (C6), so the
+/// set is no longer a static slice.
+pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
     match intent {
         // Official keyless APIs first: near-100% reliable,
         // zero egress budget spent on engines for code.
-        Intent::Code => &["stackexchange", "mdn", "github", "hn"],
-        Intent::Paper => &["scholar", "arxiv"],
-        Intent::News => &["news", "hn"],
-        Intent::Entity => &["wikipedia"],
+        // C6 stress-aware: each code vertical only fires when the
+        // query actually looks like that vertical's material. A
+        // false Code label on "python habitat" must not burn four
+        // API lanes.
+        Intent::Code => {
+            let q = query.to_lowercase();
+            let toks = tokens(&q);
+            let mut v = Vec::new();
+            if so_qaish(&q, &toks) {
+                v.push("stackexchange");
+            }
+            if mdnish(&q, &toks) {
+                v.push("mdn");
+            }
+            // github endpoint already self-gates (errorish/repoish).
+            v.push("github");
+            if hnish(&q, &toks) {
+                v.push("hn");
+            }
+            v
+        }
+        Intent::Paper => vec!["scholar", "arxiv"],
+        Intent::News => vec!["news", "hn"],
+        Intent::Entity => vec!["wikipedia"],
         // Wiki safety net only on CONCEPTUAL web queries :
         // firing it everywhere flooded merges and crowded
         // out real canonicals (bench round 2 regression).
-        Intent::Web if is_conceptual(query) => &["wikipedia"],
-        Intent::Web => &[],
+        Intent::Web if is_conceptual(query) => vec!["wikipedia"],
+        Intent::Web => vec![],
     }
+}
+
+/// Drop optional verticals under egress stress. HN goes first
+/// (noisiest); stackexchange next; the rest stay because they are
+/// the only high-signal code lane when engines are thin.
+pub fn trim_verticals_for_stress(verticals: Vec<&'static str>, stress: f64) -> Vec<&'static str> {
+    if stress < 0.35 {
+        return verticals;
+    }
+    verticals.into_iter().filter(|v| *v != "hn").collect()
+}
+
+/// StackExchange: question language, error strings, or how-to +
+/// tech. Avoids burning the API on entity names ("Linus Torvalds").
+fn so_qaish(q: &str, toks: &[&str]) -> bool {
+    const QWORDS: &[&str] = &[
+        "how",
+        "why",
+        "what",
+        "when",
+        "which",
+        "error",
+        "exception",
+        "failed",
+        "cannot",
+        "undefined",
+        "fix",
+        "debug",
+        "traceback",
+        "panic",
+        "bug",
+    ];
+    QWORDS.iter().any(|w| has_phrase(toks, w))
+        || q.contains('?')
+        || toks.iter().any(|t| TECH.contains(t)) && q.contains(' ')
+}
+
+/// MDN: browser/web platform only. "python traceback" must not
+/// hit developer.mozilla.org.
+fn mdnish(_q: &str, toks: &[&str]) -> bool {
+    const WEB: &[&str] = &[
+        "html",
+        "css",
+        "javascript",
+        "typescript",
+        "dom",
+        "web",
+        "browser",
+        "fetch",
+        "cors",
+        "flexbox",
+        "grid",
+        "http",
+        "https",
+        "cookie",
+        "localStorage",
+        "webpack",
+        "vite",
+        "react",
+        "vue",
+        "svelte",
+        "node",
+        "npm",
+        "webassembly",
+        "wasm",
+        "svg",
+        "canvas",
+        "service",
+        "worker",
+        "pwa",
+        "progressive",
+        "chrome",
+        "firefox",
+        "safari",
+        "edge",
+    ];
+    toks.iter().any(|t| WEB.contains(t))
+}
+
+/// HN: release/announce/show or short library names, not pure
+/// error dumps.
+fn hnish(q: &str, toks: &[&str]) -> bool {
+    const NEWSY: &[&str] = &[
+        "release",
+        "announce",
+        "announced",
+        "show",
+        "launch",
+        "launched",
+        "ycombinator",
+        "hacker",
+        "hn",
+    ];
+    NEWSY.iter().any(|s| q.contains(s)) || toks.len() <= 3 && toks.iter().any(|t| TECH.contains(t))
 }
 
 /// Domain quality prior per intent: 0.0..1.0 bonus mass.
@@ -460,5 +576,35 @@ mod tests {
         // substring across a word boundary ("show tools" is not
         // "how to").
         assert_ne!(detect("show tools for woodworking"), Intent::Code);
+    }
+
+    #[test]
+    fn code_verticals_fire_only_when_query_looks_like_them() {
+        // Error + tech → stackexchange + github, not mdn (no web token).
+        let v = verticals_for(Intent::Code, "python TypeError cannot read property");
+        assert!(v.contains(&"stackexchange"), "{v:?}");
+        assert!(v.contains(&"github"), "{v:?}");
+        assert!(!v.contains(&"mdn"), "no web token: {v:?}");
+        // Browser API → mdn fires.
+        let v = verticals_for(Intent::Code, "fetch cors error browser");
+        assert!(v.contains(&"mdn"), "{v:?}");
+        // Release/announce → hn.
+        let v = verticals_for(Intent::Code, "tokio 1.0 release announce");
+        assert!(v.contains(&"hn"), "{v:?}");
+        // Pure entity-ish code label without Q words or web tokens:
+        // still github (endpoint self-gates), not the full set.
+        let v = verticals_for(Intent::Code, "linus torvalds rust");
+        assert!(v.contains(&"github"), "{v:?}");
+    }
+
+    #[test]
+    fn stress_trims_noisy_verticals() {
+        let full = vec!["stackexchange", "mdn", "github", "hn"];
+        let calm = trim_verticals_for_stress(full.clone(), 0.1);
+        assert_eq!(calm, full);
+        let stressed = trim_verticals_for_stress(full, 0.5);
+        assert!(!stressed.contains(&"hn"));
+        assert!(stressed.contains(&"github"));
+        assert!(stressed.contains(&"stackexchange"));
     }
 }

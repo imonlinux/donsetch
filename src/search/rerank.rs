@@ -34,9 +34,6 @@ mod inner {
     /// Max sequence length for the MiniLM cross-encoder.
     const MAX_SEQ_LEN: usize = 512;
 
-    /// ONNX Runtime accepts the thread count as a C `int`.
-    const MAX_INTRA_THREADS: usize = i32::MAX as usize;
-
     const MODEL_URL: &str = "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model_quantized.onnx";
     const MODEL_SHA256: &str = "e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe";
     const TOKENIZER_URL: &str =
@@ -53,7 +50,7 @@ mod inner {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ThreadSelection {
-        Environment {
+        Configured {
             threads: usize,
         },
         Automatic {
@@ -70,29 +67,10 @@ mod inner {
     impl ThreadSelection {
         fn threads(self) -> Option<usize> {
             match self {
-                Self::Environment { threads } | Self::Automatic { threads, .. } => Some(threads),
+                Self::Configured { threads } | Self::Automatic { threads, .. } => Some(threads),
                 Self::OnnxDefault { .. } => None,
             }
         }
-    }
-
-    enum ThreadOverride<'a> {
-        Unset,
-        Value(&'a str),
-        InvalidUnicode,
-    }
-
-    fn parse_intra_threads(raw: &str) -> Result<usize, String> {
-        let raw = raw.trim();
-        let threads = raw.parse::<usize>().map_err(|_| {
-            format!("DONSEEK_RERANK_THREADS must be an integer between 1 and {MAX_INTRA_THREADS}")
-        })?;
-        if !(1..=MAX_INTRA_THREADS).contains(&threads) {
-            return Err(format!(
-                "DONSEEK_RERANK_THREADS must be an integer between 1 and {MAX_INTRA_THREADS}"
-            ));
-        }
-        Ok(threads)
     }
 
     fn automatic_intra_threads(effective: Option<usize>, physical: usize) -> ThreadSelection {
@@ -110,56 +88,39 @@ mod inner {
     }
 
     fn select_intra_threads(
-        override_value: ThreadOverride<'_>,
+        configured: u32,
         effective: Option<usize>,
         physical: usize,
-    ) -> (ThreadSelection, Option<String>) {
-        match override_value {
-            ThreadOverride::Value(raw) => match parse_intra_threads(raw) {
-                Ok(threads) => (ThreadSelection::Environment { threads }, None),
-                Err(e) => (
-                    automatic_intra_threads(effective, physical),
-                    Some(format!("{e}; using automatic selection")),
-                ),
-            },
-            ThreadOverride::InvalidUnicode => (
-                automatic_intra_threads(effective, physical),
-                Some(
-                    "DONSEEK_RERANK_THREADS must contain valid UTF-8; using automatic selection"
-                        .to_string(),
-                ),
-            ),
-            ThreadOverride::Unset => (automatic_intra_threads(effective, physical), None),
+    ) -> ThreadSelection {
+        if configured == 0 {
+            automatic_intra_threads(effective, physical)
+        } else {
+            ThreadSelection::Configured {
+                threads: configured as usize,
+            }
         }
     }
 
     fn configured_intra_threads() -> ThreadSelection {
         let effective = std::thread::available_parallelism().ok().map(|n| n.get());
         let physical = num_cpus::get_physical();
-        let raw = std::env::var("DONSEEK_RERANK_THREADS");
-        let override_value = match raw.as_deref() {
-            Ok(raw) => ThreadOverride::Value(raw),
-            Err(std::env::VarError::NotPresent) => ThreadOverride::Unset,
-            Err(std::env::VarError::NotUnicode(_)) => ThreadOverride::InvalidUnicode,
-        };
-        let (selection, warning) = select_intra_threads(override_value, effective, physical);
-        if let Some(warning) = warning {
-            eprintln!("[rerank] invalid configuration: {warning}");
-        }
-        selection
+        // Values have already been parsed and validated by the process-wide
+        // layered config. 0 = auto; every nonzero value is explicit.
+        let configured = crate::config::cfg().search.rerank_threads;
+        select_intra_threads(configured, effective, physical)
     }
 
-    fn log_thread_selection(selection: ThreadSelection) {
+    fn thread_selection_log(selection: ThreadSelection) -> String {
         match selection {
-            ThreadSelection::Environment { threads } => eprintln!(
-                "[rerank] ONNX intra-op threads: {} (source: DONSEEK_RERANK_THREADS)",
+            ThreadSelection::Configured { threads } => format!(
+                "[rerank] ONNX intra-op threads: {} (source: layered config)",
                 threads
             ),
             ThreadSelection::Automatic {
                 threads,
                 effective,
                 physical,
-            } => eprintln!(
+            } => format!(
                 "[rerank] ONNX intra-op threads: {} (source: automatic, effective: {}, physical: {})",
                 threads, effective, physical
             ),
@@ -167,16 +128,20 @@ mod inner {
                 effective,
                 physical,
             } => match effective {
-                Some(effective) => eprintln!(
+                Some(effective) => format!(
                     "[rerank] ONNX intra-op threads: default (effective: {effective}, physical: {})",
                     physical
                 ),
-                None => eprintln!(
+                None => format!(
                     "[rerank] ONNX intra-op threads: default (effective parallelism unavailable, physical: {})",
                     physical
                 ),
             },
         }
+    }
+
+    fn log_thread_selection(selection: ThreadSelection) {
+        eprintln!("{}", thread_selection_log(selection));
     }
 
     /// Returns the cache directory for reranker model files.
@@ -377,6 +342,18 @@ mod inner {
     /// last ranking pass in this process (feature on + model ok).
     pub fn active() -> bool {
         get().is_some()
+    }
+
+    /// True only when the cross-encoder is ALREADY loaded in this
+    /// process. Unlike active(), this NEVER initializes: no
+    /// download, no ONNX session load. The search hot paths (cache
+    /// hits, single-flight followers, report stamps) call this,
+    /// because the first active() caller used to block its tokio
+    /// worker on the whole init chain (a 120s model download + a
+    /// bounded 30s session load). Ranking itself initializes inside
+    /// its own spawn_blocking, off the reactor.
+    pub fn loaded() -> bool {
+        RERANKER.get().is_some_and(|slot| slot.is_some())
     }
 
     pub fn is_model_cached() -> bool {
@@ -762,27 +739,9 @@ mod inner {
         }
 
         #[test]
-        fn rerank_threads_accepts_positive_integers() {
-            assert_eq!(parse_intra_threads("1").unwrap(), 1);
-            assert_eq!(parse_intra_threads("2").unwrap(), 2);
-            assert_eq!(parse_intra_threads(" 64 ").unwrap(), 64);
-            assert_eq!(
-                parse_intra_threads(&MAX_INTRA_THREADS.to_string()).unwrap(),
-                MAX_INTRA_THREADS
-            );
-        }
-
-        #[test]
-        fn rerank_threads_rejects_invalid_values() {
-            for raw in ["", "0", "-1", "1.5", "two", "2147483648"] {
-                assert!(parse_intra_threads(raw).is_err(), "accepted {raw:?}");
-            }
-        }
-
-        #[test]
         fn rerank_threads_auto_clamps_constrained_processes() {
             assert_eq!(
-                automatic_intra_threads(Some(2), 8),
+                select_intra_threads(0, Some(2), 8),
                 ThreadSelection::Automatic {
                     threads: 2,
                     effective: 2,
@@ -795,10 +754,10 @@ mod inner {
         #[test]
         fn rerank_threads_auto_preserves_unconstrained_onnx_default() {
             for selection in [
-                automatic_intra_threads(Some(8), 4),
-                automatic_intra_threads(Some(4), 4),
-                automatic_intra_threads(None, 8),
-                automatic_intra_threads(Some(0), 8),
+                select_intra_threads(0, Some(8), 4),
+                select_intra_threads(0, Some(4), 4),
+                select_intra_threads(0, None, 8),
+                select_intra_threads(0, Some(0), 8),
             ] {
                 assert_eq!(selection.threads(), None);
                 assert!(matches!(selection, ThreadSelection::OnnxDefault { .. }));
@@ -806,33 +765,18 @@ mod inner {
         }
 
         #[test]
-        fn rerank_threads_environment_override_wins() {
-            let (selection, warning) = select_intra_threads(ThreadOverride::Value("1"), Some(2), 8);
-            assert_eq!(selection.threads(), Some(1));
-            assert!(matches!(
-                selection,
-                ThreadSelection::Environment { threads: 1 }
-            ));
-            assert_eq!(warning, None);
-        }
-
-        #[test]
-        fn rerank_threads_invalid_override_falls_back_to_auto() {
-            for override_value in [
-                ThreadOverride::Value("invalid"),
-                ThreadOverride::InvalidUnicode,
-            ] {
-                let (selection, warning) = select_intra_threads(override_value, Some(2), 8);
-                assert_eq!(selection.threads(), Some(2));
-                assert!(matches!(selection, ThreadSelection::Automatic { .. }));
-                assert!(warning.is_some());
+        fn rerank_threads_configured_value_wins() {
+            for configured in [1, 2, 64] {
+                let selection = select_intra_threads(configured, Some(1), 8);
+                assert_eq!(selection.threads(), Some(configured as usize));
+                assert!(matches!(selection, ThreadSelection::Configured { .. }));
+                assert_eq!(
+                    thread_selection_log(selection),
+                    format!(
+                        "[rerank] ONNX intra-op threads: {configured} (source: layered config)"
+                    )
+                );
             }
-
-            let (selection, warning) =
-                select_intra_threads(ThreadOverride::Value("invalid"), Some(8), 4);
-            assert_eq!(selection.threads(), None);
-            assert!(matches!(selection, ThreadSelection::OnnxDefault { .. }));
-            assert!(warning.is_some());
         }
     }
 }
@@ -844,6 +788,9 @@ mod inner {
     pub fn active() -> bool {
         false
     }
+    pub fn loaded() -> bool {
+        false
+    }
     pub fn cross_encoder_scores(_query: &str, _docs: &[(String, String)]) -> Option<Vec<f64>> {
         None
     }
@@ -853,4 +800,4 @@ mod inner {
     pub fn topup(_query: &str, _results: &mut [crate::search::rank::Merged], _depth: usize) {}
 }
 
-pub use inner::{active, cross_encoder_scores, is_model_cached, rerank, topup};
+pub use inner::{active, cross_encoder_scores, is_model_cached, loaded, rerank, topup};

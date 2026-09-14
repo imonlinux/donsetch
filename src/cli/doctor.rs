@@ -20,6 +20,7 @@ use crate::fetch::client::Fetcher;
 use crate::paths;
 use crate::profile::BrowserProfile;
 
+#[derive(Debug)]
 enum CheckResult {
     Pass(String),
     Warn(String),
@@ -39,9 +40,17 @@ pub async fn run() {
     let deep = args.iter().any(|a| a == "--deep");
     let fix = args.iter().any(|a| a == "--fix");
     let only_mcp = args.iter().any(|a| a == "--mcp");
-    let stealth = args.iter().any(|a| a == "--stealth");
+    let improve = args.iter().any(|a| a == "--improve");
     let stealth_record = args.iter().any(|a| a == "--stealth-record");
+    let stealth = args.iter().any(|a| a == "--stealth") || stealth_record;
     let parity = args.iter().any(|a| a == "--parity");
+
+    // --improve: explain the self-improvement loop in ~10 lines.
+    // Standalone mode; no MCP tool, no network.
+    if improve {
+        print_improve_loop();
+        std::process::exit(0);
+    }
 
     // --stealth / --stealth-record: the drift scorecard (v4 phase
     // 0.4). Standalone mode: skips the general check battery.
@@ -124,6 +133,13 @@ pub async fn run() {
     // 2b. Fetch egress + trust posture (local-only, always runs).
     report!("Fetch egress", check_fetch_egress());
 
+    // 2c. Proxy pool + persisted lane health (local-only).
+    report!("Proxy pool", check_proxy_pool());
+
+    // 2d. Egress lanes: local health always; --deep live-probes
+    // every configured proxy and prints one line per lane.
+    report!("Egress lanes", check_egress_lanes(deep).await);
+
     // 3. TLS fingerprint (fast enough to keep in fast mode).
     if let Some(ref fm) = fetcher {
         report!("TLS fingerprint", check_tls(fm).await);
@@ -142,8 +158,16 @@ pub async fn run() {
     // (default) skips the seconds-long live launch; --deep runs it.
     if deep {
         report!("Browser launch", check_browser_launch().await);
+        // Captive portal: generate_204 must stay 204. A hotel/airport
+        // login page answering 200/302 is the classic "TLS works but
+        // every fetch is a login form" failure.
+        report!(
+            "Captive portal",
+            check_captive_portal(fetcher.as_ref()).await
+        );
     } else {
         cli::check_dim("Browser launch", "skipped (--deep to run)");
+        cli::check_dim("Captive portal", "skipped (--deep to run)");
     }
 
     // 8. Cache directory.
@@ -180,8 +204,44 @@ pub async fn run() {
     // 15.5 BYOK plugins (user-registered executable adapters).
     report!("Search plugins", check_plugins());
 
-    // 16. MCP client registration (detect + print blocks).
+    // 16. Config posture: layer conflicts, missing files, redaction.
+    report!("Config posture", check_config_posture());
+
+    // 17. Search health snapshot (local, fast): trust, quarantine,
+    // quality/outcome receipts, BYOK key states, C kill switches.
+    report!("Search health", check_search_health());
+
+    // 18. Clearance stores: routes.json, handles, cookie vault.
+    report!("Clearance stores", check_clearance_stores());
+
+    // 19. Crawl stores: governor persist, page-history size.
+    report!("Crawl stores", check_crawl_stores());
+
+    // 20. Network reality: DNS + optional captive-portal probe.
+    report!("DNS", check_dns());
+
+    // 21. MCP client registration (detect + print blocks).
     print_mcp_section();
+
+    // 22. Legacy env vars (the pre-v4 names): still honored, but
+    // each one active in this shell gets ONE warning naming its
+    // config key. Cut at the v4 release.
+    let legacy: Vec<&'static str> = crate::config::legacy_vars_in_env();
+    if legacy.is_empty() {
+        report!("Legacy env vars", CheckResult::Pass("none set".to_string()));
+    } else {
+        let names: Vec<String> = legacy
+            .iter()
+            .map(|name| {
+                let (section, key) = crate::config::legacy_target_of(name);
+                format!("{name} -> {section}.{key}")
+            })
+            .collect();
+        report!(
+            "Legacy env vars",
+            CheckResult::Warn(format!("{} (deprecated, cut at v4)", names.join(", ")))
+        );
+    }
 
     // ── Self-healing pass (--fix) ───────────────────────────
     if fix {
@@ -258,7 +318,11 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
             // fetch: curl works via the env proxy, direct sockets
             // get reset. Surface the fix instead of a generic
             // "check your connection".
-            let proxy_env_set = [
+            // The advice must match what the daemon actually does:
+            // a proxy comes from the ambient env vars OR the [proxy]
+            // slots in donsetch.toml (from_env_for consults the
+            // config layer first; the pool lane adds proxy.pool).
+            let proxy_configured = [
                 "HTTPS_PROXY",
                 "https_proxy",
                 "HTTP_PROXY",
@@ -267,12 +331,19 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
                 "all_proxy",
             ]
             .iter()
-            .any(|v| std::env::var_os(v).is_some());
-            let hint = if proxy_env_set {
-                "The environment exports a proxy and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors the env proxy automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> so the re-signed certificates verify, then re-run doctor."
+            .any(|v| std::env::var_os(v).is_some())
+                || {
+                    let p = &crate::config::cfg().proxy;
+                    !p.https.trim().is_empty()
+                        || !p.http.trim().is_empty()
+                        || !p.all.trim().is_empty()
+                        || !p.pool.is_empty()
+                };
+            let hint = if proxy_configured {
+                "A proxy is configured (env vars or [proxy] in donsetch.toml) and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors it automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> or set [tls] cert_file in donsetch.toml so the re-signed certificates verify, then re-run doctor."
                     .to_string()
             } else {
-                "Check your network connection and DNS. Behind an egress proxy? Export HTTPS_PROXY/HTTP_PROXY (donsetch honors them; NO_PROXY accepted).".into()
+                "Check your network connection and DNS. Behind an egress proxy? Set [proxy] https/http in donsetch.toml or export HTTPS_PROXY/HTTP_PROXY (NO_PROXY accepted).".into()
             };
             CheckResult::Fail(e.to_string(), hint)
         }
@@ -283,21 +354,26 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
 /// and the two certificate stores the connector builds from.
 /// Local-only: no network, stays in fast mode.
 fn check_fetch_egress() -> CheckResult {
-    let kill = crate::config::env_flag("DONSETCH_NO_ENV_PROXY");
-    let resolved = if kill {
-        None
-    } else {
-        crate::transport::proxy::from_env_for("https://example.com")
-    };
+    let proxy = &crate::config::cfg().proxy;
+    let slot_set = !proxy.https.trim().is_empty()
+        || !proxy.http.trim().is_empty()
+        || !proxy.all.trim().is_empty();
+    // from_env_for already consults the [proxy] slots first and
+    // gates only the ambient env read on from_environment: call it
+    // unconditionally so the doctor's view matches the daemon's
+    // (a TOML proxy with from_environment = false used to be
+    // reported as direct egress).
+    let resolved = crate::transport::proxy::from_env_for("https://example.com");
     let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
     let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
 
     let mut bits = Vec::new();
     if let Some(p) = resolved {
-        bits.push(format!("egress via {} proxy {}:{} (env; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port));
+        bits.push(format!("egress via {} proxy {}:{} ({}; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port, if slot_set { "config" } else { "env" }));
     } else {
-        bits.push(if kill {
-            "direct egress (DONSETCH_NO_ENV_PROXY=1 disables the env-proxy convention)".into()
+        bits.push(if !proxy.from_environment {
+            "direct egress (proxy.from_environment = false disables the env-proxy convention; [proxy] slots in donsetch.toml stay live)"
+                .into()
         } else {
             "direct egress (no proxy env vars; export HTTPS_PROXY/HTTP_PROXY to route fetches)"
                 .into()
@@ -322,6 +398,216 @@ fn check_fetch_egress() -> CheckResult {
             CheckResult::Pass(bits.join(" · "))
         }
     }
+}
+
+/// Proxy pool size + persisted egress-health.json (search/fetch lane
+/// burn memory). Local-only: reads config and the health file, no
+/// network. Named fix when every proxy lane is currently benched.
+fn check_proxy_pool() -> CheckResult {
+    let proxy = &crate::config::cfg().proxy;
+    let pool_n = proxy.pool.iter().filter(|s| !s.trim().is_empty()).count();
+    let persist = proxy.egress_persist && !crate::config::cfg().state.no_disk_state;
+    let mut bits = Vec::new();
+    if pool_n == 0 {
+        bits.push("pool empty (DONSEEK_PROXIES or [proxy] pool; direct-only egress)".to_string());
+    } else {
+        bits.push(format!("{pool_n} proxy lane(s) configured"));
+    }
+    bits.push(if persist {
+        "egress health persisted".into()
+    } else {
+        "egress health NOT persisted (proxy.egress_persist=false or state.no_disk_state)".into()
+    });
+
+    if !persist {
+        return CheckResult::Pass(bits.join(" · "));
+    }
+
+    let path = paths::cache_dir().join("egress-health.json");
+    if !path.exists() {
+        bits.push("no egress-health.json yet (benches appear after the first burn)".into());
+        return CheckResult::Pass(bits.join(" · "));
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            bits.push(format!("egress-health.json unreadable: {e}"));
+            return CheckResult::Warn(bits.join(" · "));
+        }
+    };
+    let burned = raw.matches("\"burned\"").count();
+    let dead_n: usize = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("dead").and_then(|d| d.as_array()).map(|a| a.len()))
+        .unwrap_or(0);
+
+    if pool_n > 0 && dead_n >= pool_n {
+        bits.push(format!(
+            "all {pool_n} proxy lane(s) benched in egress-health.json: run `donsetch proxy check` and fix creds/network"
+        ));
+        return CheckResult::Warn(bits.join(" · "));
+    }
+    bits.push(format!(
+        "learned benches: {burned} burned pair marker(s), {dead_n} dead lane(s)"
+    ));
+    CheckResult::Pass(bits.join(" · "))
+}
+
+/// `donsetch doctor --improve`: the self-improvement loop in plain
+/// language + live local receipts. No MCP tool, no network.
+fn print_improve_loop() {
+    cli::print_title(&format!("{DISPLAY_NAME} Improve"));
+    println!();
+    println!("  DonSeTch learns from YOUR use of it, on this machine only.");
+    println!("  Nothing leaves the box. No telemetry, no cloud model.");
+    println!();
+    println!("  What it remembers");
+    println!("    · per-host walls, cookie freshness, solve cooldowns");
+    println!("    · per-(engine, intent) search trust EWMAs");
+    println!("    · domain quality from enrich success (tiny rank prior)");
+    println!("    · agent-outcome demotes (must_contain miss / thin pages)");
+    println!("    · proxy lane health + RTT (search / fetch / crawl share it)");
+    println!("    · crawl host ladders (429 storms, robots delays)");
+    println!();
+    println!("  What it does with that");
+    println!("    · skips doomed tier-1 hits and dead egress lanes");
+    println!("    · orders engines by what worked for THIS intent");
+    println!("    · nudges ranking toward hosts that historically enrich clean");
+    println!("    · soft-demotes hosts that failed your own verification");
+    println!("    · warms top results so your next web_fetch is near-instant");
+    println!("    · fails fast (honest) instead of burning a browser cycle");
+    println!();
+    let state = crate::ghost::cache::GhostState::load();
+    let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
+    let (t, ti, f) = crate::search::persist_load_for_status();
+    let low = t.values().filter(|&&x| x < 0.5).count() + ti.values().filter(|&&x| x < 0.5).count();
+    let warm_hits = state.pool_served_total + state.prewarmed_served_total;
+    let (q_hosts, q_high, q_low) = crate::search::persist_load_quality_for_status();
+    let (o_keys, o_demoted) = crate::search::persist_load_outcome_for_status();
+    cli::print_kv("receipts", "");
+    println!("    hosts {hosts} · walled {walled} · warm-ready {warm} · warm-hits {warm_hits}");
+    println!(
+        "    cooldowns {cooldowns} · flaky {flaky} · probes {} · engine trust {}/{} low",
+        state.probes_total,
+        low,
+        t.len() + ti.len()
+    );
+    println!(
+        "    quarantined engines {f} · quality hosts {q_hosts} ({q_high} high / {q_low} low)",
+        f = f.len()
+    );
+    println!(
+        "    outcome keys {o_keys} ({o_demoted} demoted) · outcome_feedback {}",
+        if crate::config::cfg().search.outcome_feedback {
+            "on"
+        } else {
+            "off (default; enable search.outcome_feedback)"
+        }
+    );
+    println!();
+    println!("  Kill switches");
+    println!("    state.route_memory=off     forget host/persona learning");
+    println!("    DONSETCH_NO_EGRESS_PERSIST forget lane health");
+    println!("    DONSETCH_NO_PREWARM        stop search→fetch warm handoff");
+    println!("    DONSETCH_NO_QUALITY_PRIOR  stop the learned domain rank nudge");
+    println!("    search.outcome_feedback=off  agent-outcome demotes (default)");
+    println!();
+    println!("  Battle-test before any public claim: 24h soak under bench/improve/.");
+    cli::print_footer();
+}
+
+/// Egress fabric lanes (v4 A2). Fast mode: local health summary
+/// from the shared pool / persisted file. --deep: live-probe every
+/// configured proxy (connect + small GET) and name the fix.
+async fn check_egress_lanes(deep: bool) -> CheckResult {
+    let pool = crate::search::egress::global()
+        .unwrap_or_else(|| std::sync::Arc::new(crate::search::egress::EgressPool::from_env()));
+    let summary = pool.lane_summary();
+    if summary.is_empty() || (summary.len() == 1 && summary[0].is_direct) {
+        return CheckResult::Pass(
+            "direct-only egress (no proxy pool; search/crawl/fetch share the home IP)".into(),
+        );
+    }
+    let mut bits: Vec<String> = Vec::new();
+    let mut bad = 0usize;
+    for row in &summary {
+        let name = if row.is_direct { "direct" } else { &row.id };
+        let rtt = row
+            .rtt_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        let persona = row
+            .persona_host
+            .as_deref()
+            .map(|h| format!(" persona={h}"))
+            .unwrap_or_default();
+        let mut line = format!("{name}: {} rtt={rtt}{persona}", row.state);
+        if matches!(row.state.as_str(), "dead" | "auth" | "burned") {
+            bad += 1;
+            if row.state == "auth" {
+                line.push_str(" · fix: `donsetch proxy test <url>` then update credentials");
+            } else {
+                line.push_str(" · fix: `donsetch proxy check`; replace dead lines");
+            }
+        }
+        bits.push(line);
+    }
+
+    if deep {
+        let proxies = pool.proxies();
+        if !proxies.is_empty() {
+            let results = crate::cli::proxy::probe_all(&proxies).await;
+            let mut dead = 0usize;
+            let mut slow = 0usize;
+            for (px, r) in proxies.iter().zip(results.iter()) {
+                if r.alive {
+                    pool.observe_rtt(&px.id(), r.latency);
+                    if r.latency.as_millis() as u64
+                        >= crate::search::egress::EgressPool::slow_rtt_ms() as u64
+                    {
+                        slow += 1;
+                        bits.push(format!(
+                            "{}: live slow {} (exit {})",
+                            px.id(),
+                            r.latency.as_millis(),
+                            r.exit_ip.as_deref().unwrap_or("?")
+                        ));
+                    }
+                } else {
+                    dead += 1;
+                    pool.report_dead(&px.id());
+                    bits.push(format!(
+                        "{}: live dead · {}",
+                        px.id(),
+                        r.error.as_deref().unwrap_or("probe failed")
+                    ));
+                }
+            }
+            // All dead = probe endpoint died, not the pool.
+            if !proxies.is_empty() && dead == proxies.len() {
+                pool.revive_all();
+                bits.push(
+                    "all lanes failed the live probe (likely api.ipify.org down); benches cleared"
+                        .into(),
+                );
+                return CheckResult::Warn(bits.join(" · "));
+            }
+            if dead > 0 {
+                return CheckResult::Fail(
+                    bits.join(" · "),
+                    "replace or repair the dead proxy lines, then re-run doctor --deep".into(),
+                );
+            }
+            if slow > 0 {
+                return CheckResult::Warn(bits.join(" · "));
+            }
+        }
+    }
+
+    if bad > 0 {
+        return CheckResult::Warn(bits.join(" · "));
+    }
+    CheckResult::Pass(bits.join(" · "))
 }
 
 async fn check_tls(fetcher: &Fetcher) -> CheckResult {
@@ -544,41 +830,73 @@ async fn check_browser_launch() -> CheckResult {
     }
 }
 
-/// ghost-state.json holds cookies : it must not be
-/// world-readable.
+/// Session-bearing state must not be world-readable. Covers the
+/// cookie vault (ghost-state.json) and the TLS-session routes file.
 fn check_state_permissions() -> CheckResult {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let f = paths::cache_dir().join("ghost-state.json");
-        if !f.exists() {
-            return CheckResult::Pass("no state file yet".into());
-        }
-        match std::fs::metadata(&f) {
-            Ok(m) => {
-                let mode = m.permissions().mode() & 0o777;
-                if mode & 0o077 != 0 {
-                    // Auto-fix: tighten to 0600.
-                    let mut perm = m.permissions();
-                    perm.set_mode(0o600);
-                    if std::fs::set_permissions(&f, perm).is_ok() {
-                        return CheckResult::Fixed(format!(
-                            "tightened ghost-state.json {mode:o} → 600"
-                        ));
-                    }
-                    return CheckResult::Fail(
-                        format!("ghost-state.json is {mode:o} (group/other readable)"),
-                        format!("chmod 600 {}", f.display()),
-                    );
-                }
-                CheckResult::Pass(format!("{mode:o} on ghost-state.json"))
+        let dir = paths::cache_dir();
+        // Files that carry cookies, TLS sessions, or auth material.
+        // handles.json is opaque tokens, not secrets: leave it out.
+        let secret_files = ["ghost-state.json", "routes.json", "byok-keys.json"];
+        let mut fixed = Vec::new();
+        let mut failed = Vec::new();
+        let mut present = 0u32;
+        for name in secret_files {
+            let f = dir.join(name);
+            if !f.exists() {
+                continue;
             }
-            Err(e) => CheckResult::Warn(format!("cannot stat: {e}")),
+            present += 1;
+            let Ok(m) = std::fs::metadata(&f) else {
+                continue;
+            };
+            let mode = m.permissions().mode() & 0o777;
+            if mode & 0o077 == 0 {
+                continue;
+            }
+            let mut perm = m.permissions();
+            perm.set_mode(0o600);
+            if std::fs::set_permissions(&f, perm).is_ok() {
+                fixed.push(format!("{name} {mode:o}→600"));
+            } else {
+                failed.push(format!("{name} is {mode:o}"));
+            }
         }
+        if !failed.is_empty() {
+            return CheckResult::Fail(
+                failed.join(", "),
+                format!(
+                    "chmod 600 {}",
+                    failed
+                        .iter()
+                        .map(|s| s.split_whitespace().next().unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+        }
+        if !fixed.is_empty() {
+            return CheckResult::Fixed(format!("tightened {}", fixed.join(", ")));
+        }
+        if present == 0 {
+            return CheckResult::Pass("no secret-bearing state files yet".into());
+        }
+        CheckResult::Pass(format!("{present} secret store(s) at 600"))
     }
     #[cfg(not(unix))]
     {
-        CheckResult::Pass("windows ACLs apply".into())
+        // Windows: ACLs inherit from the user profile; we do not
+        // rewrite them. Presence is still worth reporting.
+        let dir = paths::cache_dir();
+        let present = ["ghost-state.json", "routes.json", "byok-keys.json"]
+            .iter()
+            .filter(|n| dir.join(n).exists())
+            .count();
+        CheckResult::Pass(format!(
+            "windows ACLs apply ({present} secret store(s) present)"
+        ))
     }
 }
 
@@ -800,7 +1118,7 @@ fn check_ocr_models() -> CheckResult {
     #[cfg(feature = "ocr")]
     {
         if !crate::pdf::ocr::enabled() {
-            return CheckResult::Warn("disabled (DONSHEET_OCR=off)".into());
+            return CheckResult::Warn("disabled (fetch.ocr = false)".into());
         }
 
         let dir = crate::pdf::ocr::ocr_cache_dir();
@@ -921,6 +1239,226 @@ fn check_plugins() -> CheckResult {
             "{detail}; program not found: {}",
             missing.join(", ")
         ))
+    }
+}
+
+/// Config layers: conflicts the loader cannot express, missing
+/// explicit paths, and secret-redaction posture. Unknown keys and
+/// range errors already fail at load (`deny_unknown_fields`).
+fn check_config_posture() -> CheckResult {
+    let no_file = std::env::var_os("DONSETCH_NO_CONFIG_FILE").is_some();
+    let explicit = std::env::var_os("DONSETCH_CONFIG");
+    if no_file && explicit.is_some() {
+        return CheckResult::Fail(
+            "DONSETCH_NO_CONFIG_FILE and DONSETCH_CONFIG are both set".into(),
+            "unset one: NO_CONFIG_FILE means 'ignore all files'; DONSETCH_CONFIG names one file to load".into(),
+        );
+    }
+    if let Some(ref path) = explicit {
+        let p = std::path::PathBuf::from(path);
+        if !p.exists() {
+            return CheckResult::Fail(
+                format!("DONSETCH_CONFIG points at a missing file: {}", p.display()),
+                "create the file or unset DONSETCH_CONFIG".into(),
+            );
+        }
+    }
+    // Report layer posture without echoing secrets.
+    let home = dirs::config_dir()
+        .map(|d| d.join("donsetch").join("donsetch.toml"))
+        .filter(|p| p.exists());
+    let mut layers: Vec<&str> = Vec::new();
+    if no_file {
+        layers.push("env-only (NO_CONFIG_FILE)");
+    } else if let Some(ref h) = home {
+        layers.push(if h.exists() { "user toml" } else { "defaults" });
+    } else {
+        layers.push("defaults");
+    }
+    if explicit.is_some() {
+        layers.push("DONSETCH_CONFIG");
+    }
+    // Secret redaction: config show must never print a raw key.
+    // We only assert the redaction helpers exist (they are unit-
+    // tested); a live redaction probe would require inventing a key.
+    CheckResult::Pass(format!("layers: {}", layers.join(" + ")))
+}
+
+/// Search engine + learning receipts, local-only and fast. One
+/// line an agent can trust: is the roster healthy, is learning
+/// on, are the new C kill switches armed.
+fn check_search_health() -> CheckResult {
+    let (trust, trust_intent, failures) = crate::search::persist_load_for_status();
+    let low = trust.values().filter(|&&x| x < 0.5).count()
+        + trust_intent.values().filter(|&&x| x < 0.5).count();
+    let quarantined = failures.len();
+    let (q_hosts, _, _) = crate::search::persist_load_quality_for_status();
+    let (o_keys, o_demoted) = crate::search::persist_load_outcome_for_status();
+    let s = &crate::config::cfg().search;
+    let flags = format!(
+        "early={} compile={} instant={} quality={} outcome={}",
+        onoff(s.search_early),
+        onoff(s.query_compile),
+        onoff(s.serp_instant),
+        onoff(s.quality_prior),
+        onoff(s.outcome_feedback),
+    );
+    // BYOK key states: counts only, never the keys.
+    let store = crate::search::byok::store::ByokConfig::load();
+    let mut active = 0usize;
+    let mut limited = 0usize;
+    let mut dead = 0usize;
+    for p in &store.providers {
+        for k in &p.keys {
+            match k.state {
+                crate::search::byok::store::KeyState::Active => active += 1,
+                crate::search::byok::store::KeyState::RateLimited => limited += 1,
+                crate::search::byok::store::KeyState::CreditDepleted
+                | crate::search::byok::store::KeyState::Invalid => dead += 1,
+            }
+        }
+    }
+    let byok = if active + limited + dead == 0 {
+        "byok none".to_string()
+    } else {
+        format!("byok {active} active / {limited} limited / {dead} dead")
+    };
+    let detail = format!(
+        "trust {} entries ({low} low) · quarantined {quarantined} · quality {q_hosts} · outcome {o_keys} ({o_demoted} demoted) · {byok} · {flags}",
+        trust.len() + trust_intent.len()
+    );
+    if quarantined > 0 && low > 2 {
+        CheckResult::Warn(format!(
+            "{detail}; run a few searches to rebuild trust, or `donsetch status`"
+        ))
+    } else {
+        CheckResult::Pass(detail)
+    }
+}
+
+fn onoff(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+/// Clearance state: TLS-session routes, link handles, cookie vault.
+fn check_clearance_stores() -> CheckResult {
+    let dir = paths::cache_dir();
+    let mut bits: Vec<String> = Vec::new();
+
+    // routes.json: TLS sessions / 0-RTT material.
+    let routes = dir.join("routes.json");
+    if routes.exists() {
+        let n = std::fs::read(&routes)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("routes").and_then(|r| r.as_object()).map(|o| o.len()))
+            .unwrap_or(0);
+        bits.push(format!("routes {n}"));
+    } else {
+        bits.push("routes none".into());
+    }
+
+    // handles.json: link-handle table (24h TTL, cap 2048).
+    let handles = dir.join("handles.json");
+    if handles.exists() {
+        let n = std::fs::read(&handles)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("l")
+                    .or_else(|| v.get("entries"))
+                    .and_then(|o| o.as_object())
+                    .map(|o| o.len())
+            })
+            .unwrap_or(0);
+        bits.push(format!("handles {n}"));
+    } else {
+        bits.push("handles none".into());
+    }
+
+    let vault = onoff(crate::config::cfg().state.cookie_vault);
+    bits.push(format!("cookie_vault {vault}"));
+    CheckResult::Pass(bits.join(" · "))
+}
+
+/// Crawl learning stores: governor host ladders + page history.
+fn check_crawl_stores() -> CheckResult {
+    let dir = paths::cache_dir();
+    let mut bits: Vec<String> = Vec::new();
+    let gov = dir.join("crawl-governor.json");
+    if gov.exists() {
+        let n = std::fs::read(&gov)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("hosts").and_then(|h| h.as_array()).map(|a| a.len()))
+            .unwrap_or(0);
+        bits.push(format!("governor {n} hosts"));
+    } else {
+        bits.push("governor none".into());
+    }
+    let hist = dir.join("page-history.json");
+    if hist.exists() {
+        let size = hist.metadata().map(|m| m.len()).unwrap_or(0);
+        // > 5MB is a store that stopped rotating (or a very heavy
+        // crawl user): worth a warning, not a failure.
+        if size > 5_000_000 {
+            return CheckResult::Warn(format!(
+                "page-history is {} (delete or trim if crawls feel slow)",
+                format_size(size)
+            ));
+        }
+        bits.push(format!("history {}", format_size(size)));
+    } else {
+        bits.push("history none".into());
+    }
+    CheckResult::Pass(bits.join(" · "))
+}
+
+/// DNS resolution, independent of HTTP. Catches the "TLS works
+/// via proxy but the resolver is broken" class that check_network
+/// cannot see.
+fn check_dns() -> CheckResult {
+    use std::net::ToSocketAddrs;
+    match ("example.com", 443u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            if addrs.is_empty() {
+                CheckResult::Fail(
+                    "example.com resolved to zero addresses".into(),
+                    "check /etc/resolv.conf or your VPN DNS".into(),
+                )
+            } else {
+                let v6 = addrs.iter().any(|a| a.is_ipv6());
+                let note = if v6 { " (AAAA present)" } else { " (A only)" };
+                CheckResult::Pass(format!("example.com → {} addr(s){note}", addrs.len()))
+            }
+        }
+        Err(e) => CheckResult::Fail(
+            format!("DNS lookup failed: {e}"),
+            "check /etc/resolv.conf, systemd-resolved, or your VPN DNS".into(),
+        ),
+    }
+}
+
+/// Captive-portal detector (--deep only). gstatic generate_204 is
+/// the industry-standard probe: a clean network returns 204 with an
+/// empty body; a portal rewrites it to a login page.
+async fn check_captive_portal(fetcher: Option<&Fetcher>) -> CheckResult {
+    let Some(fetcher) = fetcher else {
+        return CheckResult::Warn("skipped: fetcher unavailable".into());
+    };
+    match fetcher
+        .fetch("http://connectivitycheck.gstatic.com/generate_204")
+        .await
+    {
+        Ok(out) if out.status == 204 => {
+            CheckResult::Pass("generate_204 returned 204 (no portal)".into())
+        }
+        Ok(out) => CheckResult::Warn(format!(
+            "generate_204 returned {} : possible captive portal (hotel/airport Wi-Fi login page)",
+            out.status
+        )),
+        Err(e) => CheckResult::Warn(format!("portal probe failed: {e}")),
     }
 }
 
@@ -1118,15 +1656,29 @@ fn classify_route_ips(status: u16, body: &str) -> ZoneProbeOut {
     }
 }
 
+/// Bright Data API root. The route_ips endpoint is appended by
+/// `route_ips_url`; `bright_zone_probe_at` takes this root (the
+/// production value here, a local rig root in tests) and never the
+/// full endpoint, or the appended path would double.
+const BRIGHT_API_BASE: &str = "https://api.brightdata.com";
+
+/// The zone route_ips URL for a base. Kept separate so the ship
+/// path and the test rig build the URL the same way: pass the API
+/// ROOT, the endpoint path is appended exactly once.
+fn route_ips_url(base: &str, zone: &str) -> String {
+    format!("{base}/zone/route_ips?zone={zone}")
+}
+
 /// Free Bright Data validation: the zone route_ips endpoint lists
 /// the zone's IP pool without making a request, so a dead token or
 /// wrong zone name shows up here before the first paid unlock.
 fn bright_zone_probe(token: &str, zone: &str) -> ZoneProbeOut {
-    bright_zone_probe_at("https://api.brightdata.com/zone/route_ips", token, zone)
+    bright_zone_probe_at(BRIGHT_API_BASE, token, zone)
 }
 
-/// The probe against an explicit endpoint (the production URL in
-/// the ship path, a local rig in tests).
+/// The probe against an API base (the production root in the ship
+/// path, a local rig root in tests); the route_ips endpoint is
+/// appended by `route_ips_url`.
 fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1154,7 +1706,7 @@ async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZonePro
             };
         }
     };
-    let url = format!("{base}/zone/route_ips?zone={zone}");
+    let url = route_ips_url(base, zone);
     let resp = match client.get(url).bearer_auth(token).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -1534,6 +2086,126 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
 }
 
 #[cfg(test)]
+mod doctor_ultra_tests {
+    use super::*;
+
+    fn isolated_cache() -> tempfile_dir::TempDir {
+        // Hand-rolled: we do not want a tempfile dep just for this.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-doctor-ultra-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        tempfile_dir::TempDir { dir }
+    }
+
+    mod tempfile_dir {
+        pub struct TempDir {
+            pub dir: std::path::PathBuf,
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
+    #[test]
+    fn config_posture_flags_no_config_file_plus_explicit_path() {
+        let _g = isolated_cache();
+        unsafe {
+            std::env::set_var("DONSETCH_NO_CONFIG_FILE", "1");
+            std::env::set_var("DONSETCH_CONFIG", "/nonexistent/donsetch.toml");
+        }
+        let r = check_config_posture();
+        unsafe {
+            std::env::remove_var("DONSETCH_NO_CONFIG_FILE");
+            std::env::remove_var("DONSETCH_CONFIG");
+        }
+        match r {
+            CheckResult::Fail(detail, _) => {
+                assert!(detail.contains("both set"), "{detail}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_posture_flags_missing_explicit_config() {
+        let _g = isolated_cache();
+        unsafe {
+            std::env::remove_var("DONSETCH_NO_CONFIG_FILE");
+            std::env::set_var("DONSETCH_CONFIG", "/nonexistent/donsetch.toml");
+        }
+        let r = check_config_posture();
+        unsafe {
+            std::env::remove_var("DONSETCH_CONFIG");
+        }
+        match r {
+            CheckResult::Fail(detail, _) => {
+                assert!(detail.contains("missing file"), "{detail}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_health_reports_kill_switches() {
+        let _g = isolated_cache();
+        let r = check_search_health();
+        let detail = match r {
+            CheckResult::Pass(d) | CheckResult::Warn(d) => d,
+            CheckResult::Fail(d, _) => d,
+            CheckResult::Fixed(d) => d,
+        };
+        assert!(detail.contains("early="), "{detail}");
+        assert!(detail.contains("compile="), "{detail}");
+        assert!(detail.contains("instant="), "{detail}");
+        assert!(detail.contains("byok"), "{detail}");
+    }
+
+    #[test]
+    fn clearance_and_crawl_stores_tolerate_missing_files() {
+        let _g = isolated_cache();
+        let c = check_clearance_stores();
+        assert!(
+            matches!(c, CheckResult::Pass(_)),
+            "clearance must pass on empty cache"
+        );
+        let k = check_crawl_stores();
+        assert!(
+            matches!(k, CheckResult::Pass(_)),
+            "crawl must pass on empty cache"
+        );
+    }
+
+    #[test]
+    fn state_permissions_tightens_world_readable_secret_files() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = paths::cache_dir().join("routes.json");
+            std::fs::write(&f, b"{}").unwrap();
+            let mut perm = std::fs::metadata(&f).unwrap().permissions();
+            perm.set_mode(0o644);
+            std::fs::set_permissions(&f, perm).unwrap();
+            match check_state_permissions() {
+                CheckResult::Fixed(d) => {
+                    assert!(d.contains("routes.json"), "{d}");
+                }
+                other => panic!("expected Fixed, got {other:?}"),
+            }
+            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+}
+
+#[cfg(test)]
 mod mask_tests {
     use super::mask_key;
 
@@ -1561,7 +2233,9 @@ mod mask_tests {
 
 #[cfg(test)]
 mod bright_probe_tests {
-    use super::{ZoneProbeOut, bright_zone_probe_at, classify_route_ips};
+    use super::{
+        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, route_ips_url,
+    };
     use std::io::{Read, Write};
 
     /// A one-request HTTP rig: serves `status` + `body`, records the
@@ -1679,6 +2353,26 @@ mod bright_probe_tests {
         }
         // 200 parse happens in the caller; the classifier only tags it.
         assert_eq!(classify_route_ips(200, "{}"), ZoneProbeOut::Routed(0));
+    }
+
+    // The production probe must hit .../zone/route_ips exactly once.
+    // The ship base used to be the full endpoint while route_ips_url
+    // appends the endpoint again, so the real request went to
+    // /zone/route_ips/zone/route_ips (a 404) and every configured
+    // Bright Data zone read as a failed probe. The wire tests missed
+    // it because they pass a bare-root rig base. Pin the ship URL.
+    #[test]
+    fn production_route_ips_url_has_a_single_endpoint_path() {
+        let url = route_ips_url(BRIGHT_API_BASE, "web-access");
+        assert_eq!(
+            url,
+            "https://api.brightdata.com/zone/route_ips?zone=web-access"
+        );
+        assert_eq!(
+            url.matches("/zone/route_ips").count(),
+            1,
+            "the endpoint path must not be doubled: {url}"
+        );
     }
 
     #[test]

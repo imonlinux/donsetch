@@ -168,12 +168,13 @@ pub async fn run() {
 
     // v4 phase 0: route-memory visibility (the self-improvement
     // loop must be observable, never magic).
-    let route_line = if crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY") {
-        "off (DONSETCH_NO_ROUTE_MEMORY)".to_string()
+    let route_line = if crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off {
+        "off (state.route_memory = off)".to_string()
     } else {
         let state = crate::ghost::cache::GhostState::load();
         let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
-        let ro = if crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
+        let ro = if crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly
+        {
             " · read-only"
         } else {
             ""
@@ -200,9 +201,6 @@ pub async fn run() {
             if state.pool_served_total > 0 {
                 line.push_str(&format!(" · {} warm", state.pool_served_total));
             }
-            if state.answered_packs_total > 0 {
-                line.push_str(&format!(" · {} answered", state.answered_packs_total));
-            }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
             }
@@ -214,20 +212,31 @@ pub async fn run() {
         }
     };
     cli::print_kv("route memory", &route_line);
-    // v4 phase 5.2: local web memory receipt. status for every
-    // subsystem, kill switch honored, non-rerank build says so.
-    #[cfg(not(feature = "rerank"))]
-    let mem_line = "unavailable (this build lacks the rerank feature)".to_string();
-    #[cfg(feature = "rerank")]
-    let mem_line = if crate::memory::kill_switch() {
-        "off (DONSETCH_NO_WEB_MEMORY)".to_string()
-    } else {
-        match crate::memory::rows() {
-            0 => "empty; ingests from fetch/search/crawl".to_string(),
-            rows => format!("{rows} rows · cap {}", crate::memory::cap()),
+
+    // v4 B5 Improve receipts: the self-improvement loop must be
+    // observable, never magic. Warm-hit + cooldown + trust health.
+    let improve_line = {
+        let state = crate::ghost::cache::GhostState::load();
+        let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
+        let warm_hits = state.pool_served_total + state.prewarmed_served_total;
+        let (_engines, _intent_keys, low_trust) = {
+            // Local search-trust snapshot without spinning a Searcher.
+            let (t, ti, f) = crate::search::persist_load_for_status();
+            let low = t.values().filter(|&&x| x < 0.5).count()
+                + ti.values().filter(|&&x| x < 0.5).count();
+            (t.len(), ti.len(), low + f.len())
+        };
+        let (q_hosts, q_high, q_low) = crate::search::persist_load_quality_for_status();
+        let (o_keys, o_demoted) = crate::search::persist_load_outcome_for_status();
+        if hosts == 0 && warm_hits == 0 && low_trust == 0 && q_hosts == 0 && o_keys == 0 {
+            "learning (nothing recorded yet)".to_string()
+        } else {
+            format!(
+                "{warm} warm-ready · {warm_hits} warm-hits · {walled} walled · {cooldowns} cooldowns · {flaky} flaky · {low_trust} low-trust/quarantined · quality {q_high}+/{q_low}-/{q_hosts} · outcome {o_demoted}/{o_keys}"
+            )
         }
     };
-    cli::print_kv("web memory", &mem_line);
+    cli::print_kv("improve", &improve_line);
     cli::print_kv(
         "deep fingerprint",
         "not probed (run `donsetch doctor --deep`)",

@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 const MA_DEFAULT: u64 = 3600; // alt-svc without ma= gets Chrome's 1h default
+/// Sanity ceiling on a server-declared ma= (30 days): a hostile
+/// u64::MAX vouch must not pin an h3 route past every eviction.
+const MAX_ALT_SVC_MA_SECS: u64 = 30 * 24 * 3600;
 // routes.json row ceiling (issue #175): everything harder than this
 // is an attack shape or a misdirected campaign, not organic browsing.
 const ROWS_MAX: usize = 512;
@@ -211,7 +214,7 @@ pub fn h3_route(origin: &str, egress: &str) -> Option<u16> {
         }
         Some(entry.h3_port)
     });
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         eprintln!("[routes] h3_route({origin}) = {hit:?}");
     }
     hit
@@ -228,7 +231,14 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
         let fresh: RouteState = RouteState {
             use_h3: true,
             h3_port: port,
-            valid_until_ms: now_ms() + u128::from(ma_secs).saturating_mul(1000),
+            // Chrome-style sanity cap on a server-declared ma=: a
+            // hostile u64::MAX vouch must not pin the route (and its
+            // 0-RTT ticket) past every eviction as the freshest row
+            // for ~2 billion years. 30 days is Chrome's own ceiling
+            // class; anything longer re-vouches on the next response
+            // anyway.
+            valid_until_ms: now_ms()
+                + u128::from(ma_secs.min(MAX_ALT_SVC_MA_SECS)).saturating_mul(1000),
             egress: egress.to_string(),
             session_b64: session,
         };
@@ -248,7 +258,7 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
                     && cur.egress == fresh.egress
                     && cur.valid_until_ms + PERSIST_GRACE_MS >= fresh.valid_until_ms =>
             {
-                if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                if crate::config::cfg().debug.ghost {
                     eprintln!(
                         "[routes] absorb {origin} eg={egress} skip (vouch not materially newer)"
                     );
@@ -257,7 +267,7 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
             }
             _ => {}
         }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!("[routes] absorb {origin} eg={egress} record (ma={ma_secs})");
         }
         mem.routes.insert(origin.to_string(), fresh);
@@ -271,7 +281,7 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
 /// recorded; None when no QUIC-v1 h3 candidate parses or the
 /// bookkeeping is switched off (DONSETCH_NO_ALT_SVC).
 pub fn absorb_alt_svc(origin: &str, value: &str, egress: &str) -> Option<(u16, u64)> {
-    if crate::config::env_flag("DONSETCH_NO_ALT_SVC") {
+    if !crate::config::cfg().fetch.alt_svc {
         return None;
     }
     let (port, ma) = parse_h3_candidate(value)?;
@@ -289,7 +299,7 @@ pub fn drop_h3(origin: &str) {
 
 pub fn save_h3_session(origin: &str, egress: &str, session: &[u8]) {
     with(|mem| {
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[routes] save_h3_session key={origin} eg={egress} n={} match={}",
                 mem.routes.len(),
@@ -309,7 +319,7 @@ pub fn save_h3_session(origin: &str, egress: &str, session: &[u8]) {
 }
 
 pub fn load_h3_session(origin: &str, egress: &str) -> Option<Vec<u8>> {
-    let dbg = std::env::var_os("DONGHOST_DEBUG").is_some();
+    let dbg = crate::config::cfg().debug.ghost;
     let result: Result<Vec<u8>, &str> = with(|mem| {
         let st = match mem.routes.get(origin) {
             Some(s) => s,
@@ -436,6 +446,34 @@ mod tests {
         assert_eq!(ma, MA_DEFAULT);
     }
 
+    // A server-declared ma= is honored, but only up to the 30-day
+    // sanity ceiling: a hostile u64::MAX vouch must not pin the
+    // route (and its 0-RTT ticket) past every eviction as the
+    // freshest row for ~2 billion years.
+    #[test]
+    fn hostile_ma_is_capped_at_the_ceiling() {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-routes-mamax-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        assert_eq!(
+            absorb_alt_svc(
+                "mamax.test",
+                "h3=\":443\"; ma=18446744073709551615",
+                "direct"
+            ),
+            Some((443, 18446744073709551615)),
+            "the parse reports the server's declared ma; the applied lifetime is capped"
+        );
+        let valid_until = with(|mem| mem.routes["mamax.test"].valid_until_ms);
+        assert!(
+            valid_until <= now_ms() + u128::from(MAX_ALT_SVC_MA_SECS) * 1000 + 60_000,
+            "the pinned lifetime must sit at the ceiling, got {valid_until} ms"
+        );
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn alt_svc_no_quotes() {
         let (port, _) = parse_h3_candidate("h3=:443").unwrap();
@@ -513,17 +551,21 @@ mod tests {
             "a materially fresher vouch must extend the record on disk"
         );
 
-        // The switch DONSETCH_NO_ALT_SVC shuts the bookkeeping up
-        // entirely: absorbs still parse, they just do not record.
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The DONSETCH_NO_ALT_SVC switch shuts the bookkeeping up entirely:
+    // absorbs still parse, they just do not record. Config freezes at
+    // first touch, so the switch must be in place before the first
+    // cfg() read (nextest isolates each test in its own process).
+    #[test]
+    fn absorb_kill_switch_parses_but_never_records() {
         unsafe { std::env::set_var("DONSETCH_NO_ALT_SVC", "1") };
         assert_eq!(
             absorb_alt_svc("skip.test", "h3=\":443\"; ma=900", "direct"),
             None
         );
-        unsafe { std::env::remove_var("DONSETCH_NO_ALT_SVC") };
-
-        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Issue #175 part 2: routes.json never grows past ROWS_MAX and

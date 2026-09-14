@@ -26,17 +26,17 @@ pub mod wiki_infobox;
 
 /// Kill switch : checked once, then cached.
 fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DONSETCH_NO_ADAPTERS").is_err())
+    crate::config::cfg().fetch.adapters
 }
 
 /// Debug capture: `DONSETCH_ADAPTER_DUMP=<dir>` writes every body
 /// an adapter inspects : fixture capture for adapter development.
 /// Best-effort, never a failure path.
 fn debug_dump(html: &str, url: &str) {
-    let Ok(dir) = std::env::var("DONSETCH_ADAPTER_DUMP") else {
+    let dir = crate::config::cfg().fetch.adapter_dump_dir.clone();
+    if dir.is_empty() {
         return;
-    };
+    }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut h);
@@ -204,7 +204,21 @@ fn pypi_json_rw(u: &url::Url) -> Option<String> {
     }
     let ver = parts.next().filter(|v| !v.is_empty());
     // PEP 503 name normalization: case + -_. runs = -
-    let norm = pkg.to_lowercase().replace(['_', '.'], "-");
+    // PEP 503: runs of `-_.` collapse to ONE dash ("zope..interface"
+    // and "zope.interface" both normalize to "zope-interface"); the
+    // old per-char replace kept the run and 404'd the API call.
+    let norm: String = pkg
+        .to_lowercase()
+        .replace(['_', '.'], "-")
+        .chars()
+        .collect::<Vec<char>>()
+        .into_iter()
+        .fold(String::new(), |mut acc, c| {
+            if !(c == '-' && acc.ends_with('-')) {
+                acc.push(c);
+            }
+            acc
+        });
     let api_path = ver.map_or_else(|| format!("{norm}/json"), |v| format!("{norm}/{v}/json"));
     let u2 = url::Url::parse(&format!("https://pypi.org/pypi/{api_path}")).ok()?;
     Some(u2.to_string())
@@ -275,6 +289,14 @@ pub fn extract_json(
     opts: &crate::extract::ExtractOptions,
 ) -> Option<crate::extract::Extracted> {
     if !enabled() {
+        return None;
+    }
+    // Same cut contract as extract_html: focus/toc/must_contain/
+    // section are pipeline features the adapters don't reproduce.
+    // Without this guard, `must_contain` on an adapter-shaped URL
+    // (reddit, npm, PyPI...) silently handed the agent the FULL
+    // document instead of the promised MATCH/NO-MATCH probe.
+    if opts.focus.is_some() || opts.toc || opts.must_contain.is_some() || opts.section.is_some() {
         return None;
     }
     let looks_json = ct.contains("json") || matches!(body.first(), Some(b'{') | Some(b'['));

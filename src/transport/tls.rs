@@ -45,12 +45,17 @@ unsafe extern "C" fn cert_decompress_brotli(
         }
         let compressed = std::slice::from_raw_parts(input, in_len);
         let mut decompressed = Vec::with_capacity(uncompressed_len);
-        if std::io::Read::read_to_end(
-            &mut brotli::Decompressor::new(compressed, 1 << 20),
-            &mut decompressed,
-        )
-        .is_err()
-        {
+        // Bounded read: take(cap + 1) makes a hostile stream that
+        // expands past its declared length stop THERE (the +1 lets
+        // read_to_end observe the overrun so the equality check
+        // rejects it), instead of decompressing gigabytes to their
+        // end before the length check fires. UFCS for take: the
+        // Iterator method of the same name otherwise wins inference.
+        let mut reader = std::io::Read::take(
+            brotli::Decompressor::new(compressed, 1 << 20),
+            uncompressed_len as u64 + 1,
+        );
+        if std::io::Read::read_to_end(&mut reader, &mut decompressed).is_err() {
             return 0;
         }
         if decompressed.len() != uncompressed_len {
@@ -99,6 +104,31 @@ pub enum HandshakeProfile {
     InterceptionSafe,
 }
 
+/// ChromeTrue keeps the profile's ML-DSA prefix (Chrome 151 parity).
+/// InterceptionSafe strips it: a TLS-intercepting egress re-terminates
+/// without ML-DSA certs, and advertising them there is a free tell.
+/// The tls.mldsa_sigalgs kill switch strips them on every wire.
+pub(crate) fn effective_sigalgs(profile: &BrowserProfile, handshake: HandshakeProfile) -> String {
+    let sig = profile.tls.sigalgs;
+    let want_mldsa =
+        handshake == HandshakeProfile::ChromeTrue && crate::config::cfg().tls.mldsa_sigalgs;
+    if want_mldsa && sig.contains("mldsa") {
+        return sig.to_string();
+    }
+    // Drop leading mldsa44:mldsa65:mldsa87: (and any stray mldsa token).
+    let stripped = sig
+        .split(':')
+        .filter(|t| !t.starts_with("mldsa"))
+        .collect::<Vec<_>>()
+        .join(":");
+    // Latent guard: an mldsa-only profile would strip to "" and
+    // set_sigalgs_list would error. Never ship an empty list.
+    if stripped.is_empty() {
+        return "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256".to_string();
+    }
+    stripped
+}
+
 pub fn build_connector(profile: &BrowserProfile) -> Result<SslConnector, FetchError> {
     build_connector_with(profile, HandshakeProfile::ChromeTrue)
 }
@@ -119,7 +149,8 @@ fn build_connector_with(
         .map_err(tls_err)?;
     b.set_cipher_list(profile.tls.ciphers_12).map_err(tls_err)?;
     b.set_curves_list(profile.tls.groups).map_err(tls_err)?;
-    b.set_sigalgs_list(profile.tls.sigalgs).map_err(tls_err)?;
+    b.set_sigalgs_list(&effective_sigalgs(profile, handshake))
+        .map_err(tls_err)?;
     b.set_alpn_protos(profile.tls.alpn).map_err(tls_err)?;
     if handshake == HandshakeProfile::ChromeTrue {
         b.set_grease_enabled(true);
@@ -203,7 +234,8 @@ pub fn build_quic_ctx_builder(
     // the profile stays the single source of truth it remains harmless.
     b.set_cipher_list(profile.tls.ciphers_12).map_err(tls_err)?;
     b.set_curves_list(profile.tls.groups).map_err(tls_err)?;
-    b.set_sigalgs_list(profile.tls.sigalgs).map_err(tls_err)?;
+    b.set_sigalgs_list(&effective_sigalgs(profile, HandshakeProfile::ChromeTrue))
+        .map_err(tls_err)?;
     // The ClientHello with one QUIC protocol carries exactly one ALPN: h3.
     b.set_alpn_protos(b"\x02h3").map_err(tls_err)?;
     b.set_grease_enabled(true);
@@ -229,12 +261,24 @@ pub fn build_quic_ctx_builder(
     }
 
     // Platform-native root store (same trust semantics as h1/h2).
-    let roots = rustls_native_certs::load_native_certs();
+    // Parsed ONCE per process: the QUIC lane builds a fresh Config
+    // per request (quiche consumes the builder), and re-running
+    // load_native_certs + ~150 from_der parses on every h3 request
+    // dwarfed the 0-RTT fast path it exists to serve. Same
+    // process-lifetime assumption as the h1/h2 connectors, which are
+    // also built once at Fetcher::new. The env bundle (SSL_CERT_FILE)
+    // keeps its own identity-keyed cache and stays live per build.
+    static QUIC_ROOTS: std::sync::OnceLock<Vec<boring::x509::X509>> = std::sync::OnceLock::new();
+    let roots = QUIC_ROOTS.get_or_init(|| {
+        rustls_native_certs::load_native_certs()
+            .certs
+            .iter()
+            .filter_map(|c| boring::x509::X509::from_der(c.as_ref()).ok())
+            .collect::<Vec<_>>()
+    });
     let mut loaded = 0usize;
-    for cert in roots.certs {
-        if let Ok(x) = X509::from_der(cert.as_ref())
-            && b.cert_store_mut().add_cert(x).is_ok()
-        {
+    for x in roots.iter().cloned() {
+        if b.cert_store_mut().add_cert(x).is_ok() {
             loaded += 1;
         }
     }
@@ -305,10 +349,20 @@ fn env_roots_fingerprint() -> Vec<(std::path::PathBuf, u64, u64)> {
 }
 
 fn env_root_paths() -> Vec<std::path::PathBuf> {
-    std::env::vars_os()
-        .filter_map(|(k, v)| (k == "SSL_CERT_FILE" || k == "SSL_CERT_DIR").then_some(v))
-        .map(std::path::PathBuf::from)
-        .collect()
+    let cfg = crate::config::cfg();
+    let mut out = Vec::new();
+    if !cfg.tls.cert_file.trim().is_empty() {
+        out.push(std::path::PathBuf::from(&cfg.tls.cert_file));
+    }
+    if !cfg.tls.cert_dir.trim().is_empty() {
+        out.push(std::path::PathBuf::from(&cfg.tls.cert_dir));
+    }
+    for (k, v) in std::env::vars_os() {
+        if k == "SSL_CERT_FILE" || k == "SSL_CERT_DIR" {
+            out.push(std::path::PathBuf::from(v));
+        }
+    }
+    out
 }
 
 fn read_env_roots() -> Vec<X509> {
@@ -686,5 +740,38 @@ mod tests {
             assert_eq!(data, payload);
             boring_sys::CRYPTO_BUFFER_free(out);
         }
+    }
+
+    #[test]
+    fn chrome_true_keeps_mldsa_and_interception_safe_strips() {
+        let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::Linux);
+        assert!(
+            profile.tls.sigalgs.starts_with("mldsa44:mldsa65:mldsa87:"),
+            "Chrome 151 ClientHello pads ML-DSA at the front"
+        );
+        let chrome = effective_sigalgs(&profile, HandshakeProfile::ChromeTrue);
+        assert!(
+            chrome.contains("mldsa44"),
+            "ChromeTrue must advertise ML-DSA when the kill switch is off: {chrome}"
+        );
+        let safe = effective_sigalgs(&profile, HandshakeProfile::InterceptionSafe);
+        assert!(
+            !safe.contains("mldsa"),
+            "InterceptionSafe must never advertise ML-DSA: {safe}"
+        );
+        assert!(
+            safe.contains("ecdsa_secp256r1_sha256"),
+            "classic algos survive the strip: {safe}"
+        );
+    }
+
+    #[test]
+    fn boring_accepts_mldsa_sigalg_list() {
+        // The 2026-09-08 note claimed set_sigalgs_list refused 0x0904/05/06.
+        // boring 5.2.0 names them; this pins that the ChromeTrue list loads.
+        let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::Linux);
+        let mut b = SslConnector::builder(SslMethod::tls()).expect("builder");
+        b.set_sigalgs_list(profile.tls.sigalgs)
+            .expect("mldsa44/65/87 must be accepted by boring 5.2.0");
     }
 }
