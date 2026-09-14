@@ -55,6 +55,11 @@ jobs:
         run: cargo build --profile ci --bin donsetch
 
       - name: Stealth scorecard
+        # Pin the probe to the Chrome stable this job installed:
+        # without it, resolve_browser prefers /usr/bin/chromium*,
+        # and the runner image's copy is older than stable.
+        env:
+          DONGHOST_CHROME: /usr/bin/google-chrome-stable
         run: ./target/ci/donsetch doctor --stealth
 
   chrome-bump:
