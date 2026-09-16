@@ -1,0 +1,75 @@
+# Publish the npm wrapper package automatically when a GitHub
+# release is published (draft -> published included).
+#
+# History (2026-09-15): v4.0.0 and v4.1.0 shipped to GitHub releases
+# but npm stayed on 3.6.7 because publishing was a manual step nobody
+# owned. npm users kept getting a year-old binary. This workflow
+# makes the registry part of the release itself: publish the release
+# and npm follows, version-matched or not at all.
+#
+# Guards:
+# - The npm/package.json version must equal the release tag. A drift
+#   fails loudly here instead of shipping a package that lies about
+#   its version.
+# - If the version is already on the registry the publish is skipped
+#   (re-publishing the same version is an npm error).
+#
+# Requires the NPM_TOKEN repo secret (an npm automation token for
+# the dondai1234 account, no 2FA prompt on CI).
+
+name: npm publish
+
+permissions:
+  contents: read
+
+on:
+  release:
+    types: [released]
+  # Manual run: proves the NPM_TOKEN secret and the guards without
+  # minting a release. Resolves the repo's latest release as the
+  # tag under test.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: npm publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org/
+
+      - name: Assert npm version matches the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          # Manual runs carry no release context: test against the
+          # repo's latest published release instead.
+          if [ -z "$TAG_VERSION" ]; then
+            TAG_VERSION=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
+            echo "manual run: testing against latest release $TAG_VERSION"
+          fi
+          TAGVER="${TAG_VERSION#v}"
+          PKGVER=$(node -p "require('./npm/package.json').version")
+          echo "release tag: $TAGVER / npm/package.json: $PKGVER"
+          if [ "$TAGVER" != "$PKGVER" ]; then
+            echo "ERROR: npm/package.json ($PKGVER) does not match the published release ($TAGVER)"
+            echo "Bump npm/package.json and tag releases only after both agree."
+            exit 1
+          fi
+
+      - name: Publish (skip if already on the registry)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "donsetch@$VERSION" version >/dev/null 2>&1; then
+            echo "donsetch@$VERSION already published, skipping"
+            exit 0
+          fi
+          npm publish --access public

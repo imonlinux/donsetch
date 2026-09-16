@@ -368,6 +368,14 @@ fn is_citation_marker(t: &str) -> bool {
 }
 
 /// Collapse all whitespace runs to single spaces.
+/// Collapse raw inline-rendered text the same way markdown() does.
+/// loose_text (blocks.rs) assembles its buffer directly from text
+/// nodes plus the br sentinel, so it needs this exact post-processing
+/// or the sentinels survive into the final markdown raw (issue #227).
+pub(crate) fn collapse_to_markdown(raw: &str) -> String {
+    collapse(raw).replace('\u{0}', "\n")
+}
+
 fn collapse(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut ws = false;

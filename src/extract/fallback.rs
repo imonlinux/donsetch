@@ -140,7 +140,7 @@ fn collect_fallback_text(
             Node::Text(t) => {
                 let text = t.text.trim();
                 if !text.is_empty() {
-                    if !current.is_empty() && !current.ends_with(' ') {
+                    if !current.is_empty() && !current.ends_with(' ') && !current.ends_with('\n') {
                         current.push(' ');
                     }
                     current.push_str(text);
@@ -163,6 +163,21 @@ fn collect_fallback_text(
                     collect_fallback_text(child_el, paragraphs, &mut heading);
                     if !heading.trim().is_empty() {
                         paragraphs.push(format!("{} {}", "#".repeat(level), heading.trim()));
+                    }
+                    continue;
+                }
+                // A br: one = a line break inside the current
+                // paragraph; two in a row = the paragraph break.
+                // Matches browser rendering and the main converter
+                // (issue #227 class): the old behavior flushed at
+                // every br, splitting prose at every line break.
+                if name == "br" {
+                    if current.ends_with('\n') {
+                        if !current.trim().is_empty() {
+                            paragraphs.push(std::mem::take(current).trim().to_string());
+                        }
+                    } else {
+                        current.push('\n');
                     }
                     continue;
                 }

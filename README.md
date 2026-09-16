@@ -55,7 +55,7 @@ and as a standalone CLI.
 | ⏱️ **Temporal stealth** | TLS session resumption, conditional revalidation (304), persistent cookies, connection pooling. The loudest remaining bot tell, and nobody else fakes it. |
 | 👻 **Solve-and-bounce** | Browser solves the challenge, hands cookies back to tier 1, goes to sleep. The browser almost never fetches content. |
 | 🧠 **Self-improving fetch** | Learns from every fetch: cookie lifetimes adapt, walls that survive real browsers cool down, searches pre-solve known walls. Converges to optimal routing per domain. Receipts in `status` and `doctor --improve`. |
-| 🔑 **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus + local semantic reranking. No API keys. $0 forever. BYOK optional. |
+| 🔑 **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus + local semantic reranking. No API keys. $0 forever. BYOK optional. Not a supported provider? Add it as a plugin. |
 | 📄 **Pixel-fusion PDF** | Glyphs + rendered pixels from the same stream, fused deterministically. Per-region trust audit. Scanned PDFs auto-OCR'd. |
 | 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
 | 🪶 **~2.4k tokens** | Four tools, ~2.4k tokens of total schema (tools/list, measured). Every token earns its place. |
@@ -658,6 +658,12 @@ required:
 
 - Stack keys per provider; DonSeTch rotates and pools them. Two Exa
   keys = one 3,000-credit pool.
+
+The official adapter list is deliberately short: only the very
+biggest services in the game get native support, and I want to keep
+it that way. Everything else belongs in the search plugin system
+(below): any provider you hold a key for, wired by you, running
+top-to-bottom in the same chain as the native ones.
 - Automatic fallback to keyless when a provider errors or runs dry.
 - Per-key rate-limit cooldown and depletion tracking.
 - Portable store: `donsetch keys export/import`.
@@ -680,14 +686,16 @@ donsetch keys default local             # dispatch order: keyless first
 > available at [get.brightdata.com](https://get.brightdata.com/ivqwoicrrlbr)
 > (affiliate link).
 
-### BYOK plugins (providers not natively supported yet)
+### Search plugins: use any provider
 
-If the platform you have a key for is not natively supported, you can
-use a plugin as a workaround in the meantime: register any executable
-that answers a tiny stdin/stdout JSON contract, and DonSeTch treats it
-like any other search provider (default chain, fallback, attribution).
-Any language works: shell, Python, a compiled binary. No code changes
-to DonSeTch, no waiting for a release.
+Not natively supported is not not-supported: the plugin system is
+the designed path for every provider without a native adapter (and
+there will not be one unless the service is one of the biggest in
+the game). Register any executable that answers a tiny stdin/stdout
+JSON contract, and DonSeTch treats it like any other search provider
+(default chain, fallback, attribution). Any language works: shell,
+Python, a compiled binary. No code changes to DonSeTch, no waiting
+for a release, no maintainer gate.
 
 ```bash
 donsetch keys add plugin searxng --cmd 'python3 ~/searxng-adapter.py' --test

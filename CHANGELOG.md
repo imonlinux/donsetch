@@ -5,6 +5,38 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.1] - 2026-09-16
+
+The bug-hunt wave: a real regression report turned into a universal
+fix, plus two reliability fixes found hunting edge cases around it.
+
+### Fixed
+- Bare-`<br>` layouts keep their paragraph breaks on every path.
+  `loose_text` is the shared DOM-to-markdown site that tier 1, the
+  tier-2 ghost browser, the site adapters, and the focus/section
+  excerpt renderers all funnel through, and it used to trim the
+  `<br>` line-break sentinel away: a page built as bare text plus
+  `<br>` tags (like the live-reported novel chapter with the
+  `<br />` + CR + `<br />` + CRLF sequence) collapsed to one
+  space-separated blob. The `<br>` now emits its sentinel in place
+  and the shared post-processing turns it into real newlines, so a
+  br/whitespace/br run yields a blank line between paragraphs,
+  matching browser rendering. Covered by fixtures for the exact
+  reported byte sequence, the plain `<br>` form, the single-br case,
+  and the downstream focus renderer.
+- The last-resort fallback extractor now tells a line break from a
+  paragraph break the same way: one `<br>` breaks the line inside
+  the paragraph, two in a row break the paragraph. It used to flush
+  a paragraph at every `<br>`, splitting prose at every line break,
+  and added a space after each break.
+- The browser relay's per-host strike cache expires after ten
+  minutes and clears on a successful connect. Three dial failures
+  used to fast-reject a host for the whole process lifetime, even
+  after the network healed and even after a successful connection.
+- Docker aarch64 builds link again: the image now installs lld so
+  the linker-fallback logic that hardens release builds applies
+  inside the container too (aarch64 rustc output needs lld).
+
 ## [4.1.0] - 2026-09-14
 
 The live-verification wave: every subsystem re-tested against the

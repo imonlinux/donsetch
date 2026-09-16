@@ -37,10 +37,44 @@ pub struct Relay {
 /// retried the refused dial.
 #[derive(Default)]
 struct StrikeCache {
-    strikes: std::collections::HashMap<String, u8>,
+    strikes: std::collections::HashMap<String, (u8, std::time::Instant)>,
+}
+
+impl StrikeCache {
+    /// The host is fast-rejected only while its strikes are at the
+    /// limit AND fresh; anything older than the TTL counts as healed
+    /// (the next dial failure re-stamps from scratch).
+    fn refused(&self, host_key: &str) -> bool {
+        self.strikes
+            .get(host_key)
+            .is_some_and(|(n, at)| *n >= STRIKE_LIMIT && at.elapsed() < STRIKE_TTL)
+    }
+
+    fn note_failure(&mut self, host_key: &str) {
+        let now = std::time::Instant::now();
+        let (n, at) = self.strikes.entry(host_key.to_owned()).or_insert((0, now));
+        // A strike that already expired counts as healed: restart the
+        // limit instead of inheriting the stale count, so a single
+        // failure right after recovery cannot fast-reject again.
+        if at.elapsed() >= STRIKE_TTL {
+            *n = 0;
+        }
+        *n = n.saturating_add(1);
+        *at = now;
+    }
+
+    fn note_success(&mut self, host_key: &str) {
+        self.strikes.remove(host_key);
+    }
 }
 
 const STRIKE_LIMIT: u8 = 3;
+
+/// A strike expires after this long: a host that hiccups three
+/// times must recover. Without a TTL the refused host stays
+/// fast-rejected for the whole process lifetime even after the
+/// network heals (each dial failure stamps the refusal time).
+const STRIKE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Relay {
     /// Bind 127.0.0.1:0 and start the accept loop. `None` when the
@@ -138,13 +172,7 @@ async fn serve_socks5_client(
     let port = u16::from_be_bytes(port_bytes);
 
     let host_key = format!("{host}:{port}");
-    let refused = {
-        let cache = strikes.lock().unwrap();
-        cache
-            .strikes
-            .get(&host_key)
-            .is_some_and(|n| *n >= STRIKE_LIMIT)
-    };
+    let refused = strikes.lock().unwrap().refused(&host_key);
     if refused {
         // Refused fast: Chrome skips the asset, the page hydrates.
         let _ = client
@@ -163,6 +191,10 @@ async fn serve_socks5_client(
                 return Ok(());
             }
             let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            // A successful connect clears the host's strikes: the
+            // outage that struck it is over, and a fast-reject held
+            // past the healing would starve the page forever.
+            strikes.lock().unwrap().note_success(&host_key);
             Ok(())
         }
         Err(e) => {
@@ -170,11 +202,7 @@ async fn serve_socks5_client(
                 "[relay] upstream dial failed for {host}:{port} through {}: {e}",
                 proxy.host
             );
-            {
-                let mut cache = strikes.lock().unwrap();
-                let s = cache.strikes.entry(host_key).or_insert(0);
-                *s = s.saturating_add(1);
-            }
+            strikes.lock().unwrap().note_failure(&host_key);
             let _ = client
                 .write_all(&[5u8, 1u8, 0u8, 1u8, 0, 0, 0, 0, 0, 0])
                 .await;
@@ -295,5 +323,47 @@ mod relay_tests {
         let mut ping = [0u8; 4];
         s.read_exact(&mut ping).await.unwrap();
         s.write_all(b"pong").await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The strike cache must not punish a healed host: three fresh
+    /// dial failures fast-reject, strikes expire after the TTL, a
+    /// limit that went stale does not reject on its own, and a
+    /// successful connect clears the host's strikes entirely.
+    #[test]
+    fn strikes_stop_at_limit_until_ttl_and_clear_on_success() {
+        let mut c = StrikeCache {
+            strikes: Default::default(),
+        };
+        assert!(!c.refused("h:1"));
+        for _ in 0..STRIKE_LIMIT {
+            c.note_failure("h:1");
+        }
+        assert!(c.refused("h:1"), "3 fresh failures = fast-reject");
+
+        // Age every strike past the TTL: the host counts as healed.
+        for (_, at) in c.strikes.values_mut() {
+            *at = std::time::Instant::now() - STRIKE_TTL - std::time::Duration::from_secs(1);
+        }
+        assert!(!c.refused("h:1"), "an expired strike must not fast-reject");
+
+        // One failure after the TTL re-stamps fresh: the limit restarts.
+        c.note_failure("h:1");
+        assert!(
+            !c.refused("h:1"),
+            "a single post-TTL failure must not fast-reject"
+        );
+
+        // A successful connect clears the host's strikes outright.
+        for _ in 0..STRIKE_LIMIT {
+            c.note_failure("h:2");
+        }
+        assert!(c.refused("h:2"));
+        c.note_success("h:2");
+        assert!(!c.refused("h:2"), "success must clear strikes");
     }
 }

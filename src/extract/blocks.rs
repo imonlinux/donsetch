@@ -354,7 +354,10 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
             Node::Text(t) => {
                 let s = t.text.trim();
                 if !s.is_empty() {
-                    if !buf.is_empty() {
+                    // After a br the buffer ends with a newline: that
+                    // IS the separator. A space here would give every
+                    // paragraph after a br run a leading space.
+                    if !buf.is_empty() && !buf.ends_with('\u{0}') {
                         buf.push(' ');
                     }
                     buf.push_str(s);
@@ -370,12 +373,33 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
                 // but an inline element wrapping BLOCK children (card
                 // links: <a><h2>…</h2><p>…</p></a>) must not be
                 // swallowed here; the walk emits those blocks itself.
+                if n == "br" {
+                    // A <br> is a line break, not empty content. The
+                    // inline renderer only walks CHILDREN, so a br
+                    // passed as the root renders empty and its break
+                    // is lost (issue #227: "text<br />\r<br />\r\ntext"
+                    // collapsed to one space). Emit the same NUL
+                    // sentinel the inline renderer uses so the collapse
+                    // turns it into a newline. This is the shared
+                    // conversion site for every DOM-to-markdown path
+                    // (tier 1, tier-2 ghost, adapters, fallback).
+                    buf.push('\u{0}');
+                    continue;
+                }
                 if INLINE_TAGS.contains(&n) && !crate::extract::junk::skip(c) && !contains_block(c)
                 {
                     let (md, _) = inline::markdown(c, base, opts);
-                    let t = md.trim();
+                    // Newlines inside inline content are real line breaks
+                    // (the br sentinel survives the inline render). Trim
+                    // horizontal whitespace but keep the newlines: a
+                    // br-only inline run ("text<br />\r<br />\r\ntext")
+                    // must yield paragraph breaks, not collapse to one
+                    // space (issue #227, live-confirmed on the tier-2
+                    // ghost path; this is the shared conversion site
+                    // every DOM-to-markdown path funnels through).
+                    let t = md.trim_matches(|ch: char| ch != '\n' && ch.is_whitespace());
                     if !t.is_empty() {
-                        if !buf.is_empty() {
+                        if !buf.is_empty() && !buf.ends_with('\u{0}') {
                             buf.push(' ');
                         }
                         buf.push_str(t);
@@ -394,7 +418,11 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
     } else {
         0.0
     };
-    (buf, ld)
+    // The buffer is raw inline rendering: it may carry the br NUL
+    // sentinel, so collapse it exactly like inline::markdown does
+    // (whitespace fold, then sentinel to newline). Without this the
+    // sentinels survive into the block markdown raw (issue #227).
+    (inline::collapse_to_markdown(&buf), ld)
 }
 
 /// True when an element has block-level descendants.

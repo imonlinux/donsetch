@@ -2315,3 +2315,94 @@ fn v3_nested_inline_formatting_preserves_links() {
     // Case J: strong > link.
     assert!(m.contains("**[J](https://example.com/j)**"), "J: {}", m);
 }
+
+/// Issue #227 (2026-09-15): pages whose text layout is bare text
+/// separated by <br> tags (no <p> elements) came back as one single
+/// flattened paragraph on the tier-2 ghost path (and every other
+/// path: loose_text is the shared conversion site). The exact source
+/// sequence from the live repro (69shuba): emsp text, `<br />` plus
+/// \r, a second `<br />` plus \r\n. A br/whitespace/br run must
+/// yield a paragraph break (blank line), matching browser rendering.
+/// loose_text used to trim the br sentinel away; the direct br
+/// sentinel push plus the shared collapse_to_markdown post-processing
+/// are covered here.
+#[test]
+fn br_paragraphs_survive_across_paths() {
+    // 1. The exact byte sequence reported in #227 (CDP outerHTML
+    //    form: self-closing <br />, \r separators).
+    let html = "<html><body><div class=\"txtnav\">\r\n&emsp;&emsp;Paragraph one text<br />\r\n<br />\r\n&emsp;&emsp;Paragraph two text<br />\r\n<br /></div></body></html>";
+    let m = extract_html(html).markdown;
+    assert!(
+        m.contains("Paragraph one text\n\nParagraph two text"),
+        "CDP form must produce a paragraph break (blank line), got: {m:?}"
+    );
+
+    // 2. Plain form (`<br>` + \n). Same contract.
+    let html2 = "<html><body><div>&emsp;&emsp;Paragraph one text<br>\n<br>\n&emsp;&emsp;Paragraph two text<br>\n<br></div></body></html>";
+    let m2 = extract_html(html2).markdown;
+    assert!(
+        m2.contains("Paragraph one text\n\nParagraph two text"),
+        "plain form must keep paragraph structure, got: {m2:?}"
+    );
+}
+
+#[test]
+fn br_single_line_break_and_downstream() {
+    // A single br inside flowing text = one newline.
+    let m = extract_html("<html><body><div>alpha<br>beta</div></body></html>").markdown;
+    assert!(
+        m.contains("alpha\nbeta"),
+        "single br = one newline, got: {m:?}"
+    );
+
+    // Downstream excerpt renderers inherit the structure: focus
+    // receives the same converted text, breaks intact.
+    let html = "<html><body><div>&emsp;&emsp;Paragraph one text<br />\r\n<br />\r\n&emsp;&emsp;Paragraph two text<br />\r\n<br /></div></body></html>";
+    let r = extract_html_opts(
+        html,
+        &ExtractOptions {
+            focus: Some("paragraph".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        r.markdown.contains("Paragraph one text\n"),
+        "focus path must inherit paragraph breaks, got: {:?}",
+        r.markdown
+    );
+}
+
+/// Issue #227 class, fallback path: the last-resort walker used to
+/// flush a paragraph at EVERY br (splitting prose at every line
+/// break) and add a space after each br's newline. Now one br = a
+/// line break inside the paragraph, two in a row = the paragraph
+/// break, matching the main converter and browser rendering.
+#[test]
+fn fallback_br_line_and_paragraph_breaks() {
+    let long = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip";
+    let html = format!(
+        "<html><body><div>{long}<br>{long} beta</div><div>{long} one<br><br>{long} two</div></body></html>",
+    );
+    let meta = metadata::metadata(&Html::parse_fragment("<div></div>"));
+    let r = fallback::text_fallback(
+        &html,
+        &meta,
+        "https://x.invalid",
+        &Default::default(),
+        10_000,
+    )
+    .expect("fallback must extract");
+    let m = &r.markdown;
+    assert!(
+        m.contains("aliquip\nlorem"),
+        "single br = one newline, got: {m:?}"
+    );
+    assert!(
+        m.contains("one\n\nlorem"),
+        "br/blank/br = paragraph break, got: {m:?}"
+    );
+    assert!(
+        !m.contains("\n "),
+        "no leading space after any br newline, got: {m:?}"
+    );
+}
