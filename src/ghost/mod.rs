@@ -183,13 +183,6 @@ impl GhostWire {
             locale,
         }
     }
-
-    /// Chrome --lang wants a BCP-47-ish tag; navigator.languages
-    /// wants the full list. Keep both derived from one locale.
-    pub fn languages_js(&self) -> String {
-        let lang = self.locale.split('-').next().unwrap_or("en");
-        format!("['{}', '{}']", self.locale, lang)
-    }
 }
 
 /// Persistent profile dir: aged state passes challenges
@@ -969,41 +962,36 @@ impl Ghost {
         }
         cdp.call(Some(&session), "Page.enable", json!({})).await?;
 
-        // Stealth JS injection : runs before any page script.
-        // Patches only what real Chrome guarantees and our launch
-        // does NOT:
-        // - navigator.languages: ensure it's set (some Xvfb setups
-        //   don't inherit the system locale)
-        // - window.chrome: ensure it exists (some headful setups
-        //   on Linux miss the chrome.runtime object)
-        // - navigator.permissions.query: patch notifications to
-        //   return 'denied' (real Chrome default, automation
-        //   returns 'prompt' : a known detection vector)
-        // - navigator.plugins: ensure length > 0 (headful Chrome
-        //   should have plugins, but some setups don't)
-        // navigator.webdriver is DELIBERATELY not patched:
-        // defining it, even with get() => false, is itself the
-        // detection vector fpscanner flags (real Chrome leaves
-        // the property undefined); --disable-blink-features=
-        // AutomationControlled on the launch args handles the
-        // headless-mode case without defining anything.
-        let langs_js = wire.languages_js();
-        let _ = cdp
-            .call(
-                Some(&session),
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({
-                    "source": format!("\
-                        Object.defineProperty(navigator, 'languages', {{ get: () => {langs_js} }});\
-                        if (!window.chrome) {{ window.chrome = {{}}; }}\
-                        if (!window.chrome.runtime) {{ window.chrome.runtime = {{}}; }}\
-                        if (navigator.plugins && navigator.plugins.length === 0) {{\
-                            Object.defineProperty(navigator, 'plugins', {{ get: () => [{{ name: 'Chrome PDF Plugin' }}, {{ name: 'Chrome PDF Viewer' }}, {{ name: 'Native Client' }}] }});\
-                        }}\
-                    ")
-                }),
-            )
-            .await;
+        // No script is injected before page scripts, deliberately.
+        //
+        // This used to define `navigator.languages`, fill in
+        // `window.chrome` / `window.chrome.runtime`, and replace an empty
+        // `navigator.plugins`, on the theory that some launches leave
+        // those gaps. Measured 2026-09-19 against real Chrome on both
+        // backends (headful Xvfb and `--headless=new`), the gaps are not
+        // there, and every patch that fired moved the page FURTHER from a
+        // real one:
+        //
+        // - `navigator.languages` already read ["en-US","en"] from
+        //   `--lang`; the patch only added an own accessor on the
+        //   navigator instance, and real Chrome has NO own properties on
+        //   `navigator` at all. The added property is itself the
+        //   fingerprint.
+        // - `window.chrome` is never missing: real Chrome exposes it as an
+        //   own value property carrying {loadTimes, csi, app}.
+        // - `chrome.runtime` is not present-but-empty in real Chrome, it is
+        //   ABSENT (`'runtime' in chrome` is false), so creating a hollow
+        //   `{}` was the tell rather than the fix.
+        // - `plugins` is a real 5-entry PluginArray with a working `item`;
+        //   the replacement was a plain Array, which no real Chrome ever
+        //   has, so it could only trade one tell for a worse one.
+        //
+        // `navigator.webdriver` stays unpatched for the reason it always
+        // did: defining it, even as `get() => false`, is the detection
+        // vector, and real Chrome already reports false with the property
+        // living on Navigator.prototype.
+        // `--disable-blink-features=AutomationControlled` covers the
+        // headless case without defining anything.
         // invisible even on macOS (Dock) and Windows (taskbar).
         // Combined with --window-position=-32000,-32000, the
         // window is both off-screen and minimized. Chrome still
@@ -1030,17 +1018,33 @@ impl Ghost {
                 .await;
         }
 
-        // Unknown platform fallback: headless mode with device
-        // metrics override (no real screen geometry available).
-        // Also applied when the persona pins a non-default viewport
-        // so window-size and the layout viewport cannot disagree.
+        // The layout viewport is pinned whenever the renderer has no real
+        // window geometry to lay out against: a headless launch (selected
+        // by config, or the no-display fallback, or the unknown-platform
+        // arm) has no window at all.
+        //
+        // Measured on bare Xvfb with no window manager: a headless launch
+        // laid the page out at 0x0, window.innerWidth/innerHeight were
+        // 0x0, and document.elementFromPoint(x, y) returned null at EVERY
+        // point, so no click could land on anything, a Turnstile checkbox
+        // included. It stayed invisible for as long as it did because
+        // extraction still works: the DOM is there and the wall oracle
+        // reads it fine, so only the paths that have to click were broken.
+        //
+        // A headful launch is left alone. Its window really is the size
+        // the persona asked for, so pinning screen.width to the viewport
+        // would be a needless difference from a real browser on a larger
+        // screen. A persona that pins a non-default viewport is pinned
+        // too, so window-size and the layout viewport cannot disagree.
         {
             let (vw, vh) = wire.viewport;
-            let needs_metrics = cfg!(not(any(
-                linux_like,
-                target_os = "macos",
-                target_os = "windows"
-            ))) || wire.viewport != (1920, 1080);
+            #[cfg(linux_like)]
+            let headless_launch = force_headless || display.is_none();
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let headless_launch = force_headless;
+            #[cfg(not(any(linux_like, target_os = "macos", target_os = "windows")))]
+            let headless_launch = true;
+            let needs_metrics = headless_launch || wire.viewport != (1920, 1080);
             if needs_metrics {
                 cdp.call(
                     Some(&session),

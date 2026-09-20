@@ -92,7 +92,7 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
         }
     });
 
-    let profile = BrowserProfile::chrome_153(Platform::Linux);
+    let profile = BrowserProfile::chrome_150(Platform::Linux);
     let fetcher = Fetcher::new(profile).expect("fetcher");
     let base = format!("http://127.0.0.1:{port}");
 
@@ -183,7 +183,7 @@ async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
     unsafe { std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}")) };
     unsafe { std::env::set_var("NO_PROXY", "127.0.0.1") };
 
-    let profile = BrowserProfile::chrome_153(Platform::Linux);
+    let profile = BrowserProfile::chrome_150(Platform::Linux);
     let fetcher = Fetcher::new(profile).expect("fetcher");
     // Hop 1: test-host.invalid is NOT covered by NO_PROXY -> through the
     // env proxy. Hop 2: 127.0.0.1 IS covered -> direct (origin-form).

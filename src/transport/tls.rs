@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn chrome_true_keeps_mldsa_and_interception_safe_strips() {
-        let profile = crate::profile::BrowserProfile::chrome_153(crate::profile::Platform::Linux);
+        let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::Linux);
         assert!(
             profile.tls.sigalgs.starts_with("mldsa44:mldsa65:mldsa87:"),
             "Chrome 151 ClientHello pads ML-DSA at the front"
@@ -769,7 +769,7 @@ mod tests {
     fn boring_accepts_mldsa_sigalg_list() {
         // The 2026-09-08 note claimed set_sigalgs_list refused 0x0904/05/06.
         // boring 5.2.0 names them; this pins that the ChromeTrue list loads.
-        let profile = crate::profile::BrowserProfile::chrome_153(crate::profile::Platform::Linux);
+        let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::Linux);
         let mut b = SslConnector::builder(SslMethod::tls()).expect("builder");
         b.set_sigalgs_list(profile.tls.sigalgs)
             .expect("mldsa44/65/87 must be accepted by boring 5.2.0");

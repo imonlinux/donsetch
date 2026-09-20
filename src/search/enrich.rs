@@ -126,20 +126,27 @@ impl Searcher {
             let url = r.url.clone();
             let sink = prewarms.clone();
             futures.push(Box::pin(async move {
+                // The prewarm rides the ambient proxy like every other
+                // request path. Behind a forward proxy that is the only
+                // route out, a direct dial here failed and the result was
+                // scored QualityObs::Dead: live search results got demoted
+                // as dead links because of the egress, not the page.
+                let env_proxy = crate::transport::proxy::from_env_for(&url);
                 let out = tokio::time::timeout(
                     ENRICH_TIMEOUT,
                     // v4 phase 2.1: enrichment rides the shared cookie
                     // jar (browser-real). Fresh-jar enrichment + warm
                     // fetch = two devices from one IP within seconds;
                     // one store, like a browser.
-                    fetcher.fetch_once_via(&url, &[], None, true, None),
+                    fetcher.fetch_once_via(&url, &[], env_proxy.as_ref(), true, None),
                 )
                 .await;
                 match out {
                     // Outer timeout / transport timeout = a slow but
                     // alive page. Demoting it as dead would punish
                     // anything slow, so stay neutral.
-                    Err(_) | Ok(Err(FetchError::Timeout)) => {
+                    Err(_) => (i, None, Some(String::new()), QualityObs::Neutral),
+                    Ok(Err(e)) if slow_not_dead(&e) => {
                         (i, None, Some(String::new()), QualityObs::Neutral)
                     }
                     // Refused / DNS-dead / nothing recovered = dead.
@@ -309,10 +316,31 @@ fn extract_description(html: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// A transport error that says "slow", not "dead": the connect timed
+/// out, or the resolver did not answer in time. #248 split the
+/// resolver timeout out of `Timeout` into `DnsTimeout`, and this leg
+/// still matched `Timeout` alone, so a 5s resolver blip during enrich
+/// demoted a live result 50% and marked its host's quality down.
+fn slow_not_dead(e: &FetchError) -> bool {
+    matches!(e, FetchError::Timeout | FetchError::DnsTimeout(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    #[test]
+    fn a_resolver_timeout_is_slow_not_dead() {
+        assert!(slow_not_dead(&FetchError::Timeout));
+        assert!(slow_not_dead(&FetchError::DnsTimeout(
+            "the resolver did not answer within 5s".into()
+        )));
+        assert!(!slow_not_dead(&FetchError::Dns("no such host".into())));
+        assert!(!slow_not_dead(&FetchError::Http(
+            "connection refused".into()
+        )));
+    }
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
@@ -499,6 +527,56 @@ mod tests {
                 .is_none(),
             "a 404 never parks a body"
         );
+    }
+
+    /// The prewarm burst must ride the ambient proxy like every other
+    /// request path. Behind a forward proxy that is the only route out, a
+    /// direct dial here failed and the result was scored
+    /// QualityObs::Dead: live search results were demoted to dead links
+    /// because of the egress, not because of the page.
+    #[tokio::test]
+    async fn prewarm_rides_the_env_proxy() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        // A port with nothing behind it stands in for "no direct route":
+        // bind and drop, so the number is free but the dial is refused.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // The rig plays the proxy: a plaintext http proxy hop arrives as an
+        // absolute-form GET, which is what it records.
+        let (port, rx) = serve(RigMode::Reach);
+        unsafe {
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{port}"));
+            std::env::set_var("ALL_PROXY", format!("http://127.0.0.1:{port}"));
+            std::env::set_var("NO_PROXY", "");
+            std::env::set_var("no_proxy", "");
+        }
+        let searcher = searcher();
+        let url = format!("http://127.0.0.1:{dead}/page");
+        let mut hits = vec![merged(&url, "search title long enough to be replaced")];
+        searcher.enrich_results(&mut hits).await;
+        let raw = rx
+            .recv_timeout(Duration::from_secs(6))
+            .expect("the prewarm must reach the proxy instead of dialing direct");
+        assert!(
+            raw.starts_with(&format!("GET http://127.0.0.1:{dead}/page")),
+            "the prewarm must go out in absolute form through the proxy: {raw}"
+        );
+        // And the leg is a real body fetch, not a Dead verdict.
+        assert!(
+            searcher
+                .prewarms()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(&url)
+                .is_some(),
+            "the body must still park for the agent's next fetch"
+        );
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("ALL_PROXY");
+        }
     }
 
     /// Bot walls (200 but not ContentOk) leave the result neutral:

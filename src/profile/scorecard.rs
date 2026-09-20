@@ -76,7 +76,7 @@ pub async fn capture(fetcher: &Fetcher) -> Result<FingerprintSnapshot, String> {
     if crate::config::cfg().debug.echo_scorecard {
         let _ = std::fs::write("/tmp/tier1-echo-raw.json", &out.body);
     }
-    parse_echo(&out.body, fetcher.profile().name)
+    parse_echo(&out.body, &fetcher.profile().name)
 }
 
 /// Parse the echo endpoint's JSON into a snapshot.

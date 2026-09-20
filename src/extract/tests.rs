@@ -35,6 +35,48 @@ fn extract_html_opts(html: &str, opts: &ExtractOptions) -> Extracted {
 // 1. MULTI-LANGUAGE EXTRACTION
 // ════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════
+// 0. PAGE IDENTITY vs REQUEST PARAMETERS
+// ════════════════════════════════════════════════════════════
+
+/// The history fingerprint must describe the PAGE, not the request.
+/// It used to be taken over the rendered, focus-filtered slice with
+/// the request's own notices prepended, so two reads of one unchanged
+/// page with different reading parameters looked like a content
+/// change: an agent alternating a focused and a full read of the same
+/// URL got "changed"/"rewritten" on every call, and the parameters of
+/// one call became the baseline for the next.
+#[test]
+fn fingerprint_describes_the_page_not_the_request() {
+    // Enough paragraphs that a focus match has to drop some, which is
+    // what emits the dropped-content manifest.
+    let body: String = (0..12)
+        .map(|i| format!("<p>Paragraph {i} about generic topics and filler text.</p>"))
+        .collect();
+    let html = format!(
+        "<!DOCTYPE html><html><head><title>Identity</title></head><body>\
+         <article><h1>Identity</h1>{body}\
+         <p>The needle marker paragraph talks about rotating a deque.</p>\
+         </article></body></html>"
+    );
+
+    let plain = extract_html_opts(&html, &ExtractOptions::default());
+    let opts = ExtractOptions {
+        focus: Some("needle marker".into()),
+        ..Default::default()
+    };
+    let focused = extract_html_opts(&html, &opts);
+
+    assert_ne!(
+        plain.markdown, focused.markdown,
+        "focus must still change what the caller sees"
+    );
+    assert_eq!(
+        plain.fingerprint, focused.fingerprint,
+        "the fingerprint must not move with the reading parameters"
+    );
+}
+
 #[test]
 fn extract_english_article() {
     let html = r#"<!DOCTYPE html>
@@ -1262,6 +1304,7 @@ fn short_pdf_is_not_classified_as_an_html_shell() {
         Vec::new(),
         lang,
         Some(pages),
+        None,
         "https://example.com/receipt.pdf",
         &ExtractOptions::default(),
         16_000,
@@ -1548,6 +1591,52 @@ fn css_selector_bad_returns_error() {
         },
     );
     assert!(r.is_err());
+}
+
+/// A selector that matches nothing must return the DEFAULT rendering plus a
+/// notice, not a different (nav-first) rendering presented as success. Issue
+/// #238: the empty scope fell through to the rescue paths, so
+/// `selector: "article.nonexistent"` handed back menus at quality 0.30 with
+/// `content_ok: true`, and an agent that had constrained the scope could not
+/// tell the constraint was never applied.
+#[test]
+fn css_selector_matching_nothing_falls_back_with_a_notice() {
+    let html = r#"<html><body>
+<nav><a href="/a">Existing user? Sign In</a><a href="/b">Sign Up</a><a href="/c">Forums</a></nav>
+<article class="message">
+  <h1>The actual thread title</h1>
+  <p>Body marker: this paragraph is the content the agent asked for, and it is long enough that
+  the extractor keeps it as a real paragraph instead of dropping it as navigation noise.</p>
+  <p>A second paragraph, so the article is more than one block and the segmenter keeps the scope.</p>
+</article>
+</body></html>"#;
+
+    let default = extract_html_opts(html, &ExtractOptions::default());
+    let missed = extract_html_opts(
+        html,
+        &ExtractOptions {
+            selector: Some("article.nonexistent".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let notice = "*[selector \"article.nonexistent\": no matches : showing full content]*";
+    assert!(
+        missed.markdown.starts_with(notice),
+        "a missed selector must be labeled, got: {}",
+        &missed.markdown[..missed.markdown.len().min(160)]
+    );
+    let body = missed
+        .markdown
+        .split_once("\n\n")
+        .map(|(_, b)| b)
+        .unwrap_or("");
+    assert_eq!(
+        body.trim(),
+        default.markdown.trim(),
+        "a missed selector must show the DEFAULT rendering, not the rescue path's"
+    );
+    assert!(missed.markdown.contains("Body marker"));
 }
 
 // ════════════════════════════════════════════════════════════

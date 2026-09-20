@@ -5,6 +5,491 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.8] - 2026-09-20
+
+### Changed
+- The macos-x86_64 lane runs the smoke suite instead of nothing, so no lane
+  in the matrix is test-free any more. It was the slowest runner and the only
+  one running no binaries: its full-suite run died at the step timeout
+  mid-compile, and ten separate integration-test links were the cost that
+  made it unaffordable. With the integration tests consolidated into one
+  binary that link is a tenth of what it was, so the lane runs the same
+  smoke set macos-arm64 runs (process spawn and restart policy, paths,
+  profile detection, extraction) and macOS-exclusive code gets a second
+  architecture's worth of exercise.
+
+### Fixed
+- The Turnstile click aims at the widget now, and it survives the widget
+  rendering late. Three defects in that path, each one measured on a live
+  widget (Turnstile's interactive test sitekey `3x00000000000000000000FF`,
+  which renders a real checkbox on a local page):
+  - In `solve`, a click that could not be aimed still spent the pass's one
+    click. The widget script is async and the first poll has no
+    `cf-turnstile-response` input at all, so that click went to a
+    hardcoded point and the pass then stopped trying before the thing it
+    was aiming at existed. An unaimed click no longer spends an attempt;
+    the fixed-point guess is still allowed once, as a last resort.
+  - The lookup refused any element with a zero-width box. A real widget
+    box does collapse to zero width once Cloudflare has taken the
+    container over (measured `x=32 y=372 w=0 h=68`) while the widget
+    still renders at that box's left edge, so the refusal sent the click
+    to a fixed point on the page. The same width also fed the 22px
+    checkbox inset (`min(22, w/2)`), which collapsed to a 0px inset on
+    that box, aiming at the widget's border. The lookup now walks the
+    real widget structure, requires only a height, and keeps the inset.
+  - A headless launch laid the page out at 0x0. The layout viewport was
+    pinned only for an unknown platform or a non-default persona
+    viewport, so a headless browser on Linux got no metrics override and
+    a launch with no window laid the page out at zero size: measured
+    `window.innerWidth`/`innerHeight` 0x0 and
+    `document.elementFromPoint(x, y)` returning null at EVERY point, with
+    nothing able to land on the checkbox. Extraction never showed it (the
+    DOM is still there and the wall oracle reads it), which is why only
+    clicking was broken. A headless launch pins the layout to the persona
+    viewport now; a headful launch is untouched, since its window really
+    is that size.
+- `deadline_ms` reaches the browser passes. Every pass was fixed at 20s
+  (25s on the actions path) and ignored the caller's budget, so a call with
+  a short deadline was cut off mid-pass by the clock that wraps the call: it
+  answered `deadline.hit` with no wall verdict, even where the pass had
+  already seen the wall, and the browser kept working on a pass nobody was
+  waiting for. A pass is bounded by what is left of the budget now, floored
+  at 3s and capped at the old default, so no pass can get longer than before
+  and a caller who sets no deadline still gets the fixed pass. One honest
+  limit: a deadline hit still reports no trail, because the escalation
+  built so far is discarded with the cancelled pass, and that needs its own
+  change.
+
+## [4.2.7] - 2026-09-20
+
+### Changed
+- The integration tests build as one binary instead of ten. Every file
+  directly under `tests/` was its own crate, so each one linked the whole
+  library and dependency tree again and re-generated the library's generic
+  code it used; they are now modules of `tests/it/`, sharing one link. At
+  the `ci` profile's opt-level 3 the integration tests' combined unit time
+  drops from 81.5s to 10.1s on a local build. On a machine with spare cores
+  the wall time does not move (those units were never on the critical
+  path); the gain is where cores are scarce, about 5% on the linux-x86_64
+  lane and about 9% on a warm Windows lane. nextest still runs every test
+  in its own process, so the isolation the `DONSETCH_CACHE_DIR` tests rely
+  on is unchanged. A new integration test goes in `tests/it/` with a `mod`
+  line in `tests/it/main.rs`: a new top-level `tests/*.rs` file would
+  quietly become a separate binary again (Mart-Bogdan).
+
+### Fixed
+- The `[meta]` block no longer runs into the document's first line. In
+  text-only mode the fold prepends `[meta] {...}` as its own content block,
+  but a separate block carries no boundary to the model: most harnesses
+  concatenate the blocks, and Claude Code joins adjacent text blocks with no
+  delimiter at all, so `...example.com/"}# Example Domain` arrived glued and
+  the heading stopped being markdown. The meta line ends with a blank line
+  now. Two newlines rather than one, because a single `\n` only separates
+  content that can interrupt a paragraph in CommonMark (an ATX heading, a
+  fence, a thematic break), and a page opening with a plain paragraph or a
+  table row would lazily continue the `[meta]` line instead, which is the
+  same failure with none of the visibility. Every tool emits exactly one
+  text block and the fold is the only place a second one is prepended, so
+  one change covers `web_fetch`, `web_search`, `web_crawl` and
+  `web_screenshot`. Harmless where a client does keep the blocks apart: a
+  trailing blank line is trimmed on render, and OpenCode already joins text
+  blocks with `\n\n` of its own, so there it doubles a separator that was
+  going to be there anyway and still reads as one paragraph break
+  (Mart-Bogdan).
+- The MCP server no longer dies on a stack overflow in a debug build. Tokio
+  gives runtime worker threads 2 MiB of stack and the MCP server runs every
+  tool call on one, while the fetch path needs more than that unoptimized:
+  measured on the `fast` profile, 2 MiB and 2.5 MiB both overflowed and
+  2.75 MiB was the first size that passed. A stack overflow is an abort with
+  no error envelope, so `donsetch mcp` killed the whole session on the first
+  fetch while the same fetch through the CLI was fine, because the CLI runs
+  on the 8 MiB main thread. Workers now get 8 MiB, the same as the main
+  thread. The released binary was never affected (the same path needs under
+  256 KiB there), so this is a development-loop fix, and it carries an
+  integration test that drives the real binary over stdio and goes red if
+  the worker stack is left at the default.
+- The handle-shape test no longer reads the process-wide config. It asserted
+  `is_handle(...)` unconditionally, and `is_handle` returns false when
+  `mcp.url_handles` is off, so on any machine where handles are disabled in
+  the real config the test failed for a reason that had nothing to do with
+  the code. The shape rules are asserted against `is_valid_handle_id` now,
+  and the gate is asserted against the knob's own value, so it holds either
+  way (Mart-Bogdan, #263).
+
+## [4.2.6] - 2026-09-19
+
+### Added
+- Search plugins can report why they failed. The format-1 error envelope
+  takes an optional `error_kind` (`invalid_key`, `credit_depleted`,
+  `rate_limited`, `server_error`, `network_error`), classified into the same
+  key states a native adapter derives from an HTTP status, so a plugin
+  whose API key was revoked is parked instead of being spawned again on
+  every search for the rest of the day. `keys list` shows the state,
+  `doctor` warns about it, and re-registering the plugin is the recovery.
+  An envelope without `error_kind` records no state, so every existing
+  plugin keeps its behaviour. The parked cases also keep the plugin's own
+  words: `keys add plugin --test` used to print a bare "invalid key" at
+  exactly the moment a user is debugging credentials (googio).
+
+### Changed
+- The ghost no longer injects a script into the page before its own scripts
+  run. It used to define `navigator.languages`, fill in `window.chrome` and
+  `window.chrome.runtime`, and replace an empty `navigator.plugins`, on the
+  theory that some launches leave those gaps. Measured against real Chrome
+  on both backends (headful Xvfb and `--headless=new`), the gaps are not
+  there, and every patch that fired moved the page further from a real one:
+  real Chrome has no own properties on `navigator` at all, `chrome.runtime`
+  is absent rather than present-and-empty, and `plugins` is a real 5-entry
+  PluginArray with a working `item`. The README's "no JS injection" line is
+  true now rather than aspirational, and it says what the page gets.
+- `_meta.engines` carries one lane per provider the search tried, in walk
+  order, instead of only the one that answered: each lane has its own wall
+  time and a status (`empty`, `rate_limited`, `error`, `ok`). A caller can
+  no longer read "Tavily answered" as "Tavily is the default" when Serper
+  was asked first and came back empty and a monitor paged a provider change
+  that never happened (#253).
+
+### Fixed
+- One entry the key-file schema rejects no longer discards the whole store.
+  `byok-keys.json` was parsed as a unit and ANY error returned an empty
+  config with "corrupt key file (...), ignoring", so a single hand-edited
+  `"state": "dead"` cost every provider at once and the keyless answer that
+  followed read as "donsetch has no provider fallback". The decode is per
+  entry now: a rejected key is dropped and named on stderr, an empty key is
+  dropped for the same reason the write path rejects it, and every other
+  key keeps working. A file that is not JSON at all still degrades to
+  empty, because nothing in it can be trusted.
+- The Turnstile click never aimed at the widget: the lookup selector was
+  invalid CSS (`iframe[src*=challenges.cloudflare]` carries an unquoted
+  dot), and since it is one selector list, that single bad arm made
+  `querySelector` throw for all three arms and the `.ok()` chain swallowed
+  it, so every click went to a hardcoded point with nothing in the log.
+  Verified on a real browser: the unquoted form throws SyntaxError while
+  the quoted form matches, and `iframe[src*=turnstile]` alone is valid,
+  which is what makes the dot the culprit. The values are quoted, the
+  container of the hidden `cf-turnstile-response` input is the fallback
+  (Cloudflare keeps the real iframe in a closed shadow root), and a failed
+  lookup logs its reason (Mart-Bogdan, #257).
+- A walled fetch reported `"verdict": "ContentOk"` beside
+  `"code": "wall.captcha"`, because the success path's default reached the
+  failure envelope. A failure never claims content now: a verdict the run
+  actually earned is kept, and otherwise the failure names itself,
+  `Blocked` for a wall and `Unknown` for anything else.
+- A failed second solve pass left no trace step, so the escalation listed
+  one `ghost-render` while the log showed two attempts. The failing pass
+  records `solve-pass2` with "still walled" and its own ms.
+- `[ghost] Xvfb started` was printed for a display that was reused rather
+  than started.
+- `cargo run` printed "ignoring DONSETCH_FEATURES: expected
+  DONSETCH_<SECTION>__<KEY>" for each of build.rs' cargo:rustc-env values.
+  They are reserved names now, not misnamed settings.
+- The BYOK key store's CLI said "dead" for a key state the file does not
+  accept. `keys list`'s legend printed one ✗ labelled "dead" for two states,
+  its no-usable-key warning said "all keys are dead", `keys --help` said
+  `reset` "fixes rate-limited/dead keys", and the store module's own doc
+  called the states dead, while the serialized states are exactly `active`,
+  `rate_limited`, `credit_depleted` and `invalid`, and anything else makes
+  the loader warn "corrupt key file" and run with no keys at all. An
+  operator who wrote `"state": "dead"` by hand, because that was the word
+  the program taught, silently lost every key and read the keyless answer
+  as "no provider fallback". Every human-facing string now names the state
+  the file names. Strings only; no behaviour change. Reported by
+  daniel-plescia.
+- A short page that loads Cloudflare Turnstile's public embed
+  (`challenges.cloudflare.com/turnstile/v0/api.js`) without a form was
+  read as a challenge interstitial, so a browser fetch that had already
+  passed the challenge never settled and ended `walled` after both
+  solve passes. scrapingcourse.com's Cloudflare test page, solved in
+  about 5 s on Windows, came back walled after 42 s; it returns the page
+  in about 10 s now. The embed host alone is no longer an interstitial
+  marker: it counts only with a `cf-turnstile` widget on the page, so a
+  bare Turnstile shell still reads as a challenge. Two golden fixtures
+  pin both sides: the solved page and the live interstitial, its
+  per-visit tokens replaced (Mart-Bogdan).
+
+## [4.2.5] - 2026-09-19
+
+### Changed
+- The npm package page carries a real README instead of the stub: the fourth
+  tool (`web_screenshot`), the feature list, the full platform matrix with
+  OCR/rerank availability per platform, the install troubleshooting notes,
+  the sponsor tiers, and links to the docs. `package.json` gained a
+  `funding` field, so npm shows a sponsor link on the package page, and
+  search keywords that describe what the package actually is.
+- The repository README was rewritten: 1090 lines to 700, sponsors moved
+  from dead last to the fourth section with a nav link from the top, the
+  v3 and v4 "what's new" sections folded into the feature sections they
+  describe, the WRB results replaced by a pointer to the WRB repo, and the
+  comparison table cut from 18 rows to 12 plus a short Firecrawl head to
+  head. Two stale numbers fixed: the tests badge said 1270 while the body
+  said 727.
+
+### Fixed
+- A crawl seeded on a page at the host root (`/p0.html`, `/index.php`)
+  returned the seed alone, or nothing, with `complete: true`. The
+  auto-scope rule that keeps `/tokio` on docs.rs inside `/tokio/*` was
+  applied to the file name too, so the scope became `/p0.html/*` and
+  every sibling link was filtered out before it reached the frontier.
+  Separately, the quality gate skipped a low-quality page before
+  harvesting its outlinks, and a hub page (a link list with almost no
+  prose) is the lowest-quality page on a site and the one a crawl is
+  seeded from. A root-level file now scopes to the host, and a skipped
+  page still feeds the frontier (mnaza, #250, fixes #249).
+- A resolver that could not answer (EAI_AGAIN: resolv.conf unreachable,
+  SERVFAIL, a VPN flap) was reported as `network.dns` with
+  `errorKind: permanent` and a do-not-retry action, the mirror of #248:
+  the outage read as a dead name. It is transient now, while a name that
+  does not exist stays permanent. Search enrichment no longer demotes a
+  live result when the resolver times out during the prefetch, and the
+  ghost probe's failure class and the search task status label kept their
+  signals (mnaza, #251).
+- Egress lane health learned the same variants: a proxy lane whose own
+  name stops resolving is marked dead again, and a resolver timeout is
+  counted as a timeout (the message reads "dns timeout", which the old
+  `contains("timed out")` check never matched).
+
+## [4.2.4] - 2026-09-19
+
+### Added
+- An in-process DNS cache. The host resolver is a network round trip on a
+  box without a local caching daemon (public resolvers, no nscd or
+  systemd-resolved), measured at ~55ms per lookup here, and one fetch
+  asked for the same name at least twice: the SSRF guard, then the
+  connect, plus once per redirect hop and once per page of a crawl. A
+  4-page crawl of one host sent 12 DNS query batches; it sends 1 now.
+  Positive answers only, cached for `fetch.dns_cache_ttl_secs` (default
+  30, 0 disables). A failure or a timeout is never cached, so a resolver
+  blip cannot block a host for the TTL, and the cache holds addresses
+  rather than decisions: the guard and the connect still filter every
+  address they dial, so a name that starts answering with a private
+  address inside the TTL is still refused. The h3 lane now resolves
+  through the same cache instead of running its own blocking lookup on a
+  worker thread.
+
+### Fixed
+- The h3 lane built a fresh `chrome_150` browser profile per request
+  instead of using the identity the fetch presents everywhere else, so
+  its QUIC and TLS configuration could drift from the caller's profile.
+  It now takes the caller's profile.
+- A URL whose host does not resolve is a DNS failure, not a policy block
+  (Mart-Bogdan, #248). The SSRF guard's DNS messages ended in "fail-closed
+  SSRF guard", and the classifier matched that phrase before it matched
+  "dns", so a typo, a dead domain or a resolver problem came back as
+  `guard.ssrf` with `errorKind: permanent`: an agent branching on the code
+  concluded the target was deliberately forbidden. A resolver TIMEOUT got
+  the same permanent verdict even though a retry can work. `FetchError`
+  now carries `Dns`, `DnsTimeout` and `Ssrf` variants, the tool error
+  carries the code its variant declares, and the classifier reads that
+  code ahead of the prose, so the mapping cannot drift with wording
+  again. A resolver timeout is `transient` now, a private/loopback address
+  is still `guard.ssrf`, and the post-action navigation guard reports the
+  real failure instead of a hardcoded private/loopback verdict.
+
+## [4.2.3] - 2026-09-19
+
+### Changed
+- The development loop and CI were rebuilt around what actually costs
+  time. Local recipes now run a `fast` cargo profile (debug codegen for
+  this crate, deps at opt-level 1, no debuginfo): an edit rebuilds in
+  seconds instead of the 8-12 minutes a release-shaped whole-crate
+  recompile cost. `just check` is the seconds-level signal, `just t` is
+  the touched scope, `just tci`/`just bin-ci` keep release-profile parity
+  on demand, and `just heavy` runs the tests that measure time and memory
+  (soak, corpus, landmarks, live probes). `just all` no longer runs the
+  suite: CI is the full gate and now runs it in parallel across the
+  matrix instead of serially under the push hook.
+- CI runs the full suite where a native warm toolchain makes it cheap
+  (both Linux arches) and a platform-specific smoke set plus
+  `clippy --all-targets` on the platforms whose cost is the link, not the
+  test count. The heavy set and all five fuzz targets run nightly; pull
+  requests fuzz one target. The pre-push hook checks both feature sets on
+  the fast profile, which is the same net for seconds instead of minutes.
+- `sccache` is used automatically when installed (`rust-sccache`), for
+  rustc and for the C/C++ compilers, so recompiles across profiles,
+  feature sets and branches become cache hits.
+
+### Fixed
+- The rerank model cache follows `DONSETCH_CACHE_DIR` and `[paths] cache_dir`
+  like every other cache (Mart-Bogdan, #243). It read `dirs::cache_dir()`
+  directly, so an override moved every cache except the model: a container or
+  a side-by-side install read and wrote the real user cache while `doctor`,
+  which checks the overridden root, reported the model as missing. The model
+  download publishes atomically now: it wrote straight to the final path, so
+  a concurrent first-use download could expose a half-written model, the load
+  failed, and reranking was silently skipped.
+- The page-history fingerprint describes the page, not the request
+  (Mart-Bogdan, #246). It was taken over the rendered, focus-filtered slice
+  with the request's own notices prepended, so two reads of one unchanged URL
+  with different reading parameters looked like a content change: an agent
+  alternating a focused and a full read got `changed` on every call, and one
+  call's parameters became the baseline for the next.
+- The profile label names the Chrome the build actually presents
+  (Mart-Bogdan, #247). `--version`, the scorecard label and every recorded
+  stealth baseline said `chrome-150` while the wire UA followed the detected
+  browser, and the undetected-browser fallback was presented as a fact about
+  the host instead of as a fallback.
+
+## [4.2.2] - 2026-09-19
+
+### Fixed
+- The tier-1 persona fetch path (MCP `web_fetch`, and the CLI `fetch` that
+  shares it) resolves `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` instead of
+  dialing direct, and re-resolves it at every redirect hop the way the main
+  fetch lane already did. Behind an egress that only allows outbound
+  traffic through a forward proxy, every tool call failed with "Network is
+  unreachable" while `donsetch doctor` reported egress healthy: two call
+  chains into the same dialer, and only one of them read the ambient proxy.
+  Search engine hops, the search prewarm fetches of result URLs and the
+  render prefetch assets follow the same convention now. A direct dial on
+  the prewarm lane did not just fail: it scored the result
+  `QualityObs::Dead`, so live results were demoted to dead links because
+  of the egress rather than the page. Reported by theangrykangaroo.
+- The Xvfb readiness probe accepts a display that exists only in the
+  abstract socket namespace. Xvfb binds its socket name both as a file
+  under `/tmp/.X11-unix` and as a Linux abstract socket, but the probe
+  looked only at the file. Under WSL that directory is a read-only mount,
+  so the file can never appear: every launch spent the full 10s readiness
+  budget waiting on it, then reported a healthy display as dead and fell
+  back to the detectable `--headless=new` instead of the headful mode the
+  virtual display exists for. The file is still probed first, so a stale
+  socket is still read as dead. On WSL, tier-2 captures go from 19.1s to
+  7.3s and run headful as intended.
+- The mid-write daemon-restart test is causal instead of timed: the client
+  waits for the child to close its own stdin before writing, so it no
+  longer races `sh` startup on a loaded macOS runner. That race is what
+  turned CI red on a documentation-only pull request (#239), as a failed
+  spawn assert before and a 30s hang after.
+- `donsetch doctor` probes the tool lane too. Its network check rode the
+  generic fetch lane only, which is a different call chain into the same
+  dialer than the tier-1 persona path that `web_fetch` and the CLI `fetch`
+  ride, so a fault in that one chain was reported as healthy egress: the
+  report above came in as a suspected deployment problem because of it.
+  The check now reports `generic and tool lanes`, and says which lane
+  failed when they disagree.
+- Build hygiene, both found by review (Mart-Bogdan, #240, #241): the
+  `guard` recipe's size test never evaluated (`$$(...)` is Makefile
+  escaping, not just, so sh saw `<pid>(du -sm target | cut -f1)` and the
+  test was silently false, which is why the bloat prune had never fired;
+  it prunes past 25G now), and the `fuzz` recipe kept a hardcoded path to
+  the budget wrapper instead of riding the `budget` variable like every
+  other recipe.
+- The CI test step's 30-minute cap was also the cold-build budget: a PR
+  branch starts with an empty dependency cache, and on the macos-x86_64
+  Intel runner a cold build plus the suite ran past 30 minutes and was
+  killed mid-compile, reddening a lane with no test failure behind it.
+  Raised to 60, which is a build-phase backstop only: a hung test is
+  still caught by nextest's own per-test timeout.
+
+## [4.2.1] - 2026-09-19
+
+### Fixed
+- `web_fetch` with a `selector` that matches nothing now returns the default
+  rendering plus a notice instead of a different, worse one presented as
+  success. The empty match set went on to the rescue paths, so the caller
+  got a navigation-first page (`content_kind: Page`, quality 0.30 on the
+  reported sites) with `content_ok: true` and no signal at all that the
+  constraint had never been applied. It now behaves like `focus` and
+  `section` already did: the constraint is reported as not applied, the
+  content is what the same fetch returns without a selector, and the first
+  line of it says so. Reported by daniel-plescia (#238).
+
+## [4.2.0] - 2026-09-19
+
+The reliability wave. Nothing new to learn: the same four tools, with the
+sharp edges taken off the fetch, search and crawl paths, the clients, and
+the build itself.
+
+### Fixed
+- Nested `Content-Encoding` headers are capped at 8 layers. A hostile
+  server could answer with a deeply nested gzip body plus a matching
+  header, and peeling those layers is recursive: the layer count chose
+  the client's stack depth and spent up to 64 MiB of decompression per
+  layer, bounded only by the response's own header length. Real
+  responses carry one layer, rarely two.
+- The HTTP/2 header decoder starts its dynamic table at the 65536 bytes
+  we advertise in `SETTINGS_HEADER_TABLE_SIZE`, not at 4096. A server
+  that keeps the default and never sends a dynamic table size update is
+  entitled to index everything it inserted, so entries we had already
+  evicted came back as `hpack: bad index N` and failed an otherwise
+  valid response.
+- `donsetch <command> --help` prints help for every command. The
+  management commands used to run instead: `doctor --help` started a
+  full health check, `update --help` checked the network, `rollback
+  --help` touched the install, `mcp --help` opened a daemon on stdin,
+  and `status --help` printed the status. `donsetch help stop` had no
+  page at all.
+- The ghost relay's upstream strike cache drops expired rows instead of
+  holding every host it ever failed to dial for the life of the
+  process, and its mutex no longer panics if it was poisoned.
+- The crawl pace store gives every writer its own temp file and treats
+  only temps older than a minute as abandoned. The store exists because
+  separate processes crawl the same host, and a temp named after the
+  host alone was shared by all of them: two concurrent stamps could
+  interleave in one file and publish a row that no longer parses, and
+  either side's prune could delete the other's in-flight temp before it
+  was renamed, losing that host's floor.
+- The pi extension sizes its client timeout from the call's own budget
+  (`deadline_s`, `deadline_ms`) instead of a flat 120s. A crawl at its
+  own default 120s deadline was racing the client timeout, and any
+  larger legal deadline was unreachable through pi. `web_screenshot`
+  also gets its own icon instead of the generic diamond.
+
+- A server-controlled `Set-Cookie: ...; Expires=` header no longer reaches
+  unbounded i64 arithmetic in the cookie date parser: the year and clock
+  fields are gated per RFC 6265 5.1.1 before any math, so an absurd year
+  or time makes the attribute fail to parse and the cookie stays a session
+  cookie, instead of a panic under overflow-checks or a silently wrapped
+  garbage expiry in release. (mnaza, #230)
+- The last-resort raw-text fallback walker caps its recursion depth at
+  300, matching the two primary HTML walkers: a deeply nested, text-poor
+  page that reaches the fallback could overflow the tokio worker's
+  2 MiB stack and abort the process on one request. (mnaza, #231)
+
+### Changed
+- MCP tool descriptions: the six parameters that inherited verbose CLI
+  wording (`tier`, `section`, `shot`, and `deadline_ms` on both fetch
+  and search, `intent`) now carry agent-facing strings. Every documented
+  fact is preserved. Measured: `tools/list` goes from 9742 to 9591
+  compact bytes (2436 to 2398 estimated tokens). The rest of the surface
+  is structural JSON (enums, `anyOf`, `maxItems`, the nested actions
+  object), not prose, so there is nothing left to trim without dropping
+  a machine-readable constraint.
+
+## [4.1.2] - 2026-09-17
+
+The install-hardening wave: smaller npm installs, recoverable blocked
+postinstall scripts, bounded offline behavior, and release plumbing that
+keeps every distribution channel on the same binary.
+
+### Fixed
+- npm CLI installs no longer pull the Pi coding-agent peer dependency
+  tree; the package remains dependency-free while Pi continues to provide
+  its host runtime modules.
+- The npm shim self-heals after pnpm/bun approval blocks or
+  `--ignore-scripts`, with package-manager-neutral recovery guidance.
+- The npm installer now supports HTTPS proxies, CONNECT tunneling,
+  timeouts, retries, release mirrors, version stamps, and the
+  `DONSETCH_INSTALL_TAG` testing seam.
+- Musl detection no longer misclassifies glibc hosts with a secondary musl
+  loader (#45); true musl systems receive a source-build command.
+- Windows ARM64 uses the Windows x64 asset under emulation, and the Rust
+  updater selects the same asset.
+- Doctor MCP JSON escapes Windows paths and reports the `donsetch` npm shim
+  (with `npx donsetch` as an alternative) instead of an internal path.
+- `--version` skips update checks in CI or when requested and bounds the
+  online check to three seconds.
+- The Pi extension uses the active Node executable, allows long installs,
+  and gives `donsetch doctor` guidance when initialization times out.
+- Release publication now gates npm on all binary and checksum assets and
+  copies the repository LICENSE into the package.
+
+### Changed
+- Build metadata environment names now consistently use the `DONSETCH_*`
+  prefix; legacy user configuration variables retain their historical
+  names.
+- Homebrew and dsh downstream repositories can auto-track published
+  releases through the npm release workflow.
+
 ## [4.1.1] - 2026-09-16
 
 The bug-hunt wave: a real regression report turned into a universal

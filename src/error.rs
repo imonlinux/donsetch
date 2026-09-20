@@ -9,6 +9,17 @@ pub enum FetchError {
     Ghost(String),
     Timeout,
     TooManyRedirects,
+    /// The host could not be resolved at all: NXDOMAIN, no addresses,
+    /// a resolver error. Deliberately its own variant rather than an
+    /// `Http` string: this is a NAME problem, and an agent that branches
+    /// on `guard.ssrf` would read it as "forbidden by policy" (#248).
+    Dns(String),
+    /// The resolver did not answer in time. Transient: the same name can
+    /// resolve a second later, unlike a name that does not exist.
+    DnsTimeout(String),
+    /// Resolved to a private/loopback/metadata address, or a URL the
+    /// guard refuses on policy. Blocked by design.
+    Ssrf(String),
 }
 
 impl FetchError {
@@ -27,6 +38,11 @@ impl fmt::Display for FetchError {
             Self::Ghost(e) => write!(f, "ghost: {e}"),
             Self::Timeout => write!(f, "timeout"),
             Self::TooManyRedirects => write!(f, "too many redirects"),
+            // The DNS prose carries no "SSRF guard" tail: that tail is
+            // what made a typo look like a policy decision.
+            Self::Dns(e) => write!(f, "dns: {e}"),
+            Self::DnsTimeout(e) => write!(f, "dns timeout: {e}"),
+            Self::Ssrf(e) => write!(f, "blocked: {e}"),
         }
     }
 }

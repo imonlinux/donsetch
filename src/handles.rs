@@ -446,17 +446,32 @@ mod tests {
     }
 
     #[test]
-    fn is_handle_recognizes_and_rejects() {
-        assert!(is_handle("SxK7mP2qa"));
-        assert!(is_handle("Lb9R4nW3p"));
-        assert!(is_handle("saB3cD4eF")); // lowercase prefix
+    fn is_valid_handle_id_recognizes_and_rejects() {
+        assert!(is_valid_handle_id("SxK7mP2qa"));
+        assert!(is_valid_handle_id("Lb9R4nW3p"));
+        assert!(is_valid_handle_id("saB3cD4eF")); // lowercase prefix
+        assert!(!is_valid_handle_id("https://example.com"));
+        assert!(!is_valid_handle_id("S1")); // old format : too short
+        assert!(!is_valid_handle_id("L12")); // old format : too short
+        assert!(!is_valid_handle_id("S")); // no suffix
+        assert!(!is_valid_handle_id("Sx")); // too short
+        assert!(!is_valid_handle_id("SxK7mP2qExtra")); // too long
+        assert!(!is_valid_handle_id("")); // empty
+    }
+
+    /// The gate, not the shape. `is_handle` must follow
+    /// `mcp.url_handles`; it must not be asserted to a fixed value,
+    /// because the process-wide config is the real one under
+    /// `cargo nextest run` and a machine with handles disabled turned
+    /// the old assertion red for a reason that had nothing to do with
+    /// the code (Mart-Bogdan, #263).
+    #[test]
+    fn is_handle_follows_the_url_handles_knob() {
+        let on = crate::config::cfg().mcp.url_handles;
+        assert_eq!(is_handle("SxK7mP2qa"), on);
+        assert_eq!(is_handle("Lb9R4nW3p"), on);
+        // A URL is never a handle, knob or no knob.
         assert!(!is_handle("https://example.com"));
-        assert!(!is_handle("S1")); // old format : too short
-        assert!(!is_handle("L12")); // old format : too short
-        assert!(!is_handle("S")); // no suffix
-        assert!(!is_handle("Sx")); // too short
-        assert!(!is_handle("SxK7mP2qExtra")); // too long
-        assert!(!is_handle("")); // empty
     }
 
     #[test]

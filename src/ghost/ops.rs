@@ -57,6 +57,80 @@ const DISMISS_MODALS_JS: &str = r#"(() => {
   window.scrollTo(0, document.body.scrollHeight * 0.6);
 })();"#;
 
+/// Where to click a Turnstile checkbox, and which lookup found it:
+/// `"iframe"`, `"widget"` (the widget's box), or `"fallback"`
+/// (a fixed point, when there is nothing measurable on the page).
+async fn turnstile_click_target(ghost: &Ghost) -> (f64, f64, &'static str) {
+    // The Turnstile iframe lives in a closed shadow root that
+    // querySelector cannot reach, so a real widget has no iframe in the
+    // light DOM and the click point has to come from the container that
+    // holds the hidden `cf-turnstile-response` input.
+    //
+    // Measured on a live widget (Turnstile's interactive test sitekey
+    // 3x00000000000000000000FF, Chrome 151): the checkbox sits ~22px in
+    // from the widget box's left edge, vertically centered, and the box
+    // can be ZERO WIDE once Cloudflare has taken the container over
+    // (measured x=32 y=372 w=0 h=68) while the widget still renders at
+    // that box's top-left. So a zero WIDTH is not evidence that there is
+    // no widget (a zero height is), and the 22px inset must never be
+    // derived from a collapsed width: the old `min(22, w/2)` turned into
+    // a 0px inset on that box and aimed at the widget's border, and the
+    // old `w <= 0` guard refused the box outright and clicked a
+    // hardcoded point on the page instead.
+    // Attribute values are quoted: unquoted `challenges.cloudflare` is
+    // invalid CSS, querySelector throws, and the lookup finds nothing.
+    const LOOKUP: &str = r#"(() => {
+  const pick = (el, via) => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.height <= 0) return null;
+    const inset = (r.width === 0 || r.width >= 44) ? 22 : r.width / 2;
+    return JSON.stringify({ x: r.x + inset, y: r.y + r.height / 2, via });
+  };
+  const f = document.querySelector('iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"], .cf-turnstile iframe');
+  if (f) { const hit = pick(f, 'iframe'); if (hit) return hit; }
+  const i = document.querySelector('input[name="cf-turnstile-response"]');
+  if (!i) return null;
+  const shell = i.closest('.cf-turnstile') || (i.parentElement && i.parentElement.parentElement);
+  const cands = [i.parentElement, shell];
+  if (shell) { for (const c of shell.querySelectorAll('div')) cands.push(c); }
+  for (const c of cands) { const hit = pick(c, 'widget'); if (hit) return hit; }
+  return null;
+})()"#;
+    let reply = ghost
+        .cdp
+        .call(
+            Some(&ghost.session),
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": LOOKUP, "returnByValue": true }),
+        )
+        .await;
+    let found = reply
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("result")?.get("value")?.as_str().map(String::from))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|c| {
+            let via = if c.get("via")?.as_str()? == "iframe" {
+                "iframe"
+            } else {
+                "widget"
+            };
+            Some((c.get("x")?.as_f64()?, c.get("y")?.as_f64()?, via))
+        });
+    if found.is_none() && crate::config::cfg().debug.ghost {
+        let why = match &reply {
+            Err(e) => e.to_string(),
+            Ok(v) => v
+                .get("exceptionDetails")
+                .map(|d| d.to_string().chars().take(300).collect())
+                .unwrap_or_else(|| "no widget in the light DOM".into()),
+        };
+        eprintln!("[turnstile] target lookup found nothing: {why}");
+    }
+    found.unwrap_or((480.0, 420.0, "fallback"))
+}
+
 /// SOLVE mode: navigate into a wall, wait for the
 /// challenge to clear, harvest everything.
 ///
@@ -83,7 +157,13 @@ pub async fn solve(
         )
         .await;
 
-    let mut clicked = false;
+    const MAX_CLICKS: u32 = 4;
+    const CLICK_EVERY: Duration = Duration::from_secs(3);
+    // Turnstile clicks spent, and whether the fixed-point guess has been
+    // used. An unaimed click does not spend one: see the gate below.
+    let mut clicks = 0u32;
+    let mut fallback_spent = false;
+    let mut last_click: Option<std::time::Instant> = None;
     let mut clear_streak = 0u8;
     let mut poll_ms = 200u64; // fast early, back off later
     let mut vendor: Option<String> = None;
@@ -173,42 +253,38 @@ pub async fn solve(
             return Ok(SolveOutcome::CaptchaWalled);
         }
 
-        // Turnstile-style checkbox: find the actual iframe position
-        // via JS and click at its center. Fixed coordinates miss
-        // because Turnstile renders at different positions per site.
-        if !clicked
-            && small
+        // Turnstile-style checkbox: locate it on the page and click.
+        // Fixed coordinates miss because Turnstile renders at
+        // different positions per site.
+        //
+        // An unaimed click does not spend an attempt. The widget script is
+        // async, and measured on a live widget the first poll (~0.4s) has
+        // no `cf-turnstile-response` input at all while the widget is there
+        // a moment later: counting that click is what let a pass stop
+        // trying before the thing it was aiming at existed. A fallback is a
+        // fixed-point guess, so it is allowed once, as a last resort.
+        if small
             && (lower.contains("challenges.cloudflare.com")
                 || lower.contains("turnstile")
                 || lower.contains("verify you are human"))
+            && clicks < MAX_CLICKS
+            && last_click.is_none_or(|t| t.elapsed() >= CLICK_EVERY)
         {
-            // Use Runtime.evaluate to find the Turnstile iframe's
-            // bounding rect, then click at its center.
-            let turnstile_pos = ghost
-                .cdp
-                .call(
-                    Some(&ghost.session),
-                    "Runtime.evaluate",
-                    serde_json::json!({
-                        "expression": "(() => { const f = document.querySelector('iframe[src*=challenges.cloudflare], iframe[src*=turnstile], cf-turnstile > div > iframe'); if (f) { const r = f.getBoundingClientRect(); return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2}); } return null; })()",
-                        "returnByValue": true
-                    }),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("result").and_then(|r| r.get("value")).cloned())
-                .and_then(|v| v.as_str().map(String::from))
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-            let (x, y) = if let Some(ref coords) = turnstile_pos {
-                (
-                    coords.get("x").and_then(|v| v.as_f64()).unwrap_or(480.0),
-                    coords.get("y").and_then(|v| v.as_f64()).unwrap_or(420.0),
-                )
-            } else {
-                (480.0, 420.0)
-            };
-            let _ = ghost.click(x, y).await;
-            clicked = true;
+            let (x, y, via) = turnstile_click_target(ghost).await;
+            if via != "fallback" || !fallback_spent {
+                if crate::config::cfg().debug.ghost {
+                    eprintln!(
+                        "[ghost] turnstile click #{} via={via} at ({x:.0}, {y:.0})",
+                        clicks + 1
+                    );
+                }
+                let _ = ghost.click(x, y).await;
+                clicks += 1;
+                if via == "fallback" {
+                    fallback_spent = true;
+                }
+                last_click = Some(std::time::Instant::now());
+            }
         }
 
         // Adaptive backoff: 300ms for the first 4s,
@@ -261,6 +337,7 @@ pub async fn ghost_fetch(
     // (a few extra KB of fonts/images) vs the reliability gain.
 
     let mut clicked_challenge = 0u8; // turnstile clicks spent (max 3)
+    let mut fallback_spent = false; // the fixed-point guess, allowed once
     let mut last_click_at = std::time::Instant::now() - Duration::from_secs(10);
     let mut clicked_consent = false;
     let mut kicked = false;
@@ -343,32 +420,25 @@ pub async fn ghost_fetch(
                     || lower.contains("turnstile")
                     || lower.contains("verify you are human"))
             {
-                let turnstile_pos = ghost
-                    .cdp
-                    .call(
-                        Some(&ghost.session),
-                        "Runtime.evaluate",
-                        serde_json::json!({
-                            "expression": "(() => { const f = document.querySelector('iframe[src*=challenges.cloudflare], iframe[src*=turnstile], cf-turnstile > div > iframe'); if (f) { const r = f.getBoundingClientRect(); return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2}); } return null; })()",
-                            "returnByValue": true
-                        }),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("result").and_then(|r| r.get("value")).cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-                let (x, y) = if let Some(ref coords) = turnstile_pos {
-                    (
-                        coords.get("x").and_then(|v| v.as_f64()).unwrap_or(480.0),
-                        coords.get("y").and_then(|v| v.as_f64()).unwrap_or(420.0),
-                    )
-                } else {
-                    (480.0, 420.0)
-                };
-                let _ = ghost.click(x, y).await;
-                clicked_challenge += 1;
-                last_click_at = std::time::Instant::now();
+                let (x, y, via) = turnstile_click_target(ghost).await;
+                // Same rule as solve(): an unaimed click does not spend one of
+                // the three attempts, so they survive until the widget has
+                // actually rendered. The fallback is allowed once.
+                if via != "fallback" || !fallback_spent {
+                    if crate::config::cfg().debug.ghost {
+                        eprintln!(
+                            "[ghost_fetch] t={:.0?} turnstile click #{} via={via} at ({x:.0}, {y:.0})",
+                            start.elapsed(),
+                            clicked_challenge + 1,
+                        );
+                    }
+                    let _ = ghost.click(x, y).await;
+                    clicked_challenge += 1;
+                    if via == "fallback" {
+                        fallback_spent = true;
+                    }
+                    last_click_at = std::time::Instant::now();
+                }
             }
             prev_len = cur_len;
             continue;

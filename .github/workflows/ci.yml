@@ -27,6 +27,12 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  # Nightly gets what a per-push run cannot afford: the heavy set (soak,
+  # corpus, landmarks, live probes) on every platform, and all five fuzz
+  # targets instead of the one smoke target. 06:00 UTC.
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
 
 # One live run per pull request: a new push evicts that PR's own
 # still-running checks instead of queueing behind them. On a
@@ -37,7 +43,11 @@ on:
 # cancellation: branch protection reads per-commit results, so a
 # cancelled master run would leave a gap rather than a verdict.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keyed per SHA on pushes: the Release job's gate reads the CI conclusion
+  # for the tag's exact SHA, and a per-ref group let the next master push
+  # (and even a rerun of an older SHA) cancel the run the gate needs. The
+  # cost is that two master pushes can run at once instead of queueing.
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -65,6 +75,8 @@ jobs:
             # and http (axum/tower-http) are only CI-exercised on Linux.
             features: --features ocr,rerank,http
             release-check: false
+            # The semantic gate: the whole suite (heavy set included).
+            tests: full
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -77,6 +89,7 @@ jobs:
             features: ''
             extra-args: -E 'not test(pdf)'
             release-check: false
+            tests: full
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
@@ -86,6 +99,10 @@ jobs:
             features: --features ocr,rerank
             extra-args: ''
             release-check: false
+            # Platform-specific value only: process spawn + restart
+            # policy, paths, profile detection, extraction. The suite
+            # itself is Linux's job (see the Test steps below).
+            tests: smoke
           - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
@@ -93,6 +110,21 @@ jobs:
             features: ''
             extra-args: ''
             release-check: false
+            # The slowest runner in the matrix, and the only one that used
+            # to run no binaries at all: its full-suite run died at this
+            # step's 30 minute timeout mid-compile, so the lane was left as
+            # a compile-check. It runs the SMOKE set now, not the full
+            # suite: the platform-exclusive surface is thin and macos-arm64
+            # already covers it (process spawn + restart policy, paths,
+            # profile detection, extraction), so what this adds is that the
+            # Intel arch stops being test-free, and macOS-exclusive code
+            # gets a second architecture's worth of exercise.
+            #
+            # Affordable now because the integration tests are one binary
+            # instead of ten (the ten MSVC/macOS links were the cost that
+            # made this lane's suite unaffordable), which is why it is
+            # being tried again rather than left as it was.
+            tests: smoke
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -101,6 +133,7 @@ jobs:
             features: ''
             extra-args: ''
             release-check: true
+            tests: none
 
     steps:
       - uses: actions/checkout@v7
@@ -159,7 +192,7 @@ jobs:
         run: |
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # Cache key: <target>-dep-<DEP_HASH>-ci1.
+      # Cache key: <target>-<CACHE_KIND>-dep-<DEP_HASH>-ci1.
       # DEP_HASH hashes Cargo.lock + Cargo.toml with `version`
       # lines stripped. That is the single most important line in
       # this workflow: a release commit bumps the version in
@@ -189,10 +222,30 @@ jobs:
           )
           echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
 
+      # What this job actually BUILDS, which is not always what the
+      # matrix declares: the windows lane is `tests: none` and still
+      # builds the suite on every non-PR event (mirrors the `if:` on
+      # "Test (nextest, Windows core suite, non-PR)" below). The two
+      # shapes must not share a cache entry : `cargo check` leaves
+      # rmeta and no codegen, so a test build that restores a
+      # check-shaped entry recompiles the whole dependency tree, and
+      # rust-cache does not re-save on an exact key hit, so the
+      # wrong shape sticks until DEP_HASH moves. That is what the
+      # windows lane has been doing since it started running tests:
+      # 223 crates recompiled per run, ~7 min.
+      - name: Compute cache kind
+        shell: bash
+        run: |
+          KIND='${{ matrix.tests }}'
+          if [ '${{ matrix.name }}' = 'windows-x86_64' ] && [ '${{ github.event_name }}' != 'pull_request' ]; then
+            KIND=full
+          fi
+          echo "CACHE_KIND=$KIND" >> "$GITHUB_ENV"
+
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-dep-${{ env.DEP_HASH }}-ci1
+          key: ${{ matrix.target }}-${{ env.CACHE_KIND }}-dep-${{ env.DEP_HASH }}-ci1
           add-rust-environment-hash-key: "false"
           # A red run must still warm the cache: the next push is
           # right behind it and should not pay full price again.
@@ -203,14 +256,49 @@ jobs:
         with:
           tool: nextest
 
-      - name: Test (nextest)
+      # Full suite on the lanes with a native, warm toolchain. This step
+      # is also the COLD BUILD (a PR branch starts with an empty
+      # rust-cache, per-branch keys), so the timeout has to clear the
+      # slowest cold build; a hung TEST is caught by nextest's own
+      # per-test slow-timeout, not by this number.
+      - name: Test (nextest, full)
+        if: matrix.tests == 'full'
         run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }}
-        # 15m was exhausted on macos-arm64 cold builds (nextest spawns
-        # one process per test; ~950 tests on the slowest runner);
-        # 30m was exhausted on macos-x86_64 when the v4 dep tree
-        # (boring/quiche/Go) cold-built past the ceiling and the run
-        # was killed mid-compile, which also lost the cache save.
-        timeout-minutes: 90
+        timeout-minutes: 60
+
+      # Everywhere else the risk is platform COMPILATION (cfg paths,
+      # linkage, process semantics), and the expensive part of a test run
+      # there is the link, not the test count. So: clippy --all-targets
+      # compiles every target on those lanes, and this smoke set runs the
+      # tests whose value is genuinely platform-specific.
+      # The heavy set (soak/corpus/landmarks/live) runs in the nightly
+      # `heavy` job and in every platform's full matrix there.
+      - name: Test (nextest, smoke)
+        if: matrix.tests == 'smoke'
+        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} -E 'test(mcp::supervisor) | test(profile::) | test(extract::) | test(pdf::) | test(ghost::)'
+        timeout-minutes: 30
+
+      # The cross-platform check for the lanes that run no suite: compile
+      # every target (tests included, no LINK). This is what keeps those
+      # lanes meaningful, and on macos-x86_64 it is the only per-push
+      # compilation of darwin-x86_64, which is a release target.
+      - name: Compile-check all targets (no test link)
+        if: matrix.tests == 'none'
+        run: cargo check --profile ci --all-targets ${{ matrix.features }} --target ${{ matrix.target }}
+        timeout-minutes: 30
+
+      # Windows is the only place a Windows-shaped test can fail, and this
+      # lane has been compile-only since 6bb584e, so a test whose fixture
+      # happens not to exist on Windows could not turn anything red
+      # (2026-09-19: a new doctor test used a path-form command and failed
+      # only under a local Windows run; #261). PR cycles stay cheap here:
+      # master pushes, tags and the nightly run the suite, and since the
+      # release gate reads the CI conclusion for the tag's SHA, a Windows
+      # test failure blocks the mint instead of surfacing after it.
+      - name: Test (nextest, Windows core suite, non-PR)
+        if: matrix.name == 'windows-x86_64' && github.event_name != 'pull_request'
+        run: cargo nextest run --profile ci --cargo-profile ci --target ${{ matrix.target }} ${{ matrix.extra-args }}
+        timeout-minutes: 60
 
       # Windows: compile-check the release feature set without the
       # 305MB MSVC static link. Catches feature-gating typos and
@@ -252,17 +340,59 @@ jobs:
       - name: Check advisories + licenses + bans + sources
         run: cargo deny --all-features check --hide-inclusion-graph
 
-  # ── Fuzz smoke: short bursts on every master push keep the
-  # corpus warm and catch shallow panics before users do. Long
-  # runs happen locally (fuzz/README). Daemon aborts are the worst
-  # failure mode for an MCP server — this is the tripwire.
+  # ── Heavy: the tests too slow for a per-push run (soak holds the
+  # process for minutes, corpus/landmark runs parse whole fixture trees,
+  # the live ones need the network) plus all five fuzz targets. Nightly
+  # and on dispatch. PRs and master pushes run the same suite minus the
+  # heavy set, on every platform.
+  heavy:
+    name: heavy (${{ matrix.name }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-heavy-ci1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Heavy suite (soak, corpus, landmarks, live)
+        run: cargo nextest run --profile ci --cargo-profile ci --target ${{ matrix.target }} -E 'test(soak) | test(corpus) | test(landmark)' --no-fail-fast
+        timeout-minutes: 90
+
+  # ── Fuzz smoke: short bursts keep the corpus warm and catch shallow
+  # panics before users do. Daemon aborts are the worst failure mode for
+  # an MCP server. One target on pull requests (the wall-clock cost of
+  # five was the same as one but the runner bill was not), all five on
+  # master pushes and nightly.
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [extract, charset, paginate, sitemap, feed]
+        # Dynamic, NOT a job-level `if` on matrix.target: the job-level
+        # condition is evaluated before the matrix expands, so referring
+        # to matrix there is not reliable. One target on pull requests,
+        # all five on master pushes and nightly.
+        target: ${{ fromJSON(github.event_name == 'pull_request' && '["extract"]' || '["extract","charset","paginate","sitemap","feed"]') }}
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust nightly

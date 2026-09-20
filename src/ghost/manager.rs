@@ -204,7 +204,14 @@ impl GhostManager {
                 Ok(xvfb) => {
                     let disp = xvfb.display_env();
                     if crate::config::cfg().debug.ghost {
-                        eprintln!("[ghost] Xvfb started on {disp}");
+                        // A borrowed display was reused, not started: a
+                        // pre-existing X server is not ours, and saying
+                        // "started" for it was wrong (#258).
+                        if xvfb.is_borrowed() {
+                            eprintln!("[ghost] Xvfb reused on {disp} (already running)");
+                        } else {
+                            eprintln!("[ghost] Xvfb started on {disp}");
+                        }
                     }
                     (Some(disp), Some(xvfb))
                 }

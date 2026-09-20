@@ -8,22 +8,48 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
 cargo build --release                     # core build (fetch, search, crawl, PDF)
+# For the dev loop use `just bin` (target/fast/donsetch, seconds) and
+# `just bin-ci` when release-profile parity matters: these two lines below
+# compile the release-shaped graph, which is the slowest thing here.
 cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
 ```
 
-**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#install) for platform-specific install commands.
+**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
 
 ## Development workflow
 
+The ladder: climb only as far as the question needs.
+
 ```bash
-cargo test --features ocr,rerank          # 637 tests
-cargo clippy --all-targets --features ocr,rerank -- -Dwarnings   # zero warnings enforced
-cargo fmt --all -- --check    # formatting check
+just check              # types + cfg on the full feature set   (seconds, warm)
+just t crawl::frontier  # the touched scope, fast profile        (seconds)
+just all                # pre-push net: guard + fmt + check + lockgate + lint
 ```
 
-All three must pass before a PR can merge. CI runs the same checks on Linux, macOS, and Windows.
+`just check` and `just t` run the **`fast` cargo profile** (debug codegen for
+this crate, deps at opt-level 1, no debuginfo): an edit rebuilds in seconds
+instead of the 8-12 minutes a release-shaped whole-crate recompile costs on a
+machine that is also doing other things. Use `just tci <expr>` or `just bin-ci`
+when the question is release-profile behavior specifically (`panic = "abort"`
+included), and `just heavy` for the tests that measure time and memory (soak,
+corpus, landmarks, live probes).
 
-The same tasks are wrapped as [`just`](https://just.systems) recipes — `just test`, `just lint`, `just fmt-check`, `just smoke`.
+Do **not** make a bare `cargo test` or `cargo build --release` your edit loop:
+those compile another artifact graph, and recompiling it is the slowest thing in
+this repository. CI is the full gate (5 platforms, in parallel); `just all` is
+the only local gate you need before pushing.
+
+A Windows-shaped failure fails the gate: the Windows lane runs the core suite on
+master pushes, tags and the nightly, while PR cycles keep a compile-only check
+there because the MSVC link is the expensive part. `macos-x86_64` is still
+compile-only for the same reason.
+
+[`sccache`](https://github.com/mozilla/sccache) is picked up automatically when
+installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
+profiles, feature sets and branches become cache hits, and it wraps the C/C++
+compilers too, which is where BoringSSL's build cost actually lives.
+
+The recipes go through `scripts/budget.sh`, which pins the whole build tree to a quarter of the cores and passes the job cap into nested build systems (cmake, make, nasm). Prefer them on a workstation you are also using: a `-j` flag alone does not bound a Rust build, because rustc spawns its own codegen threads and some `-sys` crates spawn their own `make -j$(nproc)`. `BG_JOBS=<n>` lifts the job cap when the box is otherwise idle.
 
 ### Verifying Windows compilation from Linux
 
@@ -135,8 +161,8 @@ DonSeTch is built from scratch — no dependency on existing OSS web tooling:
 ## Pull requests
 
 1. Fork the repo, create a branch (`feat/...`, `fix/...`, `docs/...`).
-2. Write tests for your change.
-3. Ensure `cargo test --features ocr,rerank`, `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings`, and `cargo fmt --check` all pass.
+2. Write tests for your change: unit tests in a `#[cfg(test)]` module next to the code, integration tests as a module under `tests/it/` (registered in `tests/it/main.rs`, so they share one binary). Do not add a new top-level `tests/*.rs` file: each one becomes a separate test binary that links the whole crate again.
+3. Ensure `just all` passes and let CI (the full matrix) be the gate.
 4. Open a PR with a conventional commit title.
 5. CI must be green on all 3 platforms before merge.
 

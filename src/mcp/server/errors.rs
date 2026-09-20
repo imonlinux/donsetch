@@ -4,6 +4,8 @@
 //! Every tool error flows through here so codes and actions
 //! stay consistent across fetch/search/crawl.
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 
 use super::*;
@@ -60,6 +62,14 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
             }
         }
         FetchError::Ghost(msg) => format!("browser automation error: {msg}"),
+        // A name failure is not a policy block: the DNS variants carry
+        // the honest message, and the code the agent reads comes from
+        // the variant, not from this prose (#248).
+        FetchError::Dns(msg) => format!("host could not be resolved (DNS): {msg}"),
+        FetchError::DnsTimeout(msg) => {
+            format!("DNS lookup timed out: {msg} (transient, a retry may work)")
+        }
+        FetchError::Ssrf(msg) => format!("blocked: {msg}"),
     }
 }
 
@@ -218,14 +228,30 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
 /// | archive.stale | served an old snapshot |
 /// | deadline.hit | time budget exhausted |
 /// | crawl.seed / crawl.resume / fetch.invalid | input errors |
-pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> &'static str {
+pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, str> {
+    // A producer that knows its own failure type outranks the text
+    // classifier. The guard KNOWS a name it could not resolve is a name
+    // problem; recovering that from prose is how a typo, a dead domain or
+    // a resolver hiccup came back as a policy block (#248).
+    if let Some(code) = structured
+        .and_then(|s| s.get("code"))
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+    {
+        return Cow::Owned(code.to_string());
+    }
     let m = msg.to_ascii_lowercase();
     let v = structured
         .and_then(|s| s.get("verdict"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    match () {
-        _ if m.contains("ssrf") || m.contains("private/loopback") => "guard.ssrf",
+    Cow::Borrowed(match () {
+        _ if m.contains("ssrf")
+            || m.contains("private/loopback")
+            || m.contains("blocked by design") =>
+        {
+            "guard.ssrf"
+        }
         _ if m.contains("deadline") => "deadline.hit",
         _ if m.contains("dns") => "network.dns",
         _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
@@ -251,7 +277,7 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> &'static str 
         _ if m.contains("extraction failed") || m.contains("no content") => "content.extract",
         _ if m.contains("cloak") => "cloak.suspected",
         _ => "content.extract",
-    }
+    })
 }
 
 pub(super) fn tool_error_structured(
@@ -375,7 +401,10 @@ pub(super) fn batch_failure_kind<'a>(kinds: impl Iterator<Item = &'a str>) -> &'
 
 pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
     match e {
-        FetchError::Timeout | FetchError::Io(_) => "transient",
+        // A resolver that did not answer is as retryable as a connect
+        // that did not: the same name can resolve a second later. A name
+        // that does not exist (Dns) stays permanent, like an Ssrf block.
+        FetchError::Timeout | FetchError::Io(_) | FetchError::DnsTimeout(_) => "transient",
         // Match on the classifier's own leading sentences, never on
         // hint text : "SSL_CERT_FILE" appears in BOTH hints, and
         // with it in the verify arm (checked first) every egress
@@ -396,6 +425,25 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
     }
 }
 
+/// The stable machine code for a transport failure, taken from the
+/// error's own variant instead of its prose. `None` means the variant
+/// carries no code of its own and the text classifier decides.
+///
+/// This exists because prose-matching is a trap (#248): the guard's DNS
+/// messages ended in "fail-closed SSRF guard", so a host that does not
+/// exist came back as `guard.ssrf`, and an agent branching on that code
+/// concluded the target was forbidden by policy.
+pub(super) fn fetch_error_code(e: &FetchError) -> Option<&'static str> {
+    match e {
+        // A name that does not resolve and a resolver that does not
+        // answer are both name failures; the KIND carries the retry
+        // signal (DnsTimeout is transient).
+        FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some("network.dns"),
+        FetchError::Ssrf(_) => Some("guard.ssrf"),
+        _ => None,
+    }
+}
+
 /// Machine class for a transport-level fetch failure, recorded in
 /// the error's structuredContent so callers (and the resurrection
 /// gate) can tell "the site is gone" from "the net is bad". Mirrors
@@ -404,6 +452,9 @@ pub(super) fn transport_class(e: &FetchError) -> &'static str {
     match e {
         FetchError::Timeout => "timeout",
         FetchError::TooManyRedirects => "too_many_redirects",
+        FetchError::Dns(_) => "dns",
+        FetchError::DnsTimeout(_) => "dns_timeout",
+        FetchError::Ssrf(_) => "ssrf",
         FetchError::InvalidUrl(_) => "invalid_url",
         FetchError::Ghost(_) => "ghost",
         FetchError::Http(_) => "protocol",
@@ -568,7 +619,7 @@ mod stitch_tests {
 }
 #[cfg(test)]
 mod error_code_tests {
-    use super::error_code;
+    use super::*;
     use serde_json::json;
 
     #[test]
@@ -603,5 +654,78 @@ mod error_code_tests {
             "crawl.resume"
         );
         assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
+    }
+
+    // #248: a host that does not resolve is a NAME failure, and a
+    // resolver that does not answer is retryable. Both used to reach the
+    // agent as `guard.ssrf` (which reads as "forbidden by policy") and
+    // `permanent`, so a name that would resolve on the next try was not
+    // retried. The guard's own error variant now sets the code, and the
+    // classifier reads that code instead of matching prose.
+    #[tokio::test]
+    pub(super) async fn a_host_that_does_not_resolve_is_not_a_policy_block() {
+        let err =
+            crate::fetch::guards::ensure_url_safe("https://no-such-host-for-donsetch.invalid/")
+                .await
+                .unwrap_err();
+        let v = tool_error_structured(
+            friendly_fetch_error(&err),
+            fetch_error_kind(&err),
+            Some(json!({
+                "code": fetch_error_code(&err),
+                "fetch_error": transport_class(&err),
+            })),
+        );
+        assert_eq!(v["code"], "network.dns", "got {v}");
+        assert_eq!(v["errorKind"], "permanent");
+        assert_eq!(v["structuredContent"]["fetch_error"], json!("dns"));
+        assert!(
+            !v["content"][0]["text"].as_str().unwrap().contains("SSRF"),
+            "the message must not read as a policy block: {v}"
+        );
+    }
+
+    #[test]
+    pub(super) fn a_resolver_timeout_is_transient() {
+        let err = FetchError::DnsTimeout("the resolver did not answer within 5s".into());
+        let v = tool_error_structured(
+            friendly_fetch_error(&err),
+            fetch_error_kind(&err),
+            Some(json!({ "code": fetch_error_code(&err) })),
+        );
+        assert_eq!(v["code"], "network.dns");
+        assert_eq!(v["errorKind"], "transient", "a retry can work: {v}");
+        assert_eq!(transport_class(&err), "dns_timeout");
+    }
+
+    // The SSRF block keeps its code: this is the case `guard.ssrf` is for.
+    #[test]
+    pub(super) fn a_private_address_is_still_a_policy_block() {
+        let err = FetchError::Ssrf("10.0.0.1 is a private/loopback address : SSRF guard".into());
+        let v = tool_error_structured(
+            friendly_fetch_error(&err),
+            fetch_error_kind(&err),
+            Some(json!({ "code": fetch_error_code(&err) })),
+        );
+        assert_eq!(v["code"], "guard.ssrf");
+        assert_eq!(v["errorKind"], "permanent");
+        assert_eq!(transport_class(&err), "ssrf");
+    }
+
+    // The text classifier is the fallback for every error that carries no
+    // code of its own, so both paths must read the same failure the same
+    // way: a DNS failure is network.dns, a policy block is guard.ssrf.
+    #[test]
+    pub(super) fn the_text_fallback_agrees_with_the_typed_code() {
+        let dns = FetchError::Dns("could not resolve x.invalid: no such host".into());
+        assert_eq!(
+            error_code(&friendly_fetch_error(&dns), None).as_ref(),
+            "network.dns"
+        );
+        let ssrf = FetchError::Ssrf("10.0.0.1 is a private/loopback address : SSRF guard".into());
+        assert_eq!(
+            error_code(&friendly_fetch_error(&ssrf), None).as_ref(),
+            "guard.ssrf"
+        );
     }
 }

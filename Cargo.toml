@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "4.1.1"
+version = "4.2.8"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
@@ -52,7 +52,7 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.231" }
+psl = { version = "=2.1.232" }
 # OCR/rerank support deps. `ort` itself goes ONLY in the per-target sections
 # below, never here: Cargo unions features across matching target sections, so
 # a shared entry leaks `load-dynamic` onto Windows/macOS and silently strips
@@ -77,8 +77,10 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 # No default features — the core tool (fetch, search, crawl, PDF)
 # works standalone. OCR and semantic reranking pull in ONNX Runtime,
 # a heavy C++ dependency whose static global constructors can deadlock
-# on some platforms (notably aarch64 Linux, see issue #9). CI and release
-# builds explicitly enable both with `--features ocr,rerank`.
+# on some platforms (notably aarch64 Linux, see issue #9). `http` adds the
+# axum HTTP transport. CI and release builds pick features per target: the
+# full `--features ocr,rerank,http` where supported, fewer or none elsewhere
+# (see the matrices in .github/workflows/ci.yml and release.yml).
 default = []
 ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
 rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/blocking"]
@@ -114,6 +116,27 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The LOCAL loop profile: the default for `just check`, `just t`,
+# `just lint` and `just bin`. Debug codegen for this crate (an edit
+# rebuilds in seconds instead of the 8-12 min an opt-level-3 whole-crate
+# recompile cost under the RAM-bounded job cap), deps at opt-level 1
+# (unoptimized deps made the suite crawl, and the debug graph hit 21G),
+# no debuginfo (linking 91k LOC + 512 deps with full DWARF is its own
+# tax), incremental for the edit-test loop.
+#
+# CI still runs the `ci` profile below: release opts, panic=abort, the
+# same shape the binary ships. `just tci` / `just bin-ci` use it when the
+# question is release-profile behavior specifically, and `just heavy`
+# (soak, corpus, landmarks, live) runs there because those tests measure
+# time and memory.
+[profile.fast]
+inherits = "dev"
+debug = 0
+incremental = true
+
+[profile.fast.package."*"]
+opt-level = 1
 
 # Test/workflow profile: release optimizations minus fat LTO.
 #

@@ -373,7 +373,6 @@ mod tests {
         let w = p.ghost_wire();
         assert_eq!(w.viewport, (1366, 768));
         assert_eq!(w.locale, "de-DE");
-        assert_eq!(w.languages_js(), "['de-DE', 'de']");
         // Corrupt viewport is clamped, never passed to Chrome.
         p.viewport = (10, 10);
         assert_eq!(p.ghost_wire().viewport, (800, 600));

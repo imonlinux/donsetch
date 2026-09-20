@@ -45,7 +45,7 @@ pub fn instructions() -> String {
     // tool NAMES up front and fetch schemas on demand, so this is
     // what tells an agent we exist. It is resident in every
     // session whether or not we are used : keep it short.
-    // tests/token_invariants.rs gates the size.
+    // tests/it/token_invariants.rs gates the size.
     format!(
         "Web access: fetch, search, crawl : pages, or whole sites.\
         \n\n{tools}\n\n\

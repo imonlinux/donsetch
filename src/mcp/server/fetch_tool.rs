@@ -6,6 +6,49 @@
 use serde_json::{Value, json};
 
 use super::*;
+
+/// The caller's whole-call budget, carried into the browser helpers so a
+/// single pass can be sized against what is left of it.
+///
+/// The passes used to be fixed at 20s (25s on the actions path) and ignored
+/// `deadline_ms` entirely, while the deadline wrapped the whole call from
+/// outside. With a short deadline the call was therefore cut off MID-pass:
+/// measured, `--tier 2 --deadline-ms 12000` against a known interstitial
+/// answered `deadline.hit` with no wall verdict at all, even though the first
+/// pass had already seen the wall, and the browser kept working on a pass
+/// nobody was waiting for. A pass is bounded by the remaining budget now,
+/// with a floor so it cannot be starved, and the fixed default stands when
+/// the caller asked for no deadline.
+#[derive(Clone, Copy)]
+pub(super) struct Budget {
+    deadline: Option<std::time::Duration>,
+    start: std::time::Instant,
+}
+
+impl Budget {
+    fn of(args: &Value) -> Self {
+        Self {
+            deadline: args
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .map(|ms| std::time::Duration::from_millis(ms.clamp(500, 600_000))),
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// How long one browser pass may run.
+    fn pass(self, default_secs: u64) -> std::time::Duration {
+        let default = std::time::Duration::from_secs(default_secs);
+        let Some(d) = self.deadline else {
+            return default;
+        };
+        // Leave room to assemble and return the envelope.
+        let usable = d
+            .saturating_sub(self.start.elapsed())
+            .saturating_sub(std::time::Duration::from_secs(2));
+        usable.clamp(std::time::Duration::from_secs(3), default)
+    }
+}
 pub(super) async fn fetch_tool(
     daemon: &Arc<Daemon>,
     args: &Value,
@@ -94,6 +137,55 @@ pub(super) async fn fetch_tool(
 
 /// Honest deadline error (v3 D1): the tool respects the agent's
 /// clock. What was fetched so far is described; nothing pretends.
+/// The verdict a FAILURE envelope reports.
+///
+/// The success path starts the verdict at ContentOk and a prewarm hit
+/// sets it too, so a failure envelope inherited "ContentOk" and
+/// contradicted the error beside it: a walled fetch reported
+/// `"verdict": "ContentOk"` with `"code": "wall.captcha"` (#258).
+///
+/// A failure never calls the fetch content. Any other verdict the run
+/// earned is kept, a challenge or a 404 included, and otherwise the
+/// failure names itself: `Blocked` for a wall, which is the word the
+/// error-code table already uses for `wall.*`, and `Unknown` for
+/// anything else.
+fn failure_verdict(current: &str, kind: &str) -> String {
+    if current != "ContentOk" {
+        return current.to_string();
+    }
+    match kind {
+        "walled" => "Blocked".to_string(),
+        _ => "Unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod failure_verdict_tests {
+    use super::failure_verdict;
+
+    #[test]
+    fn a_failure_never_reports_content_ok() {
+        // #258: a walled fetch reported `"verdict": "ContentOk"` beside
+        // `"code": "wall.captcha"`. ContentOk is the success path's
+        // default, and no failure may inherit it.
+        assert_eq!(failure_verdict("ContentOk", "walled"), "Blocked");
+        assert_eq!(failure_verdict("ContentOk", "permanent"), "Unknown");
+        assert_eq!(failure_verdict("ContentOk", "transient"), "Unknown");
+    }
+
+    #[test]
+    fn a_failure_keeps_a_verdict_the_run_actually_earned() {
+        // Tier 1 hit the wall and the ghost could not clear it: the
+        // challenge is what happened, and it stays reported rather than
+        // being flattened to Blocked.
+        assert_eq!(
+            failure_verdict("Challenge(Cloudflare)", "walled"),
+            "Challenge(Cloudflare)"
+        );
+        assert_eq!(failure_verdict("SoftNotFound", "permanent"), "SoftNotFound");
+    }
+}
+
 pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result<String, Value> {
     if raw.starts_with("http://") || raw.starts_with("https://") {
         return Ok(raw.to_string());
@@ -576,6 +668,7 @@ pub(super) fn strip_part_frontmatter(md: &str) -> String {
 #[allow(clippy::field_reassign_with_default)]
 pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     let t0 = std::time::Instant::now();
+    let budget = Budget::of(args);
     // Full parse up front: an unparseable URL would otherwise flow
     // through the whole pipeline with host="" : poisoning domain
     // profiles and producing confusing late errors.
@@ -685,8 +778,10 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 "fetch: actions need the browser : use tier=auto (default) or tier=2",
             );
         }
-        return fetch_with_actions(daemon, &url, &url_host, &opts, &actions, shot, image_text)
-            .await;
+        return fetch_with_actions(
+            daemon, &url, &url_host, &opts, &actions, shot, image_text, budget,
+        )
+        .await;
     }
 
     let host = url_host;
@@ -865,14 +960,19 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                     args2["_no_adapter"] = json!(true);
                     return Box::pin(fetch_single_inner(daemon, &args2, &orig_url)).await;
                 }
+                let kind = fetch_error_kind(&e);
                 return tool_error_structured(
                     friendly_fetch_error(&e),
-                    fetch_error_kind(&e),
+                    kind,
                     Some(json!({
                         "url": url,
                         "status": 0,
+                        // The error's OWN code outranks the text
+                        // classifier: the guard knows a resolution failure
+                        // is a DNS failure (#248).
+                        "code": fetch_error_code(&e),
                         "fetch_error": transport_class(&e),
-                        "next_action": next_action_for(None, 0, fetch_error_kind(&e)),
+                        "next_action": next_action_for(None, 0, kind),
                         "escalation": trace.value(),
                     })),
                 );
@@ -1243,6 +1343,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 challenge || shell_warm || skip_tier1,
                 shot,
                 &mut trace,
+                budget,
             )
             .await
             {
@@ -1288,13 +1389,14 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 {
                     return v3;
                 }
+                let failed_verdict = failure_verdict(&final_verdict, kind);
                 return tool_error_structured(
                     msg,
                     kind,
                     Some(json!({
                         "url": url,
                         "status": final_status,
-                        "verdict": final_verdict,
+                        "verdict": failed_verdict,
                         "next_action": next_action_for(out.as_ref().map(|o| o.verdict), final_status, kind),
                         "escalation": trace.value(),
                     })),
@@ -1474,7 +1576,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     if profile_walled
         && !skip_tier1
         && !is_warm
-        && let Some((_sim, note)) = anticloak_check(daemon, &url, &ex.markdown).await
+        && let Some((_sim, note)) = anticloak_check(daemon, &url, &ex.markdown, budget).await
     {
         cloak_warning = Some(note);
     }
@@ -1618,6 +1720,7 @@ pub(super) async fn try_bypass(
 /// ride warm tier 1 : with `replay_ok` set from the tier-1 retry's
 /// actual outcome. A pure SPA render (thin content, no wall) never
 /// touches the domain profile: the site isn't walled, it's JS-only.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn ghost_escalate(
     daemon: &Arc<Daemon>,
     url: &str,
@@ -1626,6 +1729,7 @@ pub(super) async fn ghost_escalate(
     learn: bool,
     shot: Option<&str>,
     trace: &mut Trace,
+    budget: Budget,
 ) -> Result<(extract::Extracted, &'static str, u16, String), (String, &'static str)> {
     let t0 = std::time::Instant::now();
     // v4 E2: ghost agrees with the persona pin (viewport + locale).
@@ -1645,7 +1749,7 @@ pub(super) async fn ghost_escalate(
         .map_err(|e| (format!("browser launch failed: {e}"), "permanent"))?;
     trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
     let t1 = std::time::Instant::now();
-    let mut page = match ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20)).await {
+    let mut page = match ops::ghost_fetch(&mut g, url, budget.pass(20)).await {
         Ok(p) => p,
         Err(e) => {
             // CDP timeouts on first attempt are transient : the
@@ -1654,7 +1758,7 @@ pub(super) async fn ghost_escalate(
             if crate::config::cfg().debug.ghost {
                 eprintln!("[ghost_escalate] first attempt failed: {e}, retrying...");
             }
-            ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
+            ops::ghost_fetch(&mut g, url, budget.pass(20))
                 .await
                 .map_err(|e| (format!("browser automation error: {e}"), "permanent"))?
         }
@@ -1688,9 +1792,7 @@ pub(super) async fn ghost_escalate(
         // settle re-check. Never more: two passes is the ceiling,
         // an honest captcha stays an honest captcha.
         let t1b = std::time::Instant::now();
-        let page2 = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
-            .await
-            .ok();
+        let page2 = ops::ghost_fetch(&mut g, url, budget.pass(20)).await.ok();
         match page2 {
             Some(p2) if !p2.captcha => {
                 trace.step(
@@ -1707,6 +1809,20 @@ pub(super) async fn ghost_escalate(
                 page = p2;
             }
             Some(p2) if p2.captcha => {
+                // A failed second pass must leave the same trail a
+                // successful one does. The debug log showed two
+                // attempts while the escalation listed one, so the
+                // trail implied the wall had been met once (#258).
+                trace.step(
+                    "2",
+                    "solve-pass2",
+                    &format!(
+                        "still walled: captcha={} dom={}KB",
+                        p2.captcha,
+                        p2.html.len() / 1024
+                    ),
+                    t1b.elapsed().as_millis(),
+                );
                 if let Some(p) = shot {
                     let _ = g.screenshot(p).await;
                 }
@@ -1754,8 +1870,7 @@ pub(super) async fn ghost_escalate(
         ) && page.took < std::time::Duration::from_secs(12)
         {
             let t1b = std::time::Instant::now();
-            if let Ok(p2) = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20)).await
-            {
+            if let Ok(p2) = ops::ghost_fetch(&mut g, url, budget.pass(20)).await {
                 let v2 = crate::detect::walls::detect_dom_smart(p2.html.as_bytes());
                 if !p2.captcha
                     && !matches!(
@@ -2115,6 +2230,7 @@ pub(super) fn is_pdf_url_like(url: &str) -> bool {
 /// extraction over the final DOM. focus/section/toc all work
 /// on the interacted-with page. One call replaces hound's
 /// navigate→act→act→read round-trips.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn fetch_with_actions(
     daemon: &Arc<Daemon>,
     url: &str,
@@ -2123,6 +2239,7 @@ pub(super) async fn fetch_with_actions(
     actions: &[crate::ghost::actions::Action],
     shot: Option<&str>,
     image_text: bool,
+    budget: Budget,
 ) -> Value {
     let mut trace = Trace::default();
     trace.step("route", "actions", "browser-script", 0);
@@ -2161,11 +2278,11 @@ pub(super) async fn fetch_with_actions(
     // Initial render through the standard ghost oracle: navigate,
     // settle, challenge handling, content checks.
     let t1 = std::time::Instant::now();
-    let page = match ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(25)).await {
+    let page = match ops::ghost_fetch(&mut g, url, budget.pass(25)).await {
         Ok(p) => p,
         Err(e) => {
             // One transient retry, same as ghost_escalate.
-            match ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(25)).await {
+            match ops::ghost_fetch(&mut g, url, budget.pass(25)).await {
                 Ok(p) => p,
                 Err(e2) => {
                     return tool_error_structured(
@@ -2269,13 +2386,24 @@ pub(super) async fn fetch_with_actions(
         && !cur.starts_with("about:")
         && let Err(e) = crate::fetch::guards::ensure_url_safe(&cur).await
     {
+        let kind = fetch_error_kind(&e);
+        // A click lands on a host that does not resolve, or hits a
+        // resolver hiccup, just as easily as on a private address: the
+        // kind, the code and the message come from the error itself
+        // (#248). Only the policy case gets the private-address prose.
+        let next_action = if matches!(e, FetchError::Ssrf(_)) {
+            "action caused navigation to a private/loopback URL : blocked".to_string()
+        } else {
+            next_action_for(None, 0, kind)
+        };
         return tool_error_structured(
             format!("blocked after action navigation: {e}"),
-            "permanent",
+            kind,
             Some(json!({
                 "url": cur,
+                "code": fetch_error_code(&e),
                 "escalation": trace.value(),
-                "next_action": "action caused navigation to a private/loopback URL : blocked",
+                "next_action": next_action,
             })),
         );
     }
@@ -2482,6 +2610,7 @@ pub(super) async fn anticloak_check(
     daemon: &Arc<Daemon>,
     url: &str,
     tier1_markdown: &str,
+    budget: Budget,
 ) -> Option<(f64, String)> {
     let host = crate::search::rank::host_of(url);
     let wire = {
@@ -2498,9 +2627,7 @@ pub(super) async fn anticloak_check(
         .acquire_for_wire(&daemon.profile, Some(host.as_str()), wire)
         .await
         .ok()?;
-    let page = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
-        .await
-        .ok()?;
+    let page = ops::ghost_fetch(&mut g, url, budget.pass(20)).await.ok()?;
     if page.captcha {
         return Some((
             0.0,
@@ -3789,5 +3916,53 @@ mod resurrect_tests {
         // misread as chrome : the calendar phrase differs from prose.
         let article = b"<html><body><h1>History of the Wayback Machine</h1>            It preserves redirects and their targets.</body></html>";
         assert!(!is_wayback_stub(article));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn args_with(ms: Option<u64>) -> Value {
+        match ms {
+            Some(v) => json!({ "deadline_ms": v }),
+            None => json!({}),
+        }
+    }
+
+    #[test]
+    fn no_deadline_keeps_the_fixed_pass() {
+        let b = Budget::of(&args_with(None));
+        assert_eq!(b.pass(20), std::time::Duration::from_secs(20));
+        assert_eq!(b.pass(25), std::time::Duration::from_secs(25));
+    }
+
+    #[test]
+    fn a_short_deadline_shrinks_the_pass_instead_of_being_cut_off() {
+        // 12s of budget: a 20s pass runs past it, so the caller gets a clock
+        // hit instead of the wall verdict that pass had already seen.
+        let b = Budget::of(&args_with(Some(12_000)));
+        let p = b.pass(20);
+        assert!(
+            p < std::time::Duration::from_secs(12),
+            "the pass must fit the budget, got {p:?}"
+        );
+        assert!(
+            p >= std::time::Duration::from_secs(3),
+            "the floor must keep it usable, got {p:?}"
+        );
+    }
+
+    #[test]
+    fn a_deadline_larger_than_the_default_still_caps_at_the_default() {
+        let b = Budget::of(&args_with(Some(600_000)));
+        assert_eq!(b.pass(20), std::time::Duration::from_secs(20));
+        assert_eq!(b.pass(25), std::time::Duration::from_secs(25));
+    }
+
+    #[test]
+    fn a_tiny_deadline_hits_the_floor_rather_than_zero() {
+        let b = Budget::of(&args_with(Some(500)));
+        assert_eq!(b.pass(20), std::time::Duration::from_secs(3));
     }
 }

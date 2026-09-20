@@ -347,21 +347,65 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&got), "hello\n");
     }
 
-    /// A client that sends one request after a delay long enough
-    /// for the first child to have died, then EOF.
+    /// A client that waits for the child to ANNOUNCE that its stdin is
+    /// closed before writing, then waits to see its request come back
+    /// through the replacement before closing. Both waits are on
+    /// observable effects, never on a sleep: the announcement is written
+    /// after the close, so the request is guaranteed to land on a closed
+    /// pipe and come back EPIPE however long the runner took to start
+    /// `sh`. The 300ms timer this replaces raced the shell on
+    /// macos-x86_64, first as a failed spawn assert, then as a 30s
+    /// nextest timeout.
     #[cfg(unix)]
-    struct DelayedOnce(&'static [u8], bool);
+    struct WaitsForReady {
+        sink: Arc<Mutex<Vec<u8>>>,
+        payload: &'static [u8],
+        phase: u8,
+    }
 
     #[cfg(unix)]
-    impl Read for DelayedOnce {
+    impl Read for WaitsForReady {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.1 {
-                return Ok(0);
+            match self.phase {
+                0 => {
+                    wait_for_marker(&self.sink, b"READY\n");
+                    self.phase = 1;
+                    buf[..self.payload.len()].copy_from_slice(self.payload);
+                    Ok(self.payload.len())
+                }
+                1 => {
+                    // Only the replacement echoes, so the payload
+                    // showing up in the sink IS the replay: waiting for
+                    // it keeps the final assert from racing the
+                    // forwarder thread that writes it out.
+                    wait_for_marker(&self.sink, self.payload);
+                    self.phase = 2;
+                    Ok(0)
+                }
+                _ => Ok(0),
             }
-            std::thread::sleep(Duration::from_millis(300));
-            self.1 = true;
-            buf[..self.0.len()].copy_from_slice(self.0);
-            Ok(self.0.len())
+        }
+    }
+
+    /// Block until the sink shows `needle`, bounded so a regression fails
+    /// the asserts below instead of hanging into nextest's slow-timeout
+    /// (the shape this test took on macos-x86_64).
+    #[cfg(unix)]
+    fn wait_for_marker(sink: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if sink
+                .lock()
+                .unwrap()
+                .windows(needle.len())
+                .any(|w| w == needle)
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -514,6 +558,39 @@ mod tests {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
+        let (spawns, got) = sigpipe_restart_case("exec 0<&-; echo READY");
+        assert!(spawns >= 2, "the dead child must have been replaced");
+        assert_eq!(
+            got, "READY\nping\n",
+            "the held request must replay to the restarted child"
+        );
+    }
+
+    // The macos-x86_64 signature, reproduced on every platform: a shell
+    // that is slow to reach its own `exec 0<&-`. A client that wrote on a
+    // 300ms timer landed in a LIVE pipe, got no EPIPE, and never reached
+    // the restart path: first as a failed spawn assert (#236), then as a
+    // 30s nextest timeout (#239). The child's announcement makes the
+    // ordering causal instead.
+    #[cfg(unix)]
+    #[test]
+    fn mid_write_restart_does_not_race_a_slow_to_start_child() {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+        let (spawns, got) = sigpipe_restart_case("sleep 1; exec 0<&-; echo READY");
+        assert!(spawns >= 2, "the dead child must have been replaced");
+        assert_eq!(
+            got, "READY\nping\n",
+            "the held request must replay to the restarted child"
+        );
+    }
+
+    /// Drive the mid-write crash case. `first_child` must close its own
+    /// stdin and announce it on stdout; its replacement is `cat`.
+    /// Returns the spawn count and everything the client received.
+    #[cfg(unix)]
+    fn sigpipe_restart_case(first_child: &'static str) -> (u32, String) {
         let sink = Sink::default();
         let spawns = Arc::new(Mutex::new(0u32));
         let spawns2 = Arc::clone(&spawns);
@@ -522,24 +599,20 @@ mod tests {
                 let mut n = spawns2.lock().unwrap();
                 *n += 1;
                 let mut c = Command::new("sh");
-                // First child dies instantly; its replacement serves.
-                c.args(["-c", if *n == 1 { "exit 0" } else { "cat" }]);
+                c.args(["-c", if *n == 1 { first_child } else { "cat" }]);
                 c
             },
-            DelayedOnce(b"ping\n", false),
+            WaitsForReady {
+                sink: Arc::clone(&sink.0),
+                payload: b"ping\n",
+                phase: 0,
+            },
             sink.clone(),
         )
         .unwrap();
-        assert!(
-            *spawns.lock().unwrap() >= 2,
-            "the dead child must have been replaced"
-        );
-        let got = sink.0.lock().unwrap().clone();
-        assert_eq!(
-            String::from_utf8_lossy(&got),
-            "ping\n",
-            "the held request must replay to the restarted child"
-        );
+        let spawns = *spawns.lock().unwrap();
+        let got = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        (spawns, got)
     }
 
     #[test]

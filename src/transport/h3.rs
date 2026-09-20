@@ -19,7 +19,7 @@
 //! vouched for it, no h3 behind a CONNECT proxy, DONSETCH_NO_H3 as the
 //! hard kill switch.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -83,35 +83,20 @@ fn accept_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), FetchError>
 /// the resolver's full timeout chain, and the h3 lane runs its loop
 /// on a tokio worker.
 async fn resolve_host_async(host: String, port: u16) -> Result<SocketAddr, FetchError> {
-    // `label` answers the timeout arm; the closure moves `host` and
-    // clones its own copy for its two error labels.
-    let label = host.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        let label = host.clone();
-        let addrs: Vec<SocketAddr> = (host, port)
-            .to_socket_addrs()
-            .map_err(|_| FetchError::Http(format!("dns resolve failed for {label}")))?
-            .collect();
-        // Same connect-time SSRF filter the h1/h2 dial path applies
-        // in tcp::happy_connect_with: resolve, then drop private /
-        // loopback resolved IPs (unless the private-egress escape
-        // hatch is on) before dialing. ensure_url_safe already
-        // rejected private hosts at request time, but a DNS rebind
-        // between that check and this dial would otherwise reach an
-        // internal address over QUIC — h1/h2 re-filter here, h3 did
-        // not. This closes the parity gap.
-        select_dial_addr(
-            addrs,
-            crate::fetch::guards::private_egress_allowed(),
-            &label,
-        )
-    });
-    match tokio::time::timeout(Duration::from_secs(10), task).await {
-        Ok(joined) => joined.map_err(|_| FetchError::Http("dns resolve task aborted".into()))?,
-        Err(_) => Err(FetchError::Http(format!(
-            "dns resolve timed out for {label}"
-        ))),
-    }
+    // Shared cache, and the only resolver path in the h3 lane now: it
+    // used to run its own blocking `to_socket_addrs` on a worker thread
+    // with its own 10s timeout, so the guard, the h1/h2 connect and this
+    // dial could each pay a separate round trip for one name.
+    let addrs = crate::transport::dns::resolve(&host, port).await?;
+    // Same connect-time SSRF filter the h1/h2 dial path applies
+    // in tcp::happy_connect_with: resolve, then drop private /
+    // loopback resolved IPs (unless the private-egress escape
+    // hatch is on) before dialing. ensure_url_safe already
+    // rejected private hosts at request time, but a DNS rebind
+    // between that check and this dial would otherwise reach an
+    // internal address over QUIC : h1/h2 re-filter here, h3 did
+    // not. This closes the parity gap.
+    select_dial_addr(addrs, crate::fetch::guards::private_egress_allowed(), &host)
 }
 
 /// Pick the address to dial from a resolved set, applying the same
@@ -131,17 +116,19 @@ fn select_dial_addr(
         return addrs
             .into_iter()
             .next()
-            .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {label}")));
+            .ok_or_else(|| FetchError::Dns(format!("resolve returned no addresses for {label}")));
     }
     if addrs.is_empty() {
-        return Err(FetchError::Http(format!("dns resolve empty for {label}")));
+        return Err(FetchError::Dns(format!(
+            "resolve returned no addresses for {label}"
+        )));
     }
     addrs
         .into_iter()
         .find(|a| !crate::fetch::guards::is_ssrf_resolved_ip(&a.ip()))
         .ok_or_else(|| {
-            FetchError::Http(format!(
-                "dns: {label} resolves to a private/loopback address : SSRF guard"
+            FetchError::Ssrf(format!(
+                "{label} resolves to a private/loopback address : SSRF guard"
             ))
         })
 }
@@ -538,11 +525,11 @@ pub async fn h3_fetch_direct(
     authority: &str,
     user_headers: Vec<(String, String)>,
     timeout: Option<Duration>,
+    profile: &crate::profile::BrowserProfile,
 ) -> Result<(H3Out, QuicStats), FetchError> {
     if crate::config::cfg().debug.ghost {
         eprintln!("[h3] attempt {host}:{port}{path}");
     }
-    let profile = crate::profile::BrowserProfile::chrome_153(crate::profile::Platform::host());
     let timeout = timeout.unwrap_or(Duration::from_secs(15));
     let accept = user_headers
         .iter()
@@ -569,7 +556,7 @@ pub async fn h3_fetch_direct(
         accept: accept.as_str(),
         timeout,
     };
-    let (out, stats) = h3_fetch_heat(&req, &profile).await?;
+    let (out, stats) = h3_fetch_heat(&req, profile).await?;
     if crate::config::cfg().debug.ghost {
         eprintln!(
             "[h3] stats {}:{} early={} resumed={} hs_ms={} total_ms={} pkts_in={} pkts_out={}",
@@ -607,9 +594,12 @@ mod tests {
         );
         // Resolves only to private/loopback -> refused (SSRF guard).
         assert!(select_dial_addr(vec![meta, loop_], false, "h").is_err());
-        // Empty resolution -> the honest empty error, not a guard error.
+        // Empty resolution -> the honest name failure, not a guard error.
         let err = select_dial_addr(vec![], false, "h").unwrap_err();
-        assert!(format!("{err:?}").contains("empty"));
+        assert!(
+            matches!(err, FetchError::Dns(_)),
+            "an empty resolution is a name failure, not a policy block: {err:?}"
+        );
         // The escape hatch takes the first address as-is (local egress).
         assert_eq!(
             select_dial_addr(vec![loop_, public], true, "h").unwrap(),

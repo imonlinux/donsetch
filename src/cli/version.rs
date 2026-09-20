@@ -9,6 +9,7 @@ use crate::DISPLAY_NAME;
 use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
+use std::time::Duration;
 
 const REPO: &str = "dondai44423/donsetch";
 
@@ -25,18 +26,29 @@ pub async fn run() {
     cli::print_kv("binary", &exe);
     cli::print_kv(
         "target",
-        option_env!("DONSHEET_TARGET").unwrap_or("unknown"),
+        option_env!("DONSETCH_TARGET").unwrap_or("unknown"),
     );
-    cli::print_kv("profile", "chrome-153");
+    // The label must name the Chrome this build actually presents. The UA
+    // and the client hints follow the detected browser, so a literal here
+    // mislabelled every build (and every recorded stealth baseline) as the
+    // version the tables were captured from. When no browser can be
+    // detected the profile falls back to the capture version, and that is
+    // said out loud instead of presented as a fact about the host.
+    let profile = BrowserProfile::host_default();
+    let label = match crate::profile::probe_installed() {
+        Some(_) => format!("{} (detected)", profile.name),
+        None => format!("{} (fallback: no installed browser detected)", profile.name),
+    };
+    cli::print_kv("profile", &label);
     cli::print_kv(
         "features",
-        option_env!("DONSHEET_FEATURES").unwrap_or("(none)"),
+        option_env!("DONSETCH_FEATURES").unwrap_or("(none)"),
     );
     cli::print_kv(
         "pdfium",
-        option_env!("DONSHEET_PDFIUM").unwrap_or("unknown"),
+        option_env!("DONSETCH_PDFIUM").unwrap_or("unknown"),
     );
-    cli::print_kv("git", option_env!("DONSHEET_GIT_HASH").unwrap_or("unknown"));
+    cli::print_kv("git", option_env!("DONSETCH_GIT_HASH").unwrap_or("unknown"));
 
     // ── Update check (atom feed : no API, no rate limits) ─────
     //
@@ -44,13 +56,27 @@ pub async fn run() {
     // not the API : no 60-req/hour limit). Parses the first
     // <entry><title> for the latest tag. Compares semver.
 
-    let fetcher = Fetcher::new(BrowserProfile::host_default());
-    let latest = match fetcher {
-        Ok(f) => fetch_latest_version(&f).await.ok(),
-        Err(_) => None,
+    let skip_update_check =
+        std::env::var_os("DONSETCH_NO_UPDATE_CHECK").is_some() || std::env::var_os("CI").is_some();
+    let latest = if skip_update_check {
+        None
+    } else {
+        let fetcher = Fetcher::new(BrowserProfile::host_default());
+        match fetcher {
+            Ok(f) => tokio::time::timeout(Duration::from_secs(3), fetch_latest_version(&f))
+                .await
+                .ok()
+                .and_then(Result::ok),
+            Err(_) => None,
+        }
     };
 
     println!();
+
+    if skip_update_check {
+        println!("  (update check skipped)");
+        return;
+    }
 
     match &latest {
         Some(latest) => {

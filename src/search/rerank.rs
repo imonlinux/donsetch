@@ -145,10 +145,15 @@ mod inner {
     }
 
     /// Returns the cache directory for reranker model files.
+    ///
+    /// Off the same root as every other cache: DONSETCH_CACHE_DIR and
+    /// [paths] cache_dir move this one too. It used dirs::cache_dir()
+    /// directly, so an override moved every cache except the model: a
+    /// container or a side-by-side install read and wrote the real user
+    /// cache while doctor, which checks paths::cache_dir(), reported the
+    /// model as missing.
     fn cache_dir() -> PathBuf {
-        let mut p = dirs::cache_dir().unwrap_or_else(|| PathBuf::from("."));
-        p.push("donsetch");
-        p.push("rerank");
+        let p = crate::paths::cache_dir().join("rerank");
         let _ = std::fs::create_dir_all(&p);
         p
     }
@@ -176,7 +181,24 @@ mod inner {
                     "sha256 mismatch for {url}: expected {expected}, got {got}"
                 ));
             }
-            std::fs::write(dest, &body).map_err(|e| format!("write {dest:?}: {e}"))?;
+            // Publish atomically: write a sibling temp file, then rename
+            // it over the target. Writing straight to `dest` let a
+            // concurrent first-use download (parallel test processes, two
+            // daemons on one cache) expose a half-written model: the load
+            // fails, reranking is silently skipped, and the ranking
+            // changes. The temp name carries the pid so two writers never
+            // share one.
+            let mut tmp_name = dest
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            tmp_name.push(format!(".{}.part", std::process::id()));
+            let tmp = dest.with_file_name(tmp_name);
+            std::fs::write(&tmp, &body).map_err(|e| format!("write {tmp:?}: {e}"))?;
+            std::fs::rename(&tmp, dest).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("publish {dest:?}: {e}")
+            })?;
             Ok(())
         }
 
@@ -555,6 +577,31 @@ mod inner {
     mod tests {
         use super::*;
         use crate::search::rank::Merged;
+
+        /// The rerank model cache must hang off the same root as
+        /// everything else, or DONSETCH_CACHE_DIR (and [paths]
+        /// cache_dir) moves every other cache except this one: a
+        /// container or a side-by-side install then reads and writes the
+        /// real user cache while doctor, which checks
+        /// paths::cache_dir(), reports the model as missing.
+        #[test]
+        fn cache_dir_follows_the_override() {
+            let dir =
+                std::env::temp_dir().join(format!("donsetch-rerank-cache-{}", std::process::id()));
+            let prev = std::env::var_os("DONSETCH_CACHE_DIR");
+            // SAFETY: process-scoped, and nextest runs one test per process.
+            unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+            let got = cache_dir();
+            match prev {
+                Some(v) => unsafe { std::env::set_var("DONSETCH_CACHE_DIR", v) },
+                None => unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") },
+            }
+            assert_eq!(
+                got,
+                dir.join("rerank"),
+                "the rerank cache must hang off paths::cache_dir()"
+            );
+        }
 
         #[test]
         fn sigmoid_basic() {

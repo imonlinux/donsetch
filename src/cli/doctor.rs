@@ -19,6 +19,7 @@ use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::paths;
 use crate::profile::BrowserProfile;
+use crate::search::byok::store::KeyState;
 
 #[derive(Debug)]
 enum CheckResult {
@@ -306,12 +307,9 @@ fn check_binary() -> CheckResult {
 }
 
 async fn check_network(fetcher: &Fetcher) -> CheckResult {
-    match fetcher.fetch("https://example.com").await {
-        Ok(out) if out.status == 200 => CheckResult::Pass(format!(
-            "example.com 200 OK ({:.0}ms)",
-            out.elapsed.as_secs_f64() * 1000.0,
-        )),
-        Ok(out) => CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
+    let generic = match fetcher.fetch("https://example.com").await {
+        Ok(out) if out.status == 200 => out,
+        Ok(out) => return CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
         Err(e) => {
             // Egress-filter environments are the one common case
             // where a "network is fine" box still fails every
@@ -345,8 +343,30 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
             } else {
                 "Check your network connection and DNS. Behind an egress proxy? Set [proxy] https/http in donsetch.toml or export HTTPS_PROXY/HTTP_PROXY (NO_PROXY accepted).".into()
             };
-            CheckResult::Fail(e.to_string(), hint)
+            return CheckResult::Fail(e.to_string(), hint);
         }
+    };
+    // The tool lane is a SEPARATE call chain into the same dialer:
+    // fetch_persona, the tier-1 navigation identity that every MCP
+    // web_fetch and CLI fetch rides. Probing it here is what makes this
+    // line a prediction of tool behaviour instead of a prediction of the
+    // update check: a bug that broke only the persona lane once had this
+    // check report healthy egress while every tool call failed, and the
+    // misdiagnosis sent the report to the deployment instead of here.
+    // fetch_persona reports no timing of its own (elapsed is zero on that
+    // path), so only the generic lane's RTT is quoted.
+    match fetcher.fetch_persona("https://example.com", None).await {
+        Ok(t) if t.status == 200 => CheckResult::Pass(format!(
+            "example.com 200 OK ({:.0}ms, generic and tool lanes)",
+            generic.elapsed.as_secs_f64() * 1000.0,
+        )),
+        Ok(t) => CheckResult::Warn(format!(
+            "example.com: the generic lane got HTTP {} but the tool lane (web_fetch) got HTTP {}",
+            generic.status, t.status
+        )),
+        Err(e) => CheckResult::Warn(format!(
+            "example.com: the generic lane reached it but the tool lane (web_fetch) failed: {e}"
+        )),
     }
 }
 
@@ -1093,14 +1113,14 @@ fn check_cache_dir() -> CheckResult {
 fn check_pdfium() -> CheckResult {
     #[cfg(not(windows))]
     {
-        CheckResult::Pass(option_env!("DONSHEET_PDFIUM").unwrap_or("static").into())
+        CheckResult::Pass(option_env!("DONSETCH_PDFIUM").unwrap_or("static").into())
     }
     #[cfg(windows)]
     {
         let exe = std::env::current_exe().unwrap_or_default();
         let dll = exe.parent().unwrap_or(Path::new("")).join("pdfium.dll");
         if dll.exists() {
-            CheckResult::Pass(option_env!("DONSHEET_PDFIUM").unwrap_or("dll").into())
+            CheckResult::Pass(option_env!("DONSETCH_PDFIUM").unwrap_or("dll").into())
         } else {
             CheckResult::Fail(
                 "pdfium.dll not found".into(),
@@ -1220,11 +1240,25 @@ fn check_plugins() -> CheckResult {
     // by the exec at run time, and absence there already yields
     // a clear error on the first search.
     let mut missing: Vec<String> = Vec::new();
+    // A plugin that reported itself invalid, out of credit or
+    // rate-limited is registered and parked: it will not be spawned,
+    // which is exactly how a search quietly loses that provider.
+    // `keys list` shows the state; doctor is where a user looks when
+    // a provider vanished, so the loop closes here too.
+    let mut parked: Vec<String> = Vec::new();
     for n in &names {
-        let prog = &cfg.plugins[n].cmd[0];
+        let def = &cfg.plugins[n];
+        // A hand-edited plugins.json can carry an empty argv; that is
+        // a registration problem, not a panic in the doctor.
+        let prog = def.cmd.first().map(String::as_str).unwrap_or("");
         let is_path_form = prog.contains('/') || prog.contains('\\') || prog.starts_with('.');
-        if is_path_form && !std::path::Path::new(prog).exists() {
+        if def.cmd.is_empty() {
+            missing.push(format!("{n}: no command registered"));
+        } else if is_path_form && !std::path::Path::new(prog).exists() {
             missing.push(format!("{n}: {prog}"));
+        }
+        if def.state != KeyState::Active {
+            parked.push(format!("{n}: {}", def.state.label()));
         }
     }
     let detail = format!(
@@ -1232,13 +1266,21 @@ fn check_plugins() -> CheckResult {
         names.len(),
         names.join(", ")
     );
-    if missing.is_empty() {
+    let mut problems: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("program not found: {}", missing.join(", ")));
+    }
+    if !parked.is_empty() {
+        problems.push(format!(
+            "parked, so not spawned: {} (re-register with `donsetch keys add plugin <name> --cmd ...` \
+             after fixing the credentials; a rate-limited plugin recovers on its own)",
+            parked.join(", ")
+        ));
+    }
+    if problems.is_empty() {
         CheckResult::Pass(detail)
     } else {
-        CheckResult::Warn(format!(
-            "{detail}; program not found: {}",
-            missing.join(", ")
-        ))
+        CheckResult::Warn(format!("{detail}; {}", problems.join("; ")))
     }
 }
 
@@ -1823,6 +1865,9 @@ fn print_mcp_section() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "donsetch".to_string());
+    let npm_install =
+        exe.contains("node_modules/donsetch/") || exe.contains("node_modules\\donsetch\\");
+    let command = if npm_install { "donsetch" } else { &exe };
     let found = detect_mcp_clients();
     if found.is_empty() {
         cli::check_dim("MCP clients", "none detected; generic stdio block below");
@@ -1835,19 +1880,27 @@ fn print_mcp_section() {
         }
     }
     let generic = format!(
-        "{{\"mcpServers\": {{\"donsetch\": {{\"command\": \"{exe}\", \
-         \"args\": [\"mcp\", \"--supervised\"]}}}}}}"
+        "{{\"mcpServers\": {{\"donsetch\": {{\"command\": {}, \
+         \"args\": [\"mcp\", \"--supervised\"]}}}}}}",
+        json_escape(command)
     );
     println!("      Add to an MCP client (Claude Desktop, OpenCode, .mcp.json):");
     println!("      {generic}");
     println!("      Hermes (~/.hermes/config.yaml):");
     println!("        mcp_servers:");
     println!("          donsetch:");
-    println!("            command: {exe}");
+    println!("            command: {command}");
     println!("            args: [\"mcp\", \"--supervised\"]");
     println!("            transport: stdio");
+    if npm_install {
+        println!("      For npm installs, use `npx donsetch` if `donsetch` is not on PATH.");
+    }
     println!("      Supervised mode restarts donsetch if it is ever killed,",);
     println!("      which is why the blocks above prefer it.");
+}
+
+fn json_escape(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// Known MCP client config locations. Only these small fixed files
@@ -2113,6 +2166,54 @@ mod doctor_ultra_tests {
         }
     }
 
+    // Unix only: `/bin/true` is path-form, so on Windows it does not
+    // exist and both plugins land in "program not found" as well.
+    #[cfg(unix)]
+    #[test]
+    fn a_parked_plugin_warns_instead_of_passing() {
+        // The gap: a plugin sitting in `invalid` passed the check, so
+        // the only place its state showed was `keys list`.
+        let _g = isolated_cache();
+        let mut cfg = crate::search::byok::plugin::PluginConfig::empty();
+        let none = std::collections::HashSet::new();
+        cfg.add("parkedplug", vec!["/bin/true".into()], 30_000, &none)
+            .unwrap();
+        cfg.add("liveplug", vec!["/bin/true".into()], 30_000, &none)
+            .unwrap();
+        cfg.mark_state("parkedplug", KeyState::Invalid);
+        cfg.save();
+
+        match check_plugins() {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("parkedplug: invalid"), "{detail}");
+                assert!(
+                    !detail.contains("liveplug:"),
+                    "an active plugin must not be named as parked: {detail}"
+                );
+            }
+            other => panic!("a parked plugin must warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_with_no_command_warns_instead_of_panicking() {
+        // A hand-edited plugins.json can carry an empty argv; the old
+        // `cmd[0]` indexed straight into a panic.
+        let _g = isolated_cache();
+        let dir = std::env::var("DONSETCH_CACHE_DIR").unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("plugins.json"),
+            r#"{"version":1,"plugins":{"broken":{"cmd":[],"timeout_ms":30000}},"order":["broken"]}"#,
+        )
+        .unwrap();
+        match check_plugins() {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("broken: no command registered"), "{detail}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
     #[test]
     fn config_posture_flags_no_config_file_plus_explicit_path() {
         let _g = isolated_cache();
@@ -2234,7 +2335,8 @@ mod mask_tests {
 #[cfg(test)]
 mod bright_probe_tests {
     use super::{
-        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, route_ips_url,
+        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, json_escape,
+        route_ips_url,
     };
     use std::io::{Read, Write};
 
@@ -2417,5 +2519,11 @@ mod bright_probe_tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn json_escape_handles_windows_paths() {
+        let path = r#"C:\Users\A "B"\donsetch.exe"#;
+        assert_eq!(json_escape(path), r#""C:\\Users\\A \"B\"\\donsetch.exe""#);
     }
 }

@@ -169,7 +169,7 @@ async fn fetch_via_intercepting_proxy_succeeds_with_trusted_ca() {
         std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -202,7 +202,7 @@ async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
         std::env::set_var("SSL_CERT_FILE", &ca_path);
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -223,6 +223,38 @@ async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
     );
 }
 
+// The same env-proxy contract has to hold on the tier-1 persona lane,
+// which is what the MCP `web_fetch` tool and the CLI `fetch`/`search`
+// commands ride. It used to pass `None` down to the redirect driver, so
+// on a host whose only route out is HTTP_PROXY (a container, a locked
+// down office network) every tool call died with "Network is
+// unreachable" while `donsetch doctor` and the archive fallback, which
+// ride `fetch()`, reported egress healthy: two call chains into the
+// same dialer and only one of them resolved the ambient proxy.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn persona_fetch_uses_the_env_proxy_like_fetch_does() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let mitm = spawn_mitm().await;
+    set_env_https_proxy(&mitm);
+
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+        donsetch::profile::Platform::Linux,
+    ))
+    .expect("fetcher builds");
+    let out = fetcher
+        .fetch_persona("http://console.example/persona", None)
+        .await
+        .expect("persona fetch through the env proxy");
+    assert_eq!(String::from_utf8_lossy(&out.body), "plain-http");
+    let seen = mitm.seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|h| h.starts_with("GET http://console.example/persona ")),
+        "the persona lane must ride the env proxy, saw: {seen:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn plaintext_http_through_env_proxy_uses_absolute_form() {
@@ -230,7 +262,7 @@ async fn plaintext_http_through_env_proxy_uses_absolute_form() {
     let mitm = spawn_mitm().await;
     set_env_https_proxy(&mitm);
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -264,7 +296,7 @@ async fn plaintext_http_through_credentialed_proxy_sends_proxy_authorization() {
         std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");
@@ -377,7 +409,7 @@ async fn plaintext_http_through_socks5_uses_origin_form() {
         std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
     }
 
-    let fetcher = Fetcher::new(BrowserProfile::chrome_153(
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
         donsetch::profile::Platform::Linux,
     ))
     .expect("fetcher builds");

@@ -76,7 +76,7 @@ async fn secure_cookie_never_leaks_over_plain_http() {
     let srv_flag = saw_secret.clone();
     let handle = std::thread::spawn(move || serve(listener, srv_flag));
 
-    let profile = BrowserProfile::chrome_153(Platform::Linux);
+    let profile = BrowserProfile::chrome_150(Platform::Linux);
     let fetcher = Fetcher::new(profile).expect("fetcher");
     let base = format!("http://127.0.0.1:{port}");
 

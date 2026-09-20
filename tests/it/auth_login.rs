@@ -83,7 +83,7 @@ fn spawn_gate_server() -> u16 {
 
 fn new_fetcher() -> donsetch::fetch::client::Fetcher {
     use donsetch::profile::{BrowserProfile, Platform};
-    let profile = BrowserProfile::chrome_153(Platform::Linux);
+    let profile = BrowserProfile::chrome_150(Platform::Linux);
     donsetch::fetch::client::Fetcher::new(profile).expect("fetcher")
 }
 

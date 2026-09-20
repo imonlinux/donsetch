@@ -66,8 +66,37 @@ fn config_cli(args: &[String]) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack size for the runtime's worker threads.
+///
+/// Tokio gives workers 2 MiB by default, and the MCP server runs every
+/// tool call on one of them. The fetch path needs more than that in an
+/// unoptimized build: measured on the `fast` profile, 2 MiB and 2.5 MiB
+/// both overflowed and the first size that passed was 2.75 MiB. An
+/// overflow is an abort with no error envelope, which is the worst
+/// failure a caller can get: `donsetch mcp` killed the whole session on
+/// the first fetch while the same fetch through the CLI was fine, because
+/// the CLI runs on the 8 MiB main thread. Workers get what the main thread
+/// already has, so the same work cannot be fine on one path and fatal on
+/// the other. Reserved, not committed: the pages are only touched as they
+/// are used.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("donsetch: cannot start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    rt.block_on(run());
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
@@ -92,6 +121,24 @@ async fn main() {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
+    }
+
+    // `--help`/`-h` right after a command name always means HELP, never a
+    // run. The spec-driven tools plus keys/proxy/login/adapters carry their
+    // own help; every other management command used to EXECUTE on the flag
+    // (`status --help` printed the status, `doctor --help` ran the whole
+    // health check, `update --help` checked the network, `rollback --help`
+    // touched the install, `mcp --help` opened a daemon on stdin). Route
+    // them to the same help text `donsetch help <cmd>` prints, before any
+    // dispatch or config load.
+    if matches!(args.get(2).map(String::as_str), Some("--help" | "-h"))
+        && !matches!(
+            cmd,
+            "fetch" | "search" | "crawl" | "screenshot" | "keys" | "proxy" | "login" | "adapters"
+        )
+    {
+        route_help(cmd).await;
+        return;
     }
 
     // Every command hard-fails on a broken config (the lazy fallback
@@ -119,7 +166,6 @@ async fn main() {
         // ── Management ──
         "config" => {
             config_cli(&args);
-            return;
         }
         "mcp" => {
             // Transport selection: the --http flag wins, then the
@@ -352,6 +398,13 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch tools");
             println!();
             println!("  Prints the tool schemas as JSON (same as MCP tools/list).");
+        }
+        "stop" => {
+            println!("Usage: donsetch stop");
+            println!();
+            println!("  Kills orphaned Chrome instances and cleans stale ghost locks and");
+            println!("  temp profiles. Run after a hard interrupt; harmless when there is");
+            println!("  nothing to clean.");
         }
         _ => {
             cli::tool::print_top_help();

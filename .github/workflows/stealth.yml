@@ -75,8 +75,12 @@ jobs:
           # verbatim, and PCRE's \K resets the match start. (A
           # double backslash here asks grep for a literal backslash
           # and matches nothing, leaving PINNED empty.)
-          PINNED=$(grep -oP 'chrome-\K[0-9]+' src/profile/mod.rs | head -1)
-          echo "pinned profile chrome-$PINNED, current Chromium stable $LATEST"
+          # Since upstream 4.2.3 the wire version follows the detected
+          # browser (BrowserProfile::name is dynamic), so the anchor is
+          # the capture constant `Self::chrome(150, ...)`, not a
+          # literal chrome-N label (those now only appear in docs).
+          PINNED=$(grep -oP 'Self::chrome\(\K[0-9]+' src/profile/mod.rs | head -1)
+          echo "capture pinned to Chrome $PINNED, current Chromium stable $LATEST"
           GAP=$((LATEST - PINNED))
           if [ "$GAP" -eq 0 ]; then
             echo "  profile is current."

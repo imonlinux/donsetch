@@ -115,6 +115,11 @@ section!(FetchSection {
     ocr_max_pages: u32 = 25,
     resume_ttl_secs: u64 = 7200,
     host_pace_file: bool = true,
+    /// How long a resolved name is reused in-process, in seconds. The
+    /// host resolver is a network round trip on a box without a local
+    /// caching daemon, and one fetch asks for the same name twice (the
+    /// SSRF guard, then the connect). 0 disables the cache.
+    dns_cache_ttl_secs: u64 = 30,
 });
 
 section!(BypassSection {
@@ -1594,6 +1599,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "true",
             "cross-process per-host politeness file for crawls",
         ),
+        (
+            "fetch",
+            "dns_cache_ttl_secs",
+            FieldKind::Int,
+            "30",
+            "seconds a resolved name is reused in-process; 0 disables",
+        ),
         // bypass
         (
             "bypass",
@@ -1894,7 +1906,20 @@ const RESERVED_VARS: &[&str] = &[
     "DONSETCH_NO_CONFIG_FILE",
     "DONSETCH_PLUGIN",
     "DONSETCH_DEBUG",
+    "DONSETCH_NO_UPDATE_CHECK",
+    "DONSETCH_INSTALL_TAG",
+    "DONSETCH_RELEASES_BASE",
+    "DONSETCH_SKIP_DOWNLOAD",
+    "DONSETCH_FORCE_GLIBC",
     "BLESS_MCP_FIXTURES",
+    // Build metadata baked by build.rs. cargo passes these in the env it
+    // runs the binary with, so `cargo run` printed "ignoring
+    // DONSETCH_FEATURES: expected DONSETCH_<SECTION>__<KEY>" for each
+    // one. They are not knobs and never were (#258).
+    "DONSETCH_FEATURES",
+    "DONSETCH_GIT_HASH",
+    "DONSETCH_PDFIUM",
+    "DONSETCH_TARGET",
 ];
 
 const LEGACY_VARS: &[&str] = &[
@@ -2629,8 +2654,8 @@ mod tests {
         let prefixes = [
             "DONSETCH_",
             "DONSEEK_",
-            "DONGHOST_",
             "DONSHEET_",
+            "DONGHOST_",
             "DONSIFT_",
             "CLOAKBROWSER_",
         ];
@@ -3690,6 +3715,40 @@ mod tests {
         }
         assert_eq!(boolish("maybe"), None);
         assert_eq!(boolish(""), None);
+    }
+
+    #[test]
+    fn build_metadata_env_vars_are_not_config_knobs() {
+        // `cargo run` puts build.rs' cargo:rustc-env values into the
+        // environment it runs the binary with, so the config layer used
+        // to print "ignoring DONSETCH_FEATURES: expected
+        // DONSETCH_<SECTION>__<KEY>" for each one (#258). They carry no
+        // section and no key, and they never were knobs.
+        let (map, warnings, errors) = new_env_layer_from([
+            (
+                std::ffi::OsString::from("DONSETCH_FEATURES"),
+                std::ffi::OsString::from("ocr,rerank,http"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_GIT_HASH"),
+                std::ffi::OsString::from("deadbeefcafe"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_PDFIUM"),
+                std::ffi::OsString::from("bundled, v1"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_TARGET"),
+                std::ffi::OsString::from("x86_64-unknown-linux-gnu"),
+            ),
+        ]);
+
+        assert!(map.is_empty(), "build metadata is not a setting");
+        assert!(
+            warnings.is_empty(),
+            "no warning may name build metadata: {warnings:?}"
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[cfg(unix)]
