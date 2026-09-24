@@ -678,7 +678,8 @@ impl EgressPool {
 
     /// Sticky fetch lane for a host. First call picks and
     /// remembers; later calls return the same exit while it
-    /// stays alive and unburned for this host. Direct is last
+    /// stays alive and unburned for this host. Among equally-clean
+    /// lanes the lowest measured RTT wins. Direct is last
     /// resort only (protect the home IP).
     pub fn pick_fetch(&self, host: &str, direct_ok: bool) -> Option<Egress> {
         if host.is_empty() {
@@ -706,9 +707,13 @@ impl EgressPool {
         }
         // Prefer a healthy, non-dead proxy that is not burned for
         // this host and not exclusively bound to another persona.
-        // Unknown RTT counts as healthy (optimistic, matches pick()).
+        // Unknown RTT counts as healthy (optimistic, matches pick());
+        // among equally-ranked lanes the lowest measured RTT wins, so a
+        // clean-but-slow lane in file order can never shadow a fast one
+        // (first-healthy-wins made lane 1 the exit for every new host).
         let mut best: Option<&Egress> = None;
         let mut best_score = 0u8;
+        let mut best_rtt = f64::MAX;
         for e in &self.egresses {
             if e.proxy.is_none() {
                 continue;
@@ -731,9 +736,11 @@ impl EgressPool {
             } else {
                 2
             };
-            if score > best_score {
+            let rtt = self.rtt_ms(&e.id).unwrap_or(f64::MAX);
+            if score > best_score || (best.is_some() && score == best_score && rtt < best_rtt) {
                 best = Some(e);
                 best_score = score;
+                best_rtt = rtt;
             }
         }
         if let Some(e) = best {
@@ -1124,6 +1131,27 @@ mod pacing_tests {
         pool.report_dead(&id1);
         let eg = pool.pick_fetch("example.com", false).expect("live lane");
         assert_ne!(eg.id, id1, "dead lane must never be assigned to fetch");
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn pick_fetch_prefers_the_lowest_rtt_clean_lane() {
+        let dir = isolate_cache("rtt-order");
+        let p1 = Proxy::parse("http://127.0.0.1:24021").unwrap();
+        let p2 = Proxy::parse("http://127.0.0.1:24022").unwrap();
+        let (id1, id2) = (p1.id(), p2.id());
+        let pool = EgressPool::new(vec![p1, p2]);
+        // Both lanes clean (under the slow threshold); lane 1 is slower.
+        pool.observe_rtt(&id1, std::time::Duration::from_millis(900));
+        pool.observe_rtt(&id2, std::time::Duration::from_millis(120));
+        let lane = pool.pick_fetch("example.com", false).expect("lane");
+        assert_eq!(
+            lane.id, id2,
+            "the faster clean lane must win; file order is only a tie-break"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
             std::env::remove_var("DONSETCH_CACHE_DIR");

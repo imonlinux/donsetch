@@ -6,7 +6,7 @@
 
 use scraper::{ElementRef, Html, Selector};
 
-use crate::extract::{ContentKind, ExtractOptions, Extracted};
+use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
     if opts.selector.is_some() {
@@ -18,9 +18,18 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     if !host.ends_with(".wikipedia.org") {
         return None;
     }
-    // Article pages only (/wiki/<title>, not /wiki/Special:...).
+    // Article pages only (/wiki/<title>). A colon inside a title is
+    // fine ("Star Trek: The Original Series" is an article); a
+    // NAMESPACE prefix (File:, Talk:, Special:, ...) is not. The
+    // old blanket `contains(':')` skipped every colon-titled
+    // article's infobox.
     let title = u.path().strip_prefix("/wiki/")?;
-    if title.is_empty() || title.contains(':') || u.path().contains("Special:") {
+    if title.is_empty() {
+        return None;
+    }
+    if let Some((prefix, _)) = title.split_once(':')
+        && is_namespace(prefix)
+    {
         return None;
     }
 
@@ -79,7 +88,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let body = doc.select(&body_sel).next()?;
     let mut body_opts = opts.clone();
     body_opts.max_chars = None; // paginate once, below, after prepending
-    let body_md = render_blocks(body, url, &body_opts);
+    let body_md = render_markdown_blocks(body, url, &body_opts);
 
     let mut full = md;
     full.push_str(&body_md);
@@ -109,6 +118,42 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         fingerprint: None,
         via: Some("adapter:wikipedia-infobox"),
     })
+}
+
+/// The MediaWiki namespace prefixes that are never articles
+/// (case-insensitive: `file:` and `File:` name the same namespace).
+fn is_namespace(prefix: &str) -> bool {
+    const NS: [&str; 28] = [
+        "media",
+        "special",
+        "talk",
+        "user",
+        "user talk",
+        "wikipedia",
+        "wikipedia talk",
+        "file",
+        "file talk",
+        "mediawiki",
+        "mediawiki talk",
+        "template",
+        "template talk",
+        "help",
+        "help talk",
+        "category",
+        "category talk",
+        "portal",
+        "portal talk",
+        "draft",
+        "draft talk",
+        "timedtext",
+        "module",
+        "module talk",
+        "gadget",
+        "gadget definition",
+        "book",
+        "education program",
+    ];
+    NS.contains(&prefix.to_lowercase().as_str())
 }
 
 /// Field value: text + links made readable ("Berlin, Germany"),
@@ -154,7 +199,9 @@ fn field_value(td: ElementRef) -> String {
 }
 
 fn plain_text(el: ElementRef) -> String {
-    el.text().collect::<String>().trim().to_string()
+    // Visible text only: a script/style subtree inside the element is
+    // source, not content (#288).
+    inline::visible_text_raw(el).trim().to_string()
 }
 
 /// Page furniture, checked on the element itself (selecting
@@ -175,9 +222,11 @@ fn is_furniture(el: ElementRef) -> bool {
     }
 }
 
-/// Minimal block walk over the article body: headings, paragraphs,
+/// Minimal block walk over an article body: headings, paragraphs,
 /// lists, tables, code : furniture skipped at the element level.
-fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
+/// Shared with the reddit wiki renderer (a wiki page is a whole
+/// document, not one paragraph).
+pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
     let mut out = String::new();
     let mut opts = opts.clone();
     opts.include_links = true; // interwiki links are the point of wiki
@@ -189,7 +238,7 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
             continue;
         }
         match el.value().name() {
-            "h2" | "h3" | "h4" => {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let t = plain_text(el);
                 if !t.is_empty() {
                     let level = el.value().name().as_bytes()[1] - b'0';
@@ -222,7 +271,7 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
             }
             "div" | "section" => {
                 // Recurse one level (gallery, columns…).
-                let inner = render_blocks(el, url, &opts);
+                let inner = render_markdown_blocks(el, url, &opts);
                 if !inner.is_empty() {
                     out.push_str(&inner);
                 }
@@ -323,6 +372,29 @@ mod tests {
         // No infobox → no adapter.
         let plain = "<html><body><div class='mw-parser-output'><p>text</p></div></body></html>";
         assert!(extract(plain, "https://en.wikipedia.org/wiki/Plain", &opts()).is_none());
+    }
+
+    // A colon in an article title is not a namespace: the blanket
+    // check skipped every such article's infobox.
+    #[test]
+    fn colon_articles_keep_the_infobox_namespaces_do_not() {
+        let ex = extract(
+            WIKI,
+            "https://en.wikipedia.org/wiki/Star_Trek:_The_Original_Series",
+            &opts(),
+        )
+        .expect("colon titles are articles");
+        assert!(ex.markdown.contains("## Infobox"));
+        for ns in [
+            "Talk:Rust",
+            "File:Example.jpg",
+            "Category:Programming_languages",
+            "Wikipedia:About",
+            "Special:Search",
+        ] {
+            let url = format!("https://en.wikipedia.org/wiki/{ns}");
+            assert!(extract(WIKI, &url, &opts()).is_none(), "{ns}");
+        }
     }
 
     #[test]

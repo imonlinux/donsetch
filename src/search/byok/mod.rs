@@ -127,6 +127,66 @@ pub(super) fn err_body(text: &str) -> String {
     text.chars().take(ERR_BODY_CAP).collect()
 }
 
+/// Parse a provider response body with the diagnostics the inline
+/// `parse error: {e}` used to drop (#286). Three outcomes, each
+/// named: an empty body (plausible upstream behaviour for several
+/// providers, which used to surface as a bare JSON "EOF" error), a
+/// malformed body (the message carries the HTTP status and the byte
+/// count), and a valid parse.
+pub(super) fn parse_provider_json(status: u16, text: &str) -> Result<serde_json::Value, KeyError> {
+    if text.trim().is_empty() {
+        return Err(KeyError::UnknownError(format!(
+            "empty body at HTTP {status}"
+        )));
+    }
+    serde_json::from_str(text).map_err(|e| {
+        KeyError::UnknownError(format!(
+            "parse error at HTTP {status}, {} bytes: {e}",
+            text.len()
+        ))
+    })
+}
+
+/// A one-line summary of a BYOK exhaustion error for the visible
+/// degraded trail (#285): "brightdata parse error at HTTP 200" on the
+/// search line, where the full diagnostic would not fit. The shape is
+/// built by `search()` ("all keys exhausted: <provider>: <detail>" or
+/// "all providers exhausted after N attempts: ..."); anything
+/// unrecognized passes through, bounded, so a future error never
+/// disappears from the trail.
+pub(crate) fn compact_failure(err: &str) -> String {
+    let rest = err
+        .strip_prefix("all keys exhausted: ")
+        .or_else(|| {
+            err.split_once(" attempts: ")
+                .filter(|(head, _)| head.starts_with("all providers exhausted"))
+                .map(|(_, rest)| rest)
+        })
+        .unwrap_or(err);
+    let (provider, detail) = match rest.split_once(": ") {
+        Some((p, d)) => (p, d),
+        None => ("", rest),
+    };
+    // A plugin failure's detail repeats its own name ("plugin
+    // <name>: exited with status 1"); drop the echo.
+    let detail = detail
+        .strip_prefix(&format!("plugin {provider}: "))
+        .unwrap_or(detail);
+    let short: String = detail
+        .split([',', ';'])
+        .next()
+        .unwrap_or(detail)
+        .trim()
+        .chars()
+        .take(60)
+        .collect();
+    if provider.is_empty() {
+        short
+    } else {
+        format!("{provider} {short}")
+    }
+}
+
 impl std::fmt::Display for KeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -221,7 +281,9 @@ impl ByokSearcher {
 
     /// True if at least one keyed provider or plugin exists.
     pub fn is_configured(&self) -> bool {
-        self.store.is_configured() || self.plugins.is_configured()
+        // Search-scoped: a store holding only fetch-side keys
+        // (unlocker) is not a configured search (#284).
+        self.store.has_search_providers() || self.plugins.is_configured()
     }
 
     /// True if "local" is the default search method.
@@ -902,5 +964,52 @@ mod tests {
         );
         assert_eq!(outcome.report[0].hits, 0);
         assert_eq!(outcome.report[1].status, "ok");
+    }
+
+    // #286: the helpers keep what the inline code dropped.
+    #[test]
+    fn parse_provider_json_names_empty_and_malformed_bodies() {
+        let v = parse_provider_json(200, "{\"ok\":1}").expect("valid json");
+        assert_eq!(v["ok"], 1);
+        let e = parse_provider_json(200, "").unwrap_err();
+        assert!(e.to_string().contains("empty body at HTTP 200"), "{e}");
+        let e = parse_provider_json(200, "<html>nope</html>").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("parse error at HTTP 200"), "{msg}");
+        assert!(msg.contains("17 bytes"), "{msg}");
+    }
+
+    // #285: the degraded line reads "<provider> <reason>".
+    #[test]
+    fn compact_failure_shapes_one_line() {
+        assert_eq!(
+            compact_failure("all keys exhausted: brightdata: parse error"),
+            "brightdata parse error"
+        );
+        assert_eq!(
+            compact_failure(
+                "all keys exhausted: serper: parse error at HTTP 200, 0 bytes: EOF while parsing a value"
+            ),
+            "serper parse error at HTTP 200"
+        );
+        assert_eq!(
+            compact_failure(
+                "all providers exhausted after 20 attempts: tavily: HTTP 500: upstream"
+            ),
+            "tavily HTTP 500: upstream"
+        );
+        assert_eq!(
+            compact_failure("all keys exhausted: serper: empty results"),
+            "serper empty results"
+        );
+        // A plugin detail that echoes its own name is trimmed, and
+        // an inner "status: N" survives (only commas/semicolons
+        // bound the clause).
+        assert_eq!(
+            compact_failure(
+                "all keys exhausted: badplugin: plugin badplugin: exited with status exit status: 1"
+            ),
+            "badplugin exited with status exit status: 1"
+        );
     }
 }

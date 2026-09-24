@@ -334,7 +334,13 @@ fn is_target_ok(target: &str) -> Result<(), String> {
     if u.fragment().is_some() {
         return Err("target must not contain a fragment".to_string());
     }
-    if u.path().contains("{path}") || target.matches("{path}").count() != 1 {
+    // Exactly one placeholder, and it belongs in the path: a
+    // placeholder pulled into the host fails the DNS-host gate
+    // above, and port / userinfo / query / fragment are rejected
+    // above. (The parser percent-encodes braces in the path, so
+    // this count runs on the raw template, exactly like the
+    // substitution in `apply` does.)
+    if target.matches("{path}").count() != 1 {
         return Err("target must contain exactly one {{path}} in its path".to_string());
     }
     Ok(())
@@ -456,6 +462,11 @@ mod tests {
         );
         // not a URL
         assert!(p(json!({"name":"a","hosts":["b.io"],"target":"please"})).is_err());
+        // pre-encoded placeholder: not the token substitution looks
+        // for.
+        assert!(
+            p(json!({"name":"a","hosts":["b.io"],"target":"https://b.io/a%7Bpath%7Db"})).is_err()
+        );
     }
 
     #[test]

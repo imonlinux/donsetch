@@ -82,6 +82,29 @@ const NEGATIVE_SUBSTR: &[&str] = &[
 
 const NEGATIVE_EXACT: &[&str] = &["nav", "menu", "sign-up", "sign-in"];
 
+/// Ad-slot containers: a hard skip. Reddit's in-feed ad post is a
+/// custom element (`shreddit-ad-post`), and the exact class/id
+/// tokens below cover the common wrappers. Exact tokens only: as
+/// substrings, "ads" would match "loads" and "ad" matches
+/// "shadow". Never a hard skip when the element itself carries a
+/// positive content token: some themes nest an ad inside a content
+/// card (#288).
+const AD_TAG_PREFIX: &str = "shreddit-ad";
+const AD_EXACT: &[&str] = &[
+    "ads",
+    "adsbygoogle",
+    "advert",
+    "advertisement",
+    "ad-slot",
+    "ad-unit",
+    "ad-container",
+    "ad-wrapper",
+    "ad-placement",
+    "sponsored-post",
+    "promoted-post",
+    "native-ad",
+];
+
 /// Class/id fragments that mark real content (exact token match,
 /// lowercased, separators normalized).
 pub const POSITIVE: &[&str] = &[
@@ -147,6 +170,15 @@ pub fn skip(el: ElementRef<'_>) -> bool {
     if SKIP_TAGS.contains(&name) {
         // <svg> can embed MathML-adjacent content, but <math>
         // itself is never junk : the formula is content.
+        return true;
+    }
+    // Ad slots are not content (#288): a reddit in-feed ad post or a
+    // common ad wrapper never ships as prose. Exact tokens only, and
+    // an element with its own positive content token wins.
+    if name.starts_with(AD_TAG_PREFIX) {
+        return true;
+    }
+    if !is_positive(e) && tokens(e).iter().any(|t| AD_EXACT.contains(&t.as_str())) {
         return true;
     }
     if name == "math" {
@@ -258,4 +290,43 @@ pub fn text_size(el: ElementRef<'_>, cap: usize) -> usize {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod ad_slot_tests {
+    use super::*;
+    use scraper::Html;
+
+    fn skipped(html: &str) -> bool {
+        let document = Html::parse_fragment(html);
+        let root = document.root_element();
+        let el = root.children().filter_map(ElementRef::wrap).next().unwrap();
+        skip(el)
+    }
+
+    // #288: ad slots never ship as content.
+    #[test]
+    fn ad_slots_are_skipped() {
+        assert!(skipped(
+            "<shreddit-ad-post><div>Deals are BACK, baby</div></shreddit-ad-post>"
+        ));
+        assert!(skipped(
+            "<div class=\"ad-container\"><a>Learn More</a></div>"
+        ));
+        assert!(skipped("<div id=\"adsbygoogle\">x</div>"));
+        assert!(skipped("<div class=\"sponsored-post\">Buy</div>"));
+        // Ordinary content mentioning ads, or classes that merely
+        // contain the letters, is not an ad slot.
+        assert!(!skipped(
+            "<div class=\"article-body\"><p>About ads</p></div>"
+        ));
+        assert!(!skipped("<div class=\"loads shadow\"><p>x</p></div>"));
+        // An element with its own positive content token keeps its
+        // content role.
+        assert!(!skipped("<div class=\"content ad-container\">x</div>"));
+        // Existing semantics untouched.
+        assert!(skipped("<script>var x</script>"));
+        assert!(skipped("<style>.x{}</style>"));
+        assert!(!skipped("<p>hello</p>"));
+    }
 }

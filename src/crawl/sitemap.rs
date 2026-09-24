@@ -99,17 +99,60 @@ impl Robots {
         let mut best_dis = 0usize;
         let mut best_allow = 0usize;
         for d in &self.disallow {
-            if path.starts_with(d.as_str()) && d.len() > best_dis {
+            if rule_matches(d, path) && d.len() > best_dis {
                 best_dis = d.len();
             }
         }
         for a in &self.allow {
-            if path.starts_with(a.as_str()) && a.len() > best_allow {
+            if rule_matches(a, path) && a.len() > best_allow {
                 best_allow = a.len();
             }
         }
         best_allow >= best_dis
     }
+}
+
+/// RFC 9309 §2.2.3 rule matching: the rule is a path prefix, `*`
+/// matches any run of characters, and a trailing `$` anchors the
+/// end. Plain prefix matching read `/*.pdf$` and `/*?` literally, so
+/// they matched nothing and respect_robots fetched what the site
+/// had disallowed. Iterative two-pointer wildcard match: O(n·m) on a
+/// hostile rule, never exponential (both strings are attacker text).
+fn rule_matches(rule: &str, path: &str) -> bool {
+    // An unanchored rule is a prefix: the same as `rule*` matched
+    // against the whole path.
+    let pat: Vec<u8> = match rule.strip_suffix('$') {
+        Some(r) => r.as_bytes().to_vec(),
+        None => {
+            let mut v = rule.as_bytes().to_vec();
+            v.push(b'*');
+            v
+        }
+    };
+    let (p, t) = (pat.as_slice(), path.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // The last `*` seen and the text position it is currently
+    // assumed to cover up to; on a mismatch the star eats one more.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// One sitemap URL entry.
@@ -128,6 +171,13 @@ pub struct SitemapEntry {
 /// Streaming sitemap parser: finds `<url>`/`<sitemap>` blocks
 /// and lifts `<loc>` + `<lastmod>` from each. Tolerates stray
 /// namespace prefixes and junk between tags.
+/// sitemaps.org caps a <loc> at 2048 characters; a lastmod is a W3C
+/// datetime. Anything past that is not a sitemap entry, and one
+/// 64 MiB <loc> per file × 32 files was 2 GiB of Strings held by the
+/// map, the frontier, the IDF table and the resume token.
+const MAX_LOC_LEN: usize = 2048;
+const MAX_LASTMOD_LEN: usize = 64;
+
 pub fn parse_sitemap(xml: &str, out: &mut Vec<SitemapEntry>, cap: usize) {
     let b = xml.as_bytes();
     let mut pos = 0usize;
@@ -139,8 +189,8 @@ pub fn parse_sitemap(xml: &str, out: &mut Vec<SitemapEntry>, cap: usize) {
             break;
         };
         let block = &xml[tag_off..end];
-        if let Some(loc) = extract_tag(block, "loc") {
-            let lastmod = extract_tag(block, "lastmod");
+        if let Some(loc) = extract_tag(block, "loc").filter(|l| l.len() <= MAX_LOC_LEN) {
+            let lastmod = extract_tag(block, "lastmod").filter(|l| l.len() <= MAX_LASTMOD_LEN);
             // A hostile <priority>NaN</priority> must not reach the
             // frontier score: serde_json serializes non-finite floats
             // as null, and a resume token carrying one would then
@@ -235,7 +285,12 @@ fn xml_text(raw: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(semi) = rest.find(';').filter(|&s| s <= 10) else {
+        // Look for the ';' inside the entity window only. Searching
+        // the whole remainder and filtering afterwards rescanned to
+        // the end on every '&' that has no ';' behind it, O(n²) on a
+        // <loc> made of '&'s: a 64 MiB gz-bombed sitemap held the
+        // worker for hours. ';' is ASCII, so the index is a boundary.
+        let Some(semi) = rest.as_bytes().iter().take(11).position(|&b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -383,7 +438,7 @@ fn absorb(text: String, queue: &mut Vec<String>, entries: &mut Vec<SitemapEntry>
         // publishes sitemap.txt).
         for line in text.lines().take(10_000) {
             let u = line.trim();
-            if u.starts_with("http") {
+            if u.starts_with("http") && u.len() <= MAX_LOC_LEN {
                 here.push(SitemapEntry {
                     loc: u.to_string(),
                     lastmod: None,
@@ -418,6 +473,49 @@ mod tests {
         assert!(!r.allowed("/private"));
         assert!(r.allowed("/ok"));
         assert_eq!(r.crawl_delay, Some(2.0));
+    }
+
+    // RFC 9309 §2.2.3: `*` and `$` are required. Plain prefix
+    // matching took them literally, so these rules never matched.
+    #[test]
+    fn robots_wildcard_and_end_anchor_rules_match() {
+        let r = Robots::parse(
+            "User-agent: *\nDisallow: /*.pdf$\nDisallow: /*?\nDisallow: /private*/\nDisallow: /tmp$\nAllow: /public/*.pdf$\n",
+            "ex.com",
+        );
+        assert!(!r.allowed("/x/y.pdf"));
+        assert!(r.allowed("/x/y.pdfx"), "$ anchors the end");
+        assert!(!r.allowed("/search?q=1"));
+        assert!(r.allowed("/search"));
+        assert!(!r.allowed("/private-docs/a"));
+        assert!(!r.allowed("/private/a"));
+        assert!(r.allowed("/priv/a"));
+        assert!(!r.allowed("/tmp"));
+        assert!(r.allowed("/tmpfile"), "anchored rule does not prefix-match");
+        assert!(r.allowed("/public/a.pdf"), "the longer Allow wins");
+        // Prefix semantics are unchanged for plain rules.
+        assert!(rule_matches("/a", "/a/b"));
+        assert!(!rule_matches("/a/b", "/a"));
+        assert!(rule_matches("/", "/anything"));
+        assert!(rule_matches("/*", "/"));
+        assert!(rule_matches("/a*", "/a"));
+        assert!(rule_matches("/a**b*", "/axxbyy"));
+        assert!(!rule_matches("/a*b$", "/axxbyy"));
+    }
+
+    // Both strings are attacker text: a rule of many stars against a
+    // long path must not backtrack exponentially.
+    #[test]
+    fn robots_wildcard_matching_is_polynomial() {
+        let rule = format!("/{}b", "*a".repeat(30));
+        let path = format!("/{}", "a".repeat(3000));
+        let started = std::time::Instant::now();
+        assert!(!rule_matches(&rule, &path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -494,6 +592,64 @@ mod tests {
             ]
         );
         assert_eq!(out[0].lastmod.as_deref(), Some("2026-01-02"));
+    }
+
+    // Every '&' without a ';' behind it rescanned the remainder: a
+    // 2M-'&' text took minutes. Linear now.
+    #[test]
+    fn xml_text_is_linear_on_ampersands_without_semicolons() {
+        // Judged by growth, not by the clock: a wall-clock bound
+        // flaked under load, and what matters is that ten times the
+        // input costs about ten times the work, not a hundred.
+        fn timed(raw: &str) -> std::time::Duration {
+            let started = std::time::Instant::now();
+            let out = xml_text(raw);
+            assert_eq!(out, raw);
+            started.elapsed()
+        }
+        let small = timed(&"&".repeat(200_000));
+        let big = timed(&"&".repeat(2_000_000));
+        let ratio = big.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 40.0,
+            "10x the input took {ratio:.1}x the time (quadratic)"
+        );
+        // A ';' far past the entity window must not rescue it either.
+        let small = timed(&format!("{};", "&".repeat(100_000)));
+        let big = timed(&format!("{};", "&".repeat(1_000_000)));
+        let ratio = big.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 40.0,
+            "10x the input took {ratio:.1}x the time (quadratic)"
+        );
+    }
+
+    #[test]
+    fn oversized_loc_and_lastmod_are_not_entries() {
+        let long = "x".repeat(MAX_LOC_LEN + 1);
+        let ok = "x".repeat(MAX_LOC_LEN - 20);
+        let xml = format!(
+            "<urlset><url><loc>https://ex.com/{long}</loc></url>\
+             <url><loc>https://ex.com/{ok}</loc><lastmod>{long}</lastmod></url></urlset>"
+        );
+        let mut out = Vec::new();
+        parse_sitemap(&xml, &mut out, 100);
+        assert_eq!(out.len(), 1, "the over-long loc is not an entry");
+        assert!(out[0].loc.ends_with(&ok));
+        assert_eq!(
+            out[0].lastmod, None,
+            "an over-long lastmod is dropped, the entry kept"
+        );
+
+        let mut queue = Vec::new();
+        let mut entries = Vec::new();
+        absorb(
+            format!("https://ex.com/{long}\nhttps://ex.com/a\n"),
+            &mut queue,
+            &mut entries,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].loc, "https://ex.com/a");
     }
 
     #[test]

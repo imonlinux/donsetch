@@ -30,12 +30,9 @@ fn sel(css: &str) -> Selector {
 }
 
 fn text(el: scraper::ElementRef) -> String {
-    el.text()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Visible text only: a script/style subtree in a SERP cell is
+    // source, never snippet text (#288's class, search side).
+    crate::extract::inline::visible_text(el)
 }
 
 fn first_http_href(root: scraper::ElementRef) -> Option<String> {
@@ -364,5 +361,29 @@ mod tests {
         </div></div>
         "#;
         assert!(parse_instant("bing", html).is_none());
+    }
+}
+
+#[cfg(test)]
+mod visible_text_guard_tests {
+    use super::*;
+
+    // #288's class, search side: a script/style subtree inside a SERP
+    // cell is source, never snippet text.
+    #[test]
+    fn snippets_never_carry_script_text() {
+        let doc = Html::parse_fragment(
+            "<div>Result title<style>.r { color: red; }</style> and body</div>",
+        );
+        let root = doc.root_element();
+        let el = root
+            .children()
+            .filter_map(scraper::ElementRef::wrap)
+            .next()
+            .unwrap();
+        let t = text(el);
+        assert!(!t.contains("color: red"), "{t}");
+        assert!(t.contains("Result title"), "{t}");
+        assert!(t.contains("and body"), "{t}");
     }
 }

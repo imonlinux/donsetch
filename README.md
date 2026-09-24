@@ -18,7 +18,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
 
-[Why](#-why-its-different) · [Demo](#-demo) · [Sponsors](#-sponsors) · [Install](#-install) · [Quickstart](#-quickstart) · [The 4 tools](#-the-4-tools) · [Fetch](#-fetch) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Stealth](#-stealth-chrome-tls-not-chrome-like) · [Compare](#-how-it-compares) · [Limits](#-gotchas--honest-limits) · [CLI](#-cli)
+[Why](#-why-its-different) · [Demo](#-demo) · [Sponsors](#-our-sponsors) · [Install](#-install) · [Quickstart](#-quickstart) · [The 4 tools](#-the-4-tools) · [Fetch](#-fetch) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Stealth](#-stealth-chrome-tls-not-chrome-like) · [Compare](#-how-it-compares) · [Limits](#-gotchas--honest-limits) · [CLI](#-cli)
 
 </div>
 
@@ -70,15 +70,25 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 *(Pi agent session: live research with DonSeTch as a native extension)*
 
-## 💛 Sponsors
+## 💛 Our Sponsors
+
+<div align="center">
+
+<a href="https://fluxionai.world/register?source=github&campaign=github-donsetch&promo=DONSETCH"><img src="assets/sponsors/fluxion-ai-partner-banner.png" alt="Fluxion AI: one gateway to the world's leading AI models. Get $3 in API credit through the DonSeTch partner link." width="100%"></a>
+
+**Fluxion AI** provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing, and get $3 in API credits when you sign up through [this link](https://fluxionai.world/register?source=github&campaign=github-donsetch&promo=DONSETCH).
+
+</div>
+
+## 🤝 Sponsor this project
 
 DonSeTch is free and open source, and stays that way. Sponsorship pays for the time it takes to keep shipping.
 
 | Tier | Price | What you get |
 |---|---|---|
-| 🥉 Bronze | $10/mo | Name + link in the Sponsors section |
-| 🥈 Silver | $25/mo | Small logo + link in the Sponsors section |
-| 🥇 Gold | $49/mo | Large logo + link, pinned at the top of the Sponsors section |
+| 🥉 Bronze | $10/mo | Name + link in Our Sponsors |
+| 🥈 Silver | $25/mo | Small logo + link in Our Sponsors |
+| 🥇 Gold | $49/mo | Large logo + link, pinned at the top of Our Sponsors |
 
 Prepaid monthly, cancel anytime. One-time sponsorships are welcome at any amount.
 

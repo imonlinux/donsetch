@@ -200,12 +200,18 @@ async fn ghost_cmd(args: &[String]) {
             g.kill().await;
         }
         "render" => {
-            let url = args.get(1).expect("usage: ghost render <url>");
+            let url = args
+                .get(1)
+                .expect("usage: ghost render <url> [htmldump] [mddump]");
             let mut g = ghost::Ghost::launch(&profile, None).await.expect("launch");
             let html = ghost::ops::render(&mut g, url, std::time::Duration::from_secs(30))
                 .await
                 .expect("render");
             println!("rendered {} bytes", html.len());
+            if let Some(p) = args.get(2) {
+                std::fs::write(p, &html).expect("write htmldump");
+                eprintln!("dom -> {p}");
+            }
             let ex = extract::extract(
                 html.as_bytes(),
                 extract::charset::GHOST_TEXT_CT,
@@ -213,6 +219,10 @@ async fn ghost_cmd(args: &[String]) {
                 &extract::ExtractOptions::default(),
             )
             .expect("extract");
+            if let Some(p) = args.get(3) {
+                std::fs::write(p, &ex.markdown).expect("write mddump");
+                eprintln!("markdown -> {p}");
+            }
             print!("{}", &ex.markdown[..ex.markdown.len().min(2000)]);
             eprintln!(
                 "--- thin={} kind={:?} blocks={}",

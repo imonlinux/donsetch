@@ -311,6 +311,32 @@ pub struct GhostPage {
     pub took: Duration,
 }
 
+/// Settle floor for small DOMs: the SPA hydration guard.
+///
+/// SPAs download, parse and execute their bundles asynchronously: a
+/// stable small DOM early in the load is a shell, not a page, so it is
+/// floored at 4s before the content oracle may settle. A document that
+/// carries no `<script` at all cannot hydrate : nothing can grow its DOM
+/// after load : and the floor there is pure latency (example.com is
+/// 559B with zero scripts, complete at t=0). Large DOMs are already
+/// rendered and keep no floor. `lower` is the poll's lowercased HTML.
+fn small_dom_settle_floor(cur_len: usize, lower: &str) -> Duration {
+    if cur_len < 50_000 && can_hydrate(lower) {
+        Duration::from_secs(4)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Whether anything in the document can run after load and grow the
+/// DOM. A `<script` is the usual carrier; an inline load-time handler
+/// (`<body onload="…">`, `<img onerror="…">`) runs script with no
+/// script element at all, so a shell built that way must keep the
+/// floor too. Click-time handlers need a user and are not counted.
+fn can_hydrate(lower: &str) -> bool {
+    lower.contains("<script") || lower.contains("onload=") || lower.contains("onerror=")
+}
+
 /// Unified tier-2 fetch. Success oracle = CONTENT QUALITY,
 /// not wall-clear:
 ///
@@ -525,18 +551,20 @@ pub async fn ghost_fetch(
         // hydration (infinite scroll + viewport-gated render).
         let big_dom = cur_len >= 50_000;
         let visible = visible_text_len(&html);
-        let substantive = visible >= if big_dom { 800 } else { 80 };
+        // An interstitial is never substantive, however much vendor
+        // boilerplate it renders: settling on "Verifying your
+        // browser…" shipped the challenge page as content (issue
+        // #282 case B). Wait for the challenge to clear; a wall
+        // that never clears stays a failure on the timeout path.
+        let interstitial = crate::detect::walls::detect_interstitial(html.as_bytes()).is_some();
+        let substantive = !interstitial && visible >= (if big_dom { 800 } else { 80 });
         if big_dom && visible < 800 && !scrolled && start.elapsed() > Duration::from_secs(8) {
             scrolled = true;
             let _ = ghost.scroll("down", 2400).await;
             continue;
         }
         let stable = prev_len > 0 && cur_len.abs_diff(prev_len) < cur_len / 100 + 64;
-        let min_settle = if cur_len < 50_000 {
-            Duration::from_secs(4)
-        } else {
-            Duration::ZERO
-        };
+        let min_settle = small_dom_settle_floor(cur_len, &lower);
         let past_min = start.elapsed() >= min_settle;
         if substantive && stable && past_min {
             settle_streak += 1;
@@ -783,5 +811,46 @@ mod ghost_fetch_tests {
     fn visible_text_shell_is_tiny() {
         let html = r#"<html><head><script src="app.js"></script></head><body><div id="root"></div></body></html>"#;
         assert!(visible_text_len(html) < 10);
+    }
+
+    #[test]
+    fn settle_floor_scriptless_small_page_is_zero() {
+        let html = "<html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><p>Illustrative example.</p></body></html>";
+        assert_eq!(super::small_dom_settle_floor(559, html), Duration::ZERO);
+    }
+
+    #[test]
+    fn settle_floor_scripted_small_dom_keeps_the_hydration_guard() {
+        let html = r#"<html><head><script src="app.js"></script></head><body><div id="root"></div></body></html>"#;
+        assert_eq!(
+            super::small_dom_settle_floor(8_000, html),
+            Duration::from_secs(4)
+        );
+    }
+
+    // No <script>, but an inline load-time handler runs script all
+    // the same and can build the page after load.
+    #[test]
+    fn settle_floor_inline_load_handler_counts_as_scripted() {
+        let html = r#"<html><body onload="fetch('/app').then(r=>r.text()).then(t=>document.body.innerHTML=t)"><div id="root"></div></body></html>"#;
+        assert_eq!(
+            super::small_dom_settle_floor(200, html),
+            Duration::from_secs(4)
+        );
+        let html = r#"<html><body><img src="x" onerror="document.body.innerHTML='<p>late</p>'"></body></html>"#;
+        assert_eq!(
+            super::small_dom_settle_floor(200, html),
+            Duration::from_secs(4)
+        );
+        // A click handler needs a user: still scriptless for settling.
+        let html =
+            r##"<html><body><a href="#" onclick="return false">x</a><p>static</p></body></html>"##;
+        assert_eq!(super::small_dom_settle_floor(200, html), Duration::ZERO);
+    }
+
+    #[test]
+    fn settle_floor_large_dom_settles_fast() {
+        let html = "<html><head><script>1</script></head><body></body></html>";
+        assert_eq!(super::small_dom_settle_floor(120_000, html), Duration::ZERO);
     }
 }

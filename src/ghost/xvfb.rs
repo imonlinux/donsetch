@@ -17,6 +17,7 @@
 
 #[cfg(linux_like)]
 mod linux {
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     use tokio::process::{Child, Command};
 
@@ -46,8 +47,12 @@ mod linux {
     pub(crate) const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
     pub struct Xvfb {
-        /// None if we reused an existing Xvfb (borrowed: don't kill).
-        pub(crate) child: Option<Child>,
+        /// The reaper that owns an Xvfb we started (None when we
+        /// reused an existing display: borrowed handles never own,
+        /// kill, or wait for it). The reaper wait()s the child out
+        /// the moment it exits, so a dead Xvfb can never linger as
+        /// a zombie, and it is the only thing that kills it.
+        pub(crate) reaper: Option<Reaper>,
         /// The startup gate we created (None when reused). Held for
         /// our lifetime so a second starter knows a coordinator is
         /// alive; removed when we kill the display we own.
@@ -74,7 +79,7 @@ mod linux {
             // Fast path: display already alive, reuse.
             if display_alive().await {
                 return Ok(Self {
-                    child: None,
+                    reaper: None,
                     lock_path: None,
                 });
             }
@@ -92,7 +97,7 @@ mod linux {
                     Err(Gate::Busy) => {
                         if display_alive().await {
                             return Ok(Self {
-                                child: None,
+                                reaper: None,
                                 lock_path: None,
                             });
                         }
@@ -122,7 +127,7 @@ mod linux {
             if display_alive().await {
                 let _ = std::fs::remove_file(lock_path());
                 return Ok(Self {
-                    child: None,
+                    reaper: None,
                     lock_path: None,
                 });
             }
@@ -175,6 +180,18 @@ mod linux {
                 .stderr(Stdio::piped()) // kept for the failure diagnostic
                 .stdin(Stdio::null());
 
+            // Die with the parent: the kernel kills this display when
+            // donsetch dies for ANY reason, SIGKILL included (the OOM
+            // path, a Ctrl-C'd CLI). Without it a hard parent death
+            // orphans the display as PPID 1 forever (issue #280: a
+            // three-day-old `Xvfb :99` owned by nobody on the
+            // reporter's box; the same shape on this one). Same
+            // primitive the browser child already uses.
+            unsafe {
+                cmd.as_std_mut()
+                    .pre_exec(crate::ghost::proc::pdeath_pre_exec);
+            }
+
             let mut child = cmd.spawn().map_err(|e| {
                 let _ = std::fs::remove_file(lock_path());
                 FetchError::ghost(format!(
@@ -208,6 +225,10 @@ mod linux {
                 // permission problem : none of which are fixed by
                 // "install Xvfb").
                 let tail = read_stderr_tail(&mut child).await.unwrap_or_default();
+                // A display that never came up is not this process's
+                // to leave running: no reaper owns the child yet, and
+                // tokio's Child does not kill on drop.
+                let _ = child.kill().await;
                 let _ = std::fs::remove_file(lock_path());
                 return Err(FetchError::ghost(format!(
                     "Xvfb failed to start on {display}{}{}",
@@ -220,7 +241,7 @@ mod linux {
                 eprintln!("[ghost] Xvfb started on {display}");
             }
             Ok(Self {
-                child: Some(child),
+                reaper: Some(spawn_reaper(child)),
                 lock_path: Some(lock_path()),
             })
         }
@@ -229,7 +250,7 @@ mod linux {
         /// instead of starting one. The logs say which, and the field
         /// that knows is private to this module on purpose.
         pub fn is_borrowed(&self) -> bool {
-            self.child.is_none()
+            self.reaper.is_none()
         }
 
         /// The DISPLAY environment value for Chrome.
@@ -237,23 +258,16 @@ mod linux {
             format!(":{}", display_num())
         }
 
-        /// Kill Xvfb (only if we own it). Removes the startup gate so
-        /// the next session is not blocked behind a dead coordinator.
+        /// Kill Xvfb (only if we own it) and wait for the kill and
+        /// reap to finish, so the caller can rely on the display
+        /// being gone on return. Removes the startup gate so the
+        /// next session is not blocked behind a dead coordinator.
         pub async fn kill(mut self) {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill().await;
+            if let Some(reaper) = self.reaper.take() {
+                reaper.shutdown().await;
             }
             if let Some(path) = self.lock_path.take() {
                 let _ = std::fs::remove_file(path);
-            }
-        }
-
-        /// Check if Xvfb process is still alive.
-        #[allow(dead_code)]
-        pub fn is_alive(&mut self) -> bool {
-            match &mut self.child {
-                Some(c) => c.try_wait().map(|r| r.is_none()).unwrap_or(false),
-                None => true, // borrowed : assume alive
             }
         }
     }
@@ -261,11 +275,12 @@ mod linux {
     impl Drop for Xvfb {
         fn drop(&mut self) {
             // Safety net: if the GhostManager is dropped without
-            // calling shutdown() (panic, crash, runtime exit),
-            // the Xvfb child would leak. start_kill sends SIGKILL
-            // synchronously, no async needed.
-            if let Some(child) = &mut self.child {
-                let _ = child.start_kill();
+            // calling shutdown() (panic, crash, runtime exit), the
+            // reaper task still kills the child; a hard process
+            // death is covered by PR_SET_PDEATHSIG on the child
+            // itself (issue #280).
+            if let Some(reaper) = self.reaper.take() {
+                let _ = reaper.kill_tx.send(());
             }
             // Release the gate so a fresh session can coordinate
             // without waiting out the stale-lock recovery window.
@@ -273,6 +288,59 @@ mod linux {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+
+    /// Owns an Xvfb we started, for its whole life.
+    ///
+    /// The handle used to hold `Option<Child>` and never wait() it:
+    /// an Xvfb that died while the process lived sat as a
+    /// `<defunct>` zombie for the rest of that process's life, and
+    /// a hard parent death orphaned the display instead (issue
+    /// #280). One reaper task owns the child now: it wait()s it out
+    /// the moment it exits, and it is the only thing that kills it.
+    pub(crate) struct Reaper {
+        kill_tx: tokio::sync::oneshot::Sender<()>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Reaper {
+        /// Ask for the kill and wait until it happened, so a caller
+        /// can rely on the display being gone.
+        pub(crate) async fn shutdown(self) {
+            let _ = self.kill_tx.send(());
+            let _ = self.handle.await;
+        }
+    }
+
+    /// How often the reaper checks for a kill request or child exit.
+    /// This bounds zombie latency at one tick (unobservable in
+    /// practice); a `select!` over the child and a kill channel
+    /// cannot borrow the child mutably in both arms.
+    const REAP_TICK: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// Spawn the task that owns an Xvfb for its whole life: it
+    /// wait()s the child out (no zombie can outlive it by more than
+    /// one tick) and kills it on request.
+    pub(crate) fn spawn_reaper(mut child: Child) -> Reaper {
+        let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            loop {
+                match kill_rx.try_recv() {
+                    // A request, or a dropped sender (the handle is
+                    // gone; nobody will ever ask again): kill it.
+                    Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        let _ = child.kill().await;
+                        return;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+                if child.try_wait().ok().flatten().is_some() {
+                    return; // exited: try_wait reaped it
+                }
+                tokio::time::sleep(REAP_TICK).await;
+            }
+        });
+        Reaper { kill_tx, handle }
     }
 
     /// Gate states for the serialized Xvfb startup.
@@ -507,10 +575,6 @@ mod other {
         }
         #[allow(dead_code)]
         pub async fn kill(self) {}
-        #[allow(dead_code)]
-        pub fn is_alive(&mut self) -> bool {
-            false
-        }
     }
 
     pub fn is_available() -> bool {
@@ -620,7 +684,7 @@ mod tests {
         assert!(!owned.is_borrowed(), "an owned display is not borrowed");
         let reused = x::Xvfb::start().await.expect("start reuse");
         assert!(reused.lock_path.is_none(), "reuser borrows, no gate");
-        assert!(reused.child.is_none(), "reuser does not own a child");
+        assert!(reused.reaper.is_none(), "reuser does not own a child");
         assert!(reused.is_borrowed(), "the reuser reports borrowed");
         drop(reused);
         owned.kill().await;
@@ -706,5 +770,49 @@ mod tests {
         let gate = x::lock_path();
         std::fs::remove_file(&gate).ok();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #280: the reaper owns the child so a dead Xvfb can never sit
+    // as a `<defunct>` zombie for the life of this process. A plain
+    // child proves the mechanism without a real Xvfb: it exits on
+    // its own and its /proc entry must disappear. A never-waited
+    // child would stay there as state Z forever (the reported
+    // zombie: visible in `ps` as `[Xvfb] <defunct>` with PPID = the
+    // still-running daemon).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reaper_reaps_a_child_that_exits_on_its_own() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 0.15"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id().expect("pid");
+        let _reaper = x::spawn_reaper(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exited child was never reaped (a zombie stays in /proc)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    // #280: shutdown kills the owned child and waits for the reap,
+    // so a caller can rely on the display being gone on return.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reaper_shutdown_kills_and_reaps() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id().expect("pid");
+        let reaper = x::spawn_reaper(child);
+        reaper.shutdown().await;
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "kill + reap must leave nothing behind"
+        );
     }
 }

@@ -665,6 +665,127 @@ pub(super) fn strip_part_frontmatter(md: &str) -> String {
     lines[start..].join("\n").trim().to_string()
 }
 
+/// Whether a tier-1 verdict means the ADAPTER rewrite bought
+/// nothing: every non-content verdict, a challenge included. The
+/// adapter is an optimization the caller never asked for, and
+/// adapter endpoints never route to the browser (a `.json` page in
+/// a browser is useless), so a refusal there must retry the page
+/// the caller asked for (#287: every reddit fetch died on a single
+/// `.json` 403 with no browser pass and a one-step trail).
+fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) -> bool {
+    adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
+}
+
+/// One legacy-host navigation to seed the reddit session (#291
+/// follow-through): any old.reddit.com response runs its login
+/// flow and seeds the cookies `www.reddit.com` needs before it
+/// serves the real SSR page instead of the humanity interstitial
+/// or the JS shell. The body is discarded; the side effect is the
+/// cookie jar. Returns whether a navigation actually ran.
+async fn reddit_session_hop(daemon: &Arc<Daemon>, u: &url::Url, trace: &mut Trace) -> bool {
+    let Some(oldu) = crate::adapters::reddit_session_url(u) else {
+        return false;
+    };
+    let t0 = std::time::Instant::now();
+    let hop = daemon.fetcher.fetch_persona(&oldu, None).await;
+    trace.step(
+        "1",
+        "reddit-session",
+        &format!("status={}", hop.as_ref().map_or(0, |o| o.status)),
+        t0.elapsed().as_millis(),
+    );
+    true
+}
+
+/// A reddit page refusal at tier 1 that one session-init retry can
+/// fix (the content host serves the humanity page or the JS shell
+/// to a sessionless client). Never twice (`_reddit_session`
+/// guard), never off the content host.
+fn reddit_session_retry_eligible(verdict: &Verdict, host: &str, args: &Value) -> bool {
+    matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked)
+        && matches!(host, "www.reddit.com" | "reddit.com")
+        && !args
+            .get("_reddit_session")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// Retry the caller's URL without the adapter rewrite, and fold the
+/// adapter hop's trail in front of the retry's so the escalation
+/// reads as ONE ladder rather than two unrelated hops. The retry
+/// runs the full generic pipeline, which escalates on its own
+/// rules (HTML fetch, ghost, cookie retry).
+async fn adapter_fallback(
+    daemon: &Arc<Daemon>,
+    args: &Value,
+    orig_url: &str,
+    trace: &mut Trace,
+    action: &str,
+    why: &str,
+) -> Value {
+    trace.step("adapter", action, why, 0);
+    // #291: a refused reddit `.json` hop is not the page's fate.
+    // One navigation through the legacy host first (body unused):
+    // it initializes the reddit.com session cookies the caller's
+    // host needs before it serves its real SSR page instead of the
+    // JS shell. The retry below then serves the content, with the
+    // session in the jar. Live A/B: without the hop the retry got
+    // an 8.5 KB shell (257 chars); with it, the 1 MB SSR page
+    // (1551 chars, post body).
+    let hop_done = match url::Url::parse(orig_url) {
+        Ok(pu) => reddit_session_hop(daemon, &pu, trace).await,
+        Err(_) => false,
+    };
+    // Legacy-host caller URLs retry on the content host: `old.`/
+    // `np.` serve a login wall to anonymous clients, so the retry
+    // there could never succeed.
+    let retry_url = url::Url::parse(orig_url)
+        .ok()
+        .and_then(|u| crate::adapters::reddit_content_url(&u))
+        .unwrap_or_else(|| orig_url.to_string());
+    let prior = match trace.value() {
+        Value::Array(a) => a,
+        _ => Vec::new(),
+    };
+    let mut args2 = args.clone();
+    args2["_no_adapter"] = json!(true);
+    // The hop just ran: don't let the session retry pay for a
+    // second one.
+    args2["_reddit_session"] = json!(hop_done);
+    let mut res = Box::pin(fetch_single_inner(daemon, &args2, &retry_url)).await;
+    if let Some(sc) = res.pointer_mut("/structuredContent") {
+        sc["adapter_fallback"] = json!(true);
+    }
+    fold_trace_into_result(&mut res, prior);
+    res
+}
+
+/// Put the adapter hop's steps in front of the retry's own trail.
+/// Error envelopes carry the trail in `structuredContent`; success
+/// results carry it under `_meta.com.donsetch/fetch-debug`.
+fn fold_trace_into_result(res: &mut Value, prior: Vec<Value>) {
+    if prior.is_empty() {
+        return;
+    }
+    if let Some(esc) = res
+        .pointer_mut("/structuredContent/escalation")
+        .and_then(Value::as_array_mut)
+    {
+        let mut combined = prior;
+        combined.append(esc);
+        *esc = combined;
+        return;
+    }
+    if let Some(esc) = res
+        .pointer_mut("/_meta/com.donsetch~1fetch-debug/escalation")
+        .and_then(Value::as_array_mut)
+    {
+        let mut combined = prior;
+        combined.append(esc);
+        *esc = combined;
+    }
+}
+
 #[allow(clippy::field_reassign_with_default)]
 pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     let t0 = std::time::Instant::now();
@@ -798,8 +919,8 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // === Decision: how to route this fetch? ===
     // The self-improving loop: the domain profile decides
     // cold / warm / skip-to-solve / recheck-cold.
-    // Adapter endpoints (reddit .json / old.reddit SSR, package
-    // registry APIs) are plain-GET structured targets : never
+    // Adapter endpoints (reddit .json, package registry APIs) are
+    // plain-GET structured targets : never
     // need a browser. Force Cold even if a stale profile says
     // SkipToSolve (from a previous Xvfb failure that poisoned
     // the domain).
@@ -955,10 +1076,16 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             Err(e) => {
                 if adapter_host && !no_adapter {
                     // Transport failure on the adapter endpoint :
-                    // try the original URL before giving up.
-                    let mut args2 = args.clone();
-                    args2["_no_adapter"] = json!(true);
-                    return Box::pin(fetch_single_inner(daemon, &args2, &orig_url)).await;
+                    // retry the caller's URL before giving up.
+                    return adapter_fallback(
+                        daemon,
+                        args,
+                        &orig_url,
+                        &mut trace,
+                        "fallback",
+                        "transport error : retrying original URL",
+                    )
+                    .await;
                 }
                 let kind = fetch_error_kind(&e);
                 return tool_error_structured(
@@ -1006,6 +1133,14 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             // visitor, not a fresh jar every run.
             state.sync_tier1_cookies(&daemon.fetcher.jar_all_snapshot().await);
             match o.verdict {
+                // An adapter endpoint's refusal is not evidence about
+                // the PAGE (reddit's protected `.json` is the known
+                // case, #291): recording it as a domain wall routed
+                // the fallback retry, and every later fetch, around
+                // tier 1 entirely. The fallback below re-probes the
+                // caller's URL itself; its own verdict is what
+                // records a wall.
+                Verdict::Challenge(_) if adapter_host => {}
                 Verdict::Challenge(_) => {
                     state.record_failure(&host, crate::ghost::cache::FailClass::Block);
                     if is_warm {
@@ -1050,25 +1185,43 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 // subresource burst for stealth-relevant hosts.
                 crate::fetch::shadow::maybe_shadow(&daemon.fetcher, &daemon.state, &o.url, o).await;
             }
+            // A refusal on an ADAPTER endpoint (a challenge
+            // included) is a failed adapter hop, never the end of
+            // the ladder: retry the caller's URL through the generic
+            // pipeline, which escalates to the browser on its own
+            // rules (#287: reddit's `.json` 403 used to end every
+            // fetch at exactly this point).
+            _ if adapter_hop_failed(o.verdict, adapter_host, no_adapter) => {
+                let why = format!("{:?} : retrying original URL", o.verdict);
+                return adapter_fallback(daemon, args, &orig_url, &mut trace, "fallback", &why)
+                    .await;
+            }
+            // A reddit page (thread, listing, about, wiki) refused
+            // at tier 1 without a session: the humanity page or the
+            // shell. One legacy-host navigation seeds the session,
+            // the retry gets the real SSR page, and the SSR adapter
+            // turns that into the card. Cheap enough to try before
+            // any ghost pass, on tier 1 and on auto alike.
+            _ if reddit_session_retry_eligible(&o.verdict, &host, args) => {
+                let hop_done = match url::Url::parse(&url) {
+                    Ok(pu) => reddit_session_hop(daemon, &pu, &mut trace).await,
+                    Err(_) => false,
+                };
+                let prior = match trace.value() {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                let mut args2 = args.clone();
+                args2["_reddit_session"] = json!(true);
+                let mut res = Box::pin(fetch_single_inner(daemon, &args2, &url)).await;
+                if let Some(sc) = res.pointer_mut("/structuredContent") {
+                    sc["reddit_session"] = json!(hop_done);
+                }
+                fold_trace_into_result(&mut res, prior);
+                return res;
+            }
             Verdict::Challenge(_) if tier != "1" => {}
             v => {
-                if adapter_host && !no_adapter {
-                    let mut args2 = args.clone();
-                    args2["_no_adapter"] = json!(true);
-                    trace.step(
-                        "adapter",
-                        "fallback",
-                        &format!("{:?} : retrying original URL", v),
-                        0,
-                    );
-                    let mut res = Box::pin(fetch_single_inner(daemon, &args2, &orig_url)).await;
-                    // Fold the adapter attempt into the trace so
-                    // the agent sees why there are two hops.
-                    if let Some(sc) = res.pointer_mut("/structuredContent") {
-                        sc["adapter_fallback"] = json!(true);
-                    }
-                    return res;
-                }
                 let kind = verdict_kind(v, o.status);
                 // v3.4: bypass fetch for hard walls (Challenge/Blocked).
                 // Fires on tier != "1" (respect explicit no-escalation).
@@ -1108,19 +1261,15 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             Some(b'{') | Some(b'[')
         )
     {
-        trace.step(
-            "adapter",
+        return adapter_fallback(
+            daemon,
+            args,
+            &orig_url,
+            &mut trace,
             "shape-mismatch",
             "200 but not JSON : retrying original URL",
-            0,
-        );
-        let mut args2 = args.clone();
-        args2["_no_adapter"] = json!(true);
-        let mut res = Box::pin(fetch_single_inner(daemon, &args2, &orig_url)).await;
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["adapter_fallback"] = json!(true);
-        }
-        return res;
+        )
+        .await;
     }
 
     // === Tier-1 extraction (when we have a body) ===
@@ -1158,7 +1307,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 })),
             );
         }
-        match extract::extract(&o.body, &ct, &o.url, &opts) {
+        match extract::extract_off_worker(&o.body, &ct, &o.url, &opts).await {
             Ok(e) => {
                 final_url = o.url.clone();
                 final_ex = Some(e);
@@ -1215,7 +1364,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             .unwrap_or_default();
         let mut lopts = opts.clone();
         lopts.include_links = true;
-        if let Ok(e3) = extract::extract(&o.body, &ct, &o.url, &lopts)
+        if let Ok(e3) = extract::extract_off_worker(&o.body, &ct, &o.url, &lopts).await
             && !e3.thin
         {
             final_ex = Some(e3);
@@ -1279,12 +1428,28 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             .as_ref()
             .map(|e| looks_like_shell_text(&e.markdown))
             .unwrap_or(false);
+    // #282: "the extraction is non-empty" is not a success test. A
+    // challenge interstitial or a chrome-only shell extracted at
+    // tier 1 must escalate (auto) or fail honestly, not serve.
+    let challenge_text = status_2xx
+        && final_ex
+            .as_ref()
+            .map(|e| crate::detect::walls::challenge_text(&e.markdown))
+            .unwrap_or(false);
+    let chrome_text = status_2xx
+        && !is_pdf_content
+        && final_ex
+            .as_ref()
+            .map(|e| crate::extract::quality::chrome_only(&e.markdown))
+            .unwrap_or(false);
     let need_ghost = !is_pdf_content
         && !adapter_host // adapter endpoints (reddit .json, registry APIs) are plain GETs
         && ((challenge && tier != "1" && !is_small_404)
             || skip_tier1
             || (still_thin && tier == "auto" && !is_small_404)
-            || (shell_text && tier == "auto"));
+            || (shell_text && tier == "auto")
+            || (challenge_text && tier == "auto")
+            || (chrome_text && tier == "auto" && !is_small_404));
 
     if need_ghost {
         // Render-cache shortcut: a previously recovered DOM.
@@ -1452,7 +1617,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 let html2 = crate::extract::charset::decode(&fetched.body, &ct2);
                 let mut popts = opts.clone();
                 popts.max_chars = Some(8_000);
-                match extract::extract(&fetched.body, &ct2, &fetched.url, &popts) {
+                match extract::extract_off_worker(&fetched.body, &ct2, &fetched.url, &popts).await {
                     Ok(pe) => {
                         let md = strip_part_frontmatter(&pe.markdown);
                         total += md.len();
@@ -1500,6 +1665,24 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             })),
         );
     };
+
+    // #282: a challenge interstitial or a chrome-only shell is not
+    // content, whatever tier produced it. The failure is "walled"
+    // so the escalation ladder (ghost, a configured unlocker) can
+    // engage instead of the agent trusting navigation boilerplate.
+    if let Some((msg, kind, action)) = content_fail(&ex.markdown, &url, final_status) {
+        return tool_error_structured(
+            msg,
+            kind,
+            Some(json!({
+                "url": url,
+                "status": final_status,
+                "verdict": "Challenge(Generic)",
+                "next_action": action,
+                "escalation": trace.value(),
+            })),
+        );
+    }
 
     // Final shell gate: a framework dump (React server renders)
     // must never ship as successful content regardless of the tier
@@ -1668,18 +1851,19 @@ pub(super) async fn try_bypass(
         );
         return None;
     }
-    let ex = match extract::extract(&outcome.body, &outcome.content_type, url, opts) {
-        Ok(e) => e,
-        Err(e) => {
-            trace.step(
-                "bypass",
-                "extract",
-                &format!("{e}"),
-                t0.elapsed().as_millis(),
-            );
-            return None;
-        }
-    };
+    let ex =
+        match extract::extract_off_worker(&outcome.body, &outcome.content_type, url, opts).await {
+            Ok(e) => e,
+            Err(e) => {
+                trace.step(
+                    "bypass",
+                    "extract",
+                    &format!("{e}"),
+                    t0.elapsed().as_millis(),
+                );
+                return None;
+            }
+        };
     trace.step(
         "bypass",
         "unlocker",
@@ -1829,12 +2013,16 @@ pub(super) async fn ghost_escalate(
                 // The wall survived BOTH passes in a real browser:
                 // this is wall-persisting evidence, recorded.
                 daemon.state.lock().await.record_wall_failed(host);
-                return Err((
-                    format!(
-                        "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
-                    ),
-                    "walled",
-                ));
+                // #282: different recoveries get different codes. A
+                // page holding an interactive captcha widget needs a
+                // human or a vendor solver; a vendor-less challenge
+                // that never finished is the retry-or-unlocker class.
+                let msg = if crate::detect::walls::interactive_captcha(p2.html.as_bytes()) {
+                    "interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these".to_string()
+                } else {
+                    "the page is an anti-bot challenge that did not clear (the challenge never finished on its own; retry later or let a configured unlocker solve this class)".to_string()
+                };
+                return Err((format!("blocked at {url} : {msg}"), "walled"));
             }
             // ghost_fetch errored on the retry (automation failure,
             // not a wall): no wall memory recorded.
@@ -1955,7 +2143,7 @@ pub(super) async fn ghost_escalate(
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
         if !crate::fetch::guards::is_binary(&r.body, &ct)
-            && let Ok(e) = extract::extract(&r.body, &ct, &r.url, opts)
+            && let Ok(e) = extract::extract_off_worker(&r.body, &ct, &r.url, opts).await
         {
             let thin = e.thin;
             replay_content_ok = !thin;
@@ -2029,6 +2217,12 @@ pub(super) async fn ghost_escalate(
     if let Some((thin, e, t, s, u)) = best
         && !thin
     {
+        // #282: a challenge interstitial or chrome-only shell that
+        // passed the thin gate must not be served (or learned from)
+        // as content.
+        if let Some((msg, kind, _)) = content_fail(&e.markdown, url, s) {
+            return Err((msg, kind));
+        }
         // Learning is gated on WALL-DRIVEN escalation AND gated on
         // CONTENT : success is "we got content", not "we got HTTP
         // 200". The replay probe (or its absence) sets replay_ok.
@@ -2113,7 +2307,13 @@ pub(super) async fn ghost_escalate(
             let login_only = fb.markdown.len() < 60
                 && (fb.markdown.to_ascii_lowercase().contains("log in")
                     || fb.markdown.to_ascii_lowercase().contains("sign up"));
-            if !fb.thin || (fb.markdown.len() >= 40 && !login_only) {
+            // The last resort must not resurrect junk (#282): a
+            // challenge interstitial or chrome-only shell stays a
+            // failure even though its text is technically non-empty.
+            let status = retry.as_ref().map(|r| r.status).unwrap_or(200);
+            if content_fail(&fb.markdown, url, status).is_none()
+                && (!fb.thin || (fb.markdown.len() >= 40 && !login_only))
+            {
                 return Ok((fb, "ghost-text", 200, url.to_string()));
             }
         }
@@ -2129,12 +2329,15 @@ pub(super) async fn ghost_escalate(
     let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
     if matches!(dom_verdict, Verdict::Challenge(_)) {
         daemon.state.lock().await.record_wall_failed(host);
-        return Err((
-            format!(
-                "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
-            ),
-            "walled",
-        ));
+        // #282: the code must say which recovery applies. An
+        // interactive widget needs a human or a vendor solver; a
+        // bare challenge that never finished is retry-or-unlocker.
+        let msg = if crate::detect::walls::interactive_captcha(page.html.as_bytes()) {
+            "interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these".to_string()
+        } else {
+            "the page is an anti-bot challenge that did not clear (the challenge never finished on its own; retry later or let a configured unlocker solve this class)".to_string()
+        };
+        return Err((format!("blocked at {url} : {msg}"), "walled"));
     }
     if page.html.len() < 5_000 {
         return Err((
@@ -2207,6 +2410,36 @@ fn looks_like_shell_text(markdown: &str) -> bool {
         })
         .count();
     ident * 100 / tokens.len() >= 40
+}
+
+/// Positive content tests (#282): a challenge interstitial or a
+/// chrome-only shell that made it through as "some text" is not
+/// content. Returns the honest failure for the extracted shape, or
+/// None when the text is real content.
+fn content_fail(
+    markdown: &str,
+    url: &str,
+    status: u16,
+) -> Option<(String, &'static str, &'static str)> {
+    if crate::detect::walls::challenge_text(markdown) {
+        return Some((
+            format!(
+                "blocked at {url} : the page is an anti-bot challenge that did not clear (the extracted text is the interstitial, not content)"
+            ),
+            "walled",
+            "retry later : the challenge may clear; tier=auto renders with a browser, and a configured unlocker solves this class",
+        ));
+    }
+    if (200..300).contains(&status) && crate::extract::quality::chrome_only(markdown) {
+        return Some((
+            format!(
+                "blocked at {url} : the page rendered only navigation and login chrome (an empty shell or a login wall), no content"
+            ),
+            "walled",
+            "use an agent browser to browse sites like these : the page may be a client-rendered shell or a login wall",
+        ));
+    }
+    None
 }
 
 pub(super) fn is_pdf_url_like(url: &str) -> bool {
@@ -2936,7 +3169,7 @@ async fn try_resurrect(
                 snapshot_url: Some(snap_url.clone()),
             });
         }
-        let ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
+        let ex = match extract::extract_off_worker(&snap.body, &ct, &snap_url, &opts).await {
             Ok(ex) => ex,
             Err(_) => {
                 return Err(ResurrectError {
@@ -3248,15 +3481,22 @@ pub(super) fn apply_page_history(
             *cell = json!(body);
         }
     } else if changed != "new" {
-        // Note in the content on change (first contact with the
-        // delta is valuable; unchanged stays silent).
-        if let Some(d) = &delta
+        // A change note in the content: ONE line, never the delta
+        // body. The section-level diff belongs to `since_last` (and
+        // to structuredContent.changed_sections); the unasked prepend
+        // repeated every extracted fragment into the header and was
+        // 34% of a product-page answer (#289).
+        if delta.is_some()
             && let Some(cell) = res.pointer_mut("/content/0/text")
             && let Some(md) = cell.as_str().map(String::from)
         {
+            let ago_part = if ago > 0 {
+                format!(", {ago}s ago")
+            } else {
+                String::new()
+            };
             *cell = json!(format!(
-                "*[changed since last fetch ({}): {}]*\n\n{md}",
-                changed, d
+                "*[changed since last fetch ({changed}{ago_part}) : since_last=true returns just the delta]*\n\n{md}"
             ));
         }
     }
@@ -3432,6 +3672,16 @@ pub(super) fn finish_result(
     });
     if ex.thin {
         structured["thin"] = json!(true);
+    }
+    // #292: repeated blocks/sections were omitted and marked in
+    // place; the count makes the omission auditable without reading
+    // the whole page.
+    let omitted = ex
+        .markdown
+        .matches(crate::extract::render::REPEATED_MARKER_PREFIX)
+        .count();
+    if omitted > 0 {
+        structured["omitted_repeats"] = json!(omitted);
     }
     if !matches!(ex.lang.as_str(), "" | "und" | "unknown") {
         structured["lang"] = json!(ex.lang);
@@ -3964,5 +4214,100 @@ mod budget_tests {
     fn a_tiny_deadline_hits_the_floor_rather_than_zero() {
         let b = Budget::of(&args_with(Some(500)));
         assert_eq!(b.pass(20), std::time::Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod adapter_hop_tests {
+    use super::*;
+    use crate::detect::walls::Vendor;
+
+    // #287: a challenge (or any non-content verdict) on an adapter
+    // endpoint must retry the caller's URL. Before this, the
+    // `Challenge(_) if tier != "1"` arm swallowed it and the ladder
+    // ended after one HTTP request.
+    #[test]
+    fn a_refusal_on_an_adapter_endpoint_falls_back() {
+        assert!(adapter_hop_failed(
+            Verdict::Challenge(Vendor::Generic),
+            true,
+            false
+        ));
+        assert!(adapter_hop_failed(Verdict::Blocked, true, false));
+        assert!(adapter_hop_failed(Verdict::AuthWall, true, false));
+        // Served JSON is a good adapter hop: no fallback.
+        assert!(!adapter_hop_failed(Verdict::ContentOk, true, false));
+        // Non-adapter fetches keep their own escalation rules.
+        assert!(!adapter_hop_failed(
+            Verdict::Challenge(Vendor::Generic),
+            false,
+            false
+        ));
+        // The retry itself must not bounce (`_no_adapter`).
+        assert!(!adapter_hop_failed(Verdict::Blocked, true, true));
+    }
+
+    // The session retry: reddit page refusals at tier 1 get one
+    // session-init attempt; never twice, never off the content host.
+    #[test]
+    fn reddit_session_retry_eligibility() {
+        let args = serde_json::json!({});
+        assert!(reddit_session_retry_eligible(
+            &Verdict::Challenge(Vendor::Generic),
+            "www.reddit.com",
+            &args
+        ));
+        assert!(reddit_session_retry_eligible(
+            &Verdict::Blocked,
+            "reddit.com",
+            &args
+        ));
+        // Other hosts keep their own escalation rules.
+        assert!(!reddit_session_retry_eligible(
+            &Verdict::Blocked,
+            "registry.npmjs.org",
+            &args
+        ));
+        // Served content is content.
+        assert!(!reddit_session_retry_eligible(
+            &Verdict::ContentOk,
+            "www.reddit.com",
+            &args
+        ));
+        // The retry is one-shot.
+        let done = serde_json::json!({"_reddit_session": true});
+        assert!(!reddit_session_retry_eligible(
+            &Verdict::Blocked,
+            "www.reddit.com",
+            &done
+        ));
+    }
+
+    // The adapter hop's steps fold in FRONT of the retry's own trail
+    // so the escalation reads as one ladder.
+    #[test]
+    fn adapter_steps_are_folded_in_front_of_the_retry_trail() {
+        let mut res = serde_json::json!({
+            "structuredContent": {"escalation": [{"action": "route"}]}
+        });
+        fold_trace_into_result(&mut res, vec![serde_json::json!({"action": "http-fetch"})]);
+        let esc = res.pointer("/structuredContent/escalation").unwrap();
+        assert_eq!(esc[0]["action"], "http-fetch");
+        assert_eq!(esc[1]["action"], "route");
+    }
+
+    // Success results carry the trail under _meta; the fold reaches
+    // it there too.
+    #[test]
+    fn fold_reaches_the_success_meta_trail() {
+        let mut res = serde_json::json!({
+            "_meta": {"com.donsetch/fetch-debug": {"escalation": [{"action": "route"}]}}
+        });
+        fold_trace_into_result(&mut res, vec![serde_json::json!({"action": "adapter"})]);
+        let esc = res
+            .pointer("/_meta/com.donsetch~1fetch-debug/escalation")
+            .unwrap();
+        assert_eq!(esc[0]["action"], "adapter");
+        assert_eq!(esc[1]["action"], "route");
     }
 }

@@ -1800,9 +1800,101 @@ fn jsonld_unicode_escape_decoded() {
     assert_eq!(meta.byline.as_deref(), Some("维基媒体"));
 }
 
+// html5ever's tree builder scans the open-element stack per tag: the
+// parse is O(n²) in nesting depth (8 000 nested <div> 0.4 s, 32 000
+// 6.6 s measured here) and nothing capped the depth (browsers stop at
+// 512). The gate refuses such a body before the parse; a wide page of
+// the same size is untouched.
+#[test]
+fn a_page_nested_thousands_deep_is_refused_before_the_parse() {
+    let n = 50_000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<div>".repeat(n),
+        "</div>".repeat(n)
+    );
+    let started = std::time::Instant::now();
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    // The self-closing slash is ignored by the HTML parser, so this
+    // shape nests for real too and is refused the same way.
+    let html = format!(
+        "<html><body><article>{}x</article></body></html>",
+        "<div/>".repeat(n)
+    );
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    // Same byte count, wide instead of deep: extracted as usual.
+    let html = format!(
+        "<html><body><article>{}</article></body></html>",
+        "<p>a paragraph with enough words to be kept by the extractor here</p>".repeat(n / 10)
+    );
+    let r = extract_html(&html);
+    assert!(r.markdown.contains("a paragraph"));
+}
+
 // ════════════════════════════════════════════════════════════
 // 24. TABLE WITHOUT <th> : FIRST ROW PROMOTED TO HEADERS
 // ════════════════════════════════════════════════════════════
+
+// Tables nested d deep: the table scans used descendant selects, so
+// every level re-scanned every nested cell below it, quadratic per
+// level and the walk recursed a level and repeated it. 1000 levels
+// (18 KB) took minutes on the tokio worker.
+#[test]
+fn deeply_nested_tables_extract_in_linear_time() {
+    let d = 1000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<table><tr><td>".repeat(d),
+        "</td></tr></table>".repeat(d)
+    );
+    let started = std::time::Instant::now();
+    let r = extract_html(&html);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(r.markdown.contains('x'));
+}
+
+// A table nested in a cell is that cell's content, not extra rows of
+// the outer table.
+#[test]
+fn nested_table_rows_are_not_merged_into_the_outer_table() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>inner</td><td><table><tr><td>a</td></tr><tr><td>b</td></tr><tr><td>c</td></tr></table></td></tr>
+<tr><td>after</td><td>done</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(r.markdown.contains("| Key | Value |"), "{}", r.markdown);
+    assert!(r.markdown.contains("| after | done |"), "{}", r.markdown);
+    // The inner rows do not become `| a |` rows of the outer table.
+    assert!(!r.markdown.contains("| a |"), "{}", r.markdown);
+}
 
 #[test]
 fn table_without_th_promotes_first_row() {
@@ -2494,4 +2586,27 @@ fn fallback_br_line_and_paragraph_breaks() {
         !m.contains("\n "),
         "no leading space after any br newline, got: {m:?}"
     );
+}
+
+// The fetch tool parsed a PDF inline on the tokio worker; the crawl
+// used the blocking pool. One helper now serves both: a PDF body is
+// parsed off the worker under a budget, HTML goes straight through.
+#[tokio::test]
+async fn extract_off_worker_parses_pdf_off_the_runtime_and_html_inline() {
+    let html = b"<html><head><title>T</title></head><body><article><p>Hello there, a paragraph long enough to keep.</p></article></body></html>";
+    let opts = ExtractOptions::default();
+    let out = super::extract_off_worker(html, "text/html", "https://ex.com/", &opts)
+        .await
+        .expect("html");
+    assert!(out.markdown.contains("Hello there"));
+    // A PDF body: routed through spawn_blocking; pdfium rejects the
+    // truncated bytes, and the error must come back typed, not as a
+    // join panic.
+    let pdf = b"%PDF-1.4\ngarbage";
+    let err = super::extract_off_worker(pdf, "application/pdf", "https://ex.com/x.pdf", &opts)
+        .await
+        .err();
+    // Either a typed failure or, on a lenient pdfium, an empty doc;
+    // never a panic.
+    let _ = err;
 }

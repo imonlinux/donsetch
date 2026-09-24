@@ -411,6 +411,7 @@ pub(super) async fn search_outcome(
     let local_first = daemon.byok.is_local_default();
 
     // BYOK-first mode: try providers, fall back to local.
+    let mut byok_fail: Option<String> = None;
     if byok_configured && !local_first {
         match byok_search_cached(daemon, query, max, intent).await {
             Ok(out) => return Ok(out),
@@ -418,14 +419,36 @@ pub(super) async fn search_outcome(
                 if crate::config::cfg().debug.search {
                     eprintln!("[byok] all providers exhausted, falling back to local: {e}");
                 }
-                // Fall through to local search.
+                // #285: keep the failure so the fallback result can
+                // say a provider was tried and why it failed; the
+                // result was otherwise indistinguishable from a run
+                // with no BYOK keys at all.
+                byok_fail = Some(e);
             }
         }
     }
 
     // Local search (primary in local-first mode, fallback in BYOK-first).
     match daemon.searcher.search(query, max, intent).await {
-        Ok(out) => Ok(out),
+        Ok(mut out) => {
+            // #285: fold the BYOK failure into the visible engines
+            // trail (the same `degraded:` field local engine
+            // failures use).
+            if let Some(e) = byok_fail {
+                out.report.insert(
+                    0,
+                    crate::search::EngineReport {
+                        engine: "byok".into(),
+                        profile: None,
+                        status: crate::search::byok::compact_failure(&e),
+                        hits: 0,
+                        ms: 0,
+                        egress: "byok".into(),
+                    },
+                );
+            }
+            Ok(out)
+        }
         Err(e) => {
             // Local failed : if BYOK is configured and we're in
             // local-first mode, try BYOK as a last resort.

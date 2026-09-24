@@ -47,16 +47,66 @@ fn markdown_impl(
     (collapsed, ld)
 }
 
+/// Tags whose text content is source code or otherwise never
+/// rendered. `ElementRef::text()` walks THROUGH them, which is
+/// exactly where the #288 leaks came from: an inline `<style>`
+/// landed inside a price heading, a `<script>` inside a spec-table
+/// cell, and a reddit comment header carried its own
+/// `SML.load(...)` call into the output.
+const INVISIBLE_TAGS: &[&str] = &[
+    "script", "style", "noscript", "template", "svg", "canvas", "iframe", "object", "embed",
+];
+
+/// Walk an element's text in document order, skipping the subtrees
+/// of invisible tags. `preserve_ws` keeps raw whitespace (`<pre>`);
+/// otherwise every text node is trimmed and space-joined, exactly
+/// the shape `ElementRef::text()` had.
+fn walk_visible(el: ElementRef<'_>, buf: &mut String, preserve_ws: bool) {
+    let mut stack: Vec<_> = el.children().collect();
+    stack.reverse();
+    while let Some(n) = stack.pop() {
+        match n.value() {
+            Node::Text(t) => {
+                if preserve_ws {
+                    buf.push_str(t.text.as_ref());
+                } else {
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(t.text.trim());
+                }
+            }
+            Node::Element(e) => {
+                if INVISIBLE_TAGS.contains(&e.name()) {
+                    continue;
+                }
+                let at = stack.len();
+                stack.extend(n.children());
+                stack[at..].reverse();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The element's visible text (script/style content excluded),
+/// whitespace-collapsed.
+pub fn visible_text(el: ElementRef<'_>) -> String {
+    let mut buf = String::new();
+    walk_visible(el, &mut buf, false);
+    collapse(&buf)
+}
+
+/// Visible text with whitespace preserved (`<pre>` content).
+pub fn visible_text_raw(el: ElementRef<'_>) -> String {
+    let mut buf = String::new();
+    walk_visible(el, &mut buf, true);
+    buf
+}
+
 /// Plain visible text, whitespace-collapsed.
 pub fn plain(el: ElementRef<'_>) -> String {
-    let mut buf = String::new();
-    for t in el.text() {
-        if !buf.is_empty() {
-            buf.push(' ');
-        }
-        buf.push_str(t.trim());
-    }
-    collapse(&buf)
+    visible_text(el)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -566,5 +616,54 @@ mod tests {
     fn link_shaped_plain_text_stays_literal() {
         let result = render_inline("<p>[T](u) and ![V](w) and [a] alone</p>");
         assert_eq!(result, "\\[T](u) and !\\[V](w) and [a] alone");
+    }
+}
+
+#[cfg(test)]
+mod visible_text_tests {
+    use super::*;
+    use scraper::Html;
+
+    fn plain_of(html: &str) -> String {
+        let document = Html::parse_fragment(html);
+        let root = document.root_element();
+        let el = root.children().filter_map(ElementRef::wrap).next().unwrap();
+        plain(el)
+    }
+
+    // #288: script and style text is source code, never content.
+    #[test]
+    fn script_and_style_text_is_never_plain_text() {
+        let price = plain_of(
+            "<h5>Prime Member Price<style>#buybox .a-price { font-size: 28px !important; }</style></h5>",
+        );
+        assert_eq!(price, "Prime Member Price");
+
+        // A bare <td> outside a table is dropped by the fragment
+        // parser (its content survives as raw text, and the script
+        // would become the first ELEMENT), so the cell ships inside
+        // its table, like the live page.
+        let cell = plain_of(
+            "<table><tr><td>Compatible Devices<script type=\"text/javascript\">(function(f) {var _np=window.P._namespace(\"X\");})(window);</script></td></tr></table>",
+        );
+        assert_eq!(cell, "Compatible Devices");
+
+        let header = plain_of(
+            "<h3>Sp4cemanspiff37 <span>• 4y ago</span><script>SML.load([\"28YPyQW8vz\"], 'en-US/', 'auto');</script> • Edited 4y ago</h3>",
+        );
+        assert!(header.contains("Sp4cemanspiff37 • 4y ago"), "{header}");
+        assert!(header.contains("• Edited 4y ago"), "{header}");
+        assert!(!header.contains("SML.load"), "{header}");
+    }
+
+    // `<pre>` keeps its whitespace; the script subtree still never
+    // contributes.
+    #[test]
+    fn pre_text_keeps_whitespace_but_not_script_content() {
+        let document =
+            Html::parse_fragment("<pre>line one\n   indented<script>var x = 1;</script></pre>");
+        let root = document.root_element();
+        let el = root.children().filter_map(ElementRef::wrap).next().unwrap();
+        assert_eq!(visible_text_raw(el), "line one\n   indented");
     }
 }

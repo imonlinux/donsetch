@@ -63,6 +63,11 @@ fn extract_xml_feed(text: &str, url: &str, opts: &ExtractOptions) -> Option<Extr
     let text = text
         .replace("<link>", "<rsslink>")
         .replace("</link>", "</rsslink>");
+    // Unknown elements stay on the parser's stack until closed; a
+    // feed nested thousands deep is the html5ever quadratic too.
+    if super::nesting::max_nesting(&text) > super::nesting::MAX_NESTING {
+        return None;
+    }
     let doc = scraper::Html::parse_document(&text);
 
     // RSS: channel > title/rsslink/description, item > ...
@@ -330,9 +335,11 @@ fn clean_html(s: &str) -> String {
     if !s.contains('<') {
         return s.trim().to_string();
     }
+    // Script/style subtrees inside a summary are source, never
+    // content (#288's class); the walk's join matches the old
+    // `text().join(" ")` for everything visible.
     let frag = scraper::Html::parse_fragment(s);
-    let text: String = frag.root_element().text().collect::<Vec<_>>().join(" ");
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    super::inline::visible_text(frag.root_element())
 }
 
 #[cfg(test)]
@@ -439,5 +446,19 @@ mod tests {
     fn empty_channel_is_none() {
         let rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Empty</title></channel></rss>"#;
         assert!(extract(rss.as_bytes(), "https://x/rss", &ExtractOptions::default()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod clean_html_guard_tests {
+    use super::clean_html;
+
+    // A script/style subtree inside a feed summary is source, never
+    // content (#288's class).
+    #[test]
+    fn summaries_never_carry_script_text() {
+        let out = clean_html("<p>Hello <script>var leak = 1;</script> world</p>");
+        assert!(!out.contains("leak"), "{out}");
+        assert_eq!(out, "Hello world");
     }
 }

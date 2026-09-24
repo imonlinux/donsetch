@@ -5,17 +5,27 @@
 
 use scraper::{ElementRef, Html, Selector};
 
-use crate::extract::{ContentKind, ExtractOptions, Extracted};
+use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
 
-/// Stack Exchange hosts (the big ones; the DOM shape is shared
-/// platform-wide, so suffix matching covers the tail).
-const HOST_SUFFIXES: [&str; 5] = [
+/// Stack Exchange sites (the DOM shape is shared platform-wide):
+/// label-suffix matched, so meta.* subdomains and the network's
+/// stand-alone domains are covered too.
+const HOST_SUFFIXES: [&str; 6] = [
     "stackoverflow.com",
     "stackexchange.com",
     "superuser.com",
     "serverfault.com",
     "askubuntu.com",
+    "mathoverflow.net",
 ];
+
+/// `stackoverflow.com`, `meta.stackoverflow.com`, ... but never a
+/// look-alike like `notstackoverflow.com`.
+fn is_se_host(host: &str) -> bool {
+    HOST_SUFFIXES
+        .iter()
+        .any(|s| host == *s || host.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
+}
 
 const MAX_ANSWERS: usize = 10;
 
@@ -25,11 +35,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
-    let is_se = HOST_SUFFIXES
-        .iter()
-        .any(|s| host == *s || host.strip_prefix("www.") == Some(*s))
-        || host.ends_with(".stackexchange.com");
-    if !is_se {
+    if !is_se_host(host) {
         return None;
     }
     // Question pages only: /questions/<digits>/... or /q/<digits>.
@@ -127,7 +133,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
 }
 
 fn text_of(el: ElementRef) -> String {
-    el.text().collect::<String>().trim().to_string()
+    // Visible text only: a script/style subtree inside the element is
+    // source, not content (#288).
+    inline::visible_text_raw(el).trim().to_string()
 }
 
 fn score_of(post: &ElementRef) -> i64 {
@@ -235,6 +243,11 @@ mod tests {
     #[test]
     fn subdomains_and_lists_rejected() {
         assert!(extract(QA, "https://rust.stackexchange.com/questions/1/x", &opts()).is_some());
+        // meta.* subdomains and mathoverflow.net are the same
+        // platform; look-alike domains are not the network.
+        assert!(extract(QA, "https://meta.stackoverflow.com/questions/1/x", &opts()).is_some());
+        assert!(extract(QA, "https://mathoverflow.net/questions/1/x", &opts()).is_some());
+        assert!(extract(QA, "https://notstackoverflow.com/questions/1/x", &opts()).is_none());
         assert!(
             extract(
                 QA,

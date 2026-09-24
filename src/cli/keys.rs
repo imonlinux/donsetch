@@ -17,7 +17,7 @@ use crate::DISPLAY_NAME;
 use crate::search::byok::plugin::{
     DEFAULT_TIMEOUT_MS, PluginConfig, tokenize_cmd, validate_plugin_name,
 };
-use crate::search::byok::store::{ByokConfig, KeyState, PROVIDERS, render_list};
+use crate::search::byok::store::{ByokConfig, KeyState, PROVIDERS, is_fetch_side, render_list};
 
 /// Normalize provider aliases to canonical names.
 /// `bd` -> `brightdata`
@@ -333,7 +333,16 @@ async fn cmd_add(args: &[String]) {
 
     if cfg.providers.len() == 1 {
         println!();
-        if cfg.is_local_default() {
+        if is_fetch_side(&provider) {
+            // A fetch-side provider cannot serve a search: the
+            // old "BYOK search is now active" note was a lie on
+            // top of the wasted dispatch every search paid (#284).
+            println!(
+                "  {} {} is fetch-side : search stays on the local engine.",
+                dim("note:"),
+                bold(&provider)
+            );
+        } else if cfg.is_local_default() {
             println!(
                 "  {} keys configured : local is default, BYOK is fallback.",
                 dim("note:")
@@ -563,6 +572,18 @@ fn cmd_default(args: &[String]) {
     };
 
     let mut cfg = ByokConfig::load();
+
+    // A fetch-side provider is not a search surface: it solves
+    // walls for the fetch path and has no SERP endpoint, so it can
+    // never be the search default (#284).
+    if provider != "local" && is_fetch_side(&provider) {
+        eprintln!(
+            "  {} {} is fetch-side : not a search default",
+            red("\u{2717}"),
+            bold(&provider)
+        );
+        std::process::exit(1);
+    }
 
     // "local" bypasses the is_configured() check : you can set
     // local as default even with keys configured (to test local

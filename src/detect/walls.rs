@@ -167,10 +167,12 @@ const INTERSTITIAL_TITLES: &[&str] = &[
     "just a moment",
     "performing security verification",
     "checking your browser",
+    "verifying your browser",
     "attention required",
     "verify you are human",
     "verify that you are human",
     "verifying you are human",
+    "prove your humanity",
     "security check",
     "needs to review the security",
     "one more step",
@@ -227,6 +229,49 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
         return Some(vendor_from_markers(&text).unwrap_or(Vendor::Generic));
     }
     None
+}
+
+/// True when the DOM carries an interactive captcha widget
+/// (reCAPTCHA, hCaptcha, Turnstile, PerimeterX, DataDome, GeeTest,
+/// Arkose). Distinguishes "a human must solve this" from "a
+/// challenge page that never finished": different recoveries, and
+/// different failure codes (issue #282's `wall.captcha` vs
+/// `wall.challenge_unsolved`).
+pub fn interactive_captcha(body: &[u8]) -> bool {
+    let scan = &body[..body.len().min(64 * 1024)];
+    let text = String::from_utf8_lossy(scan).to_lowercase();
+    [
+        "recaptcha",
+        "hcaptcha",
+        "cf-turnstile",
+        "px-captcha",
+        "captcha-delivery",
+        "geetest",
+        "arkoselabs",
+        "funcaptcha",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
+/// Extracted-text challenge test: the TEXT an extractor produced is
+/// an unsolved interstitial, not content.
+///
+/// The DOM-level `detect_interstitial` misses shapes with a form or
+/// a long title (reddit's "Prove your humanity" page: a real
+/// recaptcha form and 300 chars of prose-like vendor boilerplate),
+/// so the extraction step shipped it as ContentOk (issue #282 case
+/// B). Detection here is marker + size: an interstitial's own words
+/// are a handful of lines, so a long article that merely mentions a
+/// challenge phrase stays content.
+pub fn challenge_text(text: &str) -> bool {
+    if text.chars().count() > 1200 {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    INTERSTITIAL_TITLES.iter().any(|m| lower.contains(m))
+        || lower.contains("complete the challenge below")
+        || lower.contains("enable javascript and cookies to continue")
 }
 
 /// Best-effort `<title>` (head) or first `<h1>` text, lowercased.
@@ -589,6 +634,45 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #282: the two content-quality failures keep their own codes so
+    // an agent can tell "the page is a shell/login wall" from "the
+    // challenge never cleared".
+    #[test]
+    fn interactive_captcha_tells_widgets_from_bare_challenges() {
+        assert!(interactive_captcha(
+            b"<html><script src=\"https://www.google.com/recaptcha/api.js\"></script></html>"
+        ));
+        assert!(interactive_captcha(b"<div class=\"cf-turnstile\"></div>"));
+        assert!(!interactive_captcha(
+            b"<html><head><title>Checking your browser before accessing</title></head><body><p>This process is automatic.</p></body></html>"
+        ));
+    }
+
+    // #282: the extracted-TEXT test. A challenge interstitial whose
+    // prose is 100+ chars sailed past the DOM-level detectors (it
+    // has a real form; its title is not a vendor phrase) and the
+    // extraction step served it as ContentOk.
+    #[test]
+    fn challenge_text_catches_extracted_interstitials() {
+        assert!(challenge_text(
+            "# Verifying your browser…\n\nThis may take a few seconds. Please do not close this tab."
+        ));
+        assert!(challenge_text(
+            "# Prove your humanity\n\nWe're committed to safety and security. But not for bots. Complete the challenge below."
+        ));
+        assert!(challenge_text("Just a moment..."));
+        // A long article that merely mentions a phrase stays content.
+        let long = format!(
+            "Verifying your browser is a phrase this essay quotes repeatedly. {}",
+            "More words follow here to push the text past the size bound. ".repeat(30)
+        );
+        assert!(!challenge_text(&long));
+        // And a page with no marker is untouched.
+        assert!(!challenge_text(
+            "# Example Domain\n\nThis domain is for use in illustrative examples."
+        ));
+    }
 
     // A prose mention of a security vendor on a healthy 200 page is
     // an article ABOUT the vendor, not a wall. The bare-name rules

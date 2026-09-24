@@ -1144,38 +1144,8 @@ impl Crawler {
                     // pool with a generous timeout (5 min) that covers large
                     // PDFs (a 28 MB archive.org PDF takes ~70s) while still
                     // preventing infinite hangs. HTML stays on the fast path.
-                    let is_pdf = body_bytes.starts_with(b"%PDF-")
-                        || body_ctype.to_ascii_lowercase().contains("pdf");
-                    let extract_res: Result<
-                        crate::extract::Extracted,
-                        crate::extract::ExtractError,
-                    > = if is_pdf {
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            let body_owned = body_bytes.to_vec();
-                            let ctype_owned = body_ctype.to_owned();
-                            let url_owned = page_url.clone();
-                            let eo_owned = eo.clone();
-                            let task = handle.spawn_blocking(move || {
-                                extract::extract(&body_owned, &ctype_owned, &url_owned, &eo_owned)
-                            });
-                            match tokio::time::timeout(Duration::from_secs(300), task).await {
-                                Ok(Ok(Ok(r))) => Ok(r),
-                                Ok(Ok(Err(e))) => Err(e),
-                                Ok(Err(join_err)) => {
-                                    Err(crate::extract::ExtractError::BadSelector(format!(
-                                        "extract task failed: {join_err}"
-                                    )))
-                                }
-                                Err(_) => Err(crate::extract::ExtractError::BadSelector(
-                                    "extract timed out after 300s".into(),
-                                )),
-                            }
-                        } else {
-                            extract::extract(body_bytes, body_ctype, &page_url, &eo)
-                        }
-                    } else {
-                        extract::extract(body_bytes, body_ctype, &page_url, &eo)
-                    };
+                    let extract_res =
+                        extract::extract_off_worker(body_bytes, body_ctype, &page_url, &eo).await;
                     let mut r = match extract_res {
                         Ok(r) => r,
                         Err(e) => {
@@ -1379,13 +1349,17 @@ impl Crawler {
                             .unwrap_or_else(|| String::from_utf8_lossy(&page.body).into_owned());
                         // <base href> handling: resolve relative
                         // links against the base URL when present.
-                        let base = if let Some(bh) = extract_base_href(&html) {
-                            Url::parse(&bh).unwrap_or_else(|_| {
-                                Url::parse(&page.url).unwrap_or_else(|_| parsed.clone())
-                            })
-                        } else {
-                            Url::parse(&page.url).unwrap_or_else(|_| parsed.clone())
-                        };
+                        // The base itself resolves against the
+                        // document URL (HTML §4.2.3): `<base
+                        // href="/app/">` is the common form, and
+                        // Url::parse alone refused it, so every link
+                        // under it resolved against the page instead.
+                        let page_url_parsed =
+                            Url::parse(&page.url).unwrap_or_else(|_| parsed.clone());
+                        let base = extract_base_href(&html)
+                            .and_then(|bh| page_url_parsed.join(&bh).ok())
+                            .filter(|b| matches!(b.scheme(), "http" | "https"))
+                            .unwrap_or(page_url_parsed);
 
                         // Harvest <a href> links early so we can check
                         // focus match across all link sources (pagination,
@@ -1953,7 +1927,11 @@ fn self_harvest_static(html: &str, _base: &Url) -> Vec<(String, String)> {
         let Some(href) = a.value().attr("href") else {
             continue;
         };
-        let anchor: String = a.text().collect::<String>().trim().to_string();
+        // Visible text only: a script inside an anchor is tracking
+        // code, never a link label (#288's class).
+        let anchor: String = crate::extract::inline::visible_text_raw(a)
+            .trim()
+            .to_string();
         out.push((href.to_string(), anchor));
     }
     out
@@ -1965,4 +1943,20 @@ fn host_matches(a: &str, b: &str) -> bool {
     let a = a.strip_prefix("www.").unwrap_or(a);
     let b = b.strip_prefix("www.").unwrap_or(b);
     a.eq_ignore_ascii_case(b)
+}
+
+#[cfg(test)]
+mod anchor_text_guard_tests {
+    use super::self_harvest_static;
+
+    // A script inside an <a> is tracking code, never a link label
+    // (#288's class, crawl side).
+    #[test]
+    fn anchor_labels_never_carry_script_text() {
+        let html = "<a href=\"/docs\">Docs<script>void 0;</script></a>";
+        let found = self_harvest_static(html, &url::Url::parse("https://example.com/").unwrap());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "/docs");
+        assert_eq!(found[0].1, "Docs");
+    }
 }

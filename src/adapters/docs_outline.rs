@@ -6,7 +6,7 @@
 
 use scraper::{ElementRef, Html, Selector};
 
-use crate::extract::{ContentKind, ExtractOptions, Extracted};
+use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
 
 const MAX_ENTRIES: usize = 40;
 
@@ -81,16 +81,43 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     body_opts.max_chars = None;
     let mut body = String::new();
     let block_sel = Selector::parse("h1, h2, h3, h4, p, ul, ol, pre, table, blockquote").unwrap();
-    for el in root.select(&block_sel) {
+    // #293: prose that lives directly in divs (a div-based docs
+    // render, a custom content component) is content too. A div
+    // joins the walk as a paragraph candidate when nothing
+    // block-level lives inside it, outermost-only so nested
+    // wrappers never double-emit.
+    let any_sel =
+        Selector::parse("h1, h2, h3, h4, p, ul, ol, pre, table, blockquote, div").unwrap();
+    for el in root.select(&any_sel) {
+        let is_div = el.value().name() == "div";
         // Descendant select: a <p> inside a <li> or <blockquote>,
         // a nested <ul>, would be emitted as part of its parent
-        // AND again on its own. Outermost matches only.
+        // AND again on its own. Outermost matches only. A div is
+        // covered by an outer div only when that one is also a
+        // candidate (#293).
         let nested = el
             .ancestors()
             .take_while(|a| a.id() != root.id())
             .filter_map(ElementRef::wrap)
-            .any(|a| block_sel.matches(&a));
+            .any(|a| {
+                block_sel.matches(&a)
+                    || (is_div
+                        && a.value().name() == "div"
+                        && !has_block_descendant(&a, &block_sel))
+            });
         if nested {
+            continue;
+        }
+        if is_div {
+            // A wrapper holding block elements is skipped: its
+            // blocks emit on their own.
+            if !has_block_descendant(&el, &block_sel) {
+                let (m, _) = crate::extract::inline::markdown(el, url, &body_opts);
+                if !m.trim().is_empty() {
+                    body.push_str(m.trim());
+                    body.push_str("\n\n");
+                }
+            }
             continue;
         }
         match el.value().name() {
@@ -169,9 +196,16 @@ fn detect(doc: &Html) -> Option<Framework> {
             return Some(Framework::Docusaurus);
         }
     }
-    // Docusaurus doesn't always declare a generator: detect by
-    // __docusaurus script + .menu__link.
-    let dq = Selector::parse("script[src*='docusaurus'], a.menu__link").ok()?;
+    // Docusaurus doesn't always declare a generator: detect by its
+    // app root id. `a.menu__link` used to stand in here, but a CSS
+    // class name is not a claim about the framework: any BEM menu
+    // wears it, and the misfired adapter rebuilt the page from its
+    // own whitelist and lost the content (#293). `div#__docusaurus`
+    // is the root the framework wraps its app in: present on real
+    // sites, absent from the false positive. The script-src branch
+    // stays as a signal for older builds that have not hashed the
+    // bundle name.
+    let dq = Selector::parse("script[src*='docusaurus'], div#__docusaurus").ok()?;
     if doc.select(&dq).next().is_some() {
         return Some(Framework::Docusaurus);
     }
@@ -223,7 +257,16 @@ fn nav_from(doc: &Html, selectors: &str) -> Vec<(usize, String, String)> {
 }
 
 fn text_of(el: ElementRef) -> String {
-    el.text().collect::<String>().trim().to_string()
+    // Visible text only: a script/style subtree inside the element is
+    // source, not content (#288).
+    inline::visible_text_raw(el).trim().to_string()
+}
+
+/// #293: does anything block-level live inside this element? A div
+/// whose subtree holds blocks is a wrapper; its blocks emit on
+/// their own.
+fn has_block_descendant(el: &ElementRef, block_sel: &Selector) -> bool {
+    el.select(block_sel).next().is_some()
 }
 
 #[cfg(test)]
@@ -300,6 +343,81 @@ mod tests {
         assert!(
             md.contains("- Step one\n  - Detail a\n- Step two\n"),
             "{md}"
+        );
+    }
+
+    // #293: the app root id is the framework's own claim; detect by
+    // it, not by a class any menu can wear.
+    #[test]
+    fn docusaurus_detected_by_app_root() {
+        let html = r#"<html><head></head><body>
+          <div id="__docusaurus">
+            <nav>
+              <a class="menu__link" href="/docs/a/">A</a>
+              <a class="menu__link" href="/docs/b/">B</a>
+              <a class="menu__link" href="/docs/c/">C</a>
+              <a class="menu__link" href="/docs/d/">D</a>
+              <a class="menu__link" href="/docs/e/">E</a>
+            </nav>
+            <main><p>Real docs content.</p></main>
+          </div>
+        </body></html>"#;
+        let ex = extract(html, "https://docs.example.com/", &opts()).unwrap();
+        assert_eq!(ex.via, Some("adapter:docs-nav"));
+        assert!(ex.markdown.contains("- [A](/docs/a/)"));
+    }
+
+    // #293: `a.menu__link` alone is a BEM class, not a framework
+    // claim: an ordinary page must not be rebuilt by this adapter.
+    #[test]
+    fn menu_link_alone_is_not_docusaurus() {
+        let html = r#"<html><head><title>Lyrics</title></head><body>
+          <nav>
+            <a class="menu__link" href="/a/">A</a>
+            <a class="menu__link" href="/b/">B</a>
+            <a class="menu__link" href="/c/">C</a>
+            <a class="menu__link" href="/d/">D</a>
+            <a class="menu__link" href="/e/">E</a>
+          </nav>
+          <main><p>Chrome paragraph.</p><div id="song-body">The actual song text lives here.</div></main>
+        </body></html>"#;
+        assert!(extract(html, "https://lyrics.example.com/song/", &opts()).is_none());
+    }
+
+    // #293: content that lives directly in divs survives the
+    // adapter's own renderer (the whitelist had no div).
+    #[test]
+    fn div_based_content_survives() {
+        let html = r#"<html><head></head><body>
+          <div id="__docusaurus">
+            <nav>
+              <a class="menu__link" href="/docs/a/">A</a>
+              <a class="menu__link" href="/docs/b/">B</a>
+              <a class="menu__link" href="/docs/c/">C</a>
+              <a class="menu__link" href="/docs/d/">D</a>
+              <a class="menu__link" href="/docs/e/">E</a>
+            </nav>
+            <main>
+              <p>Chrome line for the nav.</p>
+              <div class="theme-doc-markdown">
+                <div>Prose that lives directly in a div block.</div>
+                <div>Second prose div a p-only whitelist would drop.</div>
+              </div>
+            </main>
+          </div>
+        </body></html>"#;
+        let ex = extract(html, "https://docs.example.com/", &opts()).unwrap();
+        assert!(
+            ex.markdown
+                .contains("Prose that lives directly in a div block."),
+            "{}",
+            ex.markdown
+        );
+        assert!(
+            ex.markdown
+                .contains("Second prose div a p-only whitelist would drop."),
+            "{}",
+            ex.markdown
         );
     }
 }

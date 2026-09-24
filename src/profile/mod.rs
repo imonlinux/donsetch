@@ -554,19 +554,32 @@ pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, 
                 .ok_or_else(|| format!("browser version probe failed for {path}"));
         }
     }
+    // Cross-process cache: the CLI is one process per fetch, so the
+    // per-process cache above still pays a spawn on every invocation
+    // (~50ms for the system Chromium). Keyed by the binary's identity
+    // (path + mtime + size): an updated browser re-probes. Best-effort:
+    // any cache read failure falls through to the spawn.
+    if let Some(banner) = cached_browser_banner(path) {
+        return Ok(banner);
+    }
     let result = probe_version_string_at_path_uncached(path);
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if result.is_ok() {
-        guard.insert(path.to_string(), result.clone().ok());
-        // Small cache: this map holds one entry per distinct binary
-        // path (system chromium, a playwright build, a cloak binary,
-        // an edge install). Never grows unbounded in practice; the
-        // paths are bounded by discoverable binaries on the host.
-        if guard.len() > 16 {
-            guard.clear();
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if result.is_ok() {
+            guard.insert(path.to_string(), result.clone().ok());
+            // Small cache: this map holds one entry per distinct binary
+            // path (system chromium, a playwright build, a cloak binary,
+            // an edge install). Never grows unbounded in practice; the
+            // paths are bounded by discoverable binaries on the host.
+            if guard.len() > 16 {
+                guard.clear();
+            }
         }
+    }
+    if let Ok(banner) = &result {
+        store_browser_banner(path, banner);
     }
     result
 }
@@ -586,6 +599,103 @@ fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     spawn_probe_with_timeout(cmd)
+}
+
+/// Disk home of the cross-process version-probe cache.
+fn probe_cache_file() -> std::path::PathBuf {
+    crate::paths::cache_dir().join("chrome-probe.json")
+}
+
+/// Identity of the probed binary: (mtime_ns, size). A browser update
+/// changes both; a missing file yields None and the cache is skipped.
+fn binary_identity(path: &str) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime_ns = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((mtime_ns, md.len()))
+}
+
+/// Banner from a previous process, when the binary's identity still
+/// matches. Best-effort: an unreadable, corrupt or mismatched cache
+/// answers None and the caller re-probes.
+fn cached_browser_banner(path: &str) -> Option<String> {
+    let (mtime_ns, size) = binary_identity(path)?;
+    let bytes = std::fs::read(probe_cache_file()).ok()?;
+    let map: std::collections::HashMap<String, (u64, u64, String)> =
+        serde_json::from_slice(&bytes).ok()?;
+    let (cached_mtime, cached_size, banner) = map.get(path)?;
+    (*cached_mtime == mtime_ns && *cached_size == size).then(|| banner.clone())
+}
+
+/// Remember a successful probe for the next process. Atomic tmp+rename;
+/// failures are silent (a cache must never fail a probe).
+fn store_browser_banner(path: &str, banner: &str) {
+    let Some((mtime_ns, size)) = binary_identity(path) else {
+        return;
+    };
+    let mut map: std::collections::HashMap<String, (u64, u64, String)> =
+        std::fs::read(probe_cache_file())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+    map.insert(path.to_string(), (mtime_ns, size, banner.to_string()));
+    if map.len() > 16 {
+        let entry = map.get(path).cloned().expect("entry just inserted");
+        map.clear();
+        map.insert(path.to_string(), entry);
+    }
+    let Ok(bytes) = serde_json::to_vec(&map) else {
+        return;
+    };
+    let file = probe_cache_file();
+    let tmp = file.with_extension("json.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &file);
+    }
+}
+
+#[cfg(test)]
+mod probe_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cross_process_banner_cache_round_trips_and_invalidates_on_change() {
+        let dir = std::env::temp_dir().join(format!("donsetch-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+        let fake = dir.join("fake-browser");
+        std::fs::write(&fake, b"#!/bin/sh\necho Chromium 151.0.7922.108\n").unwrap();
+        let fake = fake.to_string_lossy().to_string();
+
+        store_browser_banner(&fake, "Chromium 151.0.7922.108");
+        assert_eq!(
+            cached_browser_banner(&fake),
+            Some("Chromium 151.0.7922.108".to_string()),
+            "an unchanged binary must serve the cached banner"
+        );
+
+        // A browser update rewrites the file: the identity changes and
+        // the cache must miss so the new version is probed.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&fake, b"#!/bin/sh\necho Chromium 152.0.7922.109\n").unwrap();
+        assert_eq!(
+            cached_browser_banner(&fake),
+            None,
+            "a changed binary identity must invalidate the cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
+    }
 }
 
 mod version_probe;

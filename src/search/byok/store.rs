@@ -37,6 +37,22 @@ pub const PROVIDERS: &[&str] = &[
     "unlocker",
 ];
 
+/// Providers that serve a fetch-side surface, not search: the
+/// Bright Data Web Unlocker solves walls for the fetch path and
+/// has no SERP endpoint. They share the key store (one BYOK file,
+/// one `keys` CLI), but they must stay out of the search chain,
+/// out of search-default selection, and out of the "BYOK search
+/// is active" surfaces. Before this split, `keys add unlocker`
+/// put the unlocker in the search provider list, so every search
+/// burned one guaranteed-failing dispatch and the add-note claimed
+/// local search had been bypassed (issue #284).
+pub const FETCH_SIDE_PROVIDERS: &[&str] = &["unlocker"];
+
+/// True for the fetch-side providers above.
+pub fn is_fetch_side(name: &str) -> bool {
+    FETCH_SIDE_PROVIDERS.contains(&name)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyState {
@@ -270,6 +286,16 @@ impl ByokConfig {
         self.providers.iter().any(|p| !p.keys.is_empty())
     }
 
+    /// True if any configured provider can serve a search. A store
+    /// holding only fetch-side keys (unlocker) has no BYOK search
+    /// (#284): search surfaces must read it as unconfigured while
+    /// `keys list` still shows the key itself.
+    pub fn has_search_providers(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| !p.keys.is_empty() && !is_fetch_side(&p.name))
+    }
+
     /// Serialize to JSON string (for export).
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into())
@@ -335,8 +361,12 @@ impl ByokConfig {
                 }],
             });
         }
-        // First provider added becomes the default.
-        if self.default.is_empty() {
+        // First provider added becomes the default : except a
+        // fetch-side one, which can never serve a search (#284).
+        // A fetch-side name already in the default slot is a store
+        // written before that split; the next search-capable
+        // provider heals it.
+        if (self.default.is_empty() || is_fetch_side(&self.default)) && !is_fetch_side(provider) {
             self.default = provider.to_string();
         }
     }
@@ -356,11 +386,13 @@ impl ByokConfig {
         // Remove provider if no keys left.
         if p.keys.is_empty() {
             self.providers.retain(|p| p.name != provider);
-            // Fix default if it was this provider.
+            // Fix default if it was this provider : promote only a
+            // provider that can serve a search (#284).
             if self.default == provider {
                 self.default = self
                     .providers
-                    .first()
+                    .iter()
+                    .find(|p| !is_fetch_side(&p.name))
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
             }
@@ -370,11 +402,15 @@ impl ByokConfig {
 
     /// Set the default search method. Accepts "local" (use the
     /// keyless engine first, BYOK as fallback) or a configured
-    /// provider name. Returns false only for an unknown provider.
+    /// provider name. Returns false for a fetch-side name, which
+    /// is never a search default (#284), and for an unknown one.
     pub fn set_default(&mut self, provider: &str) -> bool {
         if provider == "local" {
             self.default = "local".to_string();
             return true;
+        }
+        if is_fetch_side(provider) {
+            return false;
         }
         if self.providers.iter().any(|p| p.name == provider) {
             self.default = provider.to_string();
@@ -413,12 +449,13 @@ impl ByokConfig {
         skip: &std::collections::HashSet<(String, String)>,
     ) -> Option<(String, String)> {
         // Build the priority order: default first, then rest.
+        // Fetch-side providers never enter the search chain (#284).
         let mut order: Vec<String> = Vec::with_capacity(self.providers.len());
-        if !self.default.is_empty() {
+        if !self.default.is_empty() && !is_fetch_side(&self.default) {
             order.push(self.default.clone());
         }
         for p in &self.providers {
-            if p.name != self.default {
+            if p.name != self.default && !is_fetch_side(&p.name) {
                 order.push(p.name.clone());
             }
         }
@@ -464,12 +501,13 @@ impl ByokConfig {
     #[allow(dead_code)]
     pub fn pick_key(&mut self) -> Option<(String, String)> {
         // Build the priority order: default first, then rest.
+        // Fetch-side providers never enter the search chain (#284).
         let mut order: Vec<String> = Vec::with_capacity(self.providers.len());
-        if !self.default.is_empty() {
+        if !self.default.is_empty() && !is_fetch_side(&self.default) {
             order.push(self.default.clone());
         }
         for p in &self.providers {
-            if p.name != self.default {
+            if p.name != self.default && !is_fetch_side(&p.name) {
                 order.push(p.name.clone());
             }
         }
@@ -537,6 +575,15 @@ impl ByokStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_configured()
+    }
+
+    /// Search-scoped: true only when a provider that can serve a
+    /// search has keys (#284).
+    pub fn has_search_providers(&self) -> bool {
+        self.config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_search_providers()
     }
 
     /// True if "local" is the default search method.
@@ -648,13 +695,20 @@ pub fn render_list(cfg: &ByokConfig) {
     }
 
     for p in &cfg.providers {
-        let is_default = p.name == cfg.default;
+        let is_default = p.name == cfg.default && !is_fetch_side(&p.name);
         let marker = if is_default {
             cli::green("\u{25C6}")
         } else {
             cli::dim("\u{25C7}")
         };
-        let label = if is_default {
+        let label = if is_fetch_side(&p.name) {
+            format!(
+                "{} {} {}",
+                marker,
+                cli::dim(&p.name),
+                cli::dim("(fetch-side : not a search provider)")
+            )
+        } else if is_default {
             format!(
                 "{} {} {}",
                 marker,
@@ -690,7 +744,15 @@ pub fn render_list(cfg: &ByokConfig) {
         cli::yellow("\u{23F1}"),
         cli::red("\u{2717}"),
     );
-    println!("  {}  {}", cli::dim("default:"), cli::green(&cfg.default));
+    // A fetch-side name in the default slot is a store written
+    // before #284; it is never a search default and heals on the
+    // next `keys add`.
+    let default_shown = if cfg.default.is_empty() || is_fetch_side(&cfg.default) {
+        cli::dim("(not set)")
+    } else {
+        cli::green(&cfg.default)
+    };
+    println!("  {}  {}", cli::dim("default:"), default_shown);
 
     // Warn if no usable keys remain : search will fall back
     // to the local keyless engine.
@@ -708,6 +770,14 @@ pub fn render_list(cfg: &ByokConfig) {
         println!(
             "     run {} to revive them",
             cli::bold("donsetch keys reset")
+        );
+    } else if !cfg.has_search_providers() {
+        // Keys exist but none can serve a search (#284): say so,
+        // or an unlocker-only store reads as a healthy BYOK setup.
+        println!();
+        println!(
+            "  {} no search provider configured (unlocker is fetch-side) : search runs on the local engine",
+            cli::dim("note:")
         );
     }
 
@@ -772,6 +842,60 @@ mod tests {
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].keys.len(), 1);
         assert_eq!(cfg.providers[0].keys[0].state, KeyState::Active);
+    }
+
+    // #284: the unlocker is fetch-side; it must never claim the
+    // search-default slot, must never read as a search provider,
+    // and must never be yielded by the search key chain.
+    #[test]
+    fn a_fetch_side_provider_is_never_a_search_default() {
+        let mut cfg = ByokConfig::empty();
+        cfg.add_key("unlocker", "abc::zone");
+        assert_eq!(cfg.default, "");
+        assert!(cfg.is_configured(), "the store does hold a key");
+        assert!(!cfg.has_search_providers());
+        assert!(!cfg.set_default("unlocker"), "not a search default");
+        // The next search-capable provider takes the slot.
+        cfg.add_key("tavily", "tvly-1");
+        assert_eq!(cfg.default, "tavily");
+        assert!(cfg.has_search_providers());
+    }
+
+    #[test]
+    fn a_stale_fetch_side_default_heals_on_the_next_add() {
+        // A store written before #284 can carry default=unlocker.
+        let mut cfg = ByokConfig::empty();
+        cfg.add_key("unlocker", "abc::zone");
+        cfg.default = "unlocker".to_string();
+        cfg.add_key("serper", "s-1");
+        assert_eq!(cfg.default, "serper");
+    }
+
+    #[test]
+    fn the_search_chain_skips_fetch_side_providers() {
+        let mut cfg = ByokConfig::empty();
+        cfg.add_key("unlocker", "abc::zone");
+        let skip = std::collections::HashSet::new();
+        assert_eq!(
+            cfg.pick_key_skipping(&skip),
+            None,
+            "an unlocker-only store has nothing to dispatch"
+        );
+        cfg.add_key("exa", "exa-1");
+        for _ in 0..3 {
+            let picked = cfg.pick_key_skipping(&skip).expect("exa is usable");
+            assert_eq!(picked.0, "exa", "the chain must never yield the unlocker");
+        }
+    }
+
+    #[test]
+    fn removing_the_default_never_promotes_a_fetch_side_provider() {
+        let mut cfg = ByokConfig::empty();
+        cfg.add_key("unlocker", "abc::zone");
+        cfg.add_key("tavily", "tvly-1");
+        assert_eq!(cfg.default, "tavily");
+        assert!(cfg.remove_keys("tavily", None));
+        assert_eq!(cfg.default, "", "not promoted to the unlocker");
     }
 
     #[test]

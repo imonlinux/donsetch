@@ -20,6 +20,8 @@ pub mod junk;
 pub mod language;
 pub mod math;
 pub mod metadata;
+pub mod nesting;
+pub mod quality;
 pub mod reddit;
 pub mod render;
 pub mod score;
@@ -150,12 +152,15 @@ pub enum ContentKind {
 #[derive(Debug)]
 pub enum ExtractError {
     BadSelector(String),
+    /// The body was refused (nesting gate) or the parse did not finish off the worker (budget, or the task died).
+    Failed(String),
 }
 
 impl std::fmt::Display for ExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExtractError::BadSelector(s) => write!(f, "invalid CSS selector: {s}"),
+            ExtractError::Failed(s) => write!(f, "{s}"),
         }
     }
 }
@@ -307,6 +312,50 @@ fn classify(blocks: &[&blocks::Block]) -> ContentKind {
 ///
 /// `content_type` is the raw Content-Type header value (may be
 /// empty). Non-HTML bodies pass through (truncated by max_chars).
+/// Budget for one PDF parse off the async runtime.
+pub const PDF_EXTRACT_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `extract`, with a PDF body parsed on the blocking pool under
+/// `PDF_EXTRACT_BUDGET`. pdfium rasterizes and lays out every page
+/// synchronously; run inline on a tokio worker that pinned the
+/// worker for the whole parse, the caller's deadline could not fire
+/// (the future never yields inside it), and every other tool call
+/// scheduled there waited. The crawl already did this; the fetch
+/// tool called `extract` inline at every site. HTML goes straight
+/// through: it is fast and already bounded by the walk caps.
+pub async fn extract_off_worker(
+    body: &[u8],
+    ct: &str,
+    url: &str,
+    opts: &ExtractOptions,
+) -> Result<Extracted, ExtractError> {
+    if !is_pdf_body(body, ct) {
+        return extract(body, ct, url, opts);
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return extract(body, ct, url, opts);
+    };
+    let body = body.to_vec();
+    let ct = ct.to_string();
+    let url = url.to_string();
+    let opts = opts.clone();
+    let task = handle.spawn_blocking(move || extract(&body, &ct, &url, &opts));
+    match tokio::time::timeout(PDF_EXTRACT_BUDGET, task).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(join_err)) => Err(ExtractError::Failed(format!(
+            "extract task failed: {join_err}"
+        ))),
+        Err(_) => Err(ExtractError::Failed(format!(
+            "PDF extraction timed out after {}s",
+            PDF_EXTRACT_BUDGET.as_secs()
+        ))),
+    }
+}
+
+fn is_pdf_body(body: &[u8], ct: &str) -> bool {
+    body.len() >= 5 && body.starts_with(b"%PDF-") || ct.to_ascii_lowercase().contains("pdf")
+}
+
 pub fn extract(
     body: &[u8],
     content_type: &str,
@@ -446,6 +495,12 @@ pub fn extract(
     // --- HTML upstream ---
     let html_text = charset::decode(body, &ct);
     let raw_len = body.len();
+    if nesting::max_nesting(&html_text) > nesting::MAX_NESTING {
+        return Err(ExtractError::Failed(format!(
+            "markup nested deeper than {} levels: not a document",
+            nesting::MAX_NESTING
+        )));
+    }
 
     // Reddit dedicated extractor: bypasses DonSift for
     // old.reddit.com, produces compact structured output.

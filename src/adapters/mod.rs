@@ -20,6 +20,7 @@ pub mod docs_outline;
 pub mod github;
 pub mod packages;
 pub mod plugins;
+pub mod reddit_html;
 pub mod reddit_json;
 pub mod stackexchange;
 pub mod wiki_infobox;
@@ -57,16 +58,21 @@ pub struct BuiltinRewrite {
 }
 
 /// The bundled rewrite set, in dispatch order.
-const BUILTIN_REWRITES: [BuiltinRewrite; 7] = [
+///
+/// There is deliberately no old.reddit.com retarget (issue #283):
+/// both reddit rewrites used to point there, the host serves a
+/// login wall to anonymous clients on HTML and `.json` alike, and
+/// the shape-mismatch guard silently repaired the result afterwards
+/// : every reddit fetch paid a dead hop (and, on a host already
+/// recorded as walled, an unlocker escalation) while a caller who
+/// supplied the working `www.reddit.com/....json` URL was detoured
+/// through the wall first. `www.reddit.com` serves the same JSON
+/// the adapter parses, so the host stays the caller's.
+const BUILTIN_REWRITES: [BuiltinRewrite; 6] = [
     BuiltinRewrite {
         via: "adapter:reddit-json",
-        description: "reddit thread and listing pages -> old.reddit .json endpoints",
+        description: "reddit threads, listings, about and user pages -> .json endpoints",
         apply: reddit_json_rw,
-    },
-    BuiltinRewrite {
-        via: "adapter:reddit-old",
-        description: "other reddit pages -> the legacy SSR host old.reddit.com",
-        apply: reddit_old_rw,
     },
     BuiltinRewrite {
         via: "adapter:npm-registry",
@@ -137,12 +143,58 @@ pub fn rewrite(u: &url::Url) -> Option<(String, &'static str)> {
 // -- Bundled adapters: matchers + rewrites. -------------------------
 // Each returns the rewritten URL name; `rewrite` attaches the via.
 
+/// Reddit URL -> its JSON endpoint (or None when the shape has
+/// none). Threads, listings, subreddit about pages and user pages
+/// all have one; wiki pages (`/wiki/`) and share links (`/s/`) do
+/// not, so they stay pages (the session retry and the SSR adapter
+/// handle them).
+///
+/// The content host is `www.reddit.com`: `old.`/`np.` serve a
+/// login wall to anonymous clients, so their content URLs rewrite
+/// onto www. `www.`/`reddit.com` stay the caller's (issue #283:
+/// reddit serves the same JSON there, and detouring working URLs
+/// through the legacy host was the old bug).
 fn reddit_json_rw(u: &url::Url) -> Option<String> {
     let host = u.host_str()?;
-    if !matches!(host, "www.reddit.com" | "reddit.com" | "old.reddit.com") {
+    let json_host = match host {
+        "www.reddit.com" | "reddit.com" => host,
+        "old.reddit.com" | "np.reddit.com" => "www.reddit.com",
+        _ => return None,
+    };
+    let path = u.path().to_string();
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // Wiki pages and share links have no JSON shape.
+    if segs.len() >= 3 && segs[0] == "r" && matches!(segs[2], "wiki" | "s") {
         return None;
     }
-    let path = u.path().to_string();
+
+    // User pages: the profile and the two activity listings.
+    if matches!(segs.first(), Some(&"user") | Some(&"u")) {
+        let name = segs.get(1).copied().unwrap_or("");
+        if name.is_empty() {
+            return None;
+        }
+        let new_path = match segs.as_slice() {
+            [_, _] => format!("/user/{name}/about.json"),
+            [_, _, tab @ ("comments" | "submitted")] => format!("/user/{name}/{tab}.json"),
+            _ => return None,
+        };
+        return rebuilt(u, json_host, &new_path);
+    }
+
+    // Subreddit about pages: the card and the rules list.
+    if let ["r", sub, "about"] = segs.as_slice() {
+        return rebuilt(u, json_host, &format!("/r/{sub}/about.json"));
+    }
+    if let ["r", sub, "about", "rules"] = segs.as_slice() {
+        return rebuilt(u, json_host, &format!("/r/{sub}/about/rules.json"));
+    }
+    if let ["r", _, "about", ..] = segs.as_slice() {
+        return None; // other about subpages have no JSON shape
+    }
+
+    // Threads and listings.
     let trimmed = path.trim_end_matches('/');
     let path_part = if trimmed.is_empty() { "/" } else { trimmed };
     let is_thread = path.contains("/comments/");
@@ -150,22 +202,74 @@ fn reddit_json_rw(u: &url::Url) -> Option<String> {
     if !(is_thread || is_listing) || path_part.ends_with(".json") {
         return None;
     }
-    // Keep query (?t=top sorts) : drop fragments only.
+    // Keep the query (?t=top sorts) : drop fragments only.
+    rebuilt(u, json_host, &format!("{path_part}.json"))
+}
+
+/// One rebuilt URL: the caller's URL, host swapped when needed,
+/// path replaced, fragment dropped, query kept.
+fn rebuilt(u: &url::Url, host: &str, path: &str) -> Option<String> {
     let mut u2 = u.clone();
-    let _ = u2.set_host(Some("old.reddit.com"));
-    u2.set_path(&format!("{path_part}.json"));
+    u2.set_host(Some(host)).ok()?;
+    u2.set_path(path);
     u2.set_fragment(None);
     Some(u2.to_string())
 }
 
-fn reddit_old_rw(u: &url::Url) -> Option<String> {
+/// The legacy-host navigation that initializes the reddit.com
+/// session (issue #291 follow-through): any old.reddit.com
+/// response runs its login flow and seeds the cookies (`loid`,
+/// `session_tracker`, `csrf_token`, …) that www.reddit.com needs
+/// before it serves the real SSR page instead of the humanity
+/// interstitial or the JS shell. `None` = not reddit, or already
+/// on the legacy host.
+pub fn reddit_session_url(u: &url::Url) -> Option<String> {
     let host = u.host_str()?;
-    if !matches!(host, "www.reddit.com" | "reddit.com") {
+    if !is_reddit_host(host) || host == "old.reddit.com" {
         return None;
     }
     let mut u2 = u.clone();
-    let _ = u2.set_host(Some("old.reddit.com"));
+    u2.set_host(Some("old.reddit.com")).ok()?;
+    u2.set_fragment(None);
     Some(u2.to_string())
+}
+
+/// The content-host URL for a caller URL on a legacy host
+/// (`old.`/`np.`): those serve a login wall to anonymous clients,
+/// so fallback retries head for www instead. `None` = the URL is
+/// not on a legacy host (use it as-is).
+pub fn reddit_content_url(u: &url::Url) -> Option<String> {
+    match u.host_str()? {
+        "old.reddit.com" | "np.reddit.com" => {
+            let mut u2 = u.clone();
+            u2.set_host(Some("www.reddit.com")).ok()?;
+            Some(u2.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Domain-label host check for reddit, shared by the JSON adapter
+/// and the HTML extractor: `reddit.com` itself or any `*.reddit.com`
+/// subdomain, nothing else. A bare `ends_with("reddit.com")` also
+/// claimed look-alikes like `notreddit.com`.
+pub(crate) fn is_reddit_host(host: &str) -> bool {
+    host == "reddit.com"
+        || host
+            .strip_suffix("reddit.com")
+            .is_some_and(|p| p.ends_with('.'))
+}
+
+/// 1_234_567 → "1.2M" : shared by the package cards and the
+/// reddit cards.
+pub(crate) fn human_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn npm_registry_rw(u: &url::Url) -> Option<String> {
@@ -261,6 +365,22 @@ fn go_proxy_rw(u: &url::Url) -> Option<String> {
     if !first.contains('.') || rest.chars().any(|c| c.is_uppercase()) {
         return None;
     }
+    // Version-pinned module (/module@v1.2.3): the module path is the
+    // part before the '@', and the proxy serves the same payload
+    // @latest does, pinned, under /@v/<version>.info. Sending the
+    // '@' through to @latest made the proxy read "module@v1.2.3"
+    // as the module name: 404, fallback, and the caller's page
+    // fetched anyway, one wasted hop later.
+    if let Some(at) = rest.find('@') {
+        let module = &rest[..at];
+        let ver = &rest[at + 1..];
+        if module.is_empty() || ver.is_empty() || ver.contains('/') || !ver.starts_with('v') {
+            return None;
+        }
+        let u2 =
+            url::Url::parse(&format!("https://proxy.golang.org/{module}/@v/{ver}.info")).ok()?;
+        return Some(u2.to_string());
+    }
     let u2 = url::Url::parse(&format!("https://proxy.golang.org/{rest}/@latest")).ok()?;
     Some(u2.to_string())
 }
@@ -291,12 +411,16 @@ pub fn extract_json(
     if !enabled() {
         return None;
     }
-    // Same cut contract as extract_html: focus/toc/must_contain/
-    // section are pipeline features the adapters don't reproduce.
-    // Without this guard, `must_contain` on an adapter-shaped URL
-    // (reddit, npm, PyPI...) silently handed the agent the FULL
-    // document instead of the promised MATCH/NO-MATCH probe.
-    if opts.focus.is_some() || opts.toc || opts.must_contain.is_some() || opts.section.is_some() {
+    // Cut contract, JSON edition: `must_contain` bails to the
+    // non-HTML probe in extract(), which serves it properly. focus /
+    // toc / section do NOT bail: the generic machinery for them
+    // runs on HTML blocks, a JSON payload has none, and bailing
+    // fell through to the raw-JSON passthrough, which silently
+    // dropped the cut and dumped the whole payload. The card IS
+    // the compact truth of this endpoint: serve it. (The HTML
+    // extract adapters keep their guards: there the generic path
+    // applies the cuts on the real DOM.)
+    if opts.must_contain.is_some() {
         return None;
     }
     let looks_json = ct.contains("json") || matches!(body.first(), Some(b'{') | Some(b'['));
@@ -326,7 +450,8 @@ pub fn extract_html(
         return None;
     }
     debug_dump(html, url);
-    github::extract(html, url, opts)
+    reddit_html::extract(html, url, opts)
+        .or_else(|| github::extract(html, url, opts))
         .or_else(|| stackexchange::extract(html, url, opts))
         .or_else(|| wiki_infobox::extract(html, url, opts))
         .or_else(|| docs_outline::extract(html, url, opts))
@@ -345,7 +470,7 @@ mod tests {
         let (u, via) = rw("https://www.reddit.com/r/rust/comments/abc123/title_here/").unwrap();
         assert_eq!(
             u,
-            "https://old.reddit.com/r/rust/comments/abc123/title_here.json"
+            "https://www.reddit.com/r/rust/comments/abc123/title_here.json"
         );
         assert_eq!(via, "adapter:reddit-json");
     }
@@ -353,22 +478,97 @@ mod tests {
     #[test]
     fn reddit_listing_gets_json() {
         let (u, via) = rw("https://reddit.com/r/programming/?t=top").unwrap();
-        assert_eq!(u, "https://old.reddit.com/r/programming.json?t=top");
+        assert_eq!(u, "https://reddit.com/r/programming.json?t=top");
         assert_eq!(via, "adapter:reddit-json");
         let (u, _) = rw("https://www.reddit.com/").unwrap();
-        assert_eq!(u, "https://old.reddit.com/.json");
+        assert_eq!(u, "https://www.reddit.com/.json");
+    }
+
+    // User pages: the profile and the two activity listings have
+    // JSON endpoints; the rest of /user/ stays a page.
+    #[test]
+    fn reddit_user_pages_get_json() {
+        let (u, via) = rw("https://www.reddit.com/user/spez/").unwrap();
+        assert_eq!(u, "https://www.reddit.com/user/spez/about.json");
+        assert_eq!(via, "adapter:reddit-json");
+        let (u, _) = rw("https://reddit.com/u/spez/comments/").unwrap();
+        assert_eq!(u, "https://reddit.com/user/spez/comments.json");
+        let (u, _) = rw("https://www.reddit.com/user/spez/submitted").unwrap();
+        assert_eq!(u, "https://www.reddit.com/user/spez/submitted.json");
+        assert!(rw("https://www.reddit.com/user/spez/gilded/").is_none());
+    }
+
+    // Subreddit about pages: the card and the rules list.
+    #[test]
+    fn reddit_about_pages_get_json() {
+        let (u, _) = rw("https://www.reddit.com/r/rust/about/").unwrap();
+        assert_eq!(u, "https://www.reddit.com/r/rust/about.json");
+        let (u, _) = rw("https://www.reddit.com/r/rust/about/rules").unwrap();
+        assert_eq!(u, "https://www.reddit.com/r/rust/about/rules.json");
+        // Other about subpages have no JSON shape.
+        assert!(rw("https://www.reddit.com/r/rust/about/traffic").is_none());
+    }
+
+    // Legacy hosts serve nothing to anonymous clients: their
+    // content URLs rewrite onto www.
+    #[test]
+    fn reddit_legacy_hosts_retarget_to_www() {
+        let (u, _) = rw("https://old.reddit.com/r/rust/comments/abc/x/").unwrap();
+        assert_eq!(u, "https://www.reddit.com/r/rust/comments/abc/x.json");
+        let (u, _) = rw("https://np.reddit.com/r/rust/").unwrap();
+        assert_eq!(u, "https://www.reddit.com/r/rust.json");
+    }
+
+    // Wiki pages and share links have no JSON endpoint: they stay
+    // pages (the session retry and the SSR adapter handle them).
+    #[test]
+    fn reddit_wiki_and_share_links_stay_pages() {
+        assert!(rw("https://www.reddit.com/r/rust/wiki/index").is_none());
+        assert!(rw("https://old.reddit.com/r/rust/wiki/books/chapters/").is_none());
+        assert!(rw("https://www.reddit.com/r/rust/s/AbCdEf").is_none());
+    }
+
+    // The session hop: the same path on the legacy host (any
+    // old.reddit response runs the login flow that seeds the
+    // cookies www needs).
+    #[test]
+    fn reddit_session_url_goes_through_the_legacy_host() {
+        let v = |u: &str| reddit_session_url(&url::Url::parse(u).unwrap());
+        assert_eq!(
+            v("https://www.reddit.com/r/rust/comments/abc123/title_here/?t=top").unwrap(),
+            "https://old.reddit.com/r/rust/comments/abc123/title_here/?t=top"
+        );
+        assert_eq!(
+            v("https://www.reddit.com/r/rust/wiki/index").unwrap(),
+            "https://old.reddit.com/r/rust/wiki/index"
+        );
+        assert!(v("https://old.reddit.com/r/rust/").is_none());
+        assert!(v("https://example.com/r/rust/").is_none());
     }
 
     #[test]
-    fn reddit_user_page_gets_old_domain_only() {
-        let (u, via) = rw("https://www.reddit.com/user/spez/").unwrap();
-        assert_eq!(u, "https://old.reddit.com/user/spez/");
-        assert_eq!(via, "adapter:reddit-old");
+    fn reddit_content_url_swaps_legacy_hosts_only() {
+        let c = |u: &str| reddit_content_url(&url::Url::parse(u).unwrap());
+        assert_eq!(
+            c("https://old.reddit.com/r/rust/").unwrap(),
+            "https://www.reddit.com/r/rust/"
+        );
+        assert_eq!(
+            c("https://np.reddit.com/r/rust/").unwrap(),
+            "https://www.reddit.com/r/rust/"
+        );
+        assert!(c("https://www.reddit.com/r/rust/").is_none());
+        assert!(c("https://example.com/").is_none());
     }
 
     #[test]
     fn already_json_not_double_appended() {
         assert!(rw("https://old.reddit.com/r/rust.json").is_none());
+        // A caller who supplies the URL that actually works is not
+        // detoured: no second hop, no unlocker credit spent on the
+        // wall (issue #283).
+        assert!(rw("https://www.reddit.com/r/rust/comments/abc/x.json").is_none());
+        assert!(rw("https://www.reddit.com/r/rust.json?limit=50").is_none());
     }
 
     #[test]
@@ -427,5 +627,64 @@ mod tests {
     fn non_adapter_sites_pass_through() {
         assert!(rw("https://example.com/foo").is_none());
         assert!(rw("https://github.com/tokio-rs/tokio").is_none());
+    }
+
+    // pkg.go.dev version pins map to the proxy's pinned .info; the
+    // '@' used to ride along into @latest, whose 404 cost a full
+    // adapter detour.
+    #[test]
+    fn go_proxy_version_pinned() {
+        let (u, via) = rw("https://pkg.go.dev/github.com/gin-gonic/gin@v1.10.0").unwrap();
+        assert_eq!(
+            u,
+            "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.10.0.info"
+        );
+        assert_eq!(via, "adapter:go-proxy");
+        // A malformed pin is not a proxy path: generic handles it.
+        assert!(rw("https://pkg.go.dev/github.com/gin-gonic/gin@nope").is_none());
+        assert!(rw("https://pkg.go.dev/github.com/gin-gonic/gin@v1.0.0/sub").is_none());
+    }
+
+    #[test]
+    fn reddit_host_check_is_label_aware() {
+        assert!(is_reddit_host("reddit.com"));
+        assert!(is_reddit_host("www.reddit.com"));
+        assert!(is_reddit_host("old.reddit.com"));
+        assert!(!is_reddit_host("notreddit.com"));
+        assert!(!is_reddit_host("reddit.com.evil.io"));
+    }
+
+    // focus / toc / section cannot be applied to a JSON payload: the
+    // extractors used to bail and the raw JSON got dumped, silently
+    // dropping the cut. The card is the answer now. must_contain
+    // still bails (the non-HTML probe serves it).
+    #[test]
+    fn json_cards_survive_cut_params() {
+        let body = br#"{"kind":"Listing","data":{"children":[{"kind":"t3","data":{
+          "title":"Post","subreddit":"rust","author":"a","score":1,
+          "created_utc":1755800000.0,"num_comments":0,"selftext":"","over_18":false}}]}}"#;
+        let url = "https://www.reddit.com/r/rust.json";
+        for cut in [
+            crate::extract::ExtractOptions {
+                focus: Some("post".into()),
+                ..Default::default()
+            },
+            crate::extract::ExtractOptions {
+                toc: true,
+                ..Default::default()
+            },
+            crate::extract::ExtractOptions {
+                section: Some("x".into()),
+                ..Default::default()
+            },
+        ] {
+            let ex = extract_json(body, "application/json", url, &cut).expect("card");
+            assert!(ex.markdown.contains("**Post**"), "{}", ex.markdown);
+        }
+        let probe = crate::extract::ExtractOptions {
+            must_contain: Some("Post".into()),
+            ..Default::default()
+        };
+        assert!(extract_json(body, "application/json", url, &probe).is_none());
     }
 }

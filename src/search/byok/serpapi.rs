@@ -102,7 +102,9 @@ pub async fn search(
         .map_err(KeyError::from_transport)?;
 
     let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    // A body-read failure is a transport error, not an empty body
+    // (#286): keep what reqwest saw instead of mapping it to "".
+    let text = resp.text().await.map_err(KeyError::from_transport)?;
 
     if status == 401 || status == 403 {
         return Err(KeyError::InvalidKey);
@@ -141,8 +143,7 @@ pub async fn search(
         return Err(KeyError::UnknownError(format!("HTTP {status}: {body}")));
     }
 
-    let json: Value = serde_json::from_str(&text)
-        .map_err(|e| KeyError::UnknownError(format!("parse error: {e}")))?;
+    let json: Value = super::parse_provider_json(status, &text)?;
 
     // SerpApi returns HTTP 200 with an `error` field for some
     // failure modes (e.g. unsupported engine/param combos) instead

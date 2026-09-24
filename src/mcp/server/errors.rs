@@ -220,7 +220,7 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
 /// | code | meaning |
 /// |---|---|
 /// | network.dns / network.timeout / network.ratelimit | transport |
-/// | wall.challenge / wall.captcha / wall.paywall / wall.auth | blocked |
+/// | wall.challenge / wall.challenge_unsolved / wall.empty_shell / wall.captcha / wall.paywall / wall.auth | blocked |
 /// | cloak.suspected | tier-1 content is likely decoy |
 /// | content.notfound / content.binary / content.oversize / content.extract | body |
 /// | guard.ssrf | blocked by design |
@@ -262,6 +262,8 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         _ if m.contains("bad seed") => "crawl.seed",
         _ if m.contains("resume token") => "crawl.resume",
         _ if m.contains("charset") || m.contains("decode") => "parse.encoding",
+        _ if m.contains("anti-bot challenge that did not clear") => "wall.challenge_unsolved",
+        _ if m.contains("navigation and login chrome") => "wall.empty_shell",
         _ if m.contains("captcha") => "wall.captcha",
         _ if m.contains("archived copy") || m.contains("snapshot") => "archive.stale",
         _ if v == "Challenge" => "wall.challenge",
@@ -726,6 +728,29 @@ mod error_code_tests {
         assert_eq!(
             error_code(&friendly_fetch_error(&ssrf), None).as_ref(),
             "guard.ssrf"
+        );
+    }
+
+    // #282: the two content-quality failures keep their own codes so
+    // an agent can tell "the page is a shell/login wall" from "the
+    // challenge never cleared".
+    #[test]
+    pub(super) fn content_quality_walls_get_distinct_codes() {
+        assert_eq!(
+            error_code(
+                "blocked at https://x : the page is an anti-bot challenge that did not clear (the extracted text is the interstitial, not content)",
+                None
+            )
+            .as_ref(),
+            "wall.challenge_unsolved"
+        );
+        assert_eq!(
+            error_code(
+                "blocked at https://x : the page rendered only navigation and login chrome (an empty shell or a login wall), no content",
+                None
+            )
+            .as_ref(),
+            "wall.empty_shell"
         );
     }
 }

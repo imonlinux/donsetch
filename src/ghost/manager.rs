@@ -86,7 +86,11 @@ pub struct GhostManager {
     slots: Vec<Arc<AsyncMutex<Slot>>>,
     /// Xvfb display string (":99") on Linux, None elsewhere. The
     /// display is pool-wide: every slot's Chrome attaches to it.
-    display: Option<String>,
+    /// Lazily initialized on the FIRST browser acquire: a tier-1-only
+    /// process must not pay Xvfb probes (`which Xvfb`, an `xdpyinfo`
+    /// spawn, an X11 connect, or an Xvfb start) for a browser it will
+    /// never launch. Acquire awaits the cell; once set it is stable.
+    display: tokio::sync::OnceCell<Option<String>>,
     /// The pool-wide Xvfb handle; killed once at daemon shutdown
     /// (previously one per manager; the pool shares one).
     xvfb: AsyncMutex<Option<super::xvfb::Xvfb>>,
@@ -185,65 +189,6 @@ impl GhostManager {
     /// Test seam: same init path, arbitrary default (clamped by the
     /// same rules as the env).
     async fn with_slot_default(default: usize) -> Arc<Self> {
-        // Termux (Android) has no X11 by default. Skip Xvfb entirely;
-        // Ghost will use --headless=new mode. Detecting Termux early
-        // avoids a confusing error message about Xvfb installation.
-        let is_termux = std::env::var_os("PREFIX")
-            .map(|p| p.to_string_lossy().contains("com.termux"))
-            .unwrap_or(false);
-
-        // A forced headless backend does not need a virtual display. Avoid
-        // starting Xvfb so the selection is explicit in both process and args.
-        let (display, xvfb) = if super::cloak::headless_mode_requested() {
-            if crate::config::cfg().debug.ghost {
-                eprintln!("[ghost] headless backend selected, skipping Xvfb");
-            }
-            (None, None)
-        } else if !is_termux && super::xvfb::is_available() {
-            match super::xvfb::Xvfb::start().await {
-                Ok(xvfb) => {
-                    let disp = xvfb.display_env();
-                    if crate::config::cfg().debug.ghost {
-                        // A borrowed display was reused, not started: a
-                        // pre-existing X server is not ours, and saying
-                        // "started" for it was wrong (#258).
-                        if xvfb.is_borrowed() {
-                            eprintln!("[ghost] Xvfb reused on {disp} (already running)");
-                        } else {
-                            eprintln!("[ghost] Xvfb started on {disp}");
-                        }
-                    }
-                    (Some(disp), Some(xvfb))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[ghost] Xvfb start failed: {e}, falling back to headful off-screen mode"
-                    );
-                    (None, None)
-                }
-            }
-        } else if is_termux {
-            // Termux: no Xvfb needed. Ghost uses --headless=new.
-            if crate::config::cfg().debug.ghost {
-                eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
-            }
-            (None, None)
-        } else if let Some(hint) = xvfb_missing_hint() {
-            // Xvfb not installed on a Linux-family system: warn the
-            // user. Chrome will run headful off-screen
-            // (--window-position=-32000,-32000 + CDP minimize), but
-            // on Linux a minimized window may still flash on screen
-            // briefly. Xvfb is the clean solution for invisible
-            // headful Chrome there. macOS/Windows never see this
-            // hint: headful off-screen is their native mode and the
-            // apt/pacman advice does not apply (issue #81).
-            eprintln!("{hint}");
-            (None, None)
-        } else {
-            // macOS/Windows/other: no Xvfb concept at all.
-            (None, None)
-        };
-
         let seed = pool_slots(default);
         let slots: Vec<Slot> = (0..seed)
             .map(|_| Slot {
@@ -268,12 +213,79 @@ impl GhostManager {
                 .into_iter()
                 .map(|s| Arc::new(AsyncMutex::new(s)))
                 .collect(),
-            display,
-            xvfb: AsyncMutex::new(xvfb),
+            display: tokio::sync::OnceCell::new(),
+            xvfb: AsyncMutex::new(None),
         });
         let reaper = Arc::clone(&mgr);
         tokio::spawn(async move { reaper.reap_loop().await });
         mgr
+    }
+
+    /// Start (or adopt) the pool display on first need. Idempotent:
+    /// concurrent first acquires serialize on the OnceCell. This is
+    /// the same selection logic the old boot-time init used, moved to
+    /// the moment a browser is actually going to launch.
+    async fn ensure_display(&self) -> Option<String> {
+        self.display
+            .get_or_init(|| async {
+                // Termux (Android) has no X11 by default. Skip Xvfb
+                // entirely; Ghost will use --headless=new mode.
+                let is_termux = std::env::var_os("PREFIX")
+                    .map(|p| p.to_string_lossy().contains("com.termux"))
+                    .unwrap_or(false);
+                // A forced headless backend does not need a virtual
+                // display. Avoid starting Xvfb so the selection is
+                // explicit in both process and args.
+                if super::cloak::headless_mode_requested() {
+                    if crate::config::cfg().debug.ghost {
+                        eprintln!("[ghost] headless backend selected, skipping Xvfb");
+                    }
+                    return None;
+                }
+                if is_termux {
+                    if crate::config::cfg().debug.ghost {
+                        eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
+                    }
+                    return None;
+                }
+                if !super::xvfb::is_available() {
+                    // Xvfb not installed on a Linux-family system: warn
+                    // the user. Chrome will run headful off-screen
+                    // (--window-position=-32000,-32000 + CDP minimize),
+                    // but on Linux a minimized window may still flash on
+                    // screen briefly. Xvfb is the clean solution there.
+                    // macOS/Windows never see this hint (issue #81).
+                    if let Some(hint) = xvfb_missing_hint() {
+                        eprintln!("{hint}");
+                    }
+                    return None;
+                }
+                match super::xvfb::Xvfb::start().await {
+                    Ok(xvfb) => {
+                        let disp = xvfb.display_env();
+                        if crate::config::cfg().debug.ghost {
+                            // A borrowed display was reused, not started: a
+                            // pre-existing X server is not ours, and saying
+                            // "started" for it was wrong (#258).
+                            if xvfb.is_borrowed() {
+                                eprintln!("[ghost] Xvfb reused on {disp} (already running)");
+                            } else {
+                                eprintln!("[ghost] Xvfb started on {disp}");
+                            }
+                        }
+                        *self.xvfb.lock().await = Some(xvfb);
+                        Some(disp)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ghost] Xvfb start failed: {e}, falling back to headful off-screen mode"
+                        );
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
     }
 
     /// Acquire the ghost: launch if absent, thaw if frozen,
@@ -352,7 +364,8 @@ impl GhostManager {
             if let Some(mut old) = guard.ghost.take() {
                 old.kill().await;
             }
-            guard.ghost = Some(Ghost::launch_wire(profile, self.display.as_deref(), &wire).await?);
+            let display = self.ensure_display().await;
+            guard.ghost = Some(Ghost::launch_wire(profile, display.as_deref(), &wire).await?);
         } else {
             if crate::config::cfg().debug.ghost {
                 eprintln!("[pool] warm serve slot {}", idx);
@@ -450,10 +463,11 @@ impl GhostManager {
         }
     }
 
-    /// Is Xvfb active (headful mode)?
+    /// Is Xvfb active (headful mode)? False before the first acquire
+    /// has initialized the display.
     #[allow(dead_code)]
     pub fn is_headful(&self) -> bool {
-        self.display.is_some()
+        self.display.get().is_some_and(|d| d.is_some())
     }
 }
 

@@ -5,6 +5,415 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The README sponsors section is two sections now: "Our Sponsors"
+  holds the placements, starting with Fluxion AI (Gold, banner
+  pinned at the top), and "Sponsor this project" carries the
+  tiers and the ask.
+
+### Fixed
+
+- pkg.go.dev URLs that pin a version (`/module@v1.2.3`) map to the
+  Go proxy's pinned `.info` endpoint now. The `@` used to ride along
+  into the `@latest` rewrite, which the proxy read as part of the
+  module name: every pinned page cost a 404, a fallback and a second
+  fetch of the page itself (1.9s of detour on a live probe; the
+  pinned card answers in one request, 247ms).
+- crates.io `/crates/<name>/versions` renders the versions card
+  (newest release, dates, yanked flags, total count) instead of
+  dumping the endpoint's raw JSON: a live page went from 16 KB of
+  JSON to a 500-char card.
+- Wikipedia articles whose titles contain a colon (`Star Trek: The
+  Original Series`) get the infobox treatment again. The old blanket
+  colon check read any colon as a namespace prefix and skipped the
+  adapter; namespace pages (File:, Talk:, Special:, ...) still skip.
+  Live: the same page lost 4k chars of spilled table markup and
+  gained the clean field list.
+- Stack Exchange host matching is label-aware now: `meta.*`
+  subdomains and `mathoverflow.net` are covered, and look-alikes
+  (`notstackoverflow.com`) are not.
+- The reddit extractors (JSON adapter and HTML) no longer claim
+  look-alike domains: `reddit.com` or `*.reddit.com`, nothing else.
+- GitHub releases and commits pages fire the adapter again. The
+  commits URL arm takes the ref segment (`/commits/master`, the
+  canonical link), the releases selector follows the 2025+
+  server-rendered markup, and the commits renderer reads the React
+  rows (data-testid hooks, sha from `data-commit-link`, dates from
+  the per-group titles, which are the only server-rendered dates).
+  Live: a 30-commit page came back as a titled list with authors,
+  dates and short shas, a releases page as `## vX.Y.Z : date` plus
+  its notes. The legacy markup stays as fallback.
+- Adapter JSON endpoints no longer dump raw JSON when focus, toc or
+  section is set: the card is served instead. The generic cut
+  machinery runs on HTML blocks, a JSON payload has none, and the
+  old bail fell through to the raw-JSON passthrough, silently
+  dropping the cut (a `crates.io/crates/serde --focus downloads`
+  fetch returned 16 KB of JSON). `must_contain` still runs as a
+  probe.
+
+- Reddit renders one clean card for every URL shape, on both
+  paths. The shreddit SSR adapter is new: threads with the full
+  comment tree (scores, ages, nesting, hidden-reply counts), the
+  post body, listings with the server-rendered posts and an
+  honest feed-cut note, subreddit about pages with rules, wiki
+  pages with the whole document and its revision stamp, all
+  through the same formatting helpers the `.json` adapter uses.
+  Where the `.json` endpoint refuses, the page path now lands in
+  the same cards instead of generic chrome: a live thread went
+  from 1546 chars of navigation text to a 6437-char card with 25
+  of 39 comments.
+- Reddit's session init is a first-class step now, not an accident
+  of a failed `.json` hop: a reddit page that refuses at tier 1
+  (the humanity interstitial, the JS shell) gets one legacy-host
+  navigation and one retry, on tier 1 and auto alike. A live wiki
+  page (which has no `.json` at all) went from a bot wall to the
+  full document on a cold jar.
+- Reddit URL coverage: user pages (`/user/<name>` -> profile card,
+  `/comments` and `/submitted` -> activity cards), subreddit about
+  pages (`/about`, `/about/rules`), and the legacy hosts:
+  `old.reddit.com`/`np.reddit.com` content URLs rewrite onto www
+  (they serve a login wall to anonymous clients) and fallback
+  retries ride the content host. Wiki pages and share links (`/s/`)
+  stay pages (no JSON shape); `redd.it` shortlinks resolve through
+  the redirect into the thread card.
+
+## [4.3.2] - 2026-09-23
+
+### Fixed
+
+- Reddit threads returned a 257-char JS shell instead of the post
+  once their `.json` endpoint refused: the retry re-fetched the page
+  with no reddit session, and reddit answers that with a shell, so
+  the fetch looked thin and escalated or failed. A refused `.json`
+  hop no longer marks the domain walled, and the fallback makes one
+  navigation through the legacy host first, which restores the
+  reddit.com session cookies, then retries the caller's URL: the
+  real SSR page comes back (1333-1551 chars with the post body on a
+  live thread; listings too). When the `.json` endpoint answers,
+  the path is unchanged (#291).
+- Repeated content no longer disappears silently. The
+  exact-duplicate rule ate every repeat after the first (a song's
+  refrain, a repeated clause) and a section dropped as
+  near-identical left no trace. Both rules now leave a marker in
+  place (`*[repeated block omitted]*`, `*[repeated section "X"
+  omitted]*`) and `structuredContent.omitted_repeats` counts them.
+  A paragraph that opens its own section is never dedupe-eligible,
+  section comparison is order-sensitive (token 3-grams), and a
+  section whose body carries a table only collapses on an exact
+  repeat: there the digits are the content (#292).
+- The docs-outline adapter no longer hijacks ordinary pages. It
+  detected Docusaurus by a bare `a.menu__link` class, which any BEM
+  menu can wear, and its own renderer had no `div` in its whitelist,
+  so a page whose content sits in divs came back as nav chrome with
+  the content erased, reported as success. Detection is the
+  framework's `div#__docusaurus` app root now (present on real
+  Docusaurus sites, absent from the false positive), and div-based
+  prose survives the adapter's renderer (#293).
+
+## [4.3.1] - 2026-09-23
+
+### Fixed
+- A BYOK provider failure fell back to local search with no visible
+  signal: the result line read `provider local`, indistinguishable
+  from a run with no provider configured, and the only record of
+  the failure was behind `DONSEEK_DEBUG`. The failure now rides the
+  `degraded:` field the local engine failures already use
+  (`degraded: byok brightdata parse error at HTTP 200, ...`), and
+  the same entry appears in `_meta.engines` (#285).
+- Every HTTP provider client read its response body with
+  `unwrap_or_default()`, so a body-read failure arrived as an empty
+  string, and its parse error dropped the HTTP status it already
+  held: an empty 200, a redirect and a malformed payload all read
+  "parse error: EOF while parsing a value". One shared
+  `parse_provider_json` now keeps the transport error, names an
+  empty body, and reports a parse failure with its status and byte
+  count, across all nine clients (#286).
+- A refused reddit `.json` rewrite no longer ends the fetch. Every
+  `www.reddit.com` thread died on a single 403 with a two-step trail,
+  because a challenge on an adapter endpoint matched an arm that does
+  nothing, and adapter endpoints never route to the browser. Any
+  refusal on an adapter rewrite (a challenge included) now retries
+  the page the caller asked for through the generic ladder, and the
+  adapter hop's trail is folded in front of the retry's so the
+  escalation reads as one ladder (`domain-profile` → `http-fetch`
+  403 → `adapter fallback` → `browser-launch` → solve pass →
+  `http-retry-with-ghost-cookies`). (#287)
+- Extraction no longer ships invisible nodes as content: an inline
+  `<style>` inside a price heading, a `<script>` inside a spec-table
+  cell and a comment header's `SML.load(...)` call all reached the
+  output through the raw text iterator behind headings, table cells,
+  list terms and the adapters. Invisible tags (script, style,
+  noscript, template, svg, canvas, iframe, object, embed) contribute
+  no text anywhere now, ad slots (reddit's `shreddit-ad-post`, the
+  common ad-wrapper classes) are skipped before extraction, a
+  serialized JSON blob sitting in a text node is dropped instead of
+  rendered as a paragraph, and a section that repeats its
+  predecessor (same heading, same body modulo numbers, like a
+  protection plan repeated per variant) renders once. On the issue's
+  own page shape the leaked output drops from 1543 to 715 bytes with
+  every real block kept. (#288)
+- A re-fetch of a changed page no longer prepends the full section
+  delta unless `since_last` asked for it. The unasked note is one
+  line now (`*[changed since last fetch (rewritten) :
+  since_last=true returns just the delta]*`) and the delta stays in
+  `structuredContent.changed_sections`, where it already lived. On a
+  product page the old header was 1955 characters, 34% of the
+  answer, repeating every extracted fragment. `since_last` behavior
+  is unchanged, the collapse-to-delta included. (#289)
+- A response carrying an unrecognised `Content-Encoding` token (S3's
+  classic `Content-Encoding: UTF-8` on a plain body) is passed
+  through as identity instead of failing the fetch permanently, and
+  the escalation ladder stays alive behind it. `x-gzip` and
+  `x-deflate` decode as their canonical names, a recognised codec
+  that genuinely fails to decode still errors loudly, and the size
+  cap applies to the pass-through exactly as to identity. The
+  284-page guideline PDF from the report now fetches at tier 1.
+  (#290)
+- The invisible-text rule now covers every remaining DOM collector:
+  search result titles and snippets, crawl link labels, feed
+  summaries, `jsdata`'s mined strings, the dedicated extractors and
+  the adapters all skip script and style subtrees now (the same
+  raw-text leak class as #288, found while hardening it).
+- `jsdata`'s embedded-HTML stripper never worked: it selected `body`
+  on a FRAGMENT tree, and a fragment has none, so every mined string
+  carrying markup was silently emptied instead of stripped and the
+  item vanished from SPA renders. It walks the fragment root now, so
+  `<b>Title</b>` yields `Title` instead of nothing.
+
+## [4.3.0] - 2026-09-22
+
+### Changed
+- A tier-2 render no longer waits a fixed four seconds on pages that
+  cannot hydrate. The SPA hydration guard floored every DOM under 50 KB
+  at four seconds before the content oracle could settle, and a document
+  with no `<script` at all cannot grow its DOM after load, so the floor
+  there was pure latency. Scriptless small pages settle on the content
+  oracle alone now; every page that can hydrate late keeps the guard
+  unchanged (a scripted page under `--tier 2` measures the same as
+  before). `example.com --tier 2`: 4.77s to 0.95s median in a warm
+  daemon, 5.58s to 2.02s through the CLI, where the cold browser launch
+  is the rest.
+- The browser display starts on first use instead of at pipeline boot.
+  Constructing the fetch pipeline started or adopted Xvfb and ran
+  `which Xvfb`, `which xdpyinfo` and an `xdpyinfo` connect before the
+  first fetch, so a tier-1-only CLI run paid three child processes and
+  an X11 connect for a browser it would never launch. The display now
+  initializes on the first browser acquire; tier-1-only runs spawn
+  nothing.
+- A fetch lane for a new host is chosen by measured RTT among clean
+  lanes. With a proxy pool configured, every equally-clean lane scored
+  the same and the first lane in `proxies.txt` won for every new host,
+  so a fast lane could never displace a slow one. The lowest measured
+  RTT wins now; file order remains the tie-break while no measurements
+  exist.
+- The `chromium --version` probe is cached across processes, keyed by
+  the binary's identity (path, mtime, size). The probe spawned the
+  browser once per process and the CLI is one process per fetch, so
+  every CLI fetch paid it. An updated browser re-probes because its
+  identity changed. Receipt: two consecutive CLI fetches on one cache
+  directory, the second spawns zero browsers.
+
+### Fixed
+- A small page with no `<script>` but an inline load-time handler
+  (`<body onload="…">`, `<img onerror="…">`) can still build itself
+  after load; the scriptless fast path skipped the tier-2 settle
+  floor for it. Load-time handlers count as script again; click
+  handlers, which need a user, do not.
+- The ghost lane's `Xvfb` child was never waited on. An Xvfb that
+  died while donsetch lived sat as a `<defunct>` zombie for the rest
+  of the process's life, and a hard parent death (SIGKILL from the
+  OOM killer, a Ctrl-C'd CLI) left the display detached at PPID 1
+  forever; a three-day-old orphan showed on a reporter's box. One
+  reaper task owns the child now (it reaps within a tick and is the
+  only thing that kills it), `PR_SET_PDEATHSIG` makes the kernel
+  kill the display with its parent for any death, and a display
+  that never came up is killed on the failure path instead of
+  leaked (#280).
+- `donsetch mcp --supervised` replayed raw byte history after a
+  child died, so the replacement re-ran every request the dead
+  child had already answered: a long session replayed ~50 finished
+  fetch batches (minutes of CPU, gigabytes of RSS) and the client
+  logged one "unknown message ID" per duplicate response. The
+  replay window is request-level now: every line the client sends
+  with an id is held until its response passes through the stdout
+  forwarder (or the client cancels it), and only unanswered
+  requests replay (#281).
+- "The extraction produced text" was the whole success test, so a
+  client-rendered shell's navigation and login chrome (240 chars of
+  nav, title, footer and "Continue with Email") and an unsolved
+  challenge interstitial (323 chars of vendor prose) shipped as
+  `content_ok`. Two positive tests gate the success path now:
+  chrome-only extraction (small, prompt-laden, prose-poor) fails as
+  `wall.empty_shell`, and an interstitial's own words fail as
+  `wall.challenge_unsolved`. Both are `walled`, so the escalation
+  ladder (ghost render, a configured unlocker) engages instead of
+  the agent trusting boilerplate; the ghost settle oracle also
+  refuses to settle on an interstitial any more, so a challenge
+  that clears seconds later is waited out rather than shipped
+  (#282).
+- Both reddit adapters retargeted fetches to `old.reddit.com`,
+  which serves a login wall to anonymous clients on HTML and
+  `.json` alike: every reddit fetch paid a dead hop (and on a
+  walled host already recorded by the detector, the wasted hop
+  escalated to a billed unlocker call), while a caller who
+  supplied the working `www.reddit.com/....json` URL was detoured
+  through the wall first. The `.json` path rewrite stays and keeps
+  the caller's host; the old.reddit retarget is gone (#283).
+- `donsetch keys add unlocker` put the Web Unlocker in the search
+  provider list: every search burned one guaranteed-failing
+  dispatch (`unknown provider: unlocker`), the add claimed "BYOK
+  search is now active : local search is bypassed" for a key that
+  cannot serve a search, and the unlocker held the search-default
+  slot. Fetch-side providers are tagged now: the unlocker stays out
+  of the search chain, out of default selection and out of the
+  search notes, while `keys list` still shows the key with its
+  fetch-side role; a store already carrying `default=unlocker`
+  heals on the next key add (#284).
+- `robots.txt` rules with `*` or a trailing `$` (`Disallow: /*.pdf$`,
+  `Disallow: /*?`, `Disallow: /private*/`) were matched as literal
+  prefixes, so they matched nothing and a crawl with `respect_robots`
+  fetched what the site had disallowed. RFC 9309 §2.2.3 makes both
+  required; rules are matched that way now, longest rule still wins
+  and `Allow` still wins a tie. The matcher is iterative and
+  polynomial on a hostile rule (mnaza, #271).
+- A news result whose `pubDate` carried an absurd year (the RSS date
+  token is copied as is) overflowed the freshness arithmetic: a panic
+  under overflow checks, a wrapped garbage age and a wrong freshness
+  multiplier in release. A year outside 1..=9999 is not a date now and
+  ranks neutral, the same gate the cookie jar got for `Expires`
+  (mnaza, #272).
+- A search result's title from a native provider or a SERP page was
+  taken at any length; the plugin adapter cut its titles at 512
+  characters in 4.2.9 and the other sources did not, so one result
+  could carry a multi-MiB title into the tool text and the structured
+  content. Every source passes the merge once; titles are cut there
+  (mnaza, #272).
+- A crawl scope pattern with several `*` (`/*/docs/*/api/*`) matched
+  against a link the page chose could hold the crawl worker for hours:
+  the glob matcher tried every split at every `*`, exponential on a
+  mismatch, and one 8 KiB href with the right shape was enough. The
+  matcher is iterative and polynomial now; every pattern that matched
+  before still matches, and only that (mnaza, #273).
+- The Bright Data unlocker's answer was read with no size cap, where
+  every other transport stops at 64 MiB: the target page comes back
+  inside a JSON string, then was decoded and base64-encoded for the
+  cache, three copies of whatever size the page chose. It is read in
+  chunks and refused past the same cap now (mnaza, #274).
+- A malformed proxy entry's error echoed the whole entry, password
+  included, into a fetch error that can surface in a tool result; the
+  Debug form was already redacted. The messages name the expected
+  shape (mnaza, #274).
+- `web_fetch` of a PDF parsed it on the async runtime's worker thread:
+  pdfium rasterizes and lays out every page synchronously, so for the
+  whole parse that worker did nothing else, the call's own
+  `deadline_ms` could not fire (the future never yielded inside it),
+  and other tool calls scheduled there waited. The crawl already ran
+  PDFs on the blocking pool under a five-minute budget; both paths now
+  share that helper, the ghost retry and the wayback snapshot included
+  (mnaza, #275).
+- A PDF was read to its last page whatever the count. The size gate
+  admits a document of hundreds of thousands of near-empty pages, and
+  each page costs a rasterization, so that was hours of work for a
+  note saying the pages were blank. The first 500 pages are read; the
+  true page count is reported and a note says how many were read
+  (mnaza, #275).
+- A page nested thousands of elements deep held the extractor for
+  minutes, and hours on a larger body: the HTML parser scans its
+  stack of open elements on every tag, as the specification writes
+  it, so the parse is quadratic in nesting depth (8 000 nested
+  `<div>` 0.4 s, 32 000 6.6 s) and nothing capped the depth (browsers
+  stop at 512).
+  A linear pre-parse scan now refuses a body nested deeper than 4096
+  levels as not a document, counting what the parser's stack keeps
+  (void, raw-text and sibling-closed elements are left out; the
+  self-closing slash is ignored, as the HTML parser ignores it), on
+  the HTML path and the feed path (mnaza, #276).
+- Tables nested in tables were extracted in time quadratic in the
+  nesting, and a nested table's rows were merged into the outer
+  table: the row and cell scans were descendant selects. They read
+  the table's own rows (directly or through `thead`/`tbody`/`tfoot`)
+  and the row's own cells now; 1 000 nested tables take a fraction of
+  a second and a nested table stays inside its cell (mnaza, #276).
+- A page repeating a known JS-data marker (`window.__NEXT_DATA__ = `)
+  with no value behind it rescanned the rest of the document once per
+  marker; 512 KiB of them was minutes. The scan has a budget of a few
+  document lengths (mnaza, #276).
+- The old-reddit renderer recursed without a depth cap and its list
+  renderer used descendant selects, so a post body nested a few
+  thousand levels deep overflowed the stack (an abort) after a
+  quadratic render. Both carry the same caps as the main extractor
+  (mnaza, #276).
+
+## [4.2.9] - 2026-09-20
+
+### Fixed
+- With `proxy.fetch_rotate` on, a fetch of a host that does not resolve
+  benched the proxy lane it was riding for ten minutes, on disk. The
+  4.2.5 lane-health sweep read the new `Dns`/`DnsTimeout` variants as
+  the lane's own name failing, but those come from the SSRF guard,
+  which resolves the origin before any lane dials; a lane whose own
+  name fails still arrives as an `Io` from the proxy connect. After as
+  many dead hosts as there are lanes (typos, dead domains, or pages
+  that redirect to one) every lane was benched, `pick_fetch` fell
+  through to `direct`, and the fetch left on the real address with
+  rotation configured. The origin's name now leaves lane health alone
+  (mnaza, #265).
+- A search plugin registered with an empty command (a hand-edited
+  `plugins.json`; the CLI refuses one) panicked the daemon on every
+  `web_search`. 4.2.5 guarded the doctor against that entry; the search
+  path now returns the same registration error instead of indexing an
+  empty argv.
+- A plugin that wrote past the 8 MiB stdout cap and kept running sat
+  until its `timeout_ms` and came back as a timeout. Nobody reads the
+  pipe past the cap, so the plugin blocked on it; it is killed as soon
+  as the cap is crossed, as the contract said, and the error names the
+  cap.
+- A plugin result's `title` and `url` were taken verbatim while the
+  snippet was capped at 8 KiB. A title is now cut at 512 characters and
+  a result with a url over 4 KiB is dropped, counted with the other
+  dropped entries (mnaza, #266).
+- A URL with an IPv6 literal host (`http://[2606:4700::1111]/`, or
+  `http://[::1]:8799/` under the private-egress hatch) failed with a
+  DNS error: the host string keeps its brackets and the resolver does
+  not know `[::1]`. A literal is now answered without a lookup, the
+  same address set a lookup would give, and is judged by the same
+  filter.
+- The SSRF guard judges the IPv4 address embedded in a NAT64 address
+  (`64:ff9b::/96`, `64:ff9b:1::/48`) or a 6to4 address (`2002::/16`),
+  as it already did for the `::ffff:` mapped form. On an IPv6-only
+  network the translator that turns `64:ff9b::a9fe:a9fe` into a packet
+  for 169.254.169.254 sits inside the network, so the v6 form reached
+  what the v4 rule refuses; a literal, a resolved AAAA answer and the
+  connect-time filter all go through this one predicate (mnaza, #267).
+- A sitemap element whose text held many `&` without a `;` behind them
+  (a `<loc>` of ampersands; 64 MiB of them fits a small `.xml.gz`)
+  held the crawl's worker for hours: the entity decoder searched the
+  whole remainder for the `;` on every `&` and only then asked
+  whether it was within the ten-character entity window. The search
+  is bounded to the window now, and the decoder is linear.
+- A `<loc>` or `<lastmod>` of any length was kept as a sitemap entry,
+  and a text sitemap line likewise; one 64 MiB entry per file across
+  the 32 files a discovery may read was 2 GiB of strings carried by
+  the map, the frontier, the focus IDF table and the resume token.
+  sitemaps.org caps a `<loc>` at 2048 characters; longer ones are not
+  entries, and a `<lastmod>` past 64 characters is dropped from an
+  otherwise kept entry (mnaza, #268).
+- A crawl ignored a relative `<base href>` (`<base href="/app/">`, the
+  common form): the base was parsed as an absolute URL, failed, and
+  every link on the page resolved against the page instead, so the
+  pages the site actually links to were never fetched. The base now
+  resolves against the document URL, as a browser does, and a base
+  that is not http(s) is ignored (mnaza, #269).
+- The revalidation cache capped each body at 8 MiB and the entry count
+  at 512, but not what they add up to: a daemon whose agent fetched a
+  few hundred large pages carrying an ETag or a fresh window held up
+  to 4 GiB of them in memory for as long as it ran. Resident bodies
+  are now budgeted at 64 MiB, evicting the oldest entries first, the
+  same order the entry cap uses (mnaza, #270).
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed
