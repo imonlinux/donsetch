@@ -88,36 +88,50 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     // wrappers never double-emit.
     let any_sel =
         Selector::parse("h1, h2, h3, h4, p, ul, ol, pre, table, blockquote, div").unwrap();
-    for el in root.select(&any_sel) {
-        let is_div = el.value().name() == "div";
-        // Descendant select: a <p> inside a <li> or <blockquote>,
-        // a nested <ul>, would be emitted as part of its parent
-        // AND again on its own. Outermost matches only. A div is
-        // covered by an outer div only when that one is also a
-        // candidate (#293).
-        let nested = el
-            .ancestors()
-            .take_while(|a| a.id() != root.id())
-            .filter_map(ElementRef::wrap)
-            .any(|a| {
-                block_sel.matches(&a)
-                    || (is_div
-                        && a.value().name() == "div"
-                        && !has_block_descendant(&a, &block_sel))
-            });
-        if nested {
+    // Every element with a block-level descendant, marked once: each
+    // block match walks up to the root and stops at the first
+    // ancestor already marked, so the pass is linear. Asking the
+    // question per candidate with a descendant select re-scanned the
+    // wrapper's subtree for every leaf div under it, quadratic in
+    // the leaf count.
+    let mut has_block = std::collections::HashSet::new();
+    for b in root.select(&block_sel) {
+        for a in b.ancestors() {
+            if !has_block.insert(a.id()) || a.id() == root.id() {
+                break;
+            }
+        }
+    }
+    // #304: one pre-order walk, not "every candidate walks every
+    // ancestor". The walk descends only through wrapper divs and
+    // non-candidate containers; an element it emits (or a plain div
+    // it covers) has its subtree skipped, which is exactly what the
+    // ancestor rule decided, once per element instead of once per
+    // ancestor. 5 000 leaf divs under 4 000 wrapper divs paid a
+    // 4 000-ancestor check each (~40 s on the debug profile, a
+    // ~104 KB page); this walk visits every node once.
+    let mut stack: Vec<ElementRef> = root.children().filter_map(ElementRef::wrap).rev().collect();
+    while let Some(el) = stack.pop() {
+        if !any_sel.matches(&el) {
+            // A container the adapter does not render: descend.
+            stack.extend(el.children().filter_map(ElementRef::wrap).rev());
             continue;
         }
+        let is_div = el.value().name() == "div";
         if is_div {
             // A wrapper holding block elements is skipped: its
-            // blocks emit on their own.
-            if !has_block_descendant(&el, &block_sel) {
+            // blocks emit on their own and the walk descends into
+            // it. A plain div renders its own markdown and covers
+            // every descendant.
+            if !has_block.contains(&el.id()) {
                 let (m, _) = crate::extract::inline::markdown(el, url, &body_opts);
                 if !m.trim().is_empty() {
                     body.push_str(m.trim());
                     body.push_str("\n\n");
                 }
+                continue;
             }
+            stack.extend(el.children().filter_map(ElementRef::wrap).rev());
             continue;
         }
         match el.value().name() {
@@ -262,13 +276,6 @@ fn text_of(el: ElementRef) -> String {
     inline::visible_text_raw(el).trim().to_string()
 }
 
-/// #293: does anything block-level live inside this element? A div
-/// whose subtree holds blocks is a wrapper; its blocks emit on
-/// their own.
-fn has_block_descendant(el: &ElementRef, block_sel: &Selector) -> bool {
-    el.select(block_sel).next().is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +301,85 @@ mod tests {
         <pre>code sample</pre>
       </main>
       </body></html>"#;
+
+    // A wrapper div holding many leaf divs before its first block
+    // element: every leaf's ancestor check re-scanned the wrapper's
+    // subtree up to that block, so the walk was quadratic in the
+    // number of leaves (#293 follow-up). 20 000 leaves took minutes
+    // on the extraction thread.
+    #[test]
+    fn many_leaf_divs_under_one_wrapper_extract_in_linear_time() {
+        let n = 20_000;
+        let nav: String = (0..5)
+            .map(|i| format!(r#"<a class="menu__link" href="/d/{i}/">D{i}</a>"#))
+            .collect();
+        let page = format!(
+            r#"<html><body><div id="__docusaurus"><nav>{nav}</nav>{}<p>end</p></div></body></html>"#,
+            "<div>x</div>".repeat(n)
+        );
+        let started = std::time::Instant::now();
+        let ex = extract(&page, "https://docs.example.com/", &opts()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The first page (16 000 chars by default) is all leaf
+        // paragraphs; the closing <p> sits on a later page.
+        let xs = ex.markdown.matches("x\n").count();
+        assert!(xs >= 1_000, "the leaf divs are content: {xs} of {n}");
+    }
+
+    // #304: the ancestor walk itself, not just the wrapper scan. With
+    // the wrapper set precomputed, every candidate still walked its
+    // whole ancestor chain (selector match + set lookup per level),
+    // so D wrapper divs around N leaf divs cost about N*D steps.
+    //
+    // Judged against the parse of the same page, not against the
+    // clock. The parser's own cost grows with N*D too (every tag
+    // walks the open-element stack), so it dominates this page and a
+    // wall-clock bound measures the machine: the 20 s bound this
+    // replaces took 13 s alone in a debug build and 21 to 27 s under
+    // a full parallel run. The ratio holds in both: the single walk
+    // extracts in about 1.2x the parse, the ancestor walk took about
+    // 14x at every size tried.
+    #[test]
+    fn deep_wrappers_with_many_leaf_divs_walk_once() {
+        let nav: String = (0..5)
+            .map(|i| format!(r#"<a class="menu__link" href="/d/{i}/">D{i}</a>"#))
+            .collect();
+        let (depth, n) = (1_000, 4_000);
+        let page = format!(
+            r#"<html><body><div id="__docusaurus"><nav>{nav}</nav>{}{}<p>end</p>{}</div></body></html>"#,
+            "<div>".repeat(depth),
+            "<div>x</div>".repeat(n),
+            "</div>".repeat(depth),
+        );
+        // The better of two runs each, so one preempted run does not
+        // decide the ratio.
+        fn best_of_two(mut run: impl FnMut()) -> std::time::Duration {
+            (0..2)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    run();
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        }
+        let parse = best_of_two(|| drop(scraper::Html::parse_document(&page)));
+        let mut xs = 0;
+        let full = best_of_two(|| {
+            let ex = extract(&page, "https://docs.example.com/", &opts()).unwrap();
+            xs = ex.markdown.matches("x\n").count();
+        });
+        let ratio = full.as_secs_f64() / parse.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 4.0,
+            "extract took {ratio:.1}x the parse ({full:?} vs {parse:?}): the walk is not linear"
+        );
+        assert!(xs >= 1_000, "the leaf divs are content: {xs} of {n}");
+    }
 
     #[test]
     fn mkdocs_outline_renders() {

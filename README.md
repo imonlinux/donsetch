@@ -183,7 +183,7 @@ RUSTFLAGS="-C link-arg=-fuse-ld=lld" cargo build --release
 
 The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built on Ubuntu 22.04 and runs there directly.
 
-**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64 and Windows-x64; linux-arm64 and macOS-x64 are core-only, because ONNX has no working prebuilt there. Linux ARM64 carries two honest limits: no OCR/rerank (the aarch64 ONNX prebuilt deadlocks at load) and fragile PDF (a loader hang in some paths, tracked in CI).
+**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64; linux-arm64 is core-only, because the aarch64 ONNX runtime deadlocks in its loader. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary). Linux ARM64 carries one more honest limit: fragile PDF (a loader hang in some paths, tracked in CI).
 
 </details>
 
@@ -220,7 +220,7 @@ Aliases: `original` for `chromium`, `original-headless` for `headless`. Public C
 
 `--supervised` is the crash-only daemon: a panic is a blip, the daemon restarts itself, the session survives. Without a global install, use `"command": "npx", "args": ["donsetch", "mcp"]`.
 
-HTTP transport instead of stdio: `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth via `DONSETCH_HTTP_TOKEN` and per-request timeouts are documented in `donsetch mcp --help`.
+HTTP transport instead of stdio: `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth via `DONSETCH_HTTP_TOKEN` and per-request timeouts are documented in `donsetch mcp --help`. A request that carries a browser `Origin` is refused unless the page is on loopback or CORS mode (`DONSETCH_HTTP_CORS`, which requires the token) is on, and a server bound to loopback answers only to loopback `Host` names on its own port, so a web page cannot drive it and a DNS-rebound name cannot read from it.
 
 **CLI (for humans and scripts).** Same engine, thin adapter:
 
@@ -233,15 +233,24 @@ donsetch crawl https://docs.python.org --mode map --topic asyncio
 <details>
 <summary><b>If your client shows only half the result (the <code>[meta]</code> fold)</b></summary>
 
-An MCP result has two surfaces: `content` (the page markdown) and `structuredContent` (raw URLs behind the `S3` handles, `next_offset`, resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP never said which one a client renders, so clients drop one: Claude Code and VS Code keep `structuredContent` and discard `content`, OpenCode v1 (tested on 1.18.3) keeps `content` and discards `structuredContent`.
+An MCP result has two surfaces: `content` (the page markdown) and `structuredContent` (raw URLs behind the `S3` handles, `next_offset`, resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP never said which one a client renders, so clients drop one: Claude Code and VS Code keep `structuredContent` and discard `content`, OpenCode v1 (tested on 1.18.3) keeps `content` and discards `structuredContent`, and OpenCode 2 (Code Mode on by default, tested on 2.0.16) keeps `structuredContent` and discards `content`, like Claude Code. The Pi extension is another shape: it hands the model `content` only (`structuredContent` never reaches the model there), so the document arrives without the URLs behind the handles.
 
-Symptoms: tool metadata but no page text, or page text but no citable URL behind an `S3` handle, no pagination, no error codes. The fix is the same for both: DonSeTch folds the state into a compact leading `[meta]` text block, keeps the markdown as a clean block behind it, and omits `structuredContent`. The three known clients get the fold automatically, detected by `clientInfo.name` at the handshake. Any other client (a wrapper or fork under a different name, `claude-code-proxy` say) is not detected and keeps the token-optimal split:
+Symptoms: tool metadata but no page text, or page text but no citable URL behind an `S3` handle, no pagination, no error codes. The fix is the same for all of them: DonSeTch folds the state into a compact leading `[meta]` text block, keeps the markdown as a clean block behind it, and omits `structuredContent`. The known clients get the fold automatically, detected by `clientInfo.name` at the handshake: Claude Code, VS Code, OpenCode, and the Pi extension (`pi-donsetch`). Any other client (a wrapper or fork under a different name, `claude-code-proxy` say) is not detected and keeps the token-optimal split:
 
 ```bash
-DONSETCH_MCP_TEXT_ONLY=1 donsetch mcp   # force the fold for every client
+DONSETCH_MCP__TEXT_ONLY=1 donsetch mcp   # force the fold for every client
 ```
 
-Fail-closed like the other flags: only an explicit `1`/`true` turns it on.
+or in `donsetch.toml`:
+
+```toml
+[mcp]
+text_only = true
+```
+
+Fail-closed like the other flags: only an explicit `1`/`true` turns it on; the legacy `DONSETCH_MCP_TEXT_ONLY` name still works (`donsetch config show --legacy` maps the old names).
+
+**OpenCode 2.x needs one of those today.** It reports `clientInfo.name` as `cli` (its `process.env.OPENCODE_CLIENT ?? "cli"` default, which `serve` never overrides), too generic to claim in the name list, and its Code Mode shows the model `structuredContent` only. Until OpenCode restores a usable name upstream, set `text_only` for it.
 
 </details>
 
@@ -649,13 +658,12 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | Surprise | Why |
 |---|---|
 | First build ~2 min | BoringSSL compiles from source, cached after. Go is a build dependency too, BoringSSL's build system is Go-based. |
-| OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, Windows-x64. |
+| OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
 | First OCR/rerank use downloads models | ~24MB reranker, ~37MB OCR, cached forever. |
 | Captchas need an unlocker key | hCaptcha, reCAPTCHA and Turnstile cannot be solved locally, by design. With `donsetch keys add unlocker <key>[::zone]` they come through rendered; without one you get a clear honest error, never a hang. |
 | robots.txt is ON for crawl | `respect_robots=true` for crawl. `fetch` does not check robots. |
 | Keyless search rate-limits without a proxy | It hits engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
 | Rerank in a CPU-limited container | Auto-clamped to cgroup parallelism on Linux, `DONSEEK_RERANK_THREADS` to override. |
-| Windows needs DirectML.dll | In-box since Windows 10 1903. Only trimmed Server Core/Nano images need the NuGet copy beside the binary. |
 
 | It cannot | Why |
 |---|---|

@@ -9,7 +9,7 @@
 //!   Unix:   atomic rename swap. The running process keeps its
 //!           inode open.
 //!   Windows: rename running .exe to .bak, copy old .bak to .exe.
-//!           Also swaps pdfium.dll if a .dll.bak exists.
+//!           Also swaps pdfium.dll and onnxruntime.dll if a .bak exists.
 
 use std::path::{Path, PathBuf};
 
@@ -127,18 +127,10 @@ pub fn run() {
             }
         }
 
-        // The previous binary gets its previous runtime lib back
-        // (update keeps it as `<lib>.bak`); the current lib becomes
-        // the roll-forward backup, same as the binary. Not fatal:
+        // The previous binary gets its previous runtime back
+        // (update keeps each sibling as `<name>.bak`). Not fatal:
         // the binary rollback above already succeeded.
-        for name in crate::cli::update::SIBLING_LIBS {
-            if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
-                println!(
-                    "  {} Rolled back the binary, but could not restore {name}: {e}",
-                    cli::icon_warn()
-                );
-            }
-        }
+        restore_sibling_libs(exe_dir);
     }
 
     #[cfg(windows)]
@@ -147,8 +139,11 @@ pub fn run() {
         // copy .bak to .exe, then rename .rollback.tmp to .bak.
         let tmp = exe_dir.join(".donsetch.rollback.tmp");
 
-        // Remove stale temp from interrupted rollback.
-        let _ = std::fs::remove_file(&tmp);
+        // Recover (or drop) the stale temp from an interrupted
+        // rollback. Between the two steps below the binary lives ONLY
+        // at `.donsetch.rollback.tmp`; a crash there must not have the
+        // next rollback delete that last copy.
+        recover_stale_rollback_tmp(&exe, &tmp);
 
         // Rename current running exe to temp.
         if let Err(e) = std::fs::rename(&exe, &tmp).map_err(|e| e.to_string()) {
@@ -185,20 +180,10 @@ pub fn run() {
             }
         }
 
-        // Swap pdfium.dll if backups exist.
-        let dll_path = exe_dir.join("pdfium.dll");
-        let dll_bak = exe_dir.join("pdfium.dll.bak");
-        if dll_bak.exists() && dll_path.exists() {
-            let dll_tmp = exe_dir.join(".pdfium.rollback.tmp");
-            let _ = std::fs::remove_file(&dll_tmp);
-            if std::fs::rename(&dll_path, &dll_tmp).is_ok() {
-                if std::fs::copy(&dll_bak, &dll_path).is_ok() {
-                    let _ = std::fs::rename(&dll_tmp, &dll_bak);
-                } else {
-                    let _ = std::fs::rename(&dll_tmp, &dll_path);
-                }
-            }
-        }
+        // The previous binary gets its previous runtime back
+        // (update keeps each sibling as `<name>.bak`). Not fatal:
+        // the binary rollback above already succeeded.
+        restore_sibling_libs(exe_dir);
     }
 
     println!("  {} rolled back", cli::icon_pass());
@@ -212,6 +197,38 @@ pub fn run() {
         println!("  Rolled back {current} -> {bak_ver}");
     } else {
         println!("  Rolled back to previous version");
+    }
+}
+
+/// Put every sibling runtime `update` staged back beside the
+/// previous binary. One list (`SIBLING_LIBS`) drives this on every
+/// platform so a rolled-back binary never keeps a newer runtime
+/// (4.3.7's Windows branch restored `pdfium.dll` only).
+fn restore_sibling_libs(exe_dir: &std::path::Path) {
+    for name in crate::cli::update::SIBLING_LIBS {
+        if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
+            println!(
+                "  {} Rolled back the binary, but could not restore {name}: {e}",
+                cli::icon_warn()
+            );
+        }
+    }
+}
+
+/// Recover a stale `.donsetch.rollback.tmp` from an interrupted
+/// rollback. On Windows the swap renames the running exe aside to
+/// `tmp` and only then copies the backup into place: a crash in
+/// between leaves the ONLY copy of the current binary at `tmp` and
+/// nothing at the exe path. The next rollback used to `remove_file`
+/// that temp outright -- destroying the last copy before discovering
+/// there was no exe to rename. Put it back instead; a temp next to a
+/// healthy exe is just debris and is dropped.
+#[cfg(any(windows, test))]
+fn recover_stale_rollback_tmp(exe: &Path, tmp: &Path) {
+    if !exe.exists() && tmp.exists() {
+        let _ = std::fs::rename(tmp, exe);
+    } else {
+        let _ = std::fs::remove_file(tmp);
     }
 }
 
@@ -278,7 +295,7 @@ fn swap_unix(
     Ok(None)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -296,6 +313,70 @@ mod tests {
         std::fs::read_to_string(p).unwrap_or_default()
     }
 
+    // restore_sibling_libs must cover every name the updater stages.
+    // 4.3.7's Windows rollback restored pdfium.dll only, so a
+    // rolled-back binary kept a newer onnxruntime.dll. This is the
+    // red proof: drop a name from the restore list and it fails.
+    #[test]
+    fn restore_sibling_libs_covers_every_staged_runtime() {
+        let dir = scratch("restore-libs");
+        for name in crate::cli::update::SIBLING_LIBS {
+            std::fs::write(dir.join(name), format!("new-{name}")).unwrap();
+            std::fs::write(dir.join(format!("{name}.bak")), format!("old-{name}")).unwrap();
+        }
+
+        restore_sibling_libs(&dir);
+
+        for name in crate::cli::update::SIBLING_LIBS {
+            assert_eq!(
+                read(&dir.join(name)),
+                format!("old-{name}"),
+                "{name} not restored"
+            );
+            assert_eq!(
+                read(&dir.join(format!("{name}.bak"))),
+                format!("new-{name}"),
+                "{name} roll-forward missing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An interrupted rollback leaves the ONLY copy of the current
+    // binary at `.donsetch.rollback.tmp` (the window between renaming
+    // the exe aside and copying the backup into place). The next
+    // rollback used to delete that temp outright, destroying the last
+    // copy. Red proof: the old `remove_file` leaves the exe missing.
+    #[test]
+    fn a_stale_rollback_tmp_is_restored_when_the_exe_is_gone() {
+        let dir = scratch("recover-gone");
+        let exe = dir.join("donsetch.exe");
+        let tmp = dir.join(".donsetch.rollback.tmp");
+        std::fs::write(&tmp, "current-bin").unwrap();
+
+        recover_stale_rollback_tmp(&exe, &tmp);
+
+        assert_eq!(read(&exe), "current-bin", "last copy of the binary lost");
+        assert!(!tmp.exists(), "temp left behind after recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_rollback_tmp_is_dropped_when_the_exe_is_present() {
+        let dir = scratch("recover-present");
+        let exe = dir.join("donsetch.exe");
+        let tmp = dir.join(".donsetch.rollback.tmp");
+        std::fs::write(&exe, "current-bin").unwrap();
+        std::fs::write(&tmp, "debris").unwrap();
+
+        recover_stale_rollback_tmp(&exe, &tmp);
+
+        assert_eq!(read(&exe), "current-bin");
+        assert!(!tmp.exists(), "debris kept next to a healthy exe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn swap_exchanges_binary_and_backup() {
         let dir = scratch("swap");
@@ -329,6 +410,7 @@ mod tests {
     // its place), which trips the same invariant. The rename case
     // is covered by ordering: `.bak` is not written until after the
     // rename has succeeded.
+    #[cfg(unix)]
     #[test]
     fn failure_before_the_swap_leaves_the_backup_intact() {
         let dir = scratch("stagefail");

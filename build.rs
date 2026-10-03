@@ -287,12 +287,17 @@ fn main() {
         env::var_os("CARGO_FEATURE_OCR").is_some() || env::var_os("CARGO_FEATURE_RERANK").is_some();
     if has_onnx {
         if let Some(info) = onnx_target_info(&os, &arch) {
-            // Linux x86_64: build shared lib for dynamic loading.
+            // Every ONNX target fetches Microsoft's shared library
+            // for dynamic loading and places it beside the binary
+            // (dev builds included, #298 review; macOS since #316).
             fetch_onnx_prebuilt(info, &manifest);
         } else {
-            // macOS/Windows: ort crate uses download-binaries (static
-            // linking). No shared library build needed.
-            eprintln!("donsetch build: OCR/rerank enabled, ort static link for {os}-{arch}");
+            // Anything without a pinned prebuilt (aarch64 Linux's
+            // loader deadlocks; Android is unsupported): the
+            // features compile and report unavailable at runtime.
+            eprintln!(
+                "donsetch build: OCR/rerank enabled, no pinned ONNX prebuilt for {os}-{arch}"
+            );
         }
     }
 
@@ -473,33 +478,77 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
 }
 
 /// Pinned ONNX Runtime tarball info per platform.
-/// Source: microsoft/onnxruntime official GitHub releases (v1.24.2),
-/// the prebuilt shared library for each target. These are built
-/// against older glibc than the pyke archive relink we used before
-/// (GLIBC_2.27 max required vs 2.38) and contain no
-/// `__isoc23_*`/2.38-only imports, so OCR/rerank work on every
-/// distro from Ubuntu 18.04 onward, including 20.04/22.04 where the
-/// old .so failed to load at all. SHA256 pins verified at download.
+/// Source: microsoft/onnxruntime official GitHub releases: v1.24.2 for
+/// Linux/Windows (the prebuilt shared library; built against older
+/// glibc than the pyke archive relink we used before, GLIBC_2.27 max
+/// required vs 2.38, and free of `__isoc23_*`/2.38-only imports, so
+/// OCR/rerank work on every distro from Ubuntu 18.04 onward), and
+/// v1.23.2 for macOS (#316: the last Developer-ID-signed macOS build;
+/// 1.24.2+ mac tarballs are ad-hoc signed and raise the minimum to
+/// macOS 14, while 1.23.2 asks 13.4). SHA256 pins verified at download.
 struct OnnxTarget {
     url: &'static str,
     sha256: &'static str,
-    /// Path of the real shared library inside the tarball.
+    /// Path of the real shared library inside the archive.
     inner_lib: &'static str,
     /// File name we ship it as, next to the binary.
     shared_name: &'static str,
+    /// How Microsoft packaged this target's release.
+    archive: OnnxArchive,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnnxArchive {
+    /// `.tgz` (Linux): a gzip'd tar.
+    Tgz,
+    /// `.zip` (Windows).
+    Zip,
 }
 
 /// Return ONNX target info if a prebuilt is available for this platform.
-/// Linux x86_64 and aarch64 use runtime dlopen of the official prebuilt.
-/// macOS/Windows use static linking via the ort crate (no shared library
-/// build needed).
+/// Every ONNX target uses runtime dlopen of the official prebuilt: Linux
+/// x86_64 and Windows x64 since #298, both macOS arches since #316.
+/// Linux aarch64 is deliberately absent (the official aarch64 prebuilt
+/// deadlocks in the loader; see the NOTE in the match below).
 fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
-    let (url, sha256, inner_lib, shared_name) = match (os, arch) {
+    let (url, sha256, inner_lib, shared_name, archive) = match (os, arch) {
         ("linux", "x86_64") => (
             "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
             "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
             "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
             "libonnxruntime.so",
+            OnnxArchive::Tgz,
+        ),
+        // Windows x64: the same release, Microsoft's CPU-only build
+        // (no DirectML import). Loaded at runtime like the Linux .so
+        // (#277, #298); the exe no longer links ONNX statically.
+        ("windows", "x86_64") => (
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
+            "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
+            "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
+            "onnxruntime.dll",
+            OnnxArchive::Zip,
+        ),
+        // macOS (#316), both arches: Microsoft's last signed mac
+        // builds. 1.24.2+ mac tarballs exist but are ad-hoc signed
+        // only and raise the minimum to macOS 14; 1.23.2 is the last
+        // Developer-ID-signed release and asks 13.4 (verified in
+        // review: CMS blob, Microsoft Corporation UBF8T346G9). The
+        // crate's api-23 floor serves it, the GetApi table is
+        // append-only.
+        ("macos", "aarch64") => (
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz",
+            "b4d513ab2b26f088c66891dbbc1408166708773d7cc4163de7bdca0e9bbb7856",
+            "onnxruntime-osx-arm64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
+            "libonnxruntime.dylib",
+            OnnxArchive::Tgz,
+        ),
+        ("macos", "x86_64") => (
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-x86_64-1.23.2.tgz",
+            "d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6",
+            "onnxruntime-osx-x86_64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
+            "libonnxruntime.dylib",
+            OnnxArchive::Tgz,
         ),
         // NOTE: onnxruntime-linux-aarch64-1.24.2 exists but dlopen'ing
         // it from this binary deadlocks inside the loader on native
@@ -515,12 +564,14 @@ fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
         sha256,
         inner_lib,
         shared_name,
+        archive,
     })
 }
 
 /// Download the official ONNX Runtime prebuilt, verify its SHA256, and
-/// copy it next to the binary for runtime dlopen. Used for Linux x86_64
-/// and aarch64: the ort-sys static relink is gone, so builds no longer
+/// copy it next to the binary for runtime dlopen. Used on every ONNX
+/// target (Linux x86_64 and Windows x64 since #298; both macOS arches
+/// since #316): the ort-sys static relink is gone, so builds no longer
 /// need a working C toolchain or pay a 110MB static extraction.
 fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
     let vendored = manifest.join("vendor").join("onnx");
@@ -538,8 +589,11 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         return;
     }
 
-    // 1. Download the tarball.
-    let tarball = vendored.join("onnx.tgz");
+    // 1. Download the archive.
+    let tarball = vendored.join(match info.archive {
+        OnnxArchive::Tgz => "onnx.tgz",
+        OnnxArchive::Zip => "onnx.zip",
+    });
     eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
     let status = Command::new("curl")
         .args([
@@ -571,26 +625,54 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         info.sha256, got
     );
 
-    // 3. Extract the shared library from the plain tar.gz archive.
-    let entry = extract_tarball_entry(&buf, info.inner_lib)
-        .unwrap_or_else(|| panic!("ONNX: {} not found in tarball", info.inner_lib));
+    // 3. Extract the shared library from the archive.
+    let entry = match info.archive {
+        OnnxArchive::Tgz => extract_tarball_entry(&buf, info.inner_lib),
+        OnnxArchive::Zip => extract_zip_entry(&buf, info.inner_lib),
+    }
+    .unwrap_or_else(|| panic!("ONNX: {} not found in archive", info.inner_lib));
     fs::write(&shared_path, &entry).expect("ONNX: cannot write shared lib");
 
-    // 4. Sanity: the file must be a plausible ELF shared object.
+    // 4. Sanity: the file must be a plausible shared library of its
+    // platform's format (ELF .so, PE DLL, Mach-O dylib).
     assert!(
         entry.len() > 10 * 1024 * 1024,
         "ONNX: extracted lib is implausibly small ({} bytes)",
         entry.len()
     );
-    assert!(
-        &entry[..4] == b"\x7fELF",
-        "ONNX: extracted file is not an ELF library"
-    );
+    let magic_ok = match info.shared_name {
+        "onnxruntime.dll" => &entry[..2] == b"MZ",
+        // Little-endian 64-bit thin Mach-O in practice (`cf fa ed
+        // fe`, both macOS dylibs checked); the other byte orders and
+        // the fat magics match too rather than failing a valid
+        // library over packaging drift.
+        "libonnxruntime.dylib" => matches!(
+            &entry[..4],
+            [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        ),
+        _ => &entry[..4] == b"\x7fELF",
+    };
+    assert!(magic_ok, "ONNX: extracted file is not a shared library");
 
     let _ = fs::remove_file(&tarball);
 
     // 5. Copy to output directories.
     copy_onnx_shared_lib(&shared_path);
+}
+
+/// Extract one entry from a zip archive (Microsoft's Windows release).
+fn extract_zip_entry(data: &[u8], wanted: &str) -> Option<Vec<u8>> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut file = archive.by_name(wanted).ok()?;
+    let mut out = Vec::with_capacity(file.size() as usize);
+    file.read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 /// Extract one entry from a gzip-compressed tar archive (plain
@@ -632,9 +714,12 @@ fn extract_tar_entry(data: &[u8], name: &str) -> Option<Vec<u8>> {
         if header.iter().all(|&b| b == 0) {
             break;
         }
-        // File name: bytes 0-99, null-terminated.
+        // File name: bytes 0-99, null-terminated. Microsoft's macOS
+        // tarballs store GNU-style `./`-prefixed member names; the
+        // wanted paths are written without them.
         let entry_name = header.split(|&b| b == 0).next().unwrap_or(&[]);
         let entry_name = String::from_utf8_lossy(entry_name);
+        let entry_name = entry_name.trim_start_matches("./");
         // File size: bytes 124-135, octal string.
         let size_str = header[124..136]
             .split(|&b| b == 0 || b == b' ')

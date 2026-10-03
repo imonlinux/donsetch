@@ -324,8 +324,13 @@ fn migrate_legacy_store() {
 fn write_token_file(dir: &std::path::Path, tok: &str, state: &ResumeState) -> bool {
     let tmp = dir.join(format!("{tok}.tmp"));
     let dst = token_path(dir, tok);
+    // Frontier URLs can name a private target: owner-only, same seal
+    // as the session-bearing stores.
     let ok = serde_json::to_string(state)
-        .map(|s| std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &dst).is_ok())
+        .map(|s| {
+            crate::config::write_private(&tmp, s.as_bytes()).is_ok()
+                && std::fs::rename(&tmp, &dst).is_ok()
+        })
         .unwrap_or(false);
     if !ok {
         let _ = std::fs::remove_file(&tmp);
@@ -655,7 +660,7 @@ impl Crawler {
                 if let Ok(u) = Url::parse(&e.loc)
                     && host_ok(&u)
                     && scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
-                    && (!opts.respect_robots || robots.allowed(u.path()))
+                    && (!opts.respect_robots || robots.allows_url(&u))
                 {
                     // Focus gate: skip sitemap entries that don't
                     // match the focus query (if set).
@@ -882,7 +887,7 @@ impl Crawler {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
-                    if opts_worker.respect_robots && !robots.allowed(parsed.path()) {
+                    if opts_worker.respect_robots && !robots.allows_url(&parsed) {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
@@ -1062,7 +1067,7 @@ impl Crawler {
                             &opts_worker.exclude_paths,
                         );
                         let robots_ok_final =
-                            !opts_worker.respect_robots || robots.allowed(final_parsed.path());
+                            !opts_worker.respect_robots || robots.allows_url(&final_parsed);
                         if !host_ok_final || !scope_ok_final || !robots_ok_final {
                             skipped
                                 .lock()
@@ -1401,7 +1406,7 @@ impl Crawler {
                                     ) {
                                         continue;
                                     }
-                                    if opts_worker.respect_robots && !robots.allowed(nu.path()) {
+                                    if opts_worker.respect_robots && !robots.allows_url(&nu) {
                                         continue;
                                     }
                                     // Focus gate for pagination: hard filter
@@ -1504,7 +1509,7 @@ impl Crawler {
                                         ) {
                                             continue;
                                         }
-                                        if opts_worker.respect_robots && !robots.allowed(u.path()) {
+                                        if opts_worker.respect_robots && !robots.allows_url(&u) {
                                             continue;
                                         }
                                         let lcanon = frontier::locale_canonical(u.path());
@@ -1577,7 +1582,7 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    if opts_worker.respect_robots && !robots.allowed(cu.path()) {
+                                    if opts_worker.respect_robots && !robots.allows_url(&cu) {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
@@ -1958,5 +1963,37 @@ mod anchor_text_guard_tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "/docs");
         assert_eq!(found[0].1, "Docs");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod resume_store_mode_tests {
+    use super::{ResumeState, write_token_file};
+
+    // Frontier URLs can name a private target: the token file is
+    // owner-only, same seal as the session-bearing stores (the
+    // 4.3.7 page-history class, continued 2026-09-29).
+    #[test]
+    fn a_resume_token_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-token-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = ResumeState {
+            seed: "https://intranet.example/secret-plan".into(),
+            queue: vec![(
+                "https://intranet.example/secret-plan/deep".into(),
+                1.0,
+                1,
+                0,
+                None,
+            )],
+            seen: vec!["https://intranet.example/secret-plan".into()],
+        };
+        assert!(write_token_file(&dir, "c0001", &state));
+        let p = dir.join("c0001.json");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "resume token is {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

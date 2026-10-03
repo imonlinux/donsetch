@@ -850,16 +850,82 @@ async fn check_browser_launch() -> CheckResult {
     }
 }
 
+/// Sets every regular file under `root` that others can read to
+/// 0600 and returns (files seen, files tightened, files it could not
+/// change). Symlinks are neither followed nor changed, and the walk
+/// stops after 10 000 entries.
+#[cfg(unix)]
+fn tighten_tree(root: &std::path::Path) -> (u32, u32, u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut seen, mut tightened, mut stuck) = (0u32, 0u32, 0u32);
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        return (seen, tightened, stuck);
+    }
+    let mut visited = 0u32;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > 10_000 {
+                return (seen, tightened, stuck);
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            seen += 1;
+            if meta.permissions().mode() & 0o077 == 0 {
+                continue;
+            }
+            if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).is_ok() {
+                tightened += 1;
+            } else {
+                stuck += 1;
+            }
+        }
+    }
+    (seen, tightened, stuck)
+}
+
 /// Session-bearing state must not be world-readable. Covers the
-/// cookie vault (ghost-state.json) and the TLS-session routes file.
+/// cookie vault (ghost-state.json), the TLS-session routes file, the
+/// key, page-history, search-cache and crawl-resume stores, the
+/// host-bearing stores (crawl governor, egress health, search trust,
+/// search quality, outcome feedback), and the files under
+/// `screenshots/`, `ghost-debug/`, `crawl-resumes/`, `bypass-cache/`
+/// and `host-pace/`.
 fn check_state_permissions() -> CheckResult {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let dir = paths::cache_dir();
-        // Files that carry cookies, TLS sessions, or auth material.
-        // handles.json is opaque tokens, not secrets: leave it out.
-        let secret_files = ["ghost-state.json", "routes.json", "byok-keys.json"];
+        // Files that carry cookies, TLS sessions, auth material, or
+        // fetched page content (page-history keeps whole markdown,
+        // including pages fetched behind a login). handles.json is
+        // opaque tokens, not secrets: leave it out.
+        let secret_files = [
+            "ghost-state.json",
+            "routes.json",
+            "byok-keys.json",
+            "page-history.json",
+            "search-cache.json",
+            "crawl-resumes.json",
+            "crawl-governor.json",
+            "egress-health.json",
+            "search-trust.json",
+            "search-quality.json",
+            "outcome-feedback.json",
+        ];
         let mut fixed = Vec::new();
         let mut failed = Vec::new();
         let mut present = 0u32;
@@ -882,6 +948,29 @@ fn check_state_permissions() -> CheckResult {
                 fixed.push(format!("{name} {mode:o}→600"));
             } else {
                 failed.push(format!("{name} is {mode:o}"));
+            }
+        }
+        // Page artifacts and session-bearing stores: what the ghost
+        // rendered (a logged-in page included), crawl resume frontiers,
+        // and unlocker-cached page bodies. Files written before they
+        // were sealed stay on disk, so they are tightened where they
+        // lie.
+        for sub in [
+            "screenshots",
+            "ghost-debug",
+            "crawl-resumes",
+            "bypass-cache",
+            "host-pace",
+        ] {
+            let (seen, tightened, stuck) = tighten_tree(&dir.join(sub));
+            if seen > 0 {
+                present += 1;
+            }
+            if tightened > 0 {
+                fixed.push(format!("{sub}/ {tightened} file(s) →600"));
+            }
+            if stuck > 0 {
+                failed.push(format!("{sub}/* has {stuck} file(s) others can read"));
             }
         }
         if !failed.is_empty() {
@@ -1176,42 +1265,50 @@ fn check_onnx() -> CheckResult {
     #[cfg(any(feature = "ocr", feature = "rerank"))]
     {
         // Real probe, not a cfg constant: initialize the ONNX
-        // environment and surface the result. A static-link build
-        // whose archive was never linked in fails here instead of
-        // printing a success string (this exact probe would have
-        // caught the v3.3.0 leak on Windows/macOS).
-        #[cfg(not(target_os = "linux"))]
+        // environment and surface the result. A build whose runtime
+        // cannot get in fails here instead of printing a success
+        // string (this exact probe would have caught the v3.3.0 leak
+        // on Windows/macOS).
+        //
+        // AVX is a diagnostic, not a gate: the shipped runtime
+        // dispatches its kernels at runtime and runs on SSE4.2; on
+        // arm64 the concept does not exist at all.
+        let has_avx = crate::cpu::has_avx();
+        let cpu = if cfg!(target_arch = "aarch64") {
+            "arm64 (NEON)"
+        } else if has_avx {
+            "AVX detected"
+        } else {
+            "no AVX (SSE kernels)"
+        };
+        // Check the shared library's presence beside the binary or in
+        // the cache fallback.
+        let lib_name = crate::onnx::shared_lib_name();
+        let found = if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
         {
+            parent.join(lib_name).exists()
+        } else {
+            false
+        };
+        let cache = paths::cache_dir().join("onnx").join(lib_name).exists();
+        if !(found || cache) {
+            CheckResult::Warn(format!(
+                "{cpu} but shared library missing : reinstall donsetch"
+            ))
+        } else {
+            // Presence is not proof: the library must load and
+            // initialize. A text file dressed as onnxruntime.dll
+            // passed the old exists() check, which made the release
+            // workflow's no-AVX doctor run assert nothing about the
+            // runtime (review of #300). Same payload probe on every
+            // platform.
             match crate::onnx::ensure_loaded() {
-                Ok(()) => CheckResult::Pass("static link, commit probe ok".into()),
-                Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e.to_string()),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Check AVX support (disk-cached).
-            let has_avx = crate::cpu::has_avx();
-            if !has_avx {
-                return CheckResult::Warn(
-                    "CPU lacks AVX : OCR and rerank disabled (all other features work)".into(),
-                );
-            }
-            // Check shared library presence.
-            let lib_name = "libonnxruntime.so";
-            let found = if let Ok(exe) = std::env::current_exe()
-                && let Some(parent) = exe.parent()
-            {
-                parent.join(lib_name).exists()
-            } else {
-                false
-            };
-            let cache = paths::cache_dir().join("onnx").join(lib_name).exists();
-            if found || cache {
-                CheckResult::Pass("AVX detected, shared library present".into())
-            } else {
-                CheckResult::Warn(
-                    "AVX detected but shared library missing : reinstall donsetch".into(),
-                )
+                Ok(()) => CheckResult::Pass(format!("{cpu}, shared library present")),
+                Err(e) if e.contains("not found") => CheckResult::Warn(format!(
+                    "{cpu} but shared library missing : reinstall donsetch"
+                )),
+                Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e),
             }
         }
     }
@@ -2289,19 +2386,154 @@ mod doctor_ultra_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let f = paths::cache_dir().join("routes.json");
-            std::fs::write(&f, b"{}").unwrap();
-            let mut perm = std::fs::metadata(&f).unwrap().permissions();
-            perm.set_mode(0o644);
-            std::fs::set_permissions(&f, perm).unwrap();
+            let make = |name: &str| {
+                let f = paths::cache_dir().join(name);
+                std::fs::write(&f, b"{}").unwrap();
+                let mut perm = std::fs::metadata(&f).unwrap().permissions();
+                perm.set_mode(0o644);
+                std::fs::set_permissions(&f, perm).unwrap();
+                f
+            };
+            let routes = make("routes.json");
+            // page-history keeps whole page markdown (including pages
+            // fetched behind a session) and was missed by the
+            // original list.
+            let history = make("page-history.json");
             match check_state_permissions() {
                 CheckResult::Fixed(d) => {
                     assert!(d.contains("routes.json"), "{d}");
+                    assert!(d.contains("page-history.json"), "{d}");
                 }
                 other => panic!("expected Fixed, got {other:?}"),
             }
-            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+            for f in [routes, history] {
+                let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", f.display());
+            }
+        }
+    }
+
+    // Screenshots and debug DOM dumps written before they were sealed
+    // stay on disk; doctor tightens them where they lie, subfolders
+    // included, and never follows a link out of the tree.
+    #[test]
+    fn state_permissions_tightens_page_artifacts() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let make = |rel: &str| {
+                let f = paths::cache_dir().join(rel);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, b"x").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+                f
+            };
+            let shot = make("screenshots/a.png");
+            let nested = make("screenshots/sub/b.png");
+            let dom = make("ghost-debug/dom-app_example_com.html");
+            let outside = make("elsewhere/kept.txt");
+            std::os::unix::fs::symlink(&outside, paths::cache_dir().join("screenshots/link.png"))
+                .unwrap();
+            match check_state_permissions() {
+                CheckResult::Fixed(d) => {
+                    assert!(d.contains("screenshots/"), "{d}");
+                    assert!(d.contains("ghost-debug/"), "{d}");
+                }
+                other => panic!("expected Fixed, got {other:?}"),
+            }
+            let mode =
+                |f: &std::path::Path| std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            for f in [&shot, &nested, &dom] {
+                assert_eq!(mode(f), 0o600, "{}", f.display());
+            }
+            assert_eq!(
+                mode(&outside),
+                0o644,
+                "a link's target is not ours to change"
+            );
+            // A second run has nothing left to fix.
+            assert!(matches!(check_state_permissions(), CheckResult::Pass(_)));
+        }
+    }
+
+    // Crawl resume tokens and unlocker bypass entries carry frontier
+    // URLs and page bodies: same tighten as the page artifacts.
+    // The pace, governor, egress and search-learning stores name the
+    // hosts that were fetched and searched; the ones written before
+    // they were sealed are tightened where they lie.
+    #[test]
+    fn state_permissions_tightens_the_host_bearing_stores() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let make = |rel: &str| {
+                let f = paths::cache_dir().join(rel);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, b"{}").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+                f
+            };
+            let files = [
+                make("crawl-governor.json"),
+                make("egress-health.json"),
+                make("search-trust.json"),
+                make("search-quality.json"),
+                make("outcome-feedback.json"),
+                make("host-pace/0a1b2c3d.json"),
+            ];
+            let report = match check_state_permissions() {
+                CheckResult::Fixed(d) => d,
+                other => panic!("expected Fixed, got {other:?}"),
+            };
+            for name in [
+                "crawl-governor.json",
+                "egress-health.json",
+                "search-trust.json",
+                "search-quality.json",
+                "outcome-feedback.json",
+                "host-pace/",
+            ] {
+                assert!(report.contains(name), "{name} missing from: {report}");
+            }
+            for f in &files {
+                let mode = std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", f.display());
+            }
+        }
+    }
+
+    #[test]
+    fn state_permissions_tightens_crawl_and_bypass_stores() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let make = |rel: &str| {
+                let f = paths::cache_dir().join(rel);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, b"x").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+                f
+            };
+            let tok = make("crawl-resumes/c0001.json");
+            let cache = make("bypass-cache/abc.json");
+            let single = make("search-cache.json");
+            match check_state_permissions() {
+                CheckResult::Fixed(d) => {
+                    assert!(d.contains("crawl-resumes/"), "{d}");
+                    assert!(d.contains("bypass-cache/"), "{d}");
+                    assert!(d.contains("search-cache.json"), "{d}");
+                }
+                other => panic!("expected Fixed, got {other:?}"),
+            }
+            let mode =
+                |f: &std::path::Path| std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            for f in [&tok, &cache, &single] {
+                assert_eq!(mode(f), 0o600, "{}", f.display());
+            }
+            assert!(matches!(check_state_permissions(), CheckResult::Pass(_)));
         }
     }
 }

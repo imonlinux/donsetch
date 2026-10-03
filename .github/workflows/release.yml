@@ -9,7 +9,7 @@
 #   donsetch-linux-arm64.tar.gz     (Linux ARM64 / aarch64)
 #   donsetch-darwin-arm64.tar.gz    (macOS arm64)
 #   donsetch-darwin-x64.tar.gz      (macOS Intel)
-#   donsetch-win32-x64.tar.gz       (Windows x86_64 + pdfium.dll)
+#   donsetch-win32-x64.tar.gz       (Windows x86_64 + pdfium.dll + onnxruntime.dll)
 #
 # Build steps mirror ci.yml exactly (same toolchain, same deps).
 # The only additions are: binary verification, packaging, checksums.
@@ -69,9 +69,10 @@ jobs:
           - name: darwin-x64
             os: macos-15-intel
             target: x86_64-apple-darwin
-            # ort-sys ships no prebuilt ONNX Runtime for x86_64-apple-darwin —
-            # core build (same trade-off as linux-arm64).
-            features: ''
+            # ONNX dlopens on Intel too since #316 (Microsoft's
+            # signed 1.23.2 dylib ships beside the binary): the full
+            # feature set like the other release targets.
+            features: --features ocr,rerank,http
             rustflags: ''
           - name: win32-x64
             os: windows-latest
@@ -127,47 +128,46 @@ jobs:
         run: |
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # Cache key: <target>-dep-<DEP_HASH>-rel1 (see ci.yml for the
-      # full rationale). The version-insensitive hash is what makes
-      # release builds warm: without it, every version bump nukes
-      # the dependency cache and every tag build is a cold 15-25
-      # min rebuild on all five platforms.
+      # Cache key: release-<target>-dep-<DEP_HASH>-rel2, DEP_HASH from
+      # scripts/dep-hash.py (see ci.yml).
+      #
+      # Tag runs restore but never SAVE. GitHub scopes a cache to the
+      # ref that saved it: a run for tag vX can read its own tag's
+      # entries and the default branch's, never another tag's. Nothing
+      # on master saves a release key, so a tag-saved entry can never
+      # be restored by the next release (every v4.3.x build logged "No
+      # cache found") and only takes space in the repo's 10 GB pool,
+      # evicting CI's entries. Dispatch runs on a branch still save.
       - name: Compute version-insensitive dep hash
         shell: bash
-        run: |
-          DEP_HASH=$(python3 - <<'EOF'
-          import hashlib, pathlib, re
-          h = hashlib.sha256()
-          lock = pathlib.Path('Cargo.lock').read_text()
-          lock = re.sub(r'name = "donsetch"\nversion = "[^"]+"',
-                        'name = "donsetch"', lock)
-          h.update(lock.encode())
-          for p in sorted(pathlib.Path('.').rglob('Cargo.toml')):
-              t = re.sub(r'\n\s*version\s*=\s*"[^"]*"', '', p.read_text())
-              h.update(p.name.encode()); h.update(t.encode())
-          print(h.hexdigest()[:16])
-          EOF
-          )
-          echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
+        run: echo "DEP_HASH=$(python3 scripts/dep-hash.py)" >> "$GITHUB_ENV"
 
       - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel2
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build
         env:
           # x86_64: target the baseline ISA (SSE2, no AVX) so Rust
           # code runs on QEMU-emulated x86_64 and older CPUs.
           # ONNX Runtime AVX is handled separately via dynamic loading
-          # (ort load-dynamic + build-time .so build + runtime AVX gate).
+          # (ort load-dynamic; build.rs fetches Microsoft's shared
+          # library for Linux and Windows).
           # Linux legs also pin -fuse-ld=lld per matrix.rustflags:
           # bfd 2.38 (22.04) cannot link rustc 1.98 output (.crel).
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
         timeout-minutes: 30
+
+      # Windows loads ONNX Runtime at runtime like Linux (#277, #298).
+      # build.rs fetches Microsoft's pinned, sha256-verified release
+      # zip and places onnxruntime.dll beside the exe for every build,
+      # dev included; the payload gate and the package step below
+      # require it.
 
       # NOTE: no in-tree release-mode test sweep here anymore — it
       # re-linked test binaries with fat LTO (~15 min) to re-derive
@@ -208,9 +208,9 @@ jobs:
       # the ONNX archive was silently absent from win32-x64 and
       # darwin-arm64). These gates are the tripwire: the shipped
       # bytes must be big enough to contain what they claim, the
-      # Linux dylib must ship beside the binary, and `doctor` must
-      # actually PROBE the ONNX payload instead of printing a
-      # cfg constant.
+      # ONNX shared library must ship beside the binary on every
+      # dlopen target, and `doctor` must actually PROBE the ONNX
+      # payload instead of printing a cfg constant.
       - name: Payload integrity gates
         shell: bash
         run: |
@@ -219,8 +219,9 @@ jobs:
           [ -f donsetch.exe ] && BIN=donsetch.exe
           SIZE=$(wc -c < "$BIN")
           case "${{ matrix.name }}" in
-            win32-x64)    NEED=25000000; EXPECT="commit probe ok" ;;
-            darwin-arm64) NEED=11000000; EXPECT="commit probe ok" ;;
+            win32-x64)    NEED=12000000; EXPECT="shared library present" ;;
+            darwin-arm64) NEED=12000000; EXPECT="shared library present" ;;
+            darwin-x64)   NEED=12000000; EXPECT="shared library present" ;;
             linux-x64)    NEED=15000000; EXPECT="shared library present" ;;
             *)            NEED=6000000;  EXPECT="not compiled" ;;
           esac
@@ -232,6 +233,18 @@ jobs:
           if [ "${{ matrix.name }}" = "linux-x64" ]; then
             if [ ! -f libonnxruntime.so ] || [ "$(wc -c < libonnxruntime.so)" -lt 10000000 ]; then
               echo "payload gate FAIL: libonnxruntime.so missing or too small"
+              exit 1
+            fi
+          fi
+          if [ "${{ matrix.name }}" = "darwin-arm64" ] || [ "${{ matrix.name }}" = "darwin-x64" ]; then
+            if [ ! -f libonnxruntime.dylib ] || [ "$(wc -c < libonnxruntime.dylib)" -lt 10000000 ]; then
+              echo "payload gate FAIL: libonnxruntime.dylib missing or too small"
+              exit 1
+            fi
+          fi
+          if [ "${{ matrix.name }}" = "win32-x64" ]; then
+            if [ ! -f onnxruntime.dll ] || [ "$(wc -c < onnxruntime.dll)" -lt 10000000 ]; then
+              echo "payload gate FAIL: onnxruntime.dll missing or too small"
               exit 1
             fi
           fi
@@ -285,7 +298,6 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || true
           cd target/${{ matrix.target }}/release
-          # Clear AVX cache so the CPUID check is actually performed.
           rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
           output=$(qemu-x86_64 -cpu qemu64 ./donsetch --version 2>&1 || true)
           if [ -z "$output" ]; then
@@ -294,22 +306,36 @@ jobs:
           fi
           echo "OK: binary runs on non-AVX CPU (QEMU qemu64)"
           echo "$output" | head -1
+          # The shipped runtime itself must be usable on a CPU without
+          # AVX (SSE4.2 class, #277): no gate protects it any more, so
+          # doctor has to report it present there, not "disabled".
+          doc=$(qemu-x86_64 -cpu Nehalem ./donsetch doctor 2>&1 || true)
+          echo "$doc" | grep -q "ONNX Runtime.*shared library present" || {
+            echo "ERROR: doctor on a non-AVX CPU did not report the runtime present"
+            echo "$doc" | grep -i onnx || true
+            exit 1
+          }
+          echo "OK: ONNX runtime reported present on non-AVX CPU (QEMU Nehalem)"
 
       # Package only DonSeTch release assets. CloakBrowser remains a
       # user-managed runtime dependency and is never bundled here.
-      # All platforms: tar.gz. Windows includes pdfium.dll alongside
-      # donsetch.exe. Using tar.gz (not zip) for all platforms means
-      # the npm install.js postinstall only needs one extraction method.
+      # All platforms: tar.gz. Windows includes pdfium.dll and
+      # onnxruntime.dll alongside donsetch.exe. Using tar.gz (not zip)
+      # for all platforms means the npm install.js postinstall only
+      # needs one extraction method.
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          # Include ONNX shared lib if present (Linux x64 + arm64,
-          # shipped by build.rs for runtime dlopen). macOS/Windows
-          # use static linking.
+          # Include the ONNX shared lib when present: libonnxruntime.so
+          # on Linux x64, libonnxruntime.dylib on both macOS arches
+          # (build.rs fetches it for runtime dlopen, #298/#316).
+          # Windows packages its DLL in the step below.
           if [ -f libonnxruntime.so ]; then
             tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch libonnxruntime.so
+          elif [ -f libonnxruntime.dylib ]; then
+            tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch libonnxruntime.dylib
           else
             tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch
           fi
@@ -323,7 +349,11 @@ jobs:
             echo ERROR: pdfium.dll not found - build.rs copy failed
             exit 1
           )
-          tar czf %GITHUB_WORKSPACE%\donsetch-${{ matrix.name }}.tar.gz donsetch.exe pdfium.dll
+          if not exist onnxruntime.dll (
+            echo ERROR: onnxruntime.dll not found - build.rs copy failed
+            exit 1
+          )
+          tar czf %GITHUB_WORKSPACE%\donsetch-${{ matrix.name }}.tar.gz donsetch.exe pdfium.dll onnxruntime.dll
 
       # ── Checksums ────────────────────────────────────────────
       # sha256sum format: "<hash>  <filename>" — compatible with

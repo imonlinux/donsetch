@@ -5,7 +5,420 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.4.3] - 2026-10-03
+
+### Fixed
+
+- A supervised MCP server lost the client's compatibility mode at its
+  first restart: the client's `initialize` was answered by the first
+  child, so it never replayed, and every replacement started in the
+  default split shape; after one crash Claude Code, VS Code, OpenCode
+  and pi saw tool metadata without page text for the rest of the
+  session. The supervisor now hands the client's name to each
+  replacement, which starts in the mode the handshake chose.
+  (mnaza, #340)
+- Query-shaped robots rules never applied to a crawl: every check
+  asked whether the path was allowed, and a path has no `?`, so
+  `Disallow: /*?`, `Disallow: /search?` and Wikipedia's
+  `Disallow: /w/index.php?` kept nothing out while the parser itself
+  matched them. The crawl now asks about the path with its query, at
+  the seed, the sitemap, the pop, the redirect target and every
+  harvested link. (mnaza, #341)
+- Three unlocker edges. A key of the shape `token::` was reported
+  with the token itself twice in the error, and that string reaches
+  the fetch trace the model sees and the `doctor` line; it names the
+  shape now. The daily cap was a read-then-write with no lock, so
+  parallel walled fetches at the cap each read the same count and
+  each went through and paid; the counter is updated under a file
+  lock. The solve cache was keyed by URL alone, so after toggling
+  `bypass.render` the other mode's body was served for the TTL; the
+  key carries the mode. (mnaza, #342)
+- The macOS screenshot fix kept failing most captures: un-minimizing
+  the window returns as soon as the state flips, but macOS gives the
+  window a presented compositor surface a little later, and with
+  `CDPScreenshotNewSurface` active a capture taken in that gap fails
+  instantly (`-32000`, "Unable to capture screenshot") instead of
+  waiting for the frame. On macOS, a capture now waits for the window
+  to report `normal` (bounded, plus a short compositor settle) and
+  keeps waiting even when the restore call itself reports an error;
+  the single retry on that failure applies on every platform.
+  (warc0s, #336)
+
+## [4.4.2] - 2026-10-01
+
+### Fixed
+
+- A browser whose DevTools link had ended kept being served as a
+  warm slot: the link's reader task stopped on a closed socket or on
+  a reply over the websocket frame limit (16 MiB by default; a large
+  page's `outerHTML` reaches it, a page can make it on purpose), and
+  nothing recorded that, so every call in flight waited out its own
+  timeout and the pool, which only checked that the process was
+  alive, handed the same dead browser out again. The link marks
+  itself dead when its reader ends, fails the waiting calls at once,
+  refuses new ones, and the pool relaunches the slot; the frame
+  limit is raised to the 64 MiB message limit. (mnaza, #332)
+- The HTTP transport checked neither `Origin` nor `Host`, so with
+  auth off (the default) any web page open in a local browser could
+  fire tool calls at it blind through a cross-site POST that no CORS
+  preflight stops, and a page whose name resolves to 127.0.0.1 (DNS
+  rebinding) could read the answers. Every `/mcp` route now refuses
+  a browser `Origin` unless the page is on loopback or CORS mode
+  (which requires the token) is on, and a server bound to loopback
+  refuses a `Host` that is not a loopback name on its own port.
+  Native clients send no `Origin` and are unaffected. (mnaza, #333)
+- Over the HTTP transport, a tool call that sent more than 256
+  progress notifications (a crawl with a progress token running past
+  about eight minutes) finished but never answered: its progress
+  channel had no reader while the tool ran, the forwarder blocked on
+  the 257th line, and the call ended as a request timeout. The
+  channel is drained for the life of the call. (mnaza, #334)
+- `DONSETCH_NO_CONFIG_FILE` read any value that was not an off-word
+  as on, an empty export included (`DONSETCH_NO_CONFIG_FILE= donsetch`,
+  a blank value in a `.cargo/config.toml` `[env]` block), so it
+  silently dropped `donsetch.toml`, and with `DONSETCH_CONFIG` also
+  set it failed the load naming a `=1` the user never wrote. It reads
+  the same words as every other boolean now, and a value that is not
+  a boolean is reported once and keeps the file. (mnaza, #335)
+- `web_screenshot` timed out on macOS while every other ghost call
+  answered: the window is deliberately minimized for invisibility,
+  a minimized window presents no frames, and Chromium's classic
+  capture path waits for a presented frame, so the capture ran out
+  the whole CDP timeout. Captures now un-minimize the window for
+  their call and re-minimize after, and the browser launches with
+  `--enable-features=CDPScreenshotNewSurface` (Chromium's own
+  remedy for stalls on frames not being presented, off by default
+  and enabled by Playwright) plus
+  `--disable-backgrounding-occluded-windows` (an off-screen window
+  counts as occluded and would otherwise be backgrounded).
+  (warc0s, #331)
+- Pi search results could be fetched but not cited: pi hands the
+  model `content` only, and the extension was not a detected
+  client, so the result URLs stayed in the `structuredContent` the
+  model never sees. Pi is detected now and gets the `[meta]` fold:
+  the state, result URLs included, leads the text block the model
+  reads. The extension also stopped dropping that block when
+  parsing its own text and reads the folded state for its TUI
+  badges. (codequentoum, #329)
+- The update lock degraded silently on a filesystem that cannot
+  hold locks (some network mounts): the run proceeded unserialized
+  with nothing said. It now prints a loud warning naming the lock
+  and the cause before continuing. (Mart-Bogdan, #330)
+
+## [4.4.1] - 2026-09-29
+
+### Fixed
+
+- The self-update lock refused an update nobody was running, and
+  did not stop two that started together. `update.lock` was a file
+  holding a pid and nothing else: it was never removed, so the next
+  `-u` depended on that pid being dead and reported "another
+  donsetch update is already running" whenever any other live
+  process had since been given it (common after a reboot or a killed
+  update), and two runs starting at once both passed the check
+  before either wrote the file. It is an OS file lock now, exclusive
+  while held and released when the holder exits however it exits;
+  the pid in the file only names the holder in the refusal.
+  (mnaza, #327)
+- A stable install stopped receiving updates while a prerelease was
+  the newest published release: `-u` read only the first entry of
+  the releases feed, saw the prerelease and stayed put, even with a
+  newer stable release right below it. It now takes the newest entry
+  that is not a prerelease; a prerelease install still follows the
+  newest entry, and a feed holding only prereleases still names the
+  one it is not moving to. (mnaza, #326)
+- Three update and rollback edges that could pair a binary with the
+  wrong runtime library or the wrong label. An update that ships no
+  runtime library now drops the library backup an earlier update
+  left, which was older than the binary backup and would have been
+  swapped in beside the restored binary. A failed backup copy no
+  longer leaves `donsetch.bak.ver` naming this version for a backup
+  that is an older binary or a partial file; both are removed, and
+  rollback reports that there is none. A rollback interrupted between
+  restoring a library and keeping its roll-forward copy no longer
+  loses that copy: the next rollback finds it in the stash, so
+  rolling forward moves the library with the binary. (mnaza, #325)
+- The egress health store (`egress-health.json`) names every host
+  a fetch was blocked on and the proxy it left through, and was still
+  written readable by others; it is sealed like the pace and governor
+  stores. `doctor` now also tightens the sealed stores it did not
+  list: `crawl-governor.json`, `search-trust.json`,
+  `search-quality.json`, `outcome-feedback.json` and the rows under
+  `host-pace/`, which otherwise kept their old mode until their next
+  save (a pace row for a host not fetched again, until its 7-day
+  prune). (mnaza, #324)
+- The docs-outline walk test no longer fails on a loaded or slow
+  box: it bounded the whole extraction of a deeply nested page at 20
+  seconds of wall clock, and most of that time is the HTML parser,
+  whose own cost grows with nesting depth. It now bounds the
+  extraction at four times the parse of the same page, which holds
+  under any load or build profile and still catches the ancestor
+  walk it guards (about 14 times the parse). (mnaza, #328)
+
+## [4.4.0] - 2026-09-29
+
+### Fixed
+
+- The ghost still launched Debian's `/usr/bin/chromium` wrapper, so
+  the flags that wrapper sources from `/etc/chromium.d/` kept riding
+  into its argv (the #321 class): Debian's script never writes the
+  browser's path, it builds it from two variables
+  (`LIBDIR=/usr/lib/$APPNAME`, `exec $LIBDIR/$APPNAME ...`), and the
+  launcher resolution only saw paths written out. A script's own
+  plain variable assignments are followed now; a path built from them
+  has to pass the same proof as a written one (an executable ELF of
+  browser size with a chromium-shaped name), and a value that is
+  computed or unknown resolves nothing. (mnaza, #322)
+- Screenshots and the `debug.ghost` DOM dump were written with a
+  plain write and landed readable by others under the default umask
+  (0644, or 0664 where the umask is 002), while the ghost renders
+  with the session vault replanted: an image or the markup of a
+  logged-in page sat beside stores that are all 0600. Both go through
+  `config::write_private` now, and `doctor` tightens what is already
+  on disk under `screenshots/` and `ghost-debug/`, subfolders
+  included, without following links. The same class as the
+  page-history store in 4.3.7. (mnaza, #323)
+- Windows rollback restored `pdfium.dll` but not `onnxruntime.dll`,
+  so a rolled-back binary kept the newer ONNX runtime beside it
+  while `update` stages both DLLs. One `SIBLING_LIBS` list now drives
+  update and rollback on every platform (Linux `.so`, macOS `.dylib`,
+  Windows `pdfium.dll` + `onnxruntime.dll`), and the sibling-lib
+  tests run on the Windows lane too. (self-audit, 2026-09-29)
+- Crawl resume tokens, the search cache, the unlocker bypass cache,
+  the crawl governor and host-pace stores were written with a plain
+  `fs::write` and sat world-readable under a default umask. All of
+  them can carry what the user asked for (frontier URLs, queries and
+  results, page bodies the unlocker returned): they go through
+  `config::write_private` now, and `doctor` tightens
+  `crawl-resumes/`, `bypass-cache/` and the new single-file stores
+  the same way as the page artifacts. (self-audit, 2026-09-29)
+- `donsetch stop` had two live-wipe bugs. The ghost temp-profile
+  sweep deleted every `donsetch-ghost-*` directory, including the
+  throwaway profile of a concurrent session still running (ripping
+  the user-data-dir out from under a live Chrome); it now only
+  removes profiles whose owning pid is gone. The `pkill -f` pattern
+  interpolated the profile path unescaped, so a `.` or `+` in it
+  loosened the match and orphans survived (or over-matched); the
+  path is ERE-escaped now. (self-audit, 2026-09-29)
+- Windows self-update could silently lose a runtime DLL. The swap
+  renamed the live `pdfium.dll`/`onnxruntime.dll` aside and then
+  `let _ =` the copy of the new one, so a failed copy (disk full, AV
+  lock) left zero DLLs beside a freshly swapped exe while `-u`
+  printed "updated in place". Sibling DLLs are staged all-or-nothing
+  before anything live is touched now, and landing restores the
+  previous file if the install rename fails. A Windows rollback that
+  crashed between renaming the exe aside and copying the backup used
+  to delete `.donsetch.rollback.tmp` on the next attempt, destroying
+  the last copy of the binary; it recovers that temp when the exe is
+  gone. (self-audit, 2026-09-29)
+- `donsetch -u` would move a stable install onto a prerelease when
+  one was the newest published tag (the releases.atom feed lists
+  every published release). A stable install now stays put and says
+  so; a prerelease install still follows prereleases. (self-audit,
+  2026-09-29)
+- The npm postinstall left debris and could lie about why it failed.
+  A bare `response.pipe(file)` left the write stream open when the
+  download errored, so the unlink of a partial tarball failed with
+  EBUSY on Windows and the half-download sat in `binaries/`; the
+  tarball and checksum were only removed on a SHA mismatch, so any
+  other failure kept them forever; and `mkdirSync` ran outside
+  `main().catch`, so an unwritable install dir produced a raw Node
+  stack instead of the curated message. Downloads go through
+  `stream/promises.pipeline` (both ends destroyed on error), the
+  artifacts are dropped in a `finally`, and the workspace is created
+  inside `main()`. Self-update likewise names the real cause when the
+  extract workspace cannot be created instead of failing later with
+  "unpack ...: No such file or directory". (self-audit, 2026-09-29)
+- Two concurrent `donsetch -u` runs could race the shared extract
+  workspace, the staging names and the `.bak` backups (one run's
+  cleanup wiped the other's extract mid-flight). An advisory
+  `update.lock` under the cache dir, pid-stamped, now serializes
+  self-update; a lock whose pid is gone is reclaimed. (self-audit,
+  2026-09-29)
+
+## [4.3.7] - 2026-09-28
+
+### Fixed
+
+- The tier-2 ghost no longer launches through a distro's Chromium
+  launcher wrapper when one sits at the discovered path (#321,
+  reported on 4.3.6): Arch's `/usr/bin/chromium` reads
+  `chromium-flags.conf`, Void's script prepends `CHROME_FLAGS`, and
+  either way the host's desktop flags rode into the ghost's argv. An
+  injected `--ozone-platform=wayland` costs the ghost the headless
+  platform Chromium only picks when the switch is unset, and on the
+  reporter's build the repeated GPU-process failure ends in
+  Chromium's intentional `FATAL:GPU process isn't usable. Goodbye.`
+  about eight seconds in, so every tier-2 render died. Discovery now
+  resolves a launcher to the real browser binary it references (an
+  executable ELF of browser size with a Chromium-shaped name) and
+  launches that; an explicit `browser.chromium_path` is still taken
+  as given. When the browser dies before DevTools comes up, the
+  launch error now carries its last stderr lines instead of a bare
+  "devtools ws timeout".
+- The page-history store (`~/.cache/donsetch/page-history.json`) is
+  owner-only now, like the rest of the session-bearing state: it keeps
+  up to 64 KB of page markdown per URL, including pages fetched behind
+  a login, but it was written with a plain `std::fs::write` and sat at
+  `0644` under a default umask while `ghost-state.json` and
+  `routes.json` were `0600`, and `doctor`'s permissions check did not
+  look at it. Writes go through the same owner-only path as the handle
+  table now, and `doctor` tightens an existing world-readable file on
+  sight (self-audit, 2026-09-28).
+- The ghost's process handle refuses a child without a pid
+  (self-audit, 2026-09-28): freeze, thaw and kill all signal
+  `kill(-pid, ...)`, and a zero pid would not fail there, it would
+  signal the caller's own process group, stopping or killing donsetch
+  itself. The window was theoretical (a just-spawned, unreaped child
+  always carries a pid), but the failure mode is the whole process
+  group, so the invariant is enforced and covered by tests.
+
+## [4.3.6] - 2026-09-27
+
+### Fixed
+
+- The in-process integration modules no longer read the developer's
+  own `donsetch.toml` or cache (#315, the rest of #299 and #312):
+  `tests/it` links the lib without `cfg(test)`, so the unit-test
+  defaults never reached `crawl_fresh_fetch`, `egress_proxy`,
+  `request_class`, `revalidate_redirect`, `secure_cookie_leak`,
+  `bypass_live`, `token_invariants`, `soak` (whose page-history load
+  counted the developer's real file toward its growth bound) and
+  `auth_login` (which isolated its cache but not its config, and left
+  one temp directory per test process behind), and a local proxy
+  setting or timeout could shape them on one box and not on CI. Every
+  test in those modules now calls a shared sandbox first: no config
+  file layer, a private cache root under `$TMP/donsetch-test/`, swept
+  at exit. (mnaza, #317)
+- Screenshots lost their last one or two bytes whenever the PNG's
+  length was not a multiple of 3: the hand-rolled decoder for
+  Chrome's base64 capture dropped the final group once its `=`
+  padding was stripped, which cut into the checksum of the image's
+  closing `IEND` chunk. `web_screenshot` and the captcha `shot` file
+  now get the whole image, and a capture that is not valid base64
+  fails instead of turning unknown symbols into zero bytes. Both
+  hand-rolled codecs in the browser module and the Bing redirect
+  decoder now use the `base64` crate; Bing's unpadded base64url
+  links decode as before (Mart-Bogdan, #318).
+- Login cookies outrank the tier-1 jar again (#319, reported on
+  4.3.5): the daemon replayed its persisted jar echo after the
+  session vault at every boot and vault resync, so a jar entry for
+  the same name and domain, typically the anonymous value a
+  logged-out render had written over the login cookie, replaced the
+  login value and every later fetch went out anonymous until someone
+  cleared the jar (Reddit's `token_v2`, `csrf_token`,
+  `session_tracker`). Both replay points now build their cookie set
+  with the vault winning every key both stores hold; jar-unique
+  cookies still replay.
+- macOS loads ONNX Runtime dynamically like Linux and Windows, and
+  Intel Macs get OCR and rerank back (#316): both macOS targets now
+  dlopen Microsoft's shared library from beside the binary instead
+  of the static `download-binaries` link, and the darwin-x64 release
+  builds the `ocr,rerank,http` feature set for the first time. The
+  pinned macOS runtime is 1.23.2, the last release Microsoft shipped
+  with a Developer ID signature (1.24.2+ macOS dylibs are ad-hoc
+  only and raise the minimum to macOS 14; 1.23.2 asks 13.4), and
+  the crate's API floor moves from `api-24` to `api-23` to serve it
+  (the `GetApi` table is append-only; measured on Windows against a
+  1.23.2 runtime). The binary no longer carries the statically
+  linked runtime, the release gates check the dylib beside the
+  binary, both macOS CI lanes run the payload probe, and the
+  Homebrew formula installs the library beside the binary. The
+  remaining step is a manual pass on stock Mac hardware (Gatekeeper
+  and signing behaviour), tracked on the issue. (proposed by
+  Mart-Bogdan, signature analysis by mnaza)
+
+## [4.3.5] - 2026-09-25
+
+### Fixed
+
+- A unit test no longer reads the developer's own `donsetch.toml`
+  (#305, the config side of #299): the file layer under test is empty
+  unless `DONSETCH_CONFIG` names a file, so a local `[state]
+  no_disk_state = true` can no longer flip the governor's persistence,
+  nor can any other key in that file shape a test's behavior from
+  outside the test. (mnaza, #312)
+- `mcp.text_only`'s description said "strip image blocks from tool
+  output"; the fold never touched image blocks, and `web_screenshot`
+  returning its PNG with the knob on is correct. The field is
+  described as what it does: fold `structuredContent` into a leading
+  `[meta]` text block for every client (#306, reported on 4.3.3). The
+  README covers the one client that needs the knob today: OpenCode
+  2.x reports `clientInfo.name` as `cli` (its
+  `process.env.OPENCODE_CLIENT ?? "cli"` default, which `serve` never
+  overrides), too generic to match in the text-only list, and its
+  Code Mode shows the model `structuredContent` only. Set
+  `[mcp] text_only = true` (or `DONSETCH_MCP__TEXT_ONLY=1`) for it
+  until OpenCode restores a usable name upstream; a handshake
+  fingerprint was considered and rejected, because the
+  `elicitation.form.applyDefaults` capability is a TypeScript-SDK
+  opt-in, not an OpenCode signature, so matching on it would misfire
+  on later SDK-based clients. (mnaza, #311)
+
+## [4.3.4] - 2026-09-25
+
+### Fixed
+
+- `donsetch.exe` crashed at start, with no output, on CPUs without AVX
+  (#277: a first-generation Core i7). ONNX Runtime was linked
+  statically, and its global constructors run AVX instructions before
+  `main`, so the crash hit every command. Windows now loads ONNX
+  Runtime the way Linux does: at runtime, from Microsoft's
+  `onnxruntime.dll` (CPU-only build, pinned by version and sha256 in
+  `build.rs`) shipped beside the exe; the hard `DirectML.dll` import
+  (a static-link leftover that stopped the exe from starting on Server
+  Core and Windows 10 before 1903) is gone, and the self-updater
+  carries `onnxruntime.dll` across updates the same way as
+  `pdfium.dll`. (mnaza, #298)
+- OCR and rerank were disabled on any x86-64 CPU without AVX (#277: a
+  Celeron J1900) by a CPUID gate written for pyke's static ONNX
+  archive, whose constructors do need AVX. The runtime the dlopen
+  targets ship is Microsoft's own build, which selects its kernels at
+  runtime: it loads and OCRs a scanned PDF on an SSE4.2-only CPU
+  (verified under QEMU; Windows under Intel SDE). The gate is gone;
+  `doctor` names the CPU class and proves the library loads, and the
+  release workflow checks the runtime on a non-AVX CPU. (mnaza, #300)
+- The test suite no longer reads or writes the user's real cache
+  directory: a crawl test's governor loaded
+  `~/.cache/donsetch/crawl-governor.json`, saved its mock hosts
+  there, and under nextest's process-per-test the governor tests read
+  each other's throttle state back, failing on a loaded box depending
+  on which process wrote last. A unit test without
+  `DONSETCH_CACHE_DIR` gets a temp root of its own
+  (`$TMP/donsetch-test/<id>/cache`, swept at exit on every platform),
+  and the daemon-boot integration test stops handing its child the
+  real cache. (mnaza, #299)
+- The BYOK search degraded line names the reason when no key could
+  even be tried: with every key invalid, depleted or cooling down (and
+  every plugin striking) the status read `(byok: )` with no word in
+  it. It reads `no usable key (all invalid or depleted or cooling
+  down)` now, and `compact_failure` never returns an empty status.
+  (mnaza, #301)
+- A fetch no longer falls through to the real address while an
+  unburned lane exists. Probation after one block seats its lane again
+  (it scored 0, and the seat check `score > best_score` with
+  best_score 0 never let it through, so a one-lane pool went direct
+  after a single 429); a burned pair rests its cooldown instead of
+  being re-seated on every fetch of that host (re-seating voided the
+  cooldown and held a rate-limiting lane under constant requests); a
+  live lane bound to another host's persona serves before direct
+  (exclusivity is preferred, not absolute, and a shared exit is less
+  identifying than the real address); and a `direct` answer from the
+  pool no longer mutes `HTTPS_PROXY`. (mnaza, #302)
+- The docs-outline adapter walks a wrapper div's leaf divs in linear
+  time again: asking every candidate's every ancestor whether a block
+  lives below it re-scanned the wrapper's subtree once per leaf,
+  quadratic in the leaf count (20 000 leaf divs, a 240 KB page, ran
+  for minutes). The set of elements with a block descendant is built
+  once, in one pass. (mnaza, #303)
+- The docs-outline nesting check no longer walks every ancestor of
+  every candidate: "nested" is now one pre-order walk's own
+  bookkeeping, descending only through wrapper divs and non-candidate
+  containers and skipping the subtree of anything it emits. 16 000
+  leaf divs under 4 000 wrapper divs went from 24.4 s (over the test
+  bound) to 1.1 s on the fast profile (#304).
+
+## [4.3.3] - 2026-09-24
 
 ### Changed
 
@@ -13,6 +426,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds the placements, starting with Fluxion AI (Gold, banner
   pinned at the top), and "Sponsor this project" carries the
   tiers and the ask.
+- CI keeps the compiled tree warm across dependency bumps: `target/`
+  has its own cache keyed on the target, the build kind, the
+  compiler and a version-insensitive dependency hash, a restore
+  falls back to the previous entry, a red run saves an unswept
+  `-partial-` entry the next run resumes from, and a
+  fingerprint-based sweep before each save drops only what the run
+  did not use. Pull requests and tags restore but never save, so
+  release builds stop filling the 10 GB pool with entries they can
+  never read (Mart-Bogdan, #297).
 
 ### Fixed
 
@@ -79,6 +501,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries ride the content host. Wiki pages and share links (`/s/`)
   stay pages (no JSON shape); `redd.it` shortlinks resolve through
   the redirect into the thread card.
+- A repeated block was replaced by a marker whenever the marker came
+  out one character shorter, and the marker named nothing. Sites
+  that wrap every LINE in its own element (lyrics, verse,
+  subtitles, transcripts) hand the extractor blocks barely longer
+  than the marker, so a repeated stanza came back as a run of
+  anonymous `*[repeated block omitted]*` lines: on one such page 13
+  markers stood in for 12 of the 32 lines. A marker must now be two
+  thirds of the block's length or less, so those lines print
+  verbatim (32 of 32), and a marker that does stand in names its
+  source: `*[repeated block omitted, same as block 16: "..."]*`,
+  with the ordinal identifying the copy and the quoted opening what
+  a human reads. Blocks big enough for collapsing to pay are
+  unaffected (Mart-Bogdan, #294).
+- The parent-death signal a browser or Xvfb child arms in
+  `pre_exec` covers a parent that dies after the child started; a
+  parent that died between the fork and the `prctl` left a child
+  that never got it. The child now verifies it is still its
+  parent's child after arming and fails the spawn instead of
+  leaking an orphan, and the killed-parent path has a test (mnaza,
+  #295).
+- The egress pool no longer retires a proxy lane for a certificate
+  problem at the origin. Any TLS failure read as a dead lane, so
+  fetching a self-signed, expired or hostname-mismatched site
+  through a pool lane benched that lane globally for 10 minutes:
+  two or three such probes degraded the whole pool to direct.
+  Certificate-verify failures now leave lane health alone and move
+  the HOST off the lane (pair probation + rotation), so a lane that
+  intercepts TLS cannot pin a host; egress-flavored TLS failures
+  (handshake reset or cut short) still bench.
+- A proxy dial can no longer burn over a minute per attempt: the
+  per-step 12s timeouts stacked (a SOCKS5 handshake is up to nine
+  steps), so a lane that accepted TCP and stalled mid-handshake
+  stalled every fetch, and the Chrome relay re-paid it per browser
+  request before its strike cache armed. One 30s budget now bounds
+  the whole dial+handshake.
+- NO_PROXY entries that combine brackets and a port ("[::1]:8443")
+  match again: the port strip skipped any host containing ':', so
+  the bracketed IPv6 + port form matched nothing at all.
+- An empty proxy env var counts as unset: HTTPS_PROXY="" used to
+  short-circuit the fallback chain, sending https traffic direct
+  and starving the lowercase variant and ALL_PROXY.
+- Proxy credentials with an empty user name (":token@host:port")
+  are no longer dropped: the CONNECT header, the raw-hop
+  Proxy-Authorization and the save round trip carry them, matching
+  the ghost tier's user-or-pass definition of an authenticated lane.
+  SOCKS5 offers username/password negotiation only when both fields
+  are present (RFC 1929 wants ULEN and PLEN in 1..255); otherwise it
+  offers no-auth alone.
+- IPv6 literal targets ride proxy lanes correctly: a bare literal
+  (the shape the Chrome relay forwards from ATYP 0x04) is bracketed
+  for the CONNECT line and Host header, and SOCKS5 sends IP
+  literals with their native address type instead of as an
+  unresolvable domain name.
+- Doc fixes: from_env_for's resolution-order comment described an
+  order the code never had (config slot, then config all, then the
+  env chain: exactly what doctor reports), and the relay's drop
+  comment overstated what aborting the accept loop cuts.
 
 ## [4.3.2] - 2026-09-23
 

@@ -77,7 +77,7 @@ fn write_pace(path: &Path, host: &str, last_ms: u64) {
     let Ok(json) = serde_json::to_vec(&row) else {
         return;
     };
-    if std::fs::write(&tmp, &json).is_ok() {
+    if crate::config::write_private(&tmp, &json).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
@@ -219,6 +219,22 @@ fn prune_due() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A pace row names a host that was fetched.
+    #[cfg(unix)]
+    #[test]
+    fn a_pace_row_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-pace-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let row = dir.join("row.json");
+        write_pace(&row, "fetched.example", 1);
+        let mode = std::fs::metadata(&row).unwrap().permissions().mode() & 0o777;
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+        assert_eq!(left.len(), 1, "the writer's temp is renamed, not left");
+    }
 
     fn isolate_cache(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("donsetch-pace-{tag}-{}", std::process::id()));

@@ -3,40 +3,61 @@
 //! ONNX Runtime backs OCR and the semantic reranker. It is acquired,
 //! linked and initialized differently on every target:
 //!
-//! - **Linux x86_64** : dlopen'd at runtime behind an AVX gate
+//! - **Linux x86_64** : dlopen'd at runtime; Microsoft's own release
+//!   build of the shared library, shipped beside the binary
 //! - **Linux aarch64** : no ONNX; released without `ocr,rerank`
-//! - **macOS arm64** : statically linked
-//! - **macOS x86_64** : no ONNX; released without `ocr,rerank`
-//! - **Windows x64** : statically linked; imports a `DirectML.dll` it
-//!   never calls
+//! - **macOS arm64 / x86_64** : dlopen'd at runtime; Microsoft's
+//!   signed 1.23.2 dylib, shipped beside the binary
+//! - **Windows x64** : dlopen'd at runtime; Microsoft's own release
+//!   build of the DLL, shipped beside the exe
+//!
+//! No ONNX target gates the load on AVX any more; see "Why
+//! there is no AVX gate" below.
 //!
 //! Which targets get OCR/rerank at all is decided in the release matrix
 //! (`.github/workflows/release.yml`).
 //!
-//! **The one rule that has already broken a release:** declare `ort` only
-//! in the two mutually exclusive `[target.'cfg(...)'.dependencies]`
-//! sections of `Cargo.toml`, never in shared `[dependencies]`. Cargo
-//! **unions** features across every target section whose cfg matches : it
-//! does not pick one : so a shared entry leaks Linux's `load-dynamic` onto
-//! Windows/macOS, where it wins over static linking and ships a binary
+//! **The rule that has already broken a release:** declare `ort` in
+//! exactly ONE `[target.'cfg(...)'.dependencies]` section of
+//! `Cargo.toml`, with one feature set. Cargo **unions** features across
+//! every target section whose cfg matches : it does not pick one : so a
+//! second, differently configured section (or a shared entry) leaks
+//! `load-dynamic` onto targets it was not meant for and ships a binary
 //! with no ONNX in it, no dylib beside it, and no error anywhere. That is
 //! exactly how v3.3.0 went out with OCR and rerank dead on win32-x64 and
-//! darwin-arm64.
+//! darwin-arm64. Since #316 every target shares the one section, so the
+//! hazard is gone by construction.
 //!
 //! Everything below is reference detail: per-platform rationale, a
-//! postmortem of the v3.3.0 wiring bug, and the Windows DirectML story.
-//! Read the section for the platform or failure you are actually touching.
+//! postmortem of the v3.3.0 wiring bug, and the history of the Windows
+//! static link. Read the section for the platform or failure you are
+//! actually touching.
 //!
-//! ## Linux x86_64 : dlopen behind an AVX gate
+//! ## Linux x86_64 : dlopen
 //!
-//! Dynamically loaded to avoid SIGILL on non-AVX CPUs. The prebuilt ONNX
-//! static archive contains unguarded AVX instructions in C++ global
-//! constructors that run before `main()`, so statically linking it kills
-//! the process at startup on any CPU without AVX. With `ort`'s
-//! `load-dynamic` feature ONNX is NOT statically linked: a shared library
-//! (`.so`) is built from the prebuilt archive at compile time, shipped
-//! beside the binary, and dlopen'd at runtime after an AVX check. Non-AVX
-//! CPUs get a working binary minus OCR/rerank instead of a SIGILL.
+//! Dynamically loaded to avoid SIGILL on non-AVX CPUs. pyke's prebuilt
+//! ONNX *static* archive contains unguarded AVX instructions in C++
+//! global constructors that run before `main()`, so statically linking
+//! it kills the process at startup on any CPU without AVX (#57). With
+//! `ort`'s `load-dynamic` feature ONNX is NOT statically linked: the
+//! shared library is Microsoft's own release build, fetched by
+//! `build.rs`, shipped beside the binary and dlopen'd at runtime.
+//!
+//! ## Why there is no AVX gate
+//!
+//! Until 4.3.x the dlopen was additionally gated on `cpu::has_avx()`,
+//! on the assumption that the shared library had the same constructor
+//! problem as the static archive. It does not: Microsoft's build
+//! selects its kernels at runtime (MLAS dispatch), and the shipped
+//! `libonnxruntime.so` both loads and runs OCR on a CPU with SSE4.2
+//! and no AVX (verified under `qemu-x86_64 -cpu Nehalem`: a scanned
+//! PDF OCR'd at 99% confidence; #277's Celeron J1900 is that class of
+//! CPU). The Windows DLL from the same release behaves the same: under
+//! Intel SDE `-nhm` (emulated Nehalem, no AVX) it loads and runs both
+//! OCR and rerank with no invalid-instruction report. The gate was
+//! therefore the only thing disabling OCR and rerank on such
+//! machines. `cpu::has_avx()` stays as a doctor diagnostic; nothing is
+//! gated on it.
 //!
 //! ## Linux aarch64 : no ONNX
 //!
@@ -44,23 +65,56 @@
 //! constructors can deadlock there (issue #9), so the features are simply
 //! not built rather than shipped broken.
 //!
-//! ## macOS : static link (arm64 only)
+//! ## macOS : dlopen, both arches (since #316)
 //!
-//! arm64 links statically via `download-binaries`; there is no AVX concept
-//! on ARM (NEON), so no gate is needed. x86_64-apple-darwin is released
-//! without `ocr,rerank` because `ort-sys` publishes no prebuilt for that
-//! target.
+//! arm64 used to link statically via `download-binaries`, and
+//! x86_64-apple-darwin was released without `ocr,rerank` (`ort-sys`
+//! publishes no prebuilt for it; Intel Macs lost OCR and rerank). Both now
+//! take the dlopen path with Microsoft's macOS shared library: the pinned
+//! 1.23.2 build (the last Developer-ID-signed macOS release; see
+//! `build.rs` for why not 1.24.2), loaded from beside the binary like
+//! Linux and Windows. The `api-23` floor serves it. On ARM there is no AVX
+//! concept (NEON); on Intel Macs the runtime dispatches its kernels like
+//! everywhere else.
 //!
-//! ## Windows x64 : static link
+//! ## Windows x64 : dlopen at runtime
 //!
-//! Statically linked via `download-binaries`. AVX issues are rare (most
-//! x64 CPUs since 2011 have it), and dynamic loading is not an option
-//! regardless: pyke ships **no `onnxruntime.dll` for Windows at all** :
-//! the artifact is `onnxruntime.lib` (a ~305MB static archive) plus
-//! `DirectML.dll`, nothing else. Even if a DLL existed, the MSVC linker
-//! cannot build one from that archive because of duplicate protobuf
-//! symbols. See the DirectML section below for what the static link drags
-//! in.
+//! Until 4.3.x Windows linked ONNX statically, on the reasoning that AVX
+//! issues are rare and that pyke ships no `onnxruntime.dll` (its Windows
+//! artifact is a ~305MB `onnxruntime.lib` plus `DirectML.dll`, and the
+//! MSVC linker cannot make a DLL from that archive: duplicate protobuf
+//! symbols). Both halves were true and the conclusion was still wrong:
+//! the static archive's global constructors run AVX before `main()`, so
+//! on a CPU without AVX (#277: a first-generation Core i7) `donsetch.exe`
+//! died at process start with no output, every feature included (Intel
+//! SDE reproduces it: `vpxor` under `-nhm`, and even under `-snb`,
+//! Sandy Bridge *with* AVX, `shlx` (BMI2) in the archive's MSVC STL
+//! code, so the static build in fact needed a Haswell-class CPU); and
+//! pyke is not the only source of the DLL. Microsoft publishes
+//! `onnxruntime-win-x64-<version>.zip` with `lib/onnxruntime.dll` (MIT)
+//! for every release, built without the DirectML provider.
+//!
+//! So Windows now does what Linux does: `load-dynamic`, the DLL beside
+//! the exe, `find_shared_lib` then `init_from` (no gate: the runtime
+//! dispatches its kernels, see the section above).
+//! `build.rs` fetches the pinned Microsoft zip, verifies its sha256 and
+//! places `onnxruntime.dll` beside every build's exe (dev builds too, the
+//! same `fetch_onnx_prebuilt` path as the Linux `.so`); `release.yml`
+//! packages it next to `donsetch.exe` and `pdfium.dll`, and the
+//! self-updater carries it across updates like `pdfium.dll`. Any ORT
+//! release at or above the `api-N` feature's version satisfies
+//! `GetApi`, so the pin can move forward without touching the crate.
+//!
+//! What this removed: the hard `DirectML.dll` import (the static archive
+//! was built with the DirectML provider, so `ort-sys` emitted the link
+//! directive and the exe would not start on Server Core / Nano / pre-1903
+//! Windows 10 without a copy of that DLL), and the `copy-dylibs`
+//! dev-build shim that went with it. Microsoft's CPU build imports the
+//! VC++ runtime (`MSVCP140`, `VCRUNTIME140` and their `_1` variants),
+//! which the MSVC target already requires, plus `dxgi`, `dbghelp` and
+//! `SETUPAPI`, and loads `dxcore.dll` at runtime for device discovery.
+//! Where `dxgi.dll` is missing (Nano Server) the DLL fails to load and
+//! only OCR/rerank are disabled; the exe itself still starts.
 //!
 //! ## Postmortem : how the v3.3.0 feature leak stayed silent
 //!
@@ -68,57 +122,30 @@
 //! caught the violation. `load-dynamic` implies `ort-sys/disable-linking`,
 //! and `ort-sys`'s build script early-returns on that flag : before
 //! downloading anything and before `copy-dylibs` runs : so there is no
-//! build-time error, only a runtime dlopen that finds nothing. At runtime,
-//! `load_and_init()` below still discards `commit()`'s `Result`, and the
-//! doctor's "static link, compiled in" line is a `cfg` constant rather
-//! than a probe, so neither surfaced it either. Worth fixing if you touch
-//! this again. The tell in the shipped artifacts was the Windows exe
+//! build-time error, only a runtime dlopen that finds nothing. At the
+//! time, `load_and_init()` discarded `commit()`'s `Result` and the
+//! doctor's "static link, compiled in" line was a `cfg` constant rather
+//! than a probe, so neither surfaced it either; both have since been fixed
+//! (commit() failures error, and the doctor probe is real). The tell in
+//! the shipped artifacts was the Windows exe
 //! dropping 35.6MB -> 16.3MB : the missing ONNX static archive.
 //!
-//! ## Windows : `DirectML.dll` is linked and never called
+//! ## History : the Windows `DirectML.dll` import (removed in #298)
 //!
-//! pyke's Windows archive is always built with the DirectML execution
-//! provider, so `ort-sys` unconditionally emits `dxguid`, `DXCORE`,
-//! `DXGI`, `D3D12` and `DirectML` link directives (see `ort-sys`
-//! `build/static_link/mod.rs`). `donsetch.exe` therefore hard-imports
-//! `DirectML.dll` by ordinal 2 (`DMLCreateDevice1`) and maps it at process
-//! start : but never calls it: we register no execution providers, so ONNX
-//! runs on the CPU provider. Cost is address space plus a `DllMain`, not
-//! resident memory.
-//!
-//! This cannot be removed by features: `ort`'s `directml` feature maps to
-//! `ort-sys`'s `directml = []`, which is empty and referenced nowhere in
-//! its build scripts : it gates only the Rust-side EP API, not the
-//! prebuilt. Dropping the dependency would mean building ONNX Runtime from
-//! source without `--use_dml` and pointing `ORT_LIB_PATH` at it.
-//!
-//! Consequences worth knowing:
-//!
-//! - `DirectML.dll` is an in-box OS component from Windows 10 1903 (build
-//!   18362) onward, so normal installs need nothing. Trimmed images
-//!   (Server Core, Nano Server) and pre-1903 have no copy and the process
-//!   dies at load; the fix is `bin/x64-win/DirectML.dll` from the
-//!   `Microsoft.AI.DirectML` NuGet package placed beside the binary.
-//! - The in-box **version is irrelevant**. DirectML's entire export surface
-//!   has been two functions since 1.0, so Windows 10 22H2's 1.0.200713
-//!   satisfies the import exactly as Windows 11's 1.15.x does (verified on
-//!   both).
-//! - **Never transplant a `System32` copy between Windows versions.** In-box
-//!   builds are tied to their OS; a Windows 10 one dropped beside the binary
-//!   on Windows 11 shadows the system copy (DirectML is not a KnownDLL, so
-//!   the exe directory wins) and kills the process at load with
-//!   `STATUS_DLL_INIT_FAILED` (`0xC0000142`) and no output.
-//! - `copy-dylibs` stays enabled deliberately. It places the redist next to
-//!   dev builds so they run on machines without an in-box copy, and it never
-//!   reaches releases because the release workflow packages explicit
-//!   filenames (`donsetch.exe`, `pdfium.dll`).
-//! - `/DELAYLOAD:DirectML.dll` would work mechanically and would shed the
-//!   dependency entirely, but was rejected: delay-load failures raise SEH,
-//!   which Rust cannot catch, converting a deterministic load-time failure
-//!   into an uncatchable runtime abort (`panic = "abort"`) if ONNX ever does
-//!   reach for the provider.
+//! pyke's static Windows archive was built with the DirectML provider,
+//! so `ort-sys` emitted `DXGI`/`D3D12`/`DirectML` link directives and
+//! `donsetch.exe` hard-imported `DirectML.dll` without ever calling it.
+//! The exe could not start where that DLL was missing (Server Core,
+//! Nano Server, Windows 10 before 1903), and a `System32` copy taken
+//! from another Windows version failed to load with `0xC0000142`.
+//! `copy-dylibs` put the redist beside dev builds for that reason. The
+//! dlopen switch removed all of it: neither the exe nor Microsoft's
+//! CPU-only `onnxruntime.dll` references DirectML.
 
-#[cfg(all(target_os = "linux", any(feature = "ocr", feature = "rerank")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
+    any(feature = "ocr", feature = "rerank")
+))]
 use std::path::PathBuf;
 #[cfg(any(feature = "ocr", feature = "rerank"))]
 use std::sync::OnceLock;
@@ -126,9 +153,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "ocr", feature = "rerank"))]
 use std::time::Duration;
-/// Error returned when the CPU lacks AVX support (Linux only).
-pub const NO_AVX_MSG: &str = "ONNX Runtime requires AVX CPU support. Your CPU does not support AVX (pre-2011 Intel or virtualized without AVX passthrough). OCR and rerank are disabled. All other features work normally.";
-
 /// Message when an init attempt deadlocked inside the dynamic
 /// loader (pykeio/ort #579/#560 class). Kept as a stable, actionable
 /// line: the user can still run without OCR/rerank.
@@ -165,8 +189,8 @@ pub fn ensure_loaded() -> Result<(), String> {
             return Err(ONNX_HUNG_MSG.to_string());
         }
 
-        // ort's init path (dlopen on Linux, env construction on
-        // macOS/Windows) can deadlock inside the dynamic loader in
+        // ort's init path (dlopen on Linux/Windows, env construction on
+        // macOS) can deadlock inside the dynamic loader in
         // complex binaries (pykeio/ort #579, #560) instead of
         // returning an error. Run it on a dedicated thread with a
         // bounded wait so a hung loader can never hang the MCP
@@ -196,23 +220,23 @@ pub fn ensure_loaded() -> Result<(), String> {
     }
 }
 
-// ── Linux: dynamic loading via dlopen ───────────────────────────
+// ── Linux / Windows: dynamic loading ───────────────────────────
 
-#[cfg(all(target_os = "linux", any(feature = "ocr", feature = "rerank")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
+    any(feature = "ocr", feature = "rerank")
+))]
 fn load_and_init() -> Result<(), String> {
-    // 1. AVX gate (disk-cached, permanent if true).
-    if !crate::cpu::has_avx() {
-        return Err(NO_AVX_MSG.to_string());
-    }
+    // No AVX gate here: see "Why there is no AVX gate" at the top.
 
-    // 2. Find the shared library.
+    // 1. Find the shared library.
     let lib_path = find_shared_lib().ok_or_else(|| {
         "ONNX Runtime shared library not found. \
             OCR and rerank are disabled."
             .to_string()
     })?;
 
-    // 3. dlopen and init.
+    // 2. dlopen and init.
     //    ort::init_from loads the .so via libloading.
     //    builder.commit() initializes the ONNX environment.
     let builder = ort::init_from(&lib_path).map_err(|e| {
@@ -234,12 +258,15 @@ fn load_and_init() -> Result<(), String> {
     Ok(())
 }
 
-/// Find the ONNX Runtime shared library (Linux only).
+/// Find the ONNX Runtime shared library.
 ///
 /// Searches:
 /// 1. Next to the current executable (primary).
 /// 2. `cache_dir()/onnx/` (fallback for relocatable installs).
-#[cfg(all(target_os = "linux", any(feature = "ocr", feature = "rerank")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
+    any(feature = "ocr", feature = "rerank")
+))]
 fn find_shared_lib() -> Option<PathBuf> {
     let lib_name = shared_lib_name();
 
@@ -260,30 +287,19 @@ fn find_shared_lib() -> Option<PathBuf> {
     None
 }
 
-/// Platform-specific shared library filename (Linux only).
-#[cfg(all(target_os = "linux", any(feature = "ocr", feature = "rerank")))]
-fn shared_lib_name() -> &'static str {
-    "libonnxruntime.so"
-}
-
-// ── macOS / Windows: static linking ────────────────────────────
-
-#[cfg(all(not(target_os = "linux"), any(feature = "ocr", feature = "rerank")))]
-fn load_and_init() -> Result<(), String> {
-    // macOS ARM64: no AVX concept (ARM NEON). Always works.
-    // Windows x64: if no AVX, process already crashed at startup
-    //   (static constructors ran before main). This code only
-    //   runs on AVX-capable machines.
-    // Just initialize the ONNX environment (static link).
-    // Surface commit() failures: the 3.3.0 leak shipped binaries
-    // where the static archive was never linked in and this call
-    // failed silently : treat it as an error instead.
-    // NOTE: commit() reports bool on this path too.
-    if !ort::init().commit() {
-        return Err("ONNX Runtime init failed (static)".to_string());
+/// The runtime's file name beside the binary on the dlopen targets.
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
+    any(feature = "ocr", feature = "rerank")
+))]
+pub(crate) fn shared_lib_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
     }
-    eprintln!("[onnx] Runtime initialized (static link)");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -292,6 +308,18 @@ mod tests {
     #[test]
     fn shared_lib_name_is_so_on_linux() {
         assert_eq!(super::shared_lib_name(), "libonnxruntime.so");
+    }
+
+    #[cfg(all(target_os = "windows", any(feature = "ocr", feature = "rerank")))]
+    #[test]
+    fn shared_lib_name_is_dll_on_windows() {
+        assert_eq!(super::shared_lib_name(), "onnxruntime.dll");
+    }
+
+    #[cfg(all(target_os = "macos", any(feature = "ocr", feature = "rerank")))]
+    #[test]
+    fn shared_lib_name_is_dylib_on_macos() {
+        assert_eq!(super::shared_lib_name(), "libonnxruntime.dylib");
     }
 
     /// Payload probe: the ONNX environment must actually initialize
@@ -305,11 +333,6 @@ mod tests {
     #[cfg(any(feature = "ocr", feature = "rerank"))]
     #[test]
     fn onnx_payload_probe_initializes() {
-        #[cfg(target_os = "linux")]
-        if !crate::cpu::has_avx() {
-            eprintln!("skipping ONNX payload probe: host has no AVX");
-            return;
-        }
         super::ensure_loaded().expect("ONNX Runtime failed to initialize");
         // A second call must reuse the memoized state, not re-init.
         super::ensure_loaded().expect("ONNX Runtime failed to initialize (recheck)");

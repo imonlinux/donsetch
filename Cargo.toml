@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "4.3.2"
+version = "4.4.3"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
@@ -52,26 +52,25 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.232" }
-# OCR/rerank support deps. `ort` itself goes ONLY in the per-target sections
-# below, never here: Cargo unions features across matching target sections, so
-# a shared entry leaks `load-dynamic` onto Windows/macOS and silently strips
-# ONNX from those builds (the 3.3.0 bug — full story in src/onnx.rs).
+psl = { version = "=2.1.238" }
+# OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
+# below, never here: Cargo unions features across every matching target
+# section, so declaring it in more than one place is how `load-dynamic` once
+# leaked onto macOS and silently stripped ONNX from those builds (the 3.3.0
+# bug — full story in src/onnx.rs). One section, one feature set, since #316.
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17", optional = true }
 
-# Linux: dlopen'd at runtime behind an AVX gate — the prebuilt static archive
-# runs unguarded AVX in global constructors and SIGILLs pre-`main` on non-AVX
-# CPUs (#57). The .so is built at compile time and shipped beside the binary.
-[target.'cfg(target_os = "linux")'.dependencies]
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"], optional = true }
-
-# macOS / Windows: statically linked. No AVX hazard worth the dlopen dance,
-# and the MSVC linker cannot build a DLL from the archive (duplicate protobuf
-# symbols), so dynamic loading is not an option here anyway.
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "copy-dylibs", "api-24"], optional = true }
+# Every ONNX target dlopen's Microsoft's shared library at runtime: the
+# prebuilt static archives run unguarded AVX in C++ global constructors and
+# SIGILL pre-`main` on non-AVX CPUs (#57, #277), and one `load-dynamic`
+# config removes the feature-union hazard the old Linux/Windows vs macOS
+# split carried (#316). build.rs pins the version (1.24.2 Linux/Windows;
+# 1.23.2 macOS, the last Developer-ID-signed macOS build) and its sha256,
+# and the library sits beside the binary, loaded from there at runtime.
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-23"], optional = true }
 
 [features]
 # No default features — the core tool (fetch, search, crawl, PDF)
@@ -99,6 +98,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 [build-dependencies]
 sha2 = "0.11"
 flate2 = "1"
+# Microsoft ships the Windows ONNX Runtime as a zip; same pin as the
+# runtime dependency above, so the lock is unchanged.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # cfg() on build-dependencies resolves against the HOST, not the target, so this
 # only applies when building *on* Windows -- matching the #[cfg(windows)] gate on

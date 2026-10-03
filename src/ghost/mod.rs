@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Instant;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 #[cfg(linux_like)]
 use std::os::unix::process::CommandExt as _;
@@ -128,6 +130,12 @@ pub struct Ghost {
     /// `fetch::guards::ensure_url_safe` before it hits the network.
     /// Aborted in Drop so it cannot leak after Chrome is reaped.
     fetch_guard: Option<tokio::task::JoinHandle<()>>,
+    /// The browser window found at launch (None when no window was
+    /// found) and whether it is currently minimized. Captures
+    /// restore the window for their call and re-minimize after;
+    /// see `capture_screenshot_data`. Issue #331.
+    window_id: Option<i64>,
+    window_minimized: std::sync::atomic::AtomicBool,
 
     /// Windows profile-exclusion lockfile path (unix uses flock
     /// instead). Removed in Drop so the next daemon can take the
@@ -231,6 +239,20 @@ pub fn default_chrome_args_wire(
         "--disk-cache-size=1".into(),
         "--disable-gpu-shader-disk-cache".into(),
         "--disable-features=SiteEngagementService".into(),
+        // Captures must not wait for the window to present a frame.
+        // Chromium's default screenshot path does exactly that, and
+        // its own `CDPScreenshotNewSurface` feature (disabled by
+        // default; Playwright enables it) exists to "avoid a
+        // possible stall due to frames not being presented". The
+        // ghost window is deliberately off-screen and minimized,
+        // which is that stall: on macOS a capture ran out its whole
+        // CDP timeout while every other call answered (#331).
+        "--enable-features=CDPScreenshotNewSurface".into(),
+        // An off-screen window counts as occluded, and Chromium
+        // backgrounds occluded windows, halting their rendering.
+        // This window is the only one this tool has; keep it
+        // rendering. (Playwright ships the same switch.)
+        "--disable-backgrounding-occluded-windows".into(),
         // Software WebGL: a GPU-less box (Xvfb, VM, container)
         // must still expose a renderer string. WebGL=null is a
         // headless-only signature real desktops never produce;
@@ -291,10 +313,7 @@ fn chromium_binary() -> Result<String, String> {
     }
     for path in known_chrome_paths() {
         if is_executable(&path) {
-            if let Some(real) = resolve_snap_chrome(&path) {
-                return Ok(real.to_string_lossy().into_owned());
-            }
-            return Ok(path.to_string_lossy().into_owned());
+            return Ok(resolve_past_launchers(&path).to_string_lossy().into_owned());
         }
     }
     if let Some(path_var) = std::env::var_os("PATH") {
@@ -302,7 +321,9 @@ fn chromium_binary() -> Result<String, String> {
             for name in chrome_names() {
                 let candidate = dir.join(name);
                 if is_executable(&candidate) {
-                    return Ok(candidate.to_string_lossy().into_owned());
+                    return Ok(resolve_past_launchers(&candidate)
+                        .to_string_lossy()
+                        .into_owned());
                 }
             }
         }
@@ -374,6 +395,292 @@ fn resolve_snap_chrome(path: &std::path::Path) -> Option<PathBuf> {
 #[cfg(not(linux_like))]
 fn resolve_snap_chrome(_path: &std::path::Path) -> Option<PathBuf> {
     None
+}
+
+/// Largest file still treated as a launcher wrapper. Distro launchers
+/// are kilobytes (Arch's ELF launcher is ~14 KB, Void's shell script
+/// 205 B); real Chromium-family browsers are 100 MB and up, so
+/// anything bigger is never even read.
+#[cfg(linux_like)]
+const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Smallest file accepted as the real browser behind a launcher.
+/// Guards the resolution against latching onto a small helper that
+/// lives in the same directory (`chrome-sandbox` is an executable ELF).
+#[cfg(linux_like)]
+const REAL_BROWSER_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// If `path` is a distro launcher wrapper, resolve the real browser
+/// binary it execs. Several distros install `/usr/bin/chromium` as a
+/// launcher that PREPENDS host flags before exec'ing the browser:
+/// Arch's (a small ELF) reads `/etc/chromium-flags.conf` and
+/// `$XDG_CONFIG_HOME/chromium-flags.conf`, Void and Debian ship
+/// shell scripts. Those flags are desktop preferences a controlled
+/// ghost must never inherit: `--ozone-platform=wayland` swaps the
+/// platform Chromium would pick in headless mode (it only defaults
+/// to `--ozone-platform=headless` when the switch is unset), the
+/// GPU process then keeps failing until Chromium intentionally
+/// aborts (`GPU process isn't usable. Goodbye.`, issue #321), and
+/// `--load-extension` entries are host fingerprints.
+///
+/// A wrapper is recognized by shape: a small file carrying an
+/// absolute path, written out or, in a script, built from the
+/// script's own plain variable assignments. Every candidate target
+/// must be an executable ELF of real-browser size whose file name
+/// looks like a Chromium binary, so a mis-parse falls back to `path`
+/// (today's behavior) rather than to something random.
+#[cfg(linux_like)]
+fn resolve_launcher_binary(path: &std::path::Path) -> Option<PathBuf> {
+    use std::io::Read;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > LAUNCHER_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::fs::File::open(path)
+        .ok()?
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    // ASCII path-shaped tokens: bytes that can live in a path,
+    // starting at a slash. Quotes, shell metacharacters and
+    // whitespace end a token, which both splits `VAR=/path` shapes
+    // correctly and keeps trailing syntax out.
+    // (offset, path): where in the file the reference ends, so
+    // written-out and variable-built references keep one order.
+    let mut found: Vec<(usize, PathBuf)> = Vec::new();
+    let mut token = String::new();
+    for (at, &b) in bytes.iter().chain(std::iter::once(&0u8)).enumerate() {
+        if is_path_byte(b) {
+            token.push(b as char);
+            continue;
+        }
+        if let Some(pos) = token.find('/') {
+            let cand = &token[pos..];
+            if cand.len() <= 300 && !found.iter().any(|(_, p)| p.as_os_str() == cand) {
+                found.push((at, PathBuf::from(cand)));
+            }
+        }
+        token.clear();
+    }
+    // Debian's script never writes the browser's path: it sets
+    // `LIBDIR=/usr/lib/$APPNAME` and execs `$LIBDIR/$APPNAME`.
+    for (at, cand) in variable_built_paths(&bytes) {
+        if !found.iter().any(|(_, p)| p == &cand) {
+            found.push((at, cand));
+        }
+    }
+    found.sort_by_key(|(at, _)| *at);
+
+    // The operative exec is the LAST absolute path a launcher
+    // touches (scripts exec on their final line; earlier mentions
+    // are comments, env exports or helper paths).
+    for (_, cand) in found.iter().rev() {
+        let Ok(meta) = std::fs::metadata(cand) else {
+            continue;
+        };
+        if !meta.is_file() || !is_executable(cand) || meta.len() < REAL_BROWSER_MIN_BYTES {
+            continue;
+        }
+        let chromium_shaped = cand
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase().contains("chrom"))
+            .unwrap_or(false);
+        if !chromium_shaped {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        let is_elf = std::fs::File::open(cand)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .is_ok()
+            && &magic == b"\x7fELF";
+        if is_elf {
+            return Some(cand.clone());
+        }
+    }
+    None
+}
+
+#[cfg(not(linux_like))]
+fn resolve_launcher_binary(_path: &std::path::Path) -> Option<PathBuf> {
+    None
+}
+
+/// True for a byte that can be part of a path token in a launcher:
+/// printable ASCII that is not shell or string punctuation.
+#[cfg(linux_like)]
+fn is_path_byte(b: u8) -> bool {
+    let printable = (0x21..=0x7e).contains(&b);
+    let delimiter = matches!(
+        b,
+        b'"' | b'\''
+            | b'`'
+            | b'$'
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'|'
+            | b'&'
+            | b';'
+            | b'='
+            | b','
+            | b'\\'
+            | b':'
+            | b'*'
+            | b'?'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+    );
+    printable && !delimiter
+}
+
+/// Absolute paths a launcher script builds from its own variables,
+/// each with the byte offset of the end of the line that uses it.
+/// Only plain assignments count, applied top-down; a value that is
+/// computed (`$(...)`, backticks, `${X:-...}`) or that refers to an
+/// unknown name leaves its variable unknown, and a token that touches
+/// an unknown variable yields no path. Empty for anything that is
+/// not a `#!` script.
+#[cfg(linux_like)]
+fn variable_built_paths(bytes: &[u8]) -> Vec<(usize, PathBuf)> {
+    // Marks an unknown variable inside an expanded line: it stays in
+    // its token so the token can be dropped whole.
+    const UNKNOWN: char = '\u{1}';
+
+    fn is_name(s: &str) -> bool {
+        let mut chars = s.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    // `None` when the text cannot be expanded at all (a `${...}` form
+    // that is not a bare name, or an unreasonable length).
+    fn expand(text: &str, vars: &std::collections::HashMap<String, String>) -> Option<String> {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find('$') {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            let (name, used) = if let Some(braced) = after.strip_prefix('{') {
+                let close = braced.find('}')?;
+                if !is_name(&braced[..close]) {
+                    return None;
+                }
+                (&braced[..close], close + 2)
+            } else {
+                let len = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                (&after[..len], len)
+            };
+            if is_name(name) {
+                match vars.get(name) {
+                    Some(v) => out.push_str(v),
+                    None => out.push(UNKNOWN),
+                }
+                rest = &after[used..];
+            } else {
+                // `$@`, `$1`, `$(`, `$$`: not a variable of the script.
+                out.push(' ');
+                rest = after;
+            }
+            if out.len() > 4096 {
+                return None;
+            }
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    if !text.starts_with("#!") {
+        return Vec::new();
+    }
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    let mut end = 0usize;
+    for line in text.split_inclusive('\n') {
+        end += line.len();
+        let stmt = line.trim();
+        if stmt.is_empty() || stmt.starts_with('#') || !stmt.contains(['$', '=']) {
+            continue;
+        }
+        if stmt.contains('$')
+            && let Some(expanded) = expand(stmt, &vars)
+        {
+            let mut token = String::new();
+            for c in expanded.chars().chain(std::iter::once(' ')) {
+                if c == UNKNOWN || (c.is_ascii() && is_path_byte(c as u8)) {
+                    token.push(c);
+                    continue;
+                }
+                if token.starts_with('/') && token.len() <= 300 && !token.contains(UNKNOWN) {
+                    out.push((end, PathBuf::from(&token)));
+                }
+                token.clear();
+            }
+        }
+        let decl = stmt
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(stmt);
+        let Some((name, raw)) = decl.split_once('=') else {
+            continue;
+        };
+        if !is_name(name) {
+            continue;
+        }
+        let value = match raw.chars().next() {
+            Some(quote @ ('"' | '\'')) => raw[1..]
+                .find(quote)
+                .map(|close| (&raw[1..1 + close], quote == '\'')),
+            _ => Some((
+                raw.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(';'),
+                false,
+            )),
+        };
+        let known = match value {
+            Some((v, true)) => Some(v.to_string()),
+            Some((v, false)) if !v.contains("$(") && !v.contains('`') => {
+                expand(v, &vars).filter(|e| !e.contains(UNKNOWN))
+            }
+            _ => None,
+        };
+        match known {
+            Some(v) if v.len() <= 1024 => {
+                vars.insert(name.to_string(), v);
+            }
+            _ => {
+                vars.remove(name);
+            }
+        }
+    }
+    out
+}
+
+/// Discovery-level wrapper resolution: snap confinement and distro
+/// launcher wrappers both hide the real browser behind a shim that
+/// cannot carry the ghost's flags cleanly. Callers fall back to
+/// `path` itself when nothing better is found.
+fn resolve_past_launchers(path: &std::path::Path) -> PathBuf {
+    if let Some(real) = resolve_snap_chrome(path) {
+        return real;
+    }
+    if let Some(real) = resolve_launcher_binary(path) {
+        return real;
+    }
+    path.to_path_buf()
 }
 
 /// Playwright keeps every historical Chromium layout; version
@@ -552,6 +859,28 @@ fn is_executable(path: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &std::path::Path) -> bool {
     path.is_file()
+}
+
+/// What `unminimize_for_capture` did with the launch-minimized
+/// window, so the caller knows whether a capture must first wait for
+/// a presented compositor surface.
+enum WindowRestore {
+    /// The Ghost never minimized this window: nothing to wait for.
+    NotMinimized,
+    /// The window was minimized and is back to `normal`.
+    Restored,
+    /// The window was minimized but the restore call failed. It is
+    /// still not presenting frames, so it needs the same wait.
+    Failed,
+}
+
+impl WindowRestore {
+    /// Only a window that was never minimized can skip the wait: a
+    /// failed restore leaves the window un-presented too, and a
+    /// capture against it fails the same instant way.
+    fn needs_surface_wait(self) -> bool {
+        !matches!(self, Self::NotMinimized)
+    }
 }
 
 impl Ghost {
@@ -875,7 +1204,7 @@ impl Ghost {
         // uses the Job Object's KILL_ON_JOB_CLOSE.
         #[cfg(linux_like)]
         unsafe {
-            cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec);
+            cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec());
         }
         let mut child = cmd
             .kill_on_drop(true)
@@ -890,13 +1219,24 @@ impl Ghost {
             .take()
             .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
         let mut reader = BufReader::new(stderr);
+        let mut stderr_tail: Vec<String> = Vec::new();
         let ws_url = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            scan_for_ws_url(&mut reader),
+            scan_for_ws_url(&mut reader, &mut stderr_tail),
         )
         .await
-        .map_err(|_| FetchError::ghost("devtools ws timeout"))?
-        .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
+        .map_err(|_| {
+            FetchError::ghost(format!(
+                "devtools ws timeout ({})",
+                launch_failure_detail(&stderr_tail)
+            ))
+        })?
+        .ok_or_else(|| {
+            FetchError::ghost(format!(
+                "no devtools ws line ({})",
+                launch_failure_detail(&stderr_tail)
+            ))
+        })?;
 
         let cdp = cdp::Cdp::connect(&ws_url).await?;
         // Replant the session vault: login/session cookies harvested
@@ -997,6 +1337,11 @@ impl Ghost {
         // window is both off-screen and minimized. Chrome still
         // renders normally (minimized ≠ background tab; the
         // active tab's visibilityState stays "visible").
+        // The state is kept: a capture un-minimizes the window for
+        // its call and re-minimizes after (a minimized window
+        // presents no frames, issue #331).
+        let mut window_id: Option<i64> = None;
+        let mut window_minimized = false;
         if let Ok(win) = cdp
             .call(
                 None,
@@ -1006,6 +1351,7 @@ impl Ghost {
             .await
             && let Some(id) = win.get("windowId").and_then(Value::as_i64)
         {
+            window_id = Some(id);
             let _ = cdp
                 .call(
                     None,
@@ -1016,6 +1362,7 @@ impl Ghost {
                     }),
                 )
                 .await;
+            window_minimized = true;
         }
 
         // The layout viewport is pinned whenever the renderer has no real
@@ -1099,6 +1446,8 @@ impl Ghost {
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
+            window_id,
+            window_minimized: std::sync::atomic::AtomicBool::new(window_minimized),
             #[cfg(windows)]
             winlock,
             #[cfg(windows)]
@@ -1147,6 +1496,13 @@ impl Ghost {
 
     pub fn is_frozen(&self) -> bool {
         self.frozen
+    }
+
+    /// True when the DevTools link has ended although the process
+    /// may still be running: a proxy reset, or a reply too large to
+    /// frame. Such a browser answers nothing and must be relaunched.
+    pub fn link_dead(&self) -> bool {
+        self.cdp.is_dead()
     }
 
     /// Reap the browser entirely : the whole process tree,
@@ -1474,6 +1830,168 @@ impl Ghost {
         }
     }
 
+    /// `Page.captureScreenshot` bytes (base64), with the window
+    /// restored around the call.
+    ///
+    /// A window that launched minimized presents no frames, and the
+    /// classic capture path waits for a presented frame: on macOS
+    /// that wait ran out the whole CDP timeout while every other
+    /// ghost call answered (issue #331). The window is off-screen
+    /// either way, so the capture un-minimizes it for its call and
+    /// puts it back after; the invisibility the minimize bought is
+    /// unchanged.
+    async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
+        let restore = self.unminimize_for_capture().await;
+        // macOS only: the measured state-flip/surface race lives there; other
+        // platforms keep their pre-wait behavior and lean on the single retry.
+        if restore.needs_surface_wait() && cfg!(target_os = "macos") {
+            self.wait_for_capture_surface().await;
+        }
+        let mut result = self
+            .cdp
+            .call(
+                Some(&self.session),
+                "Page.captureScreenshot",
+                params.clone(),
+            )
+            .await;
+        // One retry, no loop: restoring the window and the compositor
+        // actually presenting its first frame are not the same instant,
+        // so a capture can still race the surface by a few milliseconds.
+        // The retry matches, by text, the empty-image capture failure
+        // that race produces (not exclusive to it). It lands ~250 ms
+        // after state=normal on macOS (settle included), ~100 ms after
+        // the restore elsewhere; a longer gap is not covered and the
+        // capture error surfaces as-is.
+        if let Err(e) = &result
+            && Self::is_capture_surface_failure(e)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            result = self
+                .cdp
+                .call(Some(&self.session), "Page.captureScreenshot", params)
+                .await;
+        }
+        self.reminimize_after_capture().await;
+        result?
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| FetchError::ghost("no screenshot data"))
+    }
+
+    /// Un-minimize a window we minimized at launch, best-effort.
+    /// A window this Ghost never minimized is left alone. The state
+    /// it reports lets the caller wait for the compositor surface
+    /// even when the restore call itself failed: a window that was
+    /// minimized is not presenting frames either way.
+    async fn unminimize_for_capture(&self) -> WindowRestore {
+        if !self
+            .window_minimized
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return WindowRestore::NotMinimized;
+        }
+        let Some(id) = self.window_id else {
+            return WindowRestore::Failed;
+        };
+        if self
+            .cdp
+            .call(
+                None,
+                "Browser.setWindowBounds",
+                json!({ "windowId": id, "bounds": { "windowState": "normal" } }),
+            )
+            .await
+            .is_ok()
+        {
+            WindowRestore::Restored
+        } else {
+            WindowRestore::Failed
+        }
+    }
+
+    /// Wait for a restored window to report `normal` and settle
+    /// briefly before the first capture.
+    ///
+    /// `Browser.setWindowBounds {windowState:"normal"}` returns as
+    /// soon as the state flips, but macOS only gives the window a
+    /// presented compositor surface a little later. With
+    /// `CDPScreenshotNewSurface` active a capture taken in that gap
+    /// fails instantly ("Unable to capture screenshot"). Poll the
+    /// reported state (bounded, so a window that never comes back
+    /// cannot hang the call) and then let the compositor settle
+    /// before the first capture.
+    async fn wait_for_capture_surface(&self) {
+        let Some(id) = self.window_id else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while std::time::Instant::now() < deadline {
+            let state = self
+                .cdp
+                .call_with_timeout(
+                    None,
+                    "Browser.getWindowBounds",
+                    json!({ "windowId": id }),
+                    2,
+                )
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("bounds")
+                        .and_then(|b| b.get("windowState"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            if state.as_deref() == Some("normal") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // The state flips to "normal" before the first frame lands
+        // (measured: ~150 ms from un-minimize to a presented surface
+        // on macOS), so the check above can pass while the surface is
+        // still missing. Give the compositor this short settle before
+        // the first capture attempt (this gap is the fast-fail seen on
+        // macOS, not the #331 stall).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    /// True for the empty-image capture failure ("Unable to capture
+    /// screenshot"), which the missing-surface race produces though not
+    /// exclusively. Matched by text on purpose: the client keeps only
+    /// the message, and -32000 is the generic CDP server error. A false
+    /// positive costs one attempt; a second failure surfaces as-is.
+    fn is_capture_surface_failure(err: &FetchError) -> bool {
+        matches!(err, FetchError::Ghost(msg) if msg.contains("Unable to capture screenshot"))
+    }
+
+    /// Put the window back the way launch left it: off every screen
+    /// and minimized, invisible in macOS's Dock and Windows's
+    /// taskbar (the launch block that minimized it first).
+    async fn reminimize_after_capture(&self) {
+        use std::sync::atomic::Ordering;
+        if self.window_minimized.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(id) = self.window_id else {
+            return;
+        };
+        if self
+            .cdp
+            .call(
+                None,
+                "Browser.setWindowBounds",
+                json!({ "windowId": id, "bounds": { "windowState": "minimized" } }),
+            )
+            .await
+            .is_ok()
+        {
+            self.window_minimized.store(true, Ordering::Release);
+        }
+    }
+
     /// PNG screenshot → path (D16 byproduct).
     /// Destination is validated through the centralized
     /// `paths::resolve_screenshot_path` helper BEFORE any CDP capture,
@@ -1482,20 +2000,10 @@ impl Ghost {
         let dest = crate::paths::resolve_screenshot_path(path)
             .map_err(|e| FetchError::ghost(format!("screenshot path rejected: {e}")))?;
         let data = self
-            .cdp
-            .call(
-                Some(&self.session),
-                "Page.captureScreenshot",
-                json!({ "format": "png" }),
-            )
-            .await?
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no screenshot data"))?
-            .to_string();
-        // base64 decode (no new dep: manual).
-        let bytes = b64decode(data.as_bytes());
-        std::fs::write(&dest, bytes).map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
+            .capture_screenshot_data(json!({ "format": "png" }))
+            .await?;
+        let bytes = decode_screenshot_data(&data)?;
+        save_screenshot(&dest, &bytes)
     }
 
     /// PNG capture as in-memory bytes (web_screenshot tool, issue
@@ -1503,18 +2011,9 @@ impl Ghost {
     /// everything else is the same capture as [`Self::screenshot`].
     pub async fn screenshot_bytes(&self, full_page: bool) -> Result<Vec<u8>, FetchError> {
         let data = self
-            .cdp
-            .call(
-                Some(&self.session),
-                "Page.captureScreenshot",
-                json!({ "format": "png", "captureBeyondViewport": full_page }),
-            )
-            .await?
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no screenshot data"))?
-            .to_string();
-        Ok(b64decode(data.as_bytes()))
+            .capture_screenshot_data(json!({ "format": "png", "captureBeyondViewport": full_page }))
+            .await?;
+        decode_screenshot_data(&data)
     }
 
     /// One trusted click with a human-ish pre-move path.
@@ -2021,65 +2520,24 @@ fn sweep_crashpad() {
 #[cfg(not(linux_like))]
 fn sweep_crashpad() {}
 
-/// Minimal base64 decode (avoids a dep for one call).
-fn b64decode(s: &[u8]) -> Vec<u8> {
-    fn val(b: u8) -> u8 {
-        match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => 0,
-        }
-    }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let clean: Vec<u8> = s
-        .iter()
-        .copied()
-        .filter(|b| !b"=\n\r ".contains(b))
-        .collect();
-    for chunk in clean.chunks(4) {
-        if chunk.len() < 4 {
-            break;
-        }
-        let n = ((val(chunk[0]) as u32) << 18)
-            | ((val(chunk[1]) as u32) << 12)
-            | ((val(chunk[2]) as u32) << 6)
-            | (val(chunk[3]) as u32);
-        out.push((n >> 16) as u8);
-        out.push((n >> 8) as u8);
-        out.push(n as u8);
-    }
-    out
+/// Writes a captured image to `dest`, readable by its owner only.
+fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
+    // The ghost renders with the session vault replanted, so the
+    // image can show a logged-in page: same seal as the stores that
+    // hold the session itself.
+    crate::config::write_private(dest, bytes)
+        .map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
 }
 
-const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Minimal base64 encoder (the sibling of `b64decode`, same
-/// no-new-dependency rule). Input is raw PNG bytes, output feeds
-/// the MCP image content block (issue #171).
-pub fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(B64_ALPHA[(n >> 18) as usize & 63] as char);
-        out.push(B64_ALPHA[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            B64_ALPHA[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            B64_ALPHA[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+/// Decodes the `data` field of a CDP `Page.captureScreenshot` reply
+/// (standard alphabet, padded) into the image bytes. Malformed input
+/// is an error, never a partial image.
+fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, FetchError> {
+    // Strict decode: Chromium emits canonical padded base64 with no
+    // line breaks, so anything else means the reply is not an image.
+    BASE64_STANDARD
+        .decode(data)
+        .map_err(|e| FetchError::ghost(format!("screenshot data is not base64: {e}")))
 }
 
 /// Scan Chrome's stderr for the "DevTools listening on ws://…"
@@ -2089,7 +2547,12 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 /// used to end the scan and fail the launch with a misleading
 /// "no devtools ws line" while Chrome was actually up. The ws line
 /// itself is pure ASCII, so lossy decoding can never corrupt it.
-async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<String> {
+/// The last few non-endpoint lines are kept in `tail` for the
+/// launch-failure message.
+async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    tail: &mut Vec<String>,
+) -> Option<String> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -2101,6 +2564,27 @@ async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> 
         if let Some(i) = line.find("ws://") {
             return Some(line[i..].trim().to_string());
         }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            tail.push(trimmed.chars().take(200).collect());
+            if tail.len() > 6 {
+                tail.remove(0);
+            }
+        }
+    }
+}
+
+/// The browser's final stderr lines, folded into a launch-failure
+/// message. When the browser dies before DevTools comes up, its
+/// stderr is the only explanation available, and a bare "devtools ws
+/// timeout" sends people hunting the wrong layer (issue #321:
+/// Chromium aborted with `GPU process isn't usable. Goodbye.` about
+/// eight seconds in and the fetch error said nothing about it).
+fn launch_failure_detail(tail: &[String]) -> String {
+    if tail.is_empty() {
+        "browser said nothing".into()
+    } else {
+        format!("browser said: {}", tail.join(" | "))
     }
 }
 
@@ -2121,11 +2605,34 @@ mod sandbox_tests {
         let wire: &[u8] = b"Fontconfig warning: \xff\xfe/bad/path\n\
                             DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc\n";
         let mut r = BufReader::new(wire);
+        let mut tail = Vec::new();
         assert_eq!(
-            scan_for_ws_url(&mut r).await.as_deref(),
+            scan_for_ws_url(&mut r, &mut tail).await.as_deref(),
             Some("ws://127.0.0.1:9222/devtools/browser/abc"),
             "a non-UTF-8 stderr line must not end the scan"
         );
+        assert_eq!(tail.len(), 1, "the fontconfig line is kept as tail");
+    }
+
+    // The reporter's crash shape (#321): the browser dies before
+    // DevTools with Chromium's intentional GPU abort on stderr. The
+    // launch error must carry that line instead of hiding it.
+    #[tokio::test]
+    async fn ws_scan_keeps_the_stderr_tail_for_launch_failures() {
+        let wire: &[u8] = b"\
+            [123:456:0927/144807.570012:FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:417] GPU process isn't usable. Goodbye.\n";
+        let mut r = BufReader::new(wire);
+        let mut tail = Vec::new();
+        assert_eq!(scan_for_ws_url(&mut r, &mut tail).await, None);
+        assert_eq!(tail.len(), 1);
+        assert!(
+            tail[0].contains("GPU process isn't usable. Goodbye."),
+            "{}",
+            tail[0]
+        );
+        let detail = launch_failure_detail(&tail);
+        assert!(detail.contains("browser said:"), "{detail}");
+        assert!(detail.contains("Goodbye."), "{detail}");
     }
 
     #[test]
@@ -2140,6 +2647,28 @@ mod sandbox_tests {
         assert!(
             !args.iter().any(|a| a == "--disable-setuid-sandbox"),
             "default args must not contain --disable-setuid-sandbox"
+        );
+    }
+
+    // A minimized window presents no frames, and the classic capture
+    // path waits for a presented frame; on macOS that ran out the
+    // whole CDP timeout while every other call answered (#331).
+    // These two flags kill that stall at the source, and the capture
+    // path un-minimizes around its call.
+    #[test]
+    fn default_args_keep_captures_off_frame_presentation() {
+        let dir = std::path::PathBuf::from("/tmp/test-profile");
+        let profile = BrowserProfile::host_default();
+        let args = default_chrome_args(&dir, &profile);
+        assert!(
+            args.iter()
+                .any(|a| a == "--enable-features=CDPScreenshotNewSurface"),
+            "captures must not wait for presented frames: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--disable-backgrounding-occluded-windows"),
+            "the off-screen window must keep rendering: {args:?}"
         );
     }
 
@@ -2228,5 +2757,274 @@ mod sandbox_tests {
         // config-layer tests; here only the runtime default contract.
         assert!(!sandbox_opt_in_enabled());
         assert!(!crate::config::DonsetchConfig::default().browser.no_sandbox);
+    }
+
+    // ── Launcher resolution (issue #321) ──
+    //
+    // Distro chromium packages install a launcher at the discovered
+    // path that PREPENDS host flags before exec'ing the real browser
+    // (Arch: a tiny ELF reading chromium-flags.conf; Void/Debian:
+    // shell scripts). The ghost must launch the real binary instead.
+    // Fixtures use a sparse stand-in for the real browser so the
+    // "browser-sized ELF" acceptance check is exercised without
+    // writing 100 MB.
+
+    #[cfg(linux_like)]
+    fn fake_real_browser(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(b"\x7fELF").unwrap();
+        f.seek(SeekFrom::Start(9_000_000)).unwrap();
+        f.write_all(&[0]).unwrap();
+        drop(f);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(linux_like)]
+    fn launcher_fixture_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-launcher-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_script_resolves_to_the_real_binary() {
+        // Void's shape: export the wrapper env, prepend CHROME_FLAGS,
+        // exec the real binary on the last line.
+        let dir = launcher_fixture_dir("script");
+        let real = fake_real_browser(&dir, "chromium");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nexport CHROME_WRAPPER={p}\nexport CHROME_DESKTOP=chromium.desktop\nCHROME_FLAGS=\"--enable-gpu-rasterization $CHROME_FLAGS\"\nexec {p} $CHROME_FLAGS \"$@\"\n",
+                p = real.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(resolve_launcher_binary(&script), Some(real));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn elf_launcher_resolves_from_embedded_paths() {
+        // Arch's shape: no shebang, a small ELF whose rodata carries
+        // the real binary's absolute path.
+        let dir = launcher_fixture_dir("elf");
+        let real = fake_real_browser(&dir, "chromium");
+        let launcher = dir.join("launcher-elf");
+        let mut bytes = b"\x7fELF\x02\x01\x01\x00junk".to_vec();
+        bytes.extend_from_slice(real.display().to_string().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(b"\x00tail");
+        std::fs::write(&launcher, &bytes).unwrap();
+        assert_eq!(resolve_launcher_binary(&launcher), Some(real));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_resolution_takes_the_last_reference_that_checks_out() {
+        let dir = launcher_fixture_dir("last");
+        let decoy = fake_real_browser(&dir, "chromium-old");
+        let real = fake_real_browser(&dir, "chromium");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n# older reference first\nexec {decoy} \"$@\"\nexec {real} \"$@\"\n",
+                decoy = decoy.display(),
+                real = real.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_launcher_binary(&script),
+            Some(real),
+            "the final exec is the operative one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Debian's /usr/bin/chromium (154.0.8037.57-1) never writes the
+    // browser's path: it builds it from two variables
+    // (`APPNAME=chromium`, `LIBDIR=/usr/lib/$APPNAME`,
+    // `exec $LIBDIR/$APPNAME $CHROMIUM_FLAGS "$@"`), and sources
+    // /etc/chromium.d/* for host flags on the way. Same shape here,
+    // with the fixture dir in place of /usr/lib.
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_script_resolves_a_path_built_from_variables() {
+        let dir = launcher_fixture_dir("vars");
+        let libdir = dir.join("chromium");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let real = fake_real_browser(&libdir, "chromium");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nAPPNAME=chromium\nLIBDIR={base}/$APPNAME\nCHROMIUM_FLAGS=\"\"\nfor file in /etc/chromium.d/*; do . $file; done\nexport CHROMIUM_FLAGS=\"$CHROMIUM_FLAGS --disable-extensions-except=$(echo $CHROMIUM_FLAGS | cut -d= -f2)\"\nexport CHROME_WRAPPER=\"/usr/bin/$APPNAME\"\nif [ $want_temp_profile -eq 0 ] ; then\n    exec $LIBDIR/$APPNAME $CHROMIUM_FLAGS \"$@\"\nelse\n    ${{LIBDIR}}/${{APPNAME}} $CHROMIUM_FLAGS \"$@\"\nfi\n",
+                base = dir.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(resolve_launcher_binary(&script), Some(real));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Expansion adds candidates, never trust: a variable-built path
+    // goes through the same proof as a literal one, an undefined or
+    // computed variable resolves nothing, and a self-referencing
+    // assignment cannot loop.
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_variable_expansion_proves_its_targets_like_literals() {
+        let dir = launcher_fixture_dir("vars-reject");
+        let foreign = fake_real_browser(&dir, "somewhere-else");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nNAME=somewhere-else\nDIR={base}\nLOOP=$LOOP/x\nHERE=$(dirname \"$0\")\nexec $DIR/$NAME \"$@\"\nexec $HERE/chromium \"$@\"\nexec $UNSET/chromium \"$@\"\nexec $LOOP/chromium \"$@\"\n",
+                base = dir.display()
+            ),
+        )
+        .unwrap();
+        assert!(foreign.is_file());
+        assert_eq!(
+            resolve_launcher_binary(&script),
+            None,
+            "a name that is not chromium-shaped stays unproven, expanded or not"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_resolution_refuses_targets_it_cannot_prove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = launcher_fixture_dir("reject");
+        // A small executable ELF in the same directory (the
+        // chrome-sandbox shape): the size gate must refuse it even
+        // though the name is chromium-ish.
+        let helper = dir.join("chromium-sandbox-helper");
+        std::fs::write(&helper, b"\x7fELFsmall").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A browser-sized ELF that is not chromium-shaped.
+        let foreign = fake_real_browser(&dir, "somewhere-else");
+        // A target that does not exist at all.
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nexec {missing} \"$@\"\nexec {helper} \"$@\"\nexec {foreign} \"$@\"\n",
+                missing = dir.join("nowhere").display(),
+                helper = helper.display(),
+                foreign = foreign.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_launcher_binary(&script),
+            None,
+            "unproven targets must fall back to the wrapper"
+        );
+        // And a real-sized browser binary is never re-scanned.
+        let real = fake_real_browser(&dir, "chromium");
+        assert_eq!(resolve_launcher_binary(&real), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod screenshot_data_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_rfc4648_vectors_including_the_padded_tail() {
+        // The hand-rolled decoder this replaced skipped a final group
+        // shorter than four symbols once `=` was stripped, so any image
+        // whose length was not a multiple of 3 lost its last 1-2 bytes.
+        for (encoded, raw) in [
+            ("", ""),
+            ("Zg==", "f"),
+            ("Zm8=", "fo"),
+            ("Zm9v", "foo"),
+            ("Zm9vYg==", "foob"),
+            ("Zm9vYmE=", "fooba"),
+            ("Zm9vYmFy", "foobar"),
+        ] {
+            assert_eq!(
+                decode_screenshot_data(encoded).unwrap(),
+                raw.as_bytes(),
+                "{encoded}"
+            );
+        }
+    }
+
+    // The ghost renders with the session vault replanted, so an image
+    // of what it rendered can show a logged-in page.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_screenshot_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-shot-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("page.png");
+        save_screenshot(&dest, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn png_signature_round_trips() {
+        let png_head = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let encoded = BASE64_STANDARD.encode(png_head);
+        assert_eq!(decode_screenshot_data(&encoded).unwrap(), png_head);
+    }
+
+    #[test]
+    fn malformed_data_is_an_error_not_a_partial_image() {
+        // The old decoder mapped unknown symbols to 0 and returned
+        // garbage bytes; a bad reply must now fail the capture.
+        assert!(decode_screenshot_data("Zm9v!!!!").is_err());
+        assert!(decode_screenshot_data("Zm9vYg").is_err(), "missing padding");
+        assert!(decode_screenshot_data("Zm9v\nYmFy").is_err(), "line break");
+    }
+
+    // The macOS capture retry exists for exactly one failure: a
+    // restored window that has not presented a compositor surface yet
+    // answers -32000 instantly, and one repeat after the surface
+    // lands recovers it. The predicate has to be that narrow, or a
+    // retry would silently paper over a real capture error.
+    #[test]
+    fn the_predicate_only_matches_the_surface_capture_failure() {
+        let surface = FetchError::ghost("cdp Page.captureScreenshot: Unable to capture screenshot");
+        assert!(Ghost::is_capture_surface_failure(&surface));
+        assert!(!Ghost::is_capture_surface_failure(&FetchError::ghost(
+            "cdp timeout: Page.captureScreenshot"
+        )));
+        assert!(!Ghost::is_capture_surface_failure(&FetchError::Timeout));
+        assert!(!Ghost::is_capture_surface_failure(&FetchError::ghost(
+            "no screenshot data"
+        )));
+    }
+
+    // A window that was minimized still needs the surface wait when
+    // the restore call itself failed: it is not presenting frames
+    // either way, and only a window that was never minimized can
+    // skip the wait.
+    #[test]
+    fn a_failed_restore_still_needs_the_surface_wait() {
+        assert!(WindowRestore::Restored.needs_surface_wait());
+        assert!(WindowRestore::Failed.needs_surface_wait());
+        assert!(!WindowRestore::NotMinimized.needs_surface_wait());
     }
 }
