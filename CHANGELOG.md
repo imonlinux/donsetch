@@ -5,6 +5,716 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.3] - 2026-10-09
+
+### Fixed
+
+- Fetches whose response body cannot finish inside 30 seconds no longer
+  fail mid-transfer. The whole exchange used to be bounded by one
+  30-second wall clock (headers plus body), so `donsetch -u` died with
+  "Download failed: timeout" on any link that could not pull a 7 to 22MB
+  release asset that fast; measured on a link serving about 100KB/s, the
+  transfer was killed at exactly +30s while bytes were still arriving
+  steadily, on the attempt and on its retry. The body is now bounded by
+  progress: a read with no bytes for 30 seconds times out, while a
+  transfer that keeps moving may take as long as the link needs. Request
+  writes and the response header phase keep their 30-second bounds, and
+  h2 frame reads stall out on the same 30 seconds, so a dead or silent
+  peer still fails fast.
+
+## [4.7.2] - 2026-10-09
+
+### Fixed
+
+- A dead X display can no longer leave the browser tier broken until a
+  restart. The pooled display is re-verified before every launch and a
+  display that died mid-session gets replaced; a launch that still
+  cannot open its window system ("Missing X server or $DISPLAY")
+  retries once in headless mode. Tier-2 escalation and screenshots
+  survive an Xvfb crash instead of failing every call in under 90 ms.
+- Crawl map mode renders a thin static inventory once and merges the
+  rendered links through the same scope, robots and dedup filters:
+  JS-built navigation (mdBook-style sidebars, SPA menus) no longer
+  reads as a five-URL site. Render failure or absence keeps the static
+  map. Same-host plain-http entries under an https seed normalize to
+  the seed's scheme, and their https twins collapse.
+- Fetching with the removed `archive` argument now says so, "archive
+  was removed: web_fetch returns live page content only", instead of a
+  generic unknown-parameter error.
+
+## [4.7.1] - 2026-10-09
+
+### Changed
+
+- Removed Wayback/archive recovery and the `archive` argument from fetch.
+  Dead pages return their live failure without an archive lookup. Old calls
+  supplying `archive` receive an explicit invalid-argument result.
+- Every MCP client now gets source evidence and compact state together in
+  `content`, with leading `[meta]` JSON. This covers OpenCode's generic `cli`
+  handshake and unknown bridges that previously selected metadata alone.
+  Integrations consuming both surfaces can opt into the split shape with
+  `mcp.text_only=false`; known client compatibility remains enabled.
+- Shortened tool descriptions and measured all four definitions: 2,369
+  `o200k_base` tokens in compact `tools/list` JSON, versus 2,657 in 4.7.0.
+
+- Updated config, libc and the public suffix list; includes the reviewed
+  Tokio patch for Windows child-process cleanup and runtime fixes.
+
+### Fixed
+
+- Native smoke CI budgets include cold compilation and linking, while
+  preserving nextest's per-test timeout. Intel macOS cold builds no longer
+  have to fit compilation and test execution into the previous 30-minute cap.
+- Malformed CLI `--actions` JSON is rejected during argument parsing before
+  any fetch starts, rather than silently running without the requested steps.
+- Missing-page search hints use readable path words with a site restriction,
+  instead of returning the original URL. Credentials, query parameters,
+  fragments and opaque encoded path segments are excluded; hints with no
+  useful topic are omitted.
+- HTTP 410 is terminal missing content, including when its body resembles
+  a challenge page, rather than a wall that invites browser recovery.
+- A rejected conditional 304 gets one unconditional GET on the same route.
+  Validator checks remain strict; a second unsolicited 304 still fails
+  instead of serving an unauthorized cached body.
+- Browser startup timeouts and missing DevTools endpoints are classified
+  as browser failures with transient retry/diagnostic advice, rather than
+  permanent request errors or network failures.
+- Search health counts distinct backends instead of repeated top-up
+  attempts. A successful or cached attempt keeps that backend available;
+  markdown and metadata use the same count, while diagnostics retain the
+  full attempt history.
+- Shared MCP argument validation rejects wrong types, unknown names and
+  oversized capped lists before tool work, instead of silently substituting
+  defaults. Schemas explicitly reject unknown properties.
+
+## [4.7.0] - 2026-10-09
+
+### Changed
+
+- Tool failures are returned, never raised: every classified failure is a
+  normal result whose envelope carries `ok:false` together with its stable
+  `code`, `errorKind` and `next_action`, and the MCP `isError` flag stays
+  false, so clients that raise on it no longer turn failures into
+  exceptions an agent has to regex. Branch on `ok`/`code`; the envelope
+  contract is stated in the session instructions and every tool
+  description.
+
+- `web_fetch` `focus` guidance now carries the behavior it always had:
+  a response saving less than 20% (or matching nothing) is labeled and
+  falls back to the full page, and `toc` + `section` is named as the
+  guaranteed reducer. No behavior change.
+
+### Fixed
+
+- A JSON data endpoint is terminal at the HTTP tier: a `.json` URL or a
+  JSON response is fetched over plain HTTP at every tier, never routed
+  into a browser pass, and a refusal on one no longer marks the whole
+  domain walled (which used to poison the route for the human-facing
+  pages too). Live reddit `.json` on tier=auto went from 23.9s (20.5s of
+  it a browser pass after the session retry had already returned the
+  payload) to 4.0s; on tier=2 from a 20.5s deadline error to 3.9s. HTML
+  pages and tier-1 JSON fetches measure unchanged.
+
+- The decoy-equivalence (anti-cloak) probe skips JSON endpoints and PDF
+  responses: the comparison needs a browser-readable document, and a
+  data payload is not one.
+
+- Error codes stay honest when an error message quotes a URL: the text
+  classifier no longer reads the URL's own port, path, or query as the
+  failure signal (a Cloudflare wall on port 42945 classified as
+  `network.ratelimit`), and a bare `429` now needs a standalone number,
+  so a port or a duration cannot masquerade as an HTTP status.
+
+- A browser pass that hits its deadline before usable content now says
+  exactly that, with deadline/tier advice, instead of telling the agent to
+  check the network for a fault that is not there.
+
+- The `shot` skip receipt names its real cause: a learned solve-cooldown
+  refusal, a deadline hit, a browser-pass failure, or a capture that was
+  never needed, instead of one ambiguous string for all of them.
+
+- A domain cookie (a `Domain=` cookie, such as reddit's `loid`) keeps
+  its scope across the tier-1 vault round trip: the snapshot re-exports
+  the leading dot, so a replayed jar still sends the session to `www.`
+  hosts on its first request. Before this, re-import demoted every
+  domain cookie to one exact host, and every warm reddit fetch after a
+  state relink re-ran the legacy-host session hop plus a refused first
+  attempt. Warm `/r/rust` p50 went from 2822ms to 1192ms (n=10
+  interleaved A/B; cold unchanged at ~3.1s, where one hop is the
+  session establishment).
+
+- The reddit session hop is skipped when the jar already carries a
+  live session: one redundant request is dropped per warm fetch, and a
+  refusal still runs the one-shot session recovery, so a stale session
+  self-heals on its own.
+
+- Crawl `mode:"map"` no longer reads as an empty site when the origin
+  has no sitemap: the seed page, already fetched for identity, now
+  supplies the URL inventory, so map and full agree on what a seed
+  exposes, at zero added requests and no page fetches. `nodejs.org/api`
+  went from `discovered:0` with guidance blaming the seed to a 72-URL
+  inventory with stop `InventoryComplete`; sitemap-backed maps (MDN:
+  120 URLs) are unchanged.
+
+- Crawl `mode:"map"` inventories are relevance-ranked against the seed
+  (or the caller's `focus` when set) with the same scoring the crawl
+  frontier uses, IDF over the site's own inventory included, and the
+  `map_cap` cut now keeps from the ranked list: a topic seed pulls its
+  own neighborhood to the front instead of handing the agent a pure
+  recency dump to hand-filter. MDN's WebGPU seed now leads with
+  `WebGPU_API` before the generic API pages; a section-root seed
+  (`/api/`) ranks flat and keeps the previous order. Ranking reorders
+  only, it never filters: the same inventory, capped as before.
+
+- `since_last` change checks work on adapter pages now: Wikipedia
+  infobox reads (and every other adapter) used to record no change
+  fingerprint, so a re-check silently returned the full page with no
+  verdict and no signal. Adapter reads that still carry no fingerprint
+  say so in the result now (`changed:"no_baseline"` plus a notice on a
+  `since_last` check), and a first-seen URL is labeled "no prior
+  snapshot" instead of "new since last fetch (0s ago)". Successful
+  fetches carry `structuredContent.changed` on every read.
+
+- URL batches respect their `budget_tokens` share: member headers,
+  separators, error text and the per-member "budget-sliced" marker are
+  all charged to the budget, and the marker is reserved inside each
+  member's own slice, so the composed batch stays within it. A 3-URL
+  live batch at 800 tokens measured 111.6% of budget before and 83.4%
+  after; the old shape left all of that uncounted (about 9% over on
+  real batches).
+
+- A crawl seeded on a topic page now reads that page's own links before
+  the sitemap's recency flood: with no `focus` set, links discovered on
+  the seed page outrank the sitemap entries in the frontier, and a URL
+  the sitemap already queued is raised to that priority instead of
+  being deduped away at its old score. MDN's WebGPU seed fetched 1 of
+  its first 8 pages on topic before, and 5 after: the fetched set now
+  follows the seed page's own references (the rest of it is the
+  related-APIs block the page itself carries). Explicit `focus` crawls
+  are unchanged.
+
+- A fetch whose `shot` destination is invalid is refused when the call
+  is parsed, before any network or browser work: the rejection used to
+  arrive only if and when a capture was attempted, after the fetch had
+  already spent its work (the audit's case: 42.1s of Cloudflare render
+  before the refusal). The refusal names the allowed screenshots root
+  and the relative-name rule in `next_action`, and the `shot` help
+  carries the same contract.
+
+- `web_screenshot` gains `deadline_ms` (500-600000 ms, default 60000)
+  with the same clamp and default as `web_fetch`: the budget used to be
+  a fixed 60s the caller could not change, and an ignored `deadline_ms`
+  on a never-settling page ran to the internal ~20s cap (measured
+  21.1s for a 4s budget). Expiry now lands at the caller's wall as
+  `deadline.hit` (measured 4.0s for 4s): the outer wrapper carries a
+  dedicated envelope naming the budget (next_action: raise deadline_ms
+  or wait_ms, or capture the viewport instead of the full page), and
+  the render pass's own remaining-budget cap reports the same code when
+  it wins the race. The tool text now states the return shape (inline
+  image block plus `structuredContent` path/bytes), the server-local
+  screenshots root, and the full-page size (multi-MB).
+
+- Tool-definition honesty sweep: search `intent` now describes the
+  keyless fan-out and the single-provider reality under BYOK (no
+  phantom extra engines); read-budget presets and `max_chars` state
+  their unit (extracted-markdown bytes, about 4 per token;
+  `budget_tokens` for tokens); `next_offset` is named as a
+  source-document offset to pass back verbatim; `section` accepts the
+  `sN` ids a `toc` outline prints (verified live, it always did);
+  `thin` is listed as an output field; and the README carries observed
+  wall times (HTTP 0.3-2s, browser 17-31s, captcha give-up 41-42s
+  worst, dead URLs about 10s), the cache/freshness distinction (fast
+  is not fresh), and a worked reading ladder (toc ~170 tokens,
+  section ~840, must_contain ~70).
+
+## [4.6.0] - 2026-10-08
+
+### Fixed
+
+- A faulted or unwritable cache directory no longer takes the process
+  down while the state write lock is acquired: lock creation is best
+  effort like the lock itself, so the save reports its own persist
+  error and the process continues.
+
+- The daily unlock-attempt counter no longer fails parallel walled
+  fetches on a slow disk: the exclusive lock covers only the counter's
+  read-modify-write and is released before the durability flush, and a
+  held lock is waited out (platform contention codes included) instead
+  of being reported as a broken counter.
+
+- Warm revalidation of sites that ship Last-Modified without an ETag
+  (example.com behind Cloudflare) no longer fails: a 304 that supplies
+  an ETag the stored response never had updates the stored metadata
+  (RFC 9111) instead of erroring, and once stored the ETag drives the
+  usual mismatch checks.
+
+- A small scripted page shell keeps its hydration window: the
+  browser-settle dead-DOM early exit no longer fires before the same
+  floor the settle gate honors, so a shell that hydrates at ~2.5s is no
+  longer killed 0.14s before its own script runs and read back as
+  incomplete.
+
+- Crawl pages present the same language identity as web_fetch and the
+  ghost for the same host: a host with a persona speaks the persona's
+  Accept-Language on crawl requests too, instead of falling back to the
+  TLD/script heuristic while the fetch tool speaks the persona.
+
+- The daemon's background helpers are owned: the route-memory prober and
+  the search pre-solve are cancelled and joined on shutdown (and aborted
+  on drop), like the startup proxy probes already were, so a retired
+  daemon leaves no task working on its behalf.
+
+- Accepted client hints are honored the way Chrome does: an origin that
+  opts in with Accept-CH receives the accepted high-entropy hints on its
+  later requests (full-version-list coherent with the same request's
+  sec-ch-ua, plus arch, bitness and model), a Critical-CH response
+  triggers exactly one replay carrying the hint, and the acceptance is
+  session-scoped per origin, never persisted and never sent to an
+  insecure or different origin.
+
+- The HTTP/2 client enforces the server preface: the first server frame must
+  be SETTINGS, and anything else is refused with GOAWAY(PROTOCOL_ERROR)
+  instead of being served as if the protocol had started correctly.
+
+- An HTTP/2 response abandoned at the wait ceiling is cancelled, not
+  silently dropped: the client sends RST_STREAM(CANCEL) on the stalled
+  stream before discarding the connection, so a stalled peer stops working
+  on a response nobody will read.
+
+- The browser runs in the persona's timezone: the zone rides the ghost wire
+  (a re-mint with a different zone relaunches the browser), is sanitized
+  before it can reach the process environment, and starts Chromium with TZ
+  set, so pages report the persona's zone instead of the host machine's.
+
+- Redirect hops keep the browser's Fetch Metadata identity: a link-initiated
+  fetch classifies `sec-fetch-site` across the whole chain (worst relationship
+  wins, so `same-site` appears where Chrome sends it), sends the redirecting
+  URL as referer on later hops (origin-only when the policy trims it), and a
+  fetch with no referer still keeps `none` and no referer through redirects.
+
+- An HTTP/2 GOAWAY no longer aborts a response mid-flight: the client reads
+  the frame's last-stream-id, lets the in-flight stream at or below it
+  finish (the graceful-shutdown handshake real servers send), refuses new
+  streams on the draining connection, and keeps it out of the pool.
+
+- Cookies without a Path attribute stay inside the request directory: the jar
+  derives the RFC 6265 default-path from the request URI, so a cookie set at
+  /app/login no longer rides every path of the domain, and an empty or
+  relative Path attribute falls back to that same default instead of
+  widening the cookie to the whole domain.
+
+- A browser launched after a logout no longer surfaces the dead session: the
+  shared profile's cookies for logged-out domains are expired at launch,
+  before the session vault is replanted, so a stale cookie cannot ride into a
+  fresh browser. The purge keys on each cookie's own domain, so live sessions
+  are untouched.
+
+- The tier-2 browser harvest honors logouts that land mid-call: cookies for a
+  domain cleared at or after the browser's launch are filtered before they
+  reach the jar, the learned route, or the vault, so a pooled browser that
+  predates a logout can no longer re-vault the dead session.
+
+- The startup proxy preflight obeys one global batch budget: a pool of stalled
+  lanes no longer costs up to 6s per lane of startup, a budget-cut partial
+  batch publishes nothing, and doctor --deep treats an all-failed probe batch
+  as inconclusive: failed probes are not benched, and prior dead/auth bans are
+  never cleared by a probe.
+
+- A 304 response counts as lane health only after it validates: an unsolicited
+  or mismatched 304 no longer marks the lane healthy before its rejection,
+  while a validated revalidation still does.
+
+- The crawl adapter attributes transport errors with the same typed classifier
+  as fetch, instead of text matching: an unresolvable origin, an origin-side or
+  interception certificate failure, a URL-level policy refusal, and an
+  unclassified protocol error no longer bench a healthy proxy lane, and
+  origin-side signals become pair probation with host rotation. Only genuine
+  lane-level failures bench.
+
+- Crawl redirects are decided before the network: each redirect hop of a
+  queued page is checked for same-host scope and robots permission before the
+  target is dialed, so an excluded or disallowed target is never requested;
+  the hop records an honest skip instead, and a refusal is neutral for lane
+  health (a policy decision, not a lane fault).
+
+- The cookie vault reconciles writers transactionally: snapshot saves, cookie
+  harvests and logouts serialize on one advisory lock with per-process
+  temporary files, and cached renders carry capture and logout generations, so
+  a render captured after a harvest survives the next save while a logged-out
+  domain's cached documents stay deleted even when a live daemon still holds
+  them.
+
+- Logout now reaches every store that held the session: vault-backed cookie
+  imports register their domains with the browser jar so a jar rebuild really
+  clears them, and a browser reaped after a logout no longer re-vaults the
+  dead session it still held (cookies for a domain cleared at or after the
+  browser's launch are filtered from the reap harvest).
+
+- Successful HTTP responses across the 2xx range update fetch and crawl lane
+  health. Crawl content still requires a usable page before clearing penalties;
+  a successful status on a login wall does not qualify.
+
+- Startup proxy probes preserve the selected lane while their shared echo is
+  unavailable. Failed probes retain existing health bans; verified authentication
+  failures still bench their own lane without retrying unchanged credentials.
+  Daemon shutdown cancels pending preflight.
+
+- Screenshots report the captured document's final URL and native response receipt.
+  Captures reject main-document changes during rendering and retain one selected
+  route, persona and original tool deadline through safety checks and browser work.
+
+- Crawl browser recovery retains the actual HTTP route. Search's browser lane
+  follows search pool policy independently of fetch's pool opt-in. Browser hooks
+  retain the caller deadline and partition render reuse by route and persona wire.
+  Missing crawl lanes fail closed; updating a cached render preserves other pages.
+  Buffered seed responses retain their governor assignment for health feedback.
+  Short crawl budgets can recover browser content within the original deadline.
+  Browser redirects retain their own URL/status and pass crawl scope and robots
+  checks before extraction, history updates or link discovery.
+  Child links use the final document as their parent; visited aliases are removed
+  from the frontier so redirects and canonical links do not queue duplicate reads.
+
+- Background pre-solve retains its selected browser route for cookie replay,
+  even when a concurrent rate limit rotates the next independent request.
+  Replay also uses the selected persona language. Chromium receives its native
+  Accept-Language preference and Linux child locale. Persona HTTP preferences
+  match the native language expansion and remain stable across destinations.
+  Nondefault ports retain host-based wall history and persona lookup; invalid
+  URLs are rejected before background pre-solve starts.
+
+- Cookie-vault persistence reports directory, open, write and rename failures
+  while retaining in-memory learning. A failed write preserves the prior file.
+
+- Persisted learning counters saturate instead of overflowing. Future-dated
+  solve and render records are not fresh; invalid route timestamps allow a
+  recheck and do not create permanent cooldowns or recent failure evidence.
+
+- Anti-cloak compares a previously walled site's HTTP content before clearing
+  its wall history. Inconclusive comparisons retain that history; successful
+  browser recovery avoids a duplicate comparison, and tier 1 stays HTTP-only.
+
+- Fetch selects its route once before adapter and archive recovery. Related
+  fallbacks, browser actions and replay retain that route and the original
+  deadline; selected pool lanes retain their health feedback without a new pick.
+
+- Fetch browser recovery and HTTP replay retain the selected route. Protocol
+  proxy settings and per-target bypasses are captured for the request;
+  unauthenticated proxies use Chromium's proxy setting, and failed required
+  proxies no longer trigger a direct retry. Shadow assets retain the page route.
+  Browser slots distinguish route credentials, and successful relay connections
+  clear prior failure strikes while their tunnels remain active.
+- Search prewarm handoff preserves its actual document status, URL and route,
+  and serves only compatible route contexts. Proxy bypass matching normalizes
+  domain case, trailing dots and equivalent IP literals.
+- Invalid selected proxy settings return an error instead of silently dialing
+  direct. Proxy endpoints reject empty or malformed hosts and zero ports;
+  supported proxy schemes are case-insensitive.
+- Browser proxy relays bound their owned tunnels, close active connections on
+  retirement, and reject invalid SOCKS negotiation and target encodings.
+  An authenticated relay bind failure stops launch with an error.
+- Persona HTTP fetches use the shared revalidation cache with their actual
+  language and request identity. Bodyless HTTP/1 304 and 204 responses finish
+  at the headers, and cookie-warm retries reject unsolicited 304 responses.
+- Automatic fetch and crawl can observe an unbranded HTML 403 in the browser.
+  Explicit HTTP-only fetches, API permission errors, login pages, genuine rate
+  limits and ordinary server outages keep their terminal behavior.
+- Browser jobs reserve idle slots after FIFO capacity admission, allowing
+  waiting jobs to use a released browser rather than queue behind a busy
+  same-host session. Fetch diagnostics report queue time and browser reuse.
+- Human CAPTCHA widgets late in large challenge documents are detected without
+  the former 30 KB limit. Browser results distinguish human-only walls from
+  managed challenges, preserving bounded warm recovery for the latter.
+- Cancelled browser jobs and dead DevTools connections retire their owned
+  browser. Request interception uses bounded queues and validation workers.
+- Browser documents carry their own committed URL and HTTP status through
+  rendering and actions. Empty unresolved shells report incomplete content.
+  Failed HTTP replay cannot replace a valid browser document's status.
+- Headless and virtual-display windows stay normal so native mouse events and
+  screenshots receive compositor acknowledgements promptly.
+- Browser teardown no longer scans and kills processes whose arguments contain
+  crashpad. That scan could kill another pool slot’s renderers, GPU and zygotes.
+  Native crash handlers follow their own browser connection lifetime.
+- Browser launch owns stderr readers and request guards before setup completes,
+  drains bounded stderr continuously, and reports DevTools transport and browser
+  exit diagnostics. A stale DOM root is reacquired once during a read.
+- Linux Chromium uses ANGLE's EGL backend with native GPU support enabled,
+  replacing the nonworking legacy SwiftShader flags. WebGL availability still
+  depends on the installed browser and driver.
+- HTTP/2 validates frame sizes, continuation ordering, padding and response
+  lengths, handles informational headers and trailers, and counts padded bytes
+  toward flow control. Request compression reuses its dynamic table, honors
+  peer table limits, keeps credentials never-indexed and fragments large fields.
+- TLS collects post-handshake session tickets for reconnects, bounds their
+  retention, checks expiry and consumes tickets before sending. Tickets stay
+  scoped to the connector, origin port and proxy identity. Changed proxy
+  credentials open a new tunnel; plaintext URLs cannot reuse a TLS H2 socket.
+
+- Read-only browser navigation can replace one dead or timed-out browser under
+  its original deadline, retaining viewport, locale and direct-routing settings. Fetch,
+  pre-action reads, search, crawl and screenshot share this recovery; actions
+  are never replayed. CDP failures report browser transport or timeout codes.
+- Human verification help articles with an active CAPTCHA remain terminal walls.
+  Browser startup failures retain diagnostic context, and failed or interrupted
+  action scripts explicitly warn against replaying possible side effects.
+- HTTP revalidation cache entries follow the selected proxy identity and exact request
+  headers, including sent cookies and referrer. Login, logout and route changes
+  cannot reuse another context's body. Invalid or wildcard Vary fields evict
+  the old entry; validation headers do not prevent a new response from warming
+  its original request context.
+- HTTP 304 responses validate their request's immutable body snapshot and update
+  cache metadata without overwriting a concurrent newer response or resurrecting
+  deleted content. Cache freshness accounts for Date, Age and response time;
+  conflicting directives require validation, and uncacheable policies evict old
+  entries. Stored headers are bounded and exclude connection-specific fields.
+- Short fetch deadlines retain time for browser work; returning the result
+  reserves a bounded share of the remaining budget instead of consuming every
+  deadline of two seconds or less before navigation starts.
+
+## [4.5.7] - 2026-10-07
+
+### Fixed
+
+- Reddit tier-one retrieval overlaps JSON and session requests while retaining
+  public HTML/session recovery. Reddit recovery retries recheck HTTP when a saved
+  wall profile would skip it; other hosts retain browser cooldowns, and explicit
+  browser requests keep their route.
+  Stack Overflow public question URLs gain an API path for question, answers,
+  comments and selected sections, with website
+  fallback on unavailable items, service errors or backoff. API replies preserve
+  website wall history; successful API reads remain available during cooldown
+  without rendering incomparable API JSON. Known cooldowns return wall codes.
+  Explicit browser tier and actions retain the caller’s website URL.
+- CSS selectors fail closed across HTML, JSON, PDF and adapters. Invalid
+  selectors fail before a request. Original URLs are checked before adapter
+  rewriting, including credentials and private-network destinations.
+- Login, human CAPTCHA and soft-404 pages cannot become content through browser
+  timeout or extraction rescue. DOM headings and late SPA login forms are
+  inspected; public tutorials with example forms remain readable. Automatic
+  challenges retain their recovery paths.
+- Figma extraction ignores inactive error templates, asset names and bootstrap
+  data. Recovered script prose respects focus, section and probe controls.
+  Wikipedia keeps real attribution, infobox spacing and preformatted code.
+  Low-savings focus preserves the original lead and order. Pagination advances
+  by exact UTF-8 byte offsets without losing text at paragraph boundaries.
+- Parallel crawl workers reserve page and aggregate budgets atomically, wait
+  for in-flight discovery and requeue withheld pages for resume. Resume tokens
+  work without a repeated seed. Map mode returns an explicit URL inventory.
+  Source subsets retain reason/count metadata and cannot claim full completion
+  or overwrite full-content history.
+- Screenshot requests return a receipt on success, skip and failure. Saved PNGs
+  use private atomic files and match the inline image. Native mixed URL batches
+  retain successful siblings. Boxed MCP dispatch/fetch futures prevent the live
+  stack overflow found with large requests.
+- Search warns about weak query evidence across live, cached and provider paths
+  without discarding results. Results disclose source type, video labels and
+  requested/returned counts. Browser recovery overlaps HTTP retries; semantic
+  deadlines preserve retrieved lexical evidence.
+- HTTP/2 pools expire idle connections without shortening fresh-response
+  budgets. Archive indexes run concurrently and accept the first real capture;
+  an unreachable index cannot prove no snapshots exist. Archive reads validate
+  caller URLs and selectors before lookup, preserve read controls and disclose
+  pagination and probe state. OCR image downloads
+  overlap, inference stays ordered, bitmap channels and decode limits are
+  checked, and elapsed telemetry includes OCR work.
+- Warm builds refresh Git provenance across branch commits, detached HEAD,
+  packed refs and linked worktrees. Local payload checks isolate cache and
+  configuration state instead of modifying the operator's cache.
+
+### Changed
+
+- `web_fetch` rides your own IP by default: pool use is opt-in
+  (`proxy.fetch_rotate` defaults false). The README's proxy section has
+  always said fetch dials direct by default, but v4.0.0 wired pool
+  rotation into the fetch client: with a pool configured, the
+  fetch-adjacent paths (the ghost's post-solve retry, link following,
+  image and archive lookups, probes) left via shared exit IPs by
+  default from then on, while the main navigation was exempt only
+  because its persona lane never consulted the pool. Off is the default
+  now, and the opt-in covers every fetch path uniformly, the main
+  navigation included: `donsetch proxy fetch on` (also
+  `proxy.fetch_rotate = true` in donsetch.toml, or
+  `DONSETCH_FETCH_ROTATE=1`). The ghost rides the pool only when fetch
+  does.
+- Crawl keeps the pool by default and gained a one-command opt-out:
+  `donsetch proxy crawl off` (`proxy.crawl_rotate = false`,
+  `DONSETCH_NO_CRAWL_ROTATE=1`) leaves every crawl request on your IP.
+  Search is unchanged: the pool is its rate-limit solver.
+
+### Added
+
+- `donsetch proxy fetch on|off` and `donsetch proxy crawl on|off`: flip
+  one pool-use knob; the setting is written to the TOML file layer
+  (`~/.config/donsetch/donsetch.toml`, or `DONSETCH_CONFIG` when set),
+  leaving every other line and comment in the file untouched.
+
+## [4.5.1] - 2026-10-06
+
+### Fixed
+
+- Two ways the supervisor's replay lost track of a request. A
+  response longer than the 1 MiB replay window (a screenshot's
+  inline image, a long crawl) never retired the request it answered,
+  so every later crash of the daemon ran that request again and the
+  client got a second response; the supervisor now keeps the head of
+  an oversized response line, where the id is. And a request whose
+  replay into a fresh daemon failed because that daemon died before
+  reading it was dropped on the next idle poll, leaving the client
+  waiting for ever; it is held for the daemon after. (mnaza, #350)
+- The crawl frontier had no ceiling, and everything in it was copied
+  into every tool response and the resume token: one index page with
+  100 000 in-scope links put 100 000 entries in the queue, about 6 MB
+  of URLs into each `_meta` block and the same again into the token
+  file. The queue keeps its best 10 000 by score and counts the rest
+  as filtered out; the response's `queued` is a 100-entry preview
+  beside a `queued_total`. (mnaza, #349)
+- robots.txt now follows RFC 9309 for both failure cases: a 4xx
+  ("unavailable") still allows, while a 5xx or a transport failure
+  ("unreachable") is read as complete disallow instead of failing
+  open, per origin. The mapping lives in one helper shared by
+  discovery, the per-origin cache and the seed preflight.
+  `respect_robots=false` remains the explicit bypass. (#351, reported
+  by mnaza)
+
+## [4.5.0] - 2026-10-06
+
+### Added
+
+- Fetch output presets: `mode=scan` (800 chars), `read` (4000), and
+  `deep` (16000). Explicit `max_chars` wins; the default stays 16000.
+- Agent state distinguishes content, partial reads, probes and failures.
+  Reddit server-rendered subsets expose partiality and known item counts.
+  Search exposes its provider and degraded retrieval instead of allowing
+  an empty result set to imply that no sources exist.
+- Doctor groups runtime/browser, network/search and configuration/state
+  checks, puts problems first, wraps long details and names safe repairs.
+  The default check launches and self-tests the actual browser. Multiple
+  executable installations are reported; MCP setup uses the running binary's
+  absolute path, and startup logs identify its version and path.
+
+### Fixed
+
+- Block/login pages cannot become successful content through probe, outline,
+  section, focus, pagination or browser text fallback. Wall headings remain
+  detectable inside nested tags even when the document title is generic.
+  Short troubleshooting articles quoting wall prompts and captcha-enabled
+  contact forms stay readable. Final pagination slices preserve full history.
+- Crawl resolves the initial seed before deriving host/path scope, reuses
+  its response and reports the requested/resolved seed. Sitemap XML is a
+  URL inventory rather than a JavaScript shell. Map results expose URLs as
+  model state; empty or failed crawls no longer claim completion or invent
+  a seed 404. Discovery, fetching and rendering share the crawl deadline.
+  Sitemap cycles are deduplicated, invalid requests preserve resume tokens,
+  and seed preflight respects the governor lane.
+- Stitched articles obey output budgets and offsets, detect pagination
+  cycles, and reject redirected parts on other hosts. Collection is bounded
+  to six parts and 1 MiB; continuation distinguishes collected text from an
+  unfinished source part. Browser stitching uses its actual rendered DOM.
+- Lexical focus avoids cross-encoder work on matching documents. Semantic
+  rescue is limited to small documents with an already cached model.
+  A low-savings result returns full content with a notice. Outlines obey
+  output limits, continuation never skips paragraph tails, and adapter
+  token estimates measure the returned slice.
+- Filtered or truncated reads cannot replace full page-history snapshots.
+  Matching partial reads preserve a valid full snapshot; changed partial
+  reads discard the invalid baseline instead of fabricating a rewrite diff.
+- Browser retries are isolated between concurrent and cancelled calls.
+  Direct retries actually bypass configured/environment proxies and pooled
+  proxy browsers; direct clearance is not learned as proxy-bound state.
+  Concurrent browser slots own distinct temporary profiles, preventing
+  Chromium launch collisions and cleanup of another live slot.
+  Precise navigation/network failures avoid blind warm retries and cannot
+  poison wall cooldown. Browser pass limits include navigation and CDP work.
+  Human captcha walls return promptly; solvable challenge passes remain.
+- Deadline errors retain observed escalation steps. Batch results preserve
+  partial/probe state and do not advertise continuation offsets that skip
+  newly budget-sliced evidence. Retry guidance distinguishes access failures
+  from transient errors; browser-cost hints no longer invent a fixed delay.
+- Benchmark queries demote survey/review titles unless those are requested.
+  Named standing-desk vendors get official-domain boosts only in product
+  context, avoiding false matches on ordinary words. Up to two official-site
+  queries join a healthy keyless wave; candidates come from actual engine
+  hits and obey host scope. Optional search stages leave response time before
+  the caller deadline. Repeated transport failures change recovery advice
+  without marking the host walled; existing flaky-wall state reaches agents.
+- Doctor preserves browser profile locks and existing probe files. Safe
+  repairs back up corrupt state, leave unrelated models intact and recompute
+  checks, counts and exit status after repair.
+
+
+
+## [4.4.5] - 2026-10-06
+
+### Fixed
+
+- Bright Data setup now names the exact dashboard zone and product in
+  `keys add`; `doctor --deep` checks token access, zone existence and
+  SERP/Unlocker product type through the free account API. Malformed
+  keys fail locally; whitespace around token and zone is trimmed.
+  A parked unlocker key is reported as unavailable rather than absent.
+- Bright Data news results are read from `news`, with rank/global-rank
+  handling and valid HTTP links selected before the result limit. Bad
+  response shapes and zone/permission errors stay visible; a policy 403
+  does not permanently disable an otherwise valid SERP token.
+- Unlocker rejects HTTP-200 challenge pages and empty extracted shells;
+  rejected shells are evicted from the solve-cache. Rate-limited
+  unlocker keys recover after
+  the shared 60-second cooldown.
+- Unlocker spend limits fail closed on counter lock/read/write errors
+  and corrupt counters. Every retry reserves its own daily cap unit.
+  The full unlock operation shares one deadline; a timed-out paid POST
+  is not blindly replayed. Reflected API tokens are redacted from errors.
+- Cancelled browser CDP calls retire their pending slots immediately.
+  The call timeout now includes waiting for the writer and sending the
+  command, so a stalled writer cannot hold subsequent calls indefinitely.
+- npm's platform table now reflects OCR/rerank support on Intel Macs
+  and the macOS 13.4 minimum on both Mac architectures.
+
+### Added
+
+- [Bright Data setup guide](docs/brightdata.md): API token, separate
+  SERP and Web Unlocker zones, HTML/JSON choice, verification, costs
+  and troubleshooting. Linked from both READMEs. (#347)
+
+## [4.4.4] - 2026-10-05
+
+### Fixed
+
+- Robots and sitemap discovery run against the seed's own origin now
+  (scheme + host + port): the crawler built `https://<host>/` from the
+  bare hostname, so an `http://` seed or one on a private port never
+  had its robots.txt read and its sitemap was probed on the wrong
+  origin. Root-relative `Sitemap:` directives resolve against the
+  origin the file came from too. (#345)
+- A crawl that follows links onto other hosts (`--any-host`) reads
+  each origin's own robots.txt before its first request there, and
+  applies that origin's Disallow rules and Crawl-delay. Every URL on
+  every host used to be checked against the seed's single robots file,
+  so another host's rules were ignored while the seed's rules leaked
+  onto hosts they do not govern. (#344)
+- An enum argument outside its listed values was accepted over MCP.
+  An unknown `archive`, search `intent` or crawl `mode` silently ran
+  as the default. An unknown `tier` (`"3"`, `"two"`) did worse: it
+  routed like `auto` but switched off every escalation that checks
+  for `auto` (thin page, JS shell, challenge or chrome-only text), so
+  a misspelled tier got neither the mode it asked for nor `auto`,
+  and nothing said so. The CLI already refused these through clap,
+  but MCP clients do not enforce the schema's `enum` (Claude Code
+  forwarded `tier: "3"` as is). Every tool call is now checked
+  against the spec table before dispatch, and an off-list value is a
+  tool error naming the parameter, the accepted values and the value
+  received, with code `fetch.invalid`, `search.invalid` or
+  `crawl.invalid` (`fetch.invalid` previously meant only an unusable
+  URL). An absent or `null` argument still gets the default.
+  (Mart-Bogdan, #346)
+- `--version` under-reported the build: the features line was assembled
+  from a hardcoded pair of checks for `ocr` and `rerank`, so an `http`
+  build, the one that carries the MCP HTTP transport, was
+  indistinguishable from one without it, and any feature added later
+  would have been invisible too. The line is now built from the
+  `CARGO_FEATURE_*` variables Cargo exports for the features actually
+  enabled, so a new feature needs no code change to be reported.
+  (Mart-Bogdan, #343)
+
 ## [4.4.3] - 2026-10-03
 
 ### Fixed

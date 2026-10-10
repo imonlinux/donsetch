@@ -209,17 +209,16 @@ or add an API-key provider (`donsetch keys add`)*\n",
     ));
     // v3: degraded engines are named, never silently fewer. A merge
     // built while engines were down must never pass as full-strength.
-    let failed: Vec<String> = out
-        .report
+    let (unavailable, total) = out.engine_health();
+    let failed: Vec<String> = unavailable
         .iter()
-        .filter(|r| r.status != "ok")
         .map(|r| format!("{}: {}", r.engine, r.status))
         .collect();
     if !failed.is_empty() {
         md.push_str(&format!(
             "*degraded: {}/{} engines ok ({}) : results may skew*\n",
-            out.report.len() - failed.len(),
-            out.report.len(),
+            total - failed.len(),
+            total,
             failed.join(", ")
         ));
     }
@@ -269,6 +268,10 @@ pub fn render_compact_markdown(
             index + 1,
             result.title
         ));
+        let kind = rank::source_type(&result.url);
+        if kind != "web" {
+            markdown.push_str(&format!(" · {kind}"));
+        }
         // Report how many search-index families returned this URL,
         // using the same count as ranking. This is retrieval agreement,
         // not independent corroboration of the page's claims.
@@ -293,19 +296,15 @@ pub fn render_compact_markdown(
     if out.results.is_empty() {
         markdown.push_str("No results. Retry once with a materially different formulation.\n");
     } else if out.weak {
-        markdown.push_str("Weak results : low cross-index agreement.\n");
+        markdown.push_str("Weak results : low query relevance or cross-index agreement.\n");
     }
 
-    let unavailable = out
-        .report
-        .iter()
-        .filter(|report| report.status != "ok")
-        .count();
-    if unavailable > 0 {
+    let (unavailable, total) = out.engine_health();
+    if !unavailable.is_empty() {
         markdown.push_str(&format!(
             "Degraded retrieval : {}/{} backends available.\n",
-            out.report.len() - unavailable,
-            out.report.len()
+            total - unavailable.len(),
+            total
         ));
     }
 

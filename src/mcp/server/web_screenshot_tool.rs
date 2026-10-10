@@ -13,7 +13,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 use super::Daemon;
-use super::errors::tool_error;
+use super::errors::{tool_error, tool_error_structured};
 use crate::fetch::guards::{ensure_url_safe, validate_url_basic};
 
 const WAIT_MS_MAX: u64 = 5000;
@@ -28,11 +28,26 @@ fn full_page_arg(args: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The whole-call budget: `deadline_ms` with the fetch tool's clamp
+/// (500-600000 ms) and default (60s), so the two tools agree on what
+/// a deadline means. V12: the value used to be a fixed 60s the
+/// caller could not change.
+fn deadline_arg(args: &Value) -> Duration {
+    Duration::from_millis(
+        args.get("deadline_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(60_000)
+            .clamp(500, 600_000),
+    )
+}
+
 pub async fn web_screenshot_tool(
     daemon: &Arc<Daemon>,
     args: &Value,
     mut ctx: Option<super::ToolCtx>,
 ) -> Value {
+    let started = std::time::Instant::now();
+    let budget = deadline_arg(args);
     let url_in = match args.get("url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.to_string(),
         _ => {
@@ -45,8 +60,10 @@ pub async fn web_screenshot_tool(
         .and_then(Value::as_u64)
         .unwrap_or(600)
         .min(WAIT_MS_MAX);
+    // Cloned before the work future takes `url_in` for its debug block.
+    let deadline_error_url = url_in.clone();
 
-    let mut target = match validate_url_basic(&url_in) {
+    let target = match validate_url_basic(&url_in) {
         Ok(u) => u,
         Err(e) => return tool_error(e.to_string()),
     };
@@ -54,30 +71,34 @@ pub async fn web_screenshot_tool(
     if host.is_empty() {
         return tool_error("web_screenshot: the url has no host");
     }
-    target = match ensure_url_safe(target.as_str()).await {
-        Ok(u) => u,
-        Err(e) => return tool_error(e.to_string()),
-    };
-
     // The render path honors cancellation and a hard ceiling: the
     // pool-slot acquire alone can wait on another call's 20-40s
     // render, and the tool used to observe neither the deadline nor
     // notifications/cancelled while it did.
     let work = async {
         let inner: Result<serde_json::Value, serde_json::Value> = async {
-            let mut ghost = {
+            let target = ensure_url_safe(target.as_str())
+                .await
+                .map_err(|error| tool_error(error.to_string()))?;
+            let (wire, route) = {
+                let mut state = daemon.state.lock().await;
+                let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
+                state.ensure_persona(&host, &caps);
+                state.ensure_persona_egress(&host);
+                let mut wire = state
+                    .personas
+                    .get(&host)
+                    .filter(|p| p.quarantine_reason.is_none())
+                    .map(|p| p.ghost_wire())
+                    .unwrap_or_default();
+                let route = daemon.fetcher.route_for_fetch(target.as_str());
+                wire.route = Some(route.clone());
+                (wire, route)
+            };
+            let ghost = {
                 // v4 E2: screenshot must claim the same persona wire
                 // as tier-1 (viewport + locale), or the capture is a
                 // different identity than the page we just fetched.
-                let wire = {
-                    let state = daemon.state.lock().await;
-                    state
-                        .personas
-                        .get(host.as_str())
-                        .filter(|p| p.quarantine_reason.is_none())
-                        .map(|p| p.ghost_wire())
-                        .unwrap_or_default()
-                };
                 match daemon
                     .ghost_mgr
                     .acquire_for_wire(&daemon.profile, Some(&host), wire)
@@ -90,21 +111,33 @@ pub async fn web_screenshot_tool(
                 }
             };
 
-            if let Err(e) =
-                crate::ghost::ops::ghost_fetch(&mut ghost, target.as_str(), Duration::from_secs(20))
-                    .await
-            {
-                return Err(tool_error(format!(
-                    "web_screenshot: page failed to render: {e}"
-                )));
-            }
+            let read = daemon
+                .ghost_mgr
+                .read_document(
+                    ghost,
+                    &daemon.profile,
+                    target.as_str(),
+                    budget
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_secs(20)),
+                )
+                .await
+                .map_err(|error| {
+                    tool_error(format!("web_screenshot: page failed to render: {error}"))
+                })?;
+            let ghost = read.guard;
             if wait_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
-            let png = match ghost.screenshot_bytes(full_page).await {
+            let (png, document) = match ghost.screenshot_document(full_page).await {
                 Ok(b) => b,
                 Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
             };
+            validate_url_basic(&document.url).map_err(|error| tool_error(error.to_string()))?;
+            let filename = format!("capture-{}.png", crate::handles::random_base62(16));
+            let path = crate::paths::resolve_screenshot_path(&filename).map_err(tool_error)?;
+            crate::ghost::save_screenshot(&path, &png)
+                .map_err(|e| tool_error(format!("web_screenshot: saving capture failed: {e}")))?;
             let b64 = BASE64_STANDARD.encode(&png);
             Ok(json!({
                 "content": [
@@ -117,7 +150,7 @@ pub async fn web_screenshot_tool(
                         "type": "text",
                         "text": format!(
                             "Captured {} ({} view, {} PNG bytes)",
-                            url_in,
+                            document.url,
                             if full_page { "full-page" } else { "viewport" },
                             png.len()
                         )
@@ -125,11 +158,19 @@ pub async fn web_screenshot_tool(
                 ],
                 "structuredContent": {
                     "ok": true,
-                    "url": url_in,
+                    "url": document.url,
                     "full_page": full_page,
-                    "bytes": png.len()
+                    "bytes": png.len(),
+                    "path": path
                 },
-                "isError": false
+                "isError": false,
+                "_meta": {
+                    "com.donsetch/screenshot-debug": {
+                        "requested_url": url_in,
+                        "route": route.id(),
+                        "document": document
+                    }
+                }
             }))
         }
         .await;
@@ -137,16 +178,33 @@ pub async fn web_screenshot_tool(
             Ok(v) | Err(v) => v,
         }
     };
-    super::run_with_budget(work, Some(Duration::from_secs(60)), ctx.as_mut(), || {
-        tool_error("web_screenshot: deadline exceeded (60s)")
-    })
+    super::run_with_budget(
+        work,
+        Some(budget.saturating_sub(started.elapsed())),
+        ctx.as_mut(),
+        || {
+            tool_error_structured(
+                format!(
+                    "web_screenshot: deadline exceeded after {}ms",
+                    budget.as_millis()
+                ),
+                "transient",
+                Some(json!({
+                    "code": "deadline.hit",
+                    "url": deadline_error_url,
+                    "next_action": "raise deadline_ms or wait_ms, or capture the viewport instead of the full page",
+                })),
+            )
+        },
+    )
     .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::full_page_arg;
+    use super::{deadline_arg, full_page_arg};
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn omitted_full_page_defaults_to_viewport_not_full_page() {
@@ -156,5 +214,24 @@ mod tests {
         assert!(!full_page_arg(&json!({})), "omit = viewport");
         assert!(!full_page_arg(&json!({"full_page": false})));
         assert!(full_page_arg(&json!({"full_page": true})));
+    }
+
+    // V12: deadline_ms mirrors web_fetch: default 60s, clamp
+    // 500-600000 ms, so both tools bound a call the same way.
+    #[test]
+    fn deadline_ms_defaults_and_clamps_like_fetch() {
+        assert_eq!(deadline_arg(&json!({})), Duration::from_secs(60));
+        assert_eq!(
+            deadline_arg(&json!({"deadline_ms": 4000})),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            deadline_arg(&json!({"deadline_ms": 100})),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            deadline_arg(&json!({"deadline_ms": 10_000_000})),
+            Duration::from_secs(600)
+        );
     }
 }

@@ -32,25 +32,29 @@ pub(super) async fn search_tool(
         _ => None,
     };
 
-    if queries.len() == 1 {
-        let query = &queries[0];
-        run_with_budget(
-            search_inner(daemon, query, max, intent),
-            deadline,
-            ctx.as_mut(),
-            || search_deadline_error(query),
-        )
+    search::SEARCH_DEADLINE
+        .scope(deadline.map(|d| tokio::time::Instant::now() + d), async {
+            if queries.len() == 1 {
+                let query = &queries[0];
+                run_with_budget(
+                    search_inner(daemon, query, max, intent),
+                    deadline,
+                    ctx.as_mut(),
+                    || search_deadline_error(query),
+                )
+                .await
+            } else {
+                let deadline_queries = queries.clone();
+                run_with_budget(
+                    search_batch_inner(daemon, &queries, max, intent),
+                    deadline,
+                    ctx.as_mut(),
+                    move || search_batch_deadline_error(&deadline_queries),
+                )
+                .await
+            }
+        })
         .await
-    } else {
-        let deadline_queries = queries.clone();
-        run_with_budget(
-            search_batch_inner(daemon, &queries, max, intent),
-            deadline,
-            ctx.as_mut(),
-            move || search_batch_deadline_error(&deadline_queries),
-        )
-        .await
-    }
 }
 
 /// Parse the required base query and at most two explicit alternate
@@ -93,7 +97,7 @@ pub(super) fn parse_search_queries(args: &Value) -> Result<Vec<String>, String> 
     Ok(queries)
 }
 
-/// Honest deadline error for search (v3 D1).
+/// Render a selected browser request within its caller's absolute deadline.
 pub(super) fn make_ghost_hook(
     ghost_mgr: std::sync::Arc<GhostManager>,
     profile: BrowserProfile,
@@ -101,71 +105,92 @@ pub(super) fn make_ghost_hook(
     state: Arc<tokio::sync::Mutex<GhostState>>,
     skip_cache_read: bool,
 ) -> crate::crawl::GhostHook {
-    std::sync::Arc::new(move |url: String| {
-        let ghost_mgr = std::sync::Arc::clone(&ghost_mgr);
+    std::sync::Arc::new(move |request: crate::crawl::GhostRequest| {
+        let ghost_mgr = Arc::clone(&ghost_mgr);
         let profile = profile.clone();
-        let fetcher = std::sync::Arc::clone(&fetcher);
+        let fetcher = Arc::clone(&fetcher);
         let state = Arc::clone(&state);
         async move {
-            // Render cache shortcut (crawl only).
-            if !skip_cache_read {
-                let s = state.lock().await;
-                if let Some(rc) = s.render_for(&url) {
-                    return Ok(crate::crawl::GhostRender {
-                        html: rc.html.clone(),
-                    });
-                }
+            let deadline = request.deadline;
+            if deadline <= std::time::Instant::now() {
+                return Err("browser handoff deadline exceeded".into());
             }
-            let g_host = crate::search::rank::host_of(&url);
-            // v4 E2: the ghost render must agree with the persona pin
-            // (viewport + locale) for this host, exactly as the tier-1
-            // fetch paths and web_screenshot do — otherwise the SERP
-            // render goes out on the default en-US/default-viewport
-            // wire while the persona's HTTP fetches use its own, an
-            // incoherent fingerprint (and a relaunch thrash when a
-            // default-wire and a persona-wire acquire alternate on one
-            // pool slot).
-            let wire = {
-                let s = state.lock().await;
-                s.personas
-                    .get(&g_host)
-                    .filter(|p| p.quarantine_reason.is_none())
-                    .map(|p| p.ghost_wire())
-                    .unwrap_or_default()
-            };
-            let mut g = match ghost_mgr
-                .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
-                .await
-            {
-                Ok(g) => g,
-                Err(e) => return Err(format!("browser launch: {e}")),
-            };
-            let page = match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20))
-                .await
-            {
-                Ok(p) => p,
-                Err(first) => {
-                    // Retry once on transient timeout.
-                    match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20)).await {
-                        Ok(p) => p,
-                        Err(second) => {
-                            return Err(format!("render: {first}; retry: {second}"));
-                        }
+            tokio::time::timeout_at(deadline.into(), async move {
+                let url = request.url;
+                let g_host = crate::search::rank::host_of(&url);
+                let (mut wire, persona) = {
+                    let s = state.lock().await;
+                    let persona = s
+                        .personas
+                        .get(&g_host)
+                        .filter(|p| p.quarantine_reason.is_none());
+                    (
+                        persona.map(|p| p.ghost_wire()).unwrap_or_default(),
+                        persona.map(|p| (p.generation, p.entropy_seed)),
+                    )
+                };
+                wire.route = Some(request.route);
+                let context = crate::ghost::cache::render_context(&profile, &wire, persona);
+                // Legacy URL-only records cannot establish this route/persona.
+                if !skip_cache_read {
+                    let s = state.lock().await;
+                    if let Some(rc) = s.render_for_context(&url, &context)
+                        && let Some(document) = rc.document.as_ref()
+                        && document.url == url
+                        && crate::detect::walls::detect_dom_smart(rc.html.as_bytes())
+                            == crate::detect::walls::Verdict::ContentOk
+                    {
+                        return Ok(crate::crawl::GhostRender {
+                            html: rc.html.clone(),
+                            document: document.clone(),
+                        });
                     }
                 }
-            };
-            if page.captcha {
-                return Err("interactive captcha (unsolvable by design)".to_string());
-            }
-            if !page.cookies.is_empty() {
-                fetcher.import_cookies(&page.cookies).await;
-                crate::ghost::cache::store_session_cookies(&page.cookies);
-            }
-            {
-                let mut s = state.lock().await;
-                s.record_render(&url, &page.html);
-            }
-            Ok(crate::crawl::GhostRender { html: page.html })
+                let g = ghost_mgr
+                    .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
+                    .await
+                    .map_err(|error| format!("browser launch: {error}"))?;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let read = ghost_mgr
+                    .read_document(
+                        g,
+                        &profile,
+                        &url,
+                        remaining.min(std::time::Duration::from_secs(20)),
+                    )
+                    .await
+                    .map_err(|error| format!("render: {error}"))?;
+                let _guard = read.guard;
+                let page = read.page;
+                if page.outcome != ops::BrowserOutcome::Content {
+                    return Err(format!("browser content unavailable: {:?}", page.outcome));
+                }
+                let verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
+                if verdict != crate::detect::walls::Verdict::ContentOk {
+                    return Err(format!("rendered access gate: {verdict:?}"));
+                }
+                if !page.cookies.is_empty() {
+                    // A pooled browser can predate a logout for one of
+                    // its domains: a dead session must not ride back
+                    // into the jar or the vault.
+                    let cookies = crate::ghost::cache::session_cookies_since(
+                        &page.cookies,
+                        _guard.launched_epoch,
+                    );
+                    fetcher.import_vault_cookies(&cookies).await;
+                    crate::ghost::cache::store_session_cookies(&cookies);
+                }
+                state
+                    .lock()
+                    .await
+                    .record_render_document(&page.document, &page.html, &context);
+                Ok(crate::crawl::GhostRender {
+                    html: page.html,
+                    document: page.document,
+                })
+            })
+            .await
+            .unwrap_or_else(|_| Err("browser handoff deadline exceeded".into()))
         }
         .boxed()
     })
@@ -194,7 +219,7 @@ pub(super) async fn search_inner(
         Ok(out) => {
             let top = out.results.first().map(|r| r.url.as_str());
             maybe_pre_solve(daemon, top);
-            render_search_outcome(daemon, &out).await
+            render_search_outcome(daemon, &out, max).await
         }
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
@@ -203,11 +228,17 @@ pub(super) async fn search_inner(
 pub(super) async fn render_search_outcome(
     daemon: &Arc<Daemon>,
     out: &crate::search::SearchOutcome,
+    requested: usize,
 ) -> Value {
     let hs = bind_search_handles(daemon, out).await;
     let hints = route_hints(daemon, out).await;
     let md = search::render_compact_markdown(out, "# Search results", Some(&hs), &hints);
-    let model = search_model_meta(out, &hs);
+    let mut model = search_model_meta(out, &hs);
+    model["requested_results"] = json!(requested.clamp(1, 12));
+    model["returned_results"] = json!(out.results.len());
+    if out.results.len() < requested.clamp(1, 12) {
+        model["underfilled"] = json!(true);
+    }
     let debug = search_debug_meta(out);
     json!({
         "content": [{ "type": "text", "text": md }],
@@ -228,6 +259,7 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             let mut item = json!({
                 "rank": index + 1,
                 "url": result.url,
+                "source_type": crate::search::rank::source_type(&result.url),
             });
             if let Some(handle) = handles.get(index) {
                 item["handle"] = json!(handle);
@@ -236,9 +268,22 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         })
         .collect::<Vec<_>>();
     let mut item = json!({
+        "ok": true,
         "weak": out.weak,
         "results": results,
+        "provider": out.provider.as_deref().unwrap_or("keyless"),
     });
+    let (failed, _) = out.engine_health();
+    let failed = failed.len();
+    if failed > 0 {
+        item["degraded"] = json!(true);
+        item["failed_engines"] = json!(failed);
+        if out.results.is_empty() {
+            item["next_action"] = json!(
+                "retrieval was incomplete; check provider/engine health with doctor --deep or retry another source before concluding that no answer exists"
+            );
+        }
+    }
     // Instant answers are decision aids, not ranked evidence: they
     // ride structuredContent (not the organic list) with their source.
     if let Some(ans) = &out.instant {
@@ -353,6 +398,11 @@ pub(super) async fn search_batch_inner(
                     &hints,
                 ));
                 let mut model = search_model_meta(out, query_handles.unwrap_or(&[]));
+                model["requested_results"] = json!(max.clamp(1, 12));
+                model["returned_results"] = json!(out.results.len());
+                if out.results.len() < max.clamp(1, 12) {
+                    model["underfilled"] = json!(true);
+                }
                 model["query"] = json!(query);
                 searches.push(model);
                 let mut debug = search_debug_meta(out);
@@ -362,6 +412,7 @@ pub(super) async fn search_batch_inner(
             Err(failure) => {
                 markdown.push_str(&format!("{heading}\nFailed : {}", failure.cause));
                 searches.push(json!({
+                    "ok": false,
                     "query": query,
                     "error": failure.cause,
                     "results": [],
@@ -374,8 +425,9 @@ pub(super) async fn search_batch_inner(
     json!({
         "content": [{ "type": "text", "text": markdown }],
         "structuredContent": {
+            "ok": true,
+            "ok_count": ok,
             "query_count": queries.len(),
-            "ok": ok,
             "errors": queries.len() - ok,
             "searches": searches,
         },
@@ -518,15 +570,13 @@ async fn byok_search_cached(
             // zero added latency).
             crate::search::site_filter(query, &mut out.results);
             out.results.truncate(max.clamp(1, 12));
+            out.weak |= crate::search::rank::relevance_is_weak(&out.results, query);
             daemon.searcher.spawn_prewarm(&out.results);
             Ok(out)
         })
         .await
 }
 
-/// Search failure → structured error: every engine (and BYOK if
-/// tried) failed. The agent needs to know retrying is safe and
-/// what the levers are (BYOK keys, intent, simpler query).
 /// Predict-prefetch the walledest top result while the agent reads
 /// results: when the top URL's domain is known-walled (skip-to-solve
 /// route), start ONE background solve NOW. The agent's fetch a few
@@ -535,24 +585,26 @@ async fn byok_search_cached(
 /// cooldown memory the fetch path uses.
 pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
     let Some(url) = top_url else { return };
-    if !url.starts_with("http") {
+    let Ok(parsed) = crate::fetch::guards::validate_url_basic(url) else {
         return;
-    }
-    let Some(host) = url
-        .split_once("://")
-        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
-        .filter(|h| !h.is_empty() && h.contains('.'))
-    else {
+    };
+    let Some(host) = parsed.host_str() else {
         return;
     };
     let d = daemon.clone();
     let host_str = host.to_string();
+    let path = parsed.path().to_string();
     let url_str = url.to_string();
-    tokio::spawn(async move {
-        use std::sync::atomic::Ordering;
-        if d.pre_solve_busy.swap(true, Ordering::SeqCst) {
-            return; // one pre-solve at a time
-        }
+    // One pre-solve at a time: the flag is taken BEFORE the spawn, so
+    // the daemon's slot always holds the live handle (owned, never
+    // detached) and a lost race skips the win without burning a task.
+    if daemon
+        .pre_solve_busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let handle = tokio::spawn(async move {
         let _guard = PreSolveGuard(&d);
         {
             let state = d.state.lock().await;
@@ -574,27 +626,38 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
         // paths — a default-wire pre-solve would render incoherently
         // with the persona and thrash the pool slot against a
         // persona-wire fetch.
-        let wire = {
+        let route = d.fetcher.route_for_fetch(&url_str);
+        let (mut wire, persona_al) = {
             let s = d.state.lock().await;
-            s.personas
+            let persona = s
+                .personas
                 .get(&host_str)
-                .filter(|p| p.quarantine_reason.is_none())
-                .map(|p| p.ghost_wire())
-                .unwrap_or_default()
+                .filter(|p| p.quarantine_reason.is_none());
+            let language = persona
+                .map(|p| crate::profile::accept_language_with_persona(&host_str, &path, &p.locale));
+            (
+                persona.map(|p| p.ghost_wire()).unwrap_or_default(),
+                language,
+            )
         };
-        let Ok(mut g) = d
+        wire.route = Some(route.clone());
+        let Ok(g) = d
             .ghost_mgr
             .acquire_for_wire(&d.profile, Some(host_str.as_str()), wire)
             .await
         else {
             return;
         };
-        let page =
-            match ops::ghost_fetch(&mut g, &url_str, std::time::Duration::from_secs(20)).await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-        if page.captcha
+        let Ok(read) = d
+            .ghost_mgr
+            .read_document(g, &d.profile, &url_str, std::time::Duration::from_secs(20))
+            .await
+        else {
+            return;
+        };
+        let _guard = read.guard;
+        let page = read.page;
+        if page.outcome.is_wall()
             || matches!(
                 crate::detect::walls::detect_dom_smart(page.html.as_bytes()),
                 crate::detect::walls::Verdict::Challenge(_)
@@ -604,13 +667,24 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             d.state.lock().await.record_wall_failed(&host_str);
             return;
         }
+        if page.outcome != ops::BrowserOutcome::Content
+            || crate::detect::walls::detect_dom_smart(page.html.as_bytes())
+                != crate::detect::walls::Verdict::ContentOk
+        {
+            return;
+        }
         if !page.cookies.is_empty() {
-            d.fetcher.import_cookies(&page.cookies).await;
-            crate::ghost::cache::store_session_cookies(&page.cookies);
+            // A pooled browser can predate a logout for one of its
+            // domains: a dead session must not ride back into the
+            // jar or the vault.
+            let cookies =
+                crate::ghost::cache::session_cookies_since(&page.cookies, _guard.launched_epoch);
+            d.fetcher.import_vault_cookies(&cookies).await;
+            crate::ghost::cache::store_session_cookies(&cookies);
             // Honest replay_ok: only verified tier-1 replay earns
             // warm routing.
             let replay_ok = matches!(
-                d.fetcher.fetch(&url_str).await,
+                d.fetcher.fetch_persona_on_route(&url_str, persona_al.as_deref(), Some(&route)).await,
                 Ok(o) if o.verdict == crate::detect::walls::Verdict::ContentOk
             );
             d.state.lock().await.record_solved(
@@ -628,6 +702,9 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             );
         }
     });
+    if let Ok(mut slot) = daemon.pre_solve_task.lock() {
+        *slot = Some(handle);
+    }
 }
 
 /// RAII reset: the pre-solve flag clears when the task ends no
@@ -637,6 +714,349 @@ impl Drop for PreSolveGuard<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.0.pre_solve_busy.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod pre_solve_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Native Chromium, owned proxies and nextest's per-process state only.
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_pre_solve_replay_keeps_the_browser_route_after_concurrent_429() {
+        pre_solve_native_fixture("http://example.com/owned-solve");
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_pre_solve_uses_the_host_persona_on_a_nondefault_port() {
+        pre_solve_native_fixture("http://example.com:8443/owned-solve");
+    }
+
+    fn pre_solve_native_fixture(document_url: &'static str) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut config = crate::config::DonsetchConfig::default();
+                        config.browser.backend = crate::config::BrowserBackend::Headless;
+                        config.browser.cloak_auto_download = false;
+                        config.browser.route_probes = false;
+                        config.proxy.from_environment = false;
+                        config.proxy.fetch_rotate = true;
+                        config.fetch.allow_private_egress = true;
+                        crate::config::install(config).unwrap();
+                        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let proxies = [&a, &b].map(|listener| {
+                            crate::transport::proxy::Proxy::parse(&format!(
+                                "http://{}", listener.local_addr().unwrap()
+                            )).unwrap()
+                        });
+                        let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+                        pool.observe_rtt(&proxies[0].id(), Duration::from_millis(1));
+                        pool.observe_rtt(&proxies[1].id(), Duration::from_millis(2));
+                        crate::search::egress::install_global(Arc::clone(&pool));
+                        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let first_document = Arc::new(tokio::sync::Notify::new());
+                        let release_document = Arc::new(tokio::sync::Notify::new());
+                        let (stop, stopped) = tokio::sync::watch::channel(false);
+                        let mut servers = Vec::new();
+                        for (lane, listener) in [("A", a), ("B", b)] {
+                            let events = Arc::clone(&events);
+                            let first_document = Arc::clone(&first_document);
+                            let release_document = Arc::clone(&release_document);
+                            let mut stopped = stopped.clone();
+                            servers.push(tokio::spawn(async move {
+                                let mut handlers = tokio::task::JoinSet::new();
+                                loop {
+                                    tokio::select! {
+                                        _ = stopped.changed() => break,
+                                        accepted = listener.accept(), if handlers.len() < 16 => {
+                                            let (mut socket, _) = accepted.unwrap();
+                                            let events = Arc::clone(&events);
+                                            let first_document = Arc::clone(&first_document);
+                                            let release_document = Arc::clone(&release_document);
+                                            handlers.spawn(async move {
+                                                let mut head = Vec::new();
+                                                while !head.ends_with(b"\r\n\r\n") {
+                                                    assert!(head.len() < 16384);
+                                                    match tokio::time::timeout(Duration::from_secs(3), socket.read_u8()).await {
+                                                        Ok(Ok(byte)) => head.push(byte),
+                                                        _ if head.is_empty() => return,
+                                                        other => panic!("partial owned proxy request: {other:?}"),
+                                                    }
+                                                }
+                                                let request = String::from_utf8(head).unwrap();
+                                                let target = request.split_whitespace().nth(1).unwrap().to_string();
+                                                let document = target.ends_with("/owned-solve");
+                                                let burn = target.ends_with("/owned-burn");
+                                                let language_echo = url::Url::parse(&target).is_ok_and(|url| url.path() == "/owned-language");
+                                                let first = if document || burn || language_echo {
+                                                    let mut events = events.lock().unwrap();
+                                                    let first = document && !events.iter().any(|(_, url, _, _)| url == document_url);
+                                                    let cookie = request.lines().find(|line| line.to_ascii_lowercase().starts_with("cookie:")).unwrap_or("").to_string();
+                                                    let language = request.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("accept-language")).map(|(_, value)| value.trim().to_string())).unwrap_or_default();
+                                                    events.push((lane, target, cookie, language));
+                                                    first
+                                                } else { false };
+                                                if first {
+                                                    first_document.notify_one();
+                                                    release_document.notified().await;
+                                                }
+                                                let (status, body, cookie) = if document {
+                                                    (200, format!("<article><h1>Owned pre-solve</h1><p>{}</p></article>",
+                                                        "The browser and verified cookie replay must retain the original route through a concurrent rate limit. ".repeat(40)) + r#"<script>
+const report = (where, value) => fetch('/owned-language?where='+where+'&value='+encodeURIComponent(JSON.stringify(value)));
+const language = () => ({language:navigator.language,languages:navigator.languages,intl:Intl.DateTimeFormat().resolvedOptions().locale});
+report('main', language());
+const worker = new Worker(URL.createObjectURL(new Blob(['postMessage(({language:navigator.language,languages:navigator.languages,intl:Intl.DateTimeFormat().resolvedOptions().locale}))'], {type:'text/javascript'})));
+worker.onmessage = event => {report('worker', event.data);worker.terminate();};
+</script>"#,
+                                                        "Set-Cookie: cf_clearance=owned-clearance; Path=/; HttpOnly\r\n")
+                                                } else if language_echo {
+                                                    (204, String::new(), "")
+                                                } else if burn {
+                                                    (429, "<h1>Too many requests</h1>".into(), "")
+                                                } else {
+                                                    (502, String::new(), "")
+                                                };
+                                                let response = format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                                let _ = socket.write_all(response.as_bytes()).await;
+                                            });
+                                        }
+                                        done = handlers.join_next(), if !handlers.is_empty() => { done.unwrap().unwrap(); }
+                                    }
+                                }
+                            }));
+                        }
+                        let mut daemon = Daemon::new().await.unwrap();
+                        daemon.fetcher = Arc::new(Fetcher::new(daemon.profile.clone()).unwrap().with_egress(Arc::clone(&pool)));
+                        daemon.state.lock().await.profiles.insert("example.com".into(), crate::ghost::cache::DomainProfile {
+                            needs_tier2: true,
+                            ..Default::default()
+                        });
+                        let mut persona = crate::persona::Persona::mint(
+                            "example.com", &crate::persona::PersonaCaps::from_profile(&daemon.profile),
+                            1, crate::ghost::cache::now());
+                        persona.locale = "fr-FR".into();
+                        daemon.state.lock().await.personas.insert("example.com".into(), persona);
+                        let daemon = Arc::new(daemon);
+                        maybe_pre_solve(&daemon, Some(document_url));
+                        tokio::time::timeout(Duration::from_secs(15), first_document.notified()).await.expect("known wall and persona must be found by host independently of the port");
+                        let burn = daemon.fetcher.fetch("http://example.com/owned-burn").await.unwrap();
+                        assert_eq!(burn.status, 429, "the concurrent request must really rate-limit");
+                        assert_eq!(pool.pick_fetch("example.com", true).unwrap().id, proxies[1].id(), "the actual 429 must burn A for the next independent call");
+                        release_document.notify_one();
+                        tokio::time::timeout(Duration::from_secs(15), async {
+                            while daemon.pre_solve_busy.load(std::sync::atomic::Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(3), async {
+                            while events.lock().unwrap().iter().filter(|(_, url, _, _)| url::Url::parse(url).is_ok_and(|url| url.path() == "/owned-language")).count() < 2 {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.unwrap();
+                        daemon.ghost_mgr.shutdown().await;
+                        stop.send(true).unwrap();
+                        for server in servers { server.await.unwrap(); }
+                        assert!(daemon.state.lock().await.profiles["example.com"].replay_ok);
+                        let events = events.lock().unwrap();
+                        let documents: Vec<_> = events.iter().filter(|(_, url, _, _)| url.ends_with("/owned-solve")).collect();
+                        assert_eq!(documents.len(), 2, "one native read and one verified HTTP replay: {events:?}");
+                        assert!(documents.iter().all(|(_, url, _, _)| url == document_url), "original authority and port survive browser and replay: {events:?}");
+                        assert!(documents.iter().all(|(lane, _, _, _)| *lane == "A"), "replay must keep the browser's selected route: {events:?}");
+                        assert!(documents[0].2.is_empty(), "fresh native profile has no fixture cookie");
+                        assert!(documents[1].2.contains("cf_clearance=owned-clearance"), "HTTP replay must actually carry the exported cookie: {events:?}");
+                        assert!(documents[0].3.starts_with("fr-FR"), "native read must use the persona locale: {events:?}");
+                        assert_eq!(documents[0].3, documents[1].3, "browser and replay must keep the full preference list: {events:?}");
+                        assert_eq!(documents[1].3, crate::profile::accept_language_with_persona("example.com", "/owned-solve", "fr-FR"), "replay must retain the persona language: {events:?}");
+                        let echoes: Vec<_> = events.iter().filter(|(_, url, _, _)| url::Url::parse(url).is_ok_and(|url| url.path() == "/owned-language")).map(|(lane, target, _, _)| {
+                            assert_eq!(*lane, "A", "native language beacons retain the document route");
+                            let url = url::Url::parse(target).unwrap();
+                            let payload = url.query_pairs().find(|(name, _)| name == "value").unwrap().1.into_owned();
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }).collect();
+                        assert_eq!(echoes.len(), 2, "actual main-frame and worker observations");
+                        for echo in &echoes {
+                            assert_eq!(echo["language"], "fr-FR", "{echoes:?}");
+                            assert_eq!(echo["languages"][0], "fr-FR", "{echoes:?}");
+                            // Chromium's French UI/ICU bundle is `fr`; it
+                            // need not retain the regional preference tag.
+                            assert_eq!(echo["intl"].as_str().unwrap().split('-').next(), Some("fr"), "{echoes:?}");
+                        }
+                    });
+            }).unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod crawl_route_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn stealth_v3_expired_browser_handoff_cannot_return_cached_content() {
+        let profile = BrowserProfile::host_default();
+        let route = crate::transport::request_route::RequestRoute::direct();
+        let wire = crate::ghost::GhostWire {
+            route: Some(route.clone()),
+            ..Default::default()
+        };
+        let context = crate::ghost::cache::render_context(&profile, &wire, None);
+        let url = "https://owned.example/expired";
+        let mut state = GhostState::default();
+        state.record_render_document(
+            &crate::ghost::document::Document {
+                url: url.into(),
+                generation: 7,
+                status: Some(201),
+                ..Default::default()
+            },
+            "<article><h1>Owned cached article</h1><p>Useful cached content.</p></article>",
+            &context,
+        );
+        assert!(state.render_for_context(url, &context).is_some());
+        let manager = GhostManager::new().await;
+        let hook = make_ghost_hook(
+            Arc::clone(&manager),
+            profile.clone(),
+            Arc::new(Fetcher::new(profile).unwrap()),
+            Arc::new(tokio::sync::Mutex::new(state)),
+            false,
+        );
+        let result = hook(crate::crawl::GhostRequest {
+            url: url.into(),
+            route,
+            deadline: std::time::Instant::now() - Duration::from_secs(1),
+        })
+        .await;
+        manager.shutdown().await;
+        assert!(matches!(result, Err(ref reason) if reason == "browser handoff deadline exceeded"));
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_native_crawl_keeps_its_selected_http_lane() {
+        native_crawl_fixture(false, Duration::from_secs(45));
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_native_crawl_recovers_a_wall_with_a_short_budget() {
+        native_crawl_fixture(false, Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_native_crawl_recovers_a_thin_shell_with_a_short_budget() {
+        native_crawl_fixture(true, Duration::from_secs(5));
+    }
+
+    fn native_crawl_fixture(thin: bool, deadline: Duration) {
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let mut config = crate::config::DonsetchConfig::default();
+                config.browser.backend = crate::config::BrowserBackend::Headless;
+                config.browser.cloak_auto_download = false;
+                config.browser.route_probes = false;
+                config.proxy.from_environment = false;
+                config.proxy.fetch_rotate = false;
+                config.fetch.allow_private_egress = true;
+                config.fetch.shadow_fetch = crate::config::ShadowFetch::Never;
+                crate::config::install(config).unwrap();
+                let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/owned-crawl", origin.local_addr().unwrap());
+                let proxy = (crate::transport::proxy::Proxy::parse(&format!("http://{}",proxy.local_addr().unwrap())).unwrap(), proxy);
+                let pool = Arc::new(EgressPool::new(vec![proxy.0.clone()]));
+                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let (stop, stopped) = tokio::sync::watch::channel(false);
+                let mut servers = Vec::new();
+                for (lane, listener) in [("DIRECT", origin), ("A", proxy.1)] {
+                    let events = Arc::clone(&events);
+                    let mut stopped = stopped.clone();
+                    servers.push(tokio::spawn(async move {
+                        let mut handlers = tokio::task::JoinSet::new();
+                        loop {
+                            tokio::select! {
+                                _ = stopped.changed() => break,
+                                accepted = listener.accept(), if handlers.len() < 16 => {
+                                    let (mut socket, _) = accepted.unwrap();
+                                    let events = Arc::clone(&events);
+                                    handlers.spawn(async move {
+                                        let mut head = Vec::new();
+                                        while !head.ends_with(b"\r\n\r\n") {
+                                            assert!(head.len() < 16384);
+                                            match tokio::time::timeout(Duration::from_secs(3),socket.read_u8()).await {
+                                                Ok(Ok(byte)) => head.push(byte),
+                                                _ if head.is_empty() => return,
+                                                other => panic!("partial owned crawl request: {other:?}"),
+                                            }
+                                        }
+                                        let head = String::from_utf8(head).unwrap();
+                                        let target = head.split_whitespace().nth(1).unwrap();
+                                        let document = target.ends_with("/owned-crawl");
+                                        let first = if document {
+                                            let mut events = events.lock().unwrap();
+                                            let first = events.is_empty();
+                                            events.push((lane, target.to_string()));
+                                            first
+                                        } else { false };
+                                        let (status, body) = if document && first && lane == "A" && thin {
+                                            (200, format!("<html><body><div id='app'></div><script>{}</script></body></html>", "/* owned shell */".repeat(400)))
+                                        } else if document && first && lane == "A" {
+                                            (403, "<html><body><h1>Access denied</h1></body></html>".into())
+                                        } else if document {
+                                            (201, format!("<article><h1>Owned crawl route {lane}</h1><p>{}</p></article>",
+                                                "Useful research content from the selected route must survive the actual HTTP to native browser handoff. ".repeat(45)))
+                                        } else { (502, String::new()) };
+                                        let response = format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                        let _ = socket.write_all(response.as_bytes()).await;
+                                    });
+                                }
+                                done = handlers.join_next(), if !handlers.is_empty() => { done.unwrap().unwrap(); }
+                            }
+                        }
+                    }));
+                }
+                let daemon = Daemon::new().await.unwrap();
+                let (crawler, governor) = crate::crawl::real::build(
+                    Arc::clone(&daemon.fetcher),
+                    pool,
+                    Some(Arc::clone(&daemon.state)),
+                );
+                // Only the owned A lane is currently ready; fetch's pool opt-in
+                // remains off. The crawl's independent lane choice must travel.
+                for _ in 0..8 { governor.on_error("127.0.0.1", "direct"); }
+                assert_eq!(governor.best_lane("127.0.0.1").unwrap().id,proxy.0.id());
+                let crawler = crawler.with_ghost(make_ghost_hook(
+                    Arc::clone(&daemon.ghost_mgr),daemon.profile.clone(),Arc::clone(&daemon.fetcher),Arc::clone(&daemon.state),true));
+                let started = std::time::Instant::now();
+                let result = crawler.crawl(&url,crate::crawl::CrawlOptions {
+                    mode:crate::crawl::CrawlMode::Content,respect_robots:false,max_pages:1,max_depth:0,
+                    deadline,..Default::default()
+                },None).await.unwrap();
+                assert!(started.elapsed() < deadline, "useful native content must arrive inside the original budget");
+                daemon.ghost_mgr.shutdown().await;
+                stop.send(true).unwrap();
+                for server in servers { server.await.unwrap(); }
+                let events = events.lock().unwrap();
+                assert_eq!(result.pages.len(),1,"real HTTP denial must recover useful native content: {:?}",result.skipped);
+                assert_eq!(events.len(),2,"one actual HTTP read and one native read: {events:?}");
+                assert!(events.iter().all(|(lane,_)| *lane=="A"),"native recovery must retain the crawl's selected lane: {events:?}");
+                assert!(result.pages[0].markdown.contains("Owned crawl route A"));
+            });
+        }).unwrap().join().unwrap();
     }
 }
 
@@ -698,6 +1118,56 @@ mod search_output_contract_tests {
     use crate::search::intent::Intent;
     use crate::search::rank::Merged;
     use std::time::Duration;
+
+    #[test]
+    fn v471_search_health_counts_backends_not_topup_attempts() {
+        use crate::search::{EngineReport, render_compact_markdown, render_markdown};
+        let mut output = SearchOutcome {
+            results: Vec::new(),
+            weak: true,
+            intent: Intent::Web,
+            report: Vec::new(),
+            cached: false,
+            elapsed: Duration::ZERO,
+            provider: None,
+            reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
+        };
+        let report = |engine: &str, status: &str| EngineReport {
+            engine: engine.into(),
+            status: status.into(),
+            profile: None,
+            hits: 0,
+            ms: 0,
+            egress: "direct".into(),
+        };
+        output.report = vec![
+            report("bing", "ok"),
+            report("bing", "no-results"),
+            report("bing", "pacing-timeout"),
+            report("ddg", "blocked:403"),
+        ];
+        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
+        let compact = render_compact_markdown(&output, "Results", None, &[]);
+        assert!(compact.contains("1/2 backends available"), "{compact}");
+        let full = render_markdown(&output, "query", None, &[]);
+        assert!(full.contains("1/2 engines ok (ddg: blocked:403)"), "{full}");
+        // A successful recovery or a cached provider remains available.
+        output.report = vec![report("bing", "blocked:429"), report("bing", "cached")];
+        assert!(search_model_meta(&output, &[]).get("degraded").is_none());
+        assert!(!render_compact_markdown(&output, "Results", None, &[]).contains("Degraded"));
+        assert!(!render_markdown(&output, "query", None, &[]).contains("degraded"));
+        output.report = vec![
+            report("bing", "blocked:429"),
+            report("bing", "pacing-timeout"),
+        ];
+        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
+        assert!(
+            render_compact_markdown(&output, "Results", None, &[])
+                .contains("0/1 backends available")
+        );
+    }
 
     #[test]
     pub(super) fn search_structure_routes_without_repeating_ranked_evidence() {

@@ -50,6 +50,24 @@ use rank::Merged;
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
+tokio::task_local! {
+    pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
+}
+
+fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
+    SEARCH_DEADLINE
+        .try_with(|deadline| {
+            deadline.map_or(cap, |deadline| {
+                cap.min(
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .saturating_sub(reserve),
+                )
+            })
+        })
+        .unwrap_or(cap)
+}
+
 /// Chronic-failure bench time. A walled engine stops wasting a
 /// fan-out slot for this long after 3 consecutive strikes.
 const QUARANTINE_TTL: Duration = Duration::from_secs(600);
@@ -150,7 +168,9 @@ fn is_engine_fault(status: &str) -> bool {
         && status != "auth-fail"
         && status != "no-results"
         && status != "invalid-config"
+        && !status.starts_with("invalid-config:")
         && status != "pacing-timeout"
+        && status != "budget-skipped"
 }
 
 /// C1 roster hygiene: Mojeek answers blocked traffic with HTTP 200
@@ -255,14 +275,21 @@ pub struct Searcher {
 /// Semantic reranking can enter ONNX inference and wait on the shared session
 /// mutex. The ranking API stays synchronous, so the blocking pool is the narrow
 /// boundary that keeps unrelated async work progressing.
-async fn run_blocking_ranking<F, T>(job: F) -> Result<T, FetchError>
+async fn run_blocking_ranking<F, T>(job: F) -> Result<Option<T>, FetchError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(job)
-        .await
-        .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}")))
+    let budget = stage_budget(Duration::from_secs(30), Duration::from_millis(500));
+    if budget.is_zero() {
+        return Ok(None);
+    }
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(job)).await {
+        Ok(result) => result
+            .map(Some)
+            .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}"))),
+        Err(_) => Ok(None),
+    }
 }
 
 // v3 F1: search→fetch warm handoff store : filled by enrichment, drained
@@ -301,6 +328,26 @@ pub struct SearchOutcome {
     /// Post-fan-out phase timings for the search-debug meta:
     /// (stage, ms). Empty for the cache/BYOK paths.
     pub stage_ms: Vec<(&'static str, u128)>,
+}
+
+impl SearchOutcome {
+    /// Unavailable unique backends and total backends tried. A successful or
+    /// cached attempt wins over failed retries; `report` keeps every attempt.
+    pub(crate) fn engine_health(&self) -> (Vec<&EngineReport>, usize) {
+        let mut engines = std::collections::BTreeMap::new();
+        for report in &self.report {
+            let current = engines.entry(report.engine.as_str()).or_insert(report);
+            if matches!(report.status.as_str(), "ok" | "cached") {
+                *current = report;
+            }
+        }
+        let total = engines.len();
+        let failed = engines
+            .into_values()
+            .filter(|report| !matches!(report.status.as_str(), "ok" | "cached"))
+            .collect();
+        (failed, total)
+    }
 }
 
 impl Searcher {
@@ -381,11 +428,10 @@ impl Searcher {
         site_filter(query, &mut results);
         query::intitle_filter(query, &mut results);
         query::filetype_filter(query, &mut results);
+        let weak = results.is_empty() || rank::relevance_is_weak(&results, query);
         Some(SearchOutcome {
             results,
-            // BYOK results are provider-ranked and never flagged weak,
-            // matching the live BYOK path.
-            weak: false,
+            weak,
             intent,
             report: report.clone(),
             cached: true,
@@ -471,18 +517,32 @@ impl Searcher {
         save_cache_disk(&cache);
     }
 
-    /// Proxy preflight: probe every proxy at startup so
-    /// dead lines are benched BEFORE a query ever gets
-    /// assigned to them. Runs in the background; the first
-    /// queries just use healthy lanes. Successful probes also
-    /// seed the per-lane RTT EWMA (v4 A2).
-    pub fn preflight(self: &Arc<Self>) {
+    /// Probe configured proxies in the background and seed their RTTs.
+    /// Generic failures bench lanes only after a completed batch with a
+    /// successful echo; authentication failures are applied immediately.
+    /// One global batch budget caps the whole run: a pool of stalled
+    /// lanes cannot cost N * 6s of startup. The caller owns the returned
+    /// task and must abort it on shutdown.
+    pub fn preflight(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Per-probe liveness timeout plus one ceiling for the whole
+            // batch. A probe never outlives the remaining budget, and
+            // lanes the budget never reaches stay unprobed (inconclusive:
+            // nothing is published for them).
+            const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+            const BATCH_BUDGET: Duration = Duration::from_secs(20);
             let proxies = this.pool.proxies();
-            let total = proxies.len();
-            let mut dead = 0usize;
+            let batch_started = Instant::now();
+            let mut completed = true;
+            let mut echo_available = false;
+            let mut dead = Vec::new();
             for proxy in proxies {
+                let remaining = BATCH_BUDGET.saturating_sub(batch_started.elapsed());
+                if remaining.is_zero() {
+                    completed = false;
+                    break;
+                }
                 let id = proxy.id();
                 let started = Instant::now();
                 let probe = this.fetcher.fetch_once_via(
@@ -492,26 +552,31 @@ impl Searcher {
                     false,
                     None,
                 );
-                match tokio::time::timeout(Duration::from_secs(6), probe).await {
+                match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), probe).await {
                     Ok(Ok(o)) if o.status == 200 => {
+                        echo_available = true;
                         this.pool.observe_rtt(&id, started.elapsed());
                     }
                     Ok(Err(e)) if format!("{e}").contains("CONNECT -> 407") => {
                         this.pool.report_auth_fail(&id);
                     }
                     _ => {
-                        dead += 1;
-                        this.pool.report_dead(&id);
+                        dead.push(id);
                     }
                 }
             }
-            // ALL proxies failing means the PROBE endpoint
-            // died, not the pool : clear the marks rather
-            // than bench every lane over our own bug.
-            if total > 0 && dead == total {
-                this.pool.revive_all();
+            // An entirely unavailable shared echo is inconclusive. Publish
+            // failures only after a completed batch; temporary benches can
+            // otherwise move an in-flight caller onto direct before the
+            // last result. Existing dead/auth evidence is not cleared by a
+            // failed probe, and a budget-cut partial batch publishes
+            // nothing at all.
+            if completed && echo_available {
+                for id in dead {
+                    this.pool.report_dead(&id);
+                }
             }
-        });
+        })
     }
 
     /// True when an engine is benched for chronic failure.
@@ -577,11 +642,11 @@ impl Searcher {
                 if let Some((at, cached, total, reports)) = hit
                     && at.elapsed() < cache_ttl(intent_probe, query)
                 {
-                    let weak = rank::is_weak(&cached, total);
                     let mut results = cached.iter().take(max_results).cloned().collect();
                     site_filter(query, &mut results);
                     query::intitle_filter(query, &mut results);
                     query::filetype_filter(query, &mut results);
+                    let weak = rank::is_weak(&results, total, query);
                     return Ok(SearchOutcome {
                         results,
                         weak,
@@ -628,11 +693,11 @@ impl Searcher {
             .get(&cache_key)
             && at.elapsed() < cache_ttl(intent, query)
         {
-            let weak = rank::is_weak(cached, *total);
             let mut results = cached.iter().take(max_results).cloned().collect();
             site_filter(query, &mut results);
             query::intitle_filter(query, &mut results);
             query::filetype_filter(query, &mut results);
+            let weak = rank::is_weak(&results, *total, query);
             return Ok(SearchOutcome {
                 results,
                 weak,
@@ -717,6 +782,21 @@ impl Searcher {
         if queries.len() > 1 && self.pool.stress() < 0.15 {
             for e in live.iter().take(2) {
                 assignments.push((e.to_string(), queries[1].clone()));
+            }
+        }
+        // Authority cannot lift a source absent from the candidate pool.
+        // Two scoped recalls join the initial wave, on an engine that honors
+        // site:, only while the pool is healthy. Results still need ranking.
+        if matches!(intent, Intent::Web | Intent::Code) && self.pool.stress() < 0.15 {
+            let engine = live
+                .iter()
+                .find(|e| matches!(**e, "bing" | "ddg_html"))
+                .copied()
+                .or_else(|| live.contains(&"ddg").then_some("ddg_html"));
+            if let Some(engine) = engine {
+                for q in authority::official_queries(&compiled) {
+                    assignments.push((engine.to_string(), q));
+                }
             }
         }
 
@@ -835,7 +915,7 @@ impl Searcher {
                     engine.clone(),
                     eg.id,
                     false,
-                    RETRY_TIMEOUT,
+                    stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
                 )));
                 continue;
             }
@@ -859,48 +939,49 @@ impl Searcher {
                 eg.id,
                 eg.proxy,
                 context,
-                RETRY_TIMEOUT,
+                stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
                 previous,
             )));
         }
-        let retry_outcomes = futures_util::future::join_all(retry_futures).await;
-
-        // ── Ghost SERP cascade lane ──
-        // Google's desktop endpoint may serve a JS shell to plain HTTP.
-        // The WML HTTP lane uses a separate layout and legacy User-Agent.
-        // When the plain fan-out AND its retry wave still left the
-        // merge thin, one browser render buys a genuinely independent
-        // index family instead of shipping weak results.
-        let retry_ok: usize = ok_engines + retry_outcomes.iter().filter(|(_, r)| r.is_ok()).count();
-        let retry_hits: usize = ok_hits
-            + retry_outcomes
-                .iter()
-                .filter_map(|(_, r)| r.as_ref().ok())
-                .map(|(h, _, _, _, _)| h.len())
-                .sum::<usize>();
+        // Start the independent browser index alongside recovery requests.
+        // Waiting for failed HTTP retries first only delays a lane that can
+        // succeed without them. A healthy first merge keeps the cheap path.
         let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
         let google_http_ok = outcomes
             .iter()
-            .chain(&retry_outcomes)
             .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
         let lane_permitted = self.ghost.is_some()
             && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
             && !self.quarantined("google_ghost");
-        let lane_outcomes: Vec<(String, EngineResult)> = if lane_permitted
-            && google_ghost_wanted(force_lane, google_http_ok, retry_ok, retry_hits)
-        {
-            let hook = self.ghost.as_ref().unwrap().clone();
-            let task = ghost_engine_task("google_ghost".to_string(), query.to_string(), hook);
-            match tokio::time::timeout(Duration::from_secs(30), task).await {
-                Ok(outcome) => vec![outcome],
-                Err(_) => vec![(
-                    "google_ghost".to_string(),
-                    Err(("ghost-timeout".into(), "ghost".into(), true)),
-                )],
+        let browser_recovery = async {
+            if !lane_permitted
+                || !google_ghost_wanted(force_lane, google_http_ok, ok_engines, ok_hits)
+            {
+                return Vec::new();
             }
-        } else {
-            Vec::new()
+            let hook = self.ghost.as_ref().unwrap().clone();
+            let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
+            if budget.is_zero() {
+                return vec![(
+                    "google_ghost".to_string(),
+                    Err(("budget-skipped".into(), "ghost".into(), true)),
+                )];
+            }
+            vec![
+                ghost_engine_task(
+                    "google_ghost".to_string(),
+                    query.to_string(),
+                    hook,
+                    &self.pool,
+                    budget,
+                )
+                .await,
+            ]
         };
+        let (retry_outcomes, lane_outcomes) = tokio::join!(
+            futures_util::future::join_all(retry_futures),
+            browser_recovery
+        );
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
@@ -1022,11 +1103,18 @@ impl Searcher {
         // With semantic reranking enabled, merge includes synchronous ONNX
         // inference. Core builds keep the existing inline fast path below.
         #[cfg(feature = "rerank")]
-        let mut results = {
+        let (mut results, ranking_finished) = {
+            let fallback = rank::merge_lexical(&per_engine, query, intent, &trust, 12);
             let query = query.to_string();
-            run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
+            match run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
                 .await?
+            {
+                Some(results) => (results, true),
+                None => (fallback, false),
+            }
         };
+        #[cfg(not(feature = "rerank"))]
+        let ranking_finished = true;
         #[cfg(not(feature = "rerank"))]
         let mut results = rank::merge(&per_engine, query, intent, &trust, 12);
         // B3: learned host quality nudge. After merge (and its
@@ -1049,7 +1137,6 @@ impl Searcher {
             persist::apply_outcome_demote(&mut results, &outcome);
         }
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        let weak = rank::is_weak(&results, total);
 
         // ── Result enrichment: prefetch top results to extract
         // real <title> and <meta description> from the actual
@@ -1057,7 +1144,11 @@ impl Searcher {
         // The genius feature: results carry the page's own title
         // and description, not the SERP's truncated version.
         let enrich_t = std::time::Instant::now();
-        self.enrich_results(&mut results).await;
+        let _ = tokio::time::timeout(
+            stage_budget(Duration::from_secs(4), Duration::from_millis(500)),
+            self.enrich_results(&mut results),
+        )
+        .await;
         let enrich_ms = enrich_t.elapsed().as_millis();
 
         // ── site:/intitle:/filetype: post-merge enforcement:
@@ -1076,17 +1167,20 @@ impl Searcher {
         // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
         #[cfg(feature = "rerank")]
         let topup_ms: u128 = {
-            if crate::config::cfg().search.rerank_topup {
+            if crate::config::cfg().search.rerank_topup
+                && !stage_budget(Duration::from_secs(1), Duration::from_millis(500)).is_zero()
+            {
                 let t = std::time::Instant::now();
                 let q = query.to_string();
-                let mut owned = std::mem::take(&mut results);
+                let mut owned = results.clone();
                 let r = run_blocking_ranking(move || {
                     crate::search::rerank::topup(&q, &mut owned, 8);
                     owned
                 });
-                let ms = t.elapsed().as_millis();
-                results = r.await?;
-                ms
+                if let Some(ranked) = r.await? {
+                    results = ranked;
+                }
+                t.elapsed().as_millis()
             } else {
                 0
             }
@@ -1096,10 +1190,11 @@ impl Searcher {
         // halves of the build matrix.
         #[cfg(not(feature = "rerank"))]
         let topup_ms: u128 = 0;
+        let weak = rank::is_weak(&results, total, query);
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
-        let cacheable = ok_engines >= 2 && total >= 8;
+        let cacheable = ranking_finished && ok_engines >= 2 && total >= 8;
         if cacheable {
             let snapshot = {
                 let mut cache = self
@@ -1166,7 +1261,7 @@ impl Searcher {
             cached: false,
             elapsed: started.elapsed(),
             provider: None,
-            reranked: crate::search::rerank::loaded(),
+            reranked: ranking_finished && crate::search::rerank::loaded(),
             instant,
             stage_ms: stages,
         })
@@ -1313,6 +1408,7 @@ fn engine_health_key(engine: &str) -> &str {
 
 fn retry_engine_failure(status: &str) -> bool {
     !matches!(status, "no-results" | "pacing-timeout" | "invalid-config")
+        && !status.starts_with("invalid-config:")
 }
 
 /// Vertical retries retain explicit timeout outcomes; engine tasks own their
@@ -1435,6 +1531,256 @@ mod tests {
     use super::render::clip_snippet;
     use super::*;
 
+    #[derive(Clone, Copy)]
+    enum ProbeCase {
+        Unavailable,
+        PriorBan,
+        Auth,
+        Cancelled,
+        Healthy,
+    }
+
+    async fn preflight_pair(case: ProbeCase) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxies = [&a, &b].map(|listener| {
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap()
+        });
+        let acceptor = if matches!(case, ProbeCase::Healthy) {
+            use boring::ssl::{SslAcceptor, SslMethod};
+            let cert = rcgen::generate_simple_self_signed(vec!["api.ipify.org".into()]).unwrap();
+            let bundle = crate::paths::cache_dir().join("owned-probe-ca.pem");
+            std::fs::write(&bundle, cert.cert.pem()).unwrap();
+            // Nextest gives this owned trust bundle its own process.
+            unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
+            let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+            acceptor
+                .set_certificate(&boring::x509::X509::from_der(cert.cert.der()).unwrap())
+                .unwrap();
+            acceptor
+                .set_private_key(
+                    &boring::pkey::PKey::private_key_from_der(&cert.signing_key.serialize_der())
+                        .unwrap(),
+                )
+                .unwrap();
+            acceptor.set_alpn_select_callback(|_, peer| {
+                boring::ssl::select_next_proto(b"\x08http/1.1", peer)
+                    .ok_or(boring::ssl::AlpnError::NOACK)
+            });
+            Some(Arc::new(acceptor.build()))
+        } else {
+            None
+        };
+        let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+        if matches!(case, ProbeCase::PriorBan) {
+            pool.report_auth_fail(&proxies[0].id());
+        }
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            Arc::clone(&pool),
+        ));
+        let second_reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut servers = Vec::new();
+        for (ordinal, listener) in [a, b].into_iter().enumerate() {
+            let second_reached = Arc::clone(&second_reached);
+            let release = Arc::clone(&release);
+            let acceptor = acceptor.clone();
+            servers.push(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16384);
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                assert!(head.starts_with(b"CONNECT api.ipify.org:443 HTTP/1.1\r\n"));
+                if ordinal == 1 {
+                    second_reached.notify_one();
+                    if matches!(case, ProbeCase::Cancelled) {
+                        assert_eq!(socket.read(&mut [0u8; 1]).await.unwrap(), 0,
+                            "aborting preflight must close its pending CONNECT");
+                        return;
+                    }
+                    release.notified().await;
+                    if let Some(acceptor) = acceptor {
+                        socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                        let mut tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            assert!(request.len() < 16384);
+                            request.push(tls.read_u8().await.unwrap());
+                        }
+                        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                        tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n192.0.2.1").await.unwrap();
+                        return;
+                    }
+                }
+                let status = if ordinal == 0 && matches!(case, ProbeCase::Auth) {407} else {503};
+                socket.write_all(format!("HTTP/1.1 {status} Owned probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                if status == 407 {
+                    assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err(),
+                        "unchanged credentials must not retry CONNECT407");
+                }
+            }));
+        }
+        let probe = searcher.preflight();
+        tokio::time::timeout(Duration::from_secs(3), second_reached.notified())
+            .await
+            .expect("both real proxy probes must be reached");
+        let ban_before_batch = matches!(case, ProbeCase::PriorBan | ProbeCase::Auth);
+        let first_was_benched = pool.is_dead(&proxies[0].id());
+        let selected = pool.pick_fetch("owned.example", true).unwrap().id;
+        if matches!(case, ProbeCase::Cancelled) {
+            probe.abort();
+            assert!(probe.await.unwrap_err().is_cancelled());
+        } else {
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), probe)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for server in servers {
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            first_was_benched, ban_before_batch,
+            "generic echo failures cannot alter a lane while the batch is pending"
+        );
+        assert_eq!(
+            selected,
+            proxies[usize::from(ban_before_batch)].id(),
+            "an unresolved echo batch must preserve the selected egress"
+        );
+        assert_eq!(
+            pool.is_dead(&proxies[0].id()),
+            ban_before_batch || matches!(case, ProbeCase::Healthy)
+        );
+        assert!(
+            !pool.is_dead(&proxies[1].id()),
+            "an unavailable echo must not bench B, including after a real A407"
+        );
+        let reloaded = EgressPool::new(proxies.to_vec());
+        assert_eq!(
+            reloaded.is_dead(&proxies[0].id()),
+            pool.is_dead(&proxies[0].id()),
+            "completed health evidence must survive actual persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_does_not_bench_a_lane_before_the_probe_batch_finishes() {
+        preflight_pair(ProbeCase::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_preserves_prior_bans_when_echo_is_unavailable() {
+        preflight_pair(ProbeCase::PriorBan).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_applies_auth_failure_without_benching_inconclusive_peer() {
+        preflight_pair(ProbeCase::Auth).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_cancellation_closes_connect_without_publishing_partial_batch() {
+        preflight_pair(ProbeCase::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_completed_healthy_tls_echo_benches_failed_peer() {
+        preflight_pair(ProbeCase::Healthy).await;
+    }
+
+    // The batch must obey one global ceiling: a pool of stalled lanes
+    // used to cost N * 6s of startup (8 lanes = 48s serial). With the
+    // ceiling the run stops at ~20s, the partial batch publishes
+    // nothing, and the unprobed lanes stay unbenched.
+    #[tokio::test]
+    async fn stealth_v3_preflight_batch_obeys_a_global_ceiling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let mut listeners = Vec::new();
+        let mut proxies = Vec::new();
+        for _ in 0..8 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            proxies.push(
+                crate::transport::proxy::Proxy::parse(&format!(
+                    "http://{}",
+                    listener.local_addr().unwrap()
+                ))
+                .unwrap(),
+            );
+            listeners.push(listener);
+        }
+        let pool = Arc::new(EgressPool::new(proxies.clone()));
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            Arc::clone(&pool),
+        ));
+        let mut servers = Vec::new();
+        for listener in listeners {
+            servers.push(tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            assert!(head.len() < 16384);
+                            let mut buf = [0u8; 1024];
+                            let Ok(n) = socket.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..n]);
+                        }
+                        // Accept the tunnel, then stall the handshake so
+                        // the probe dies on its own timeout.
+                        if socket
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await
+                            .is_ok()
+                        {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                    });
+                }
+            }));
+        }
+        let started = Instant::now();
+        searcher.preflight().await.unwrap();
+        let elapsed = started.elapsed();
+        for server in servers {
+            server.abort();
+        }
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "preflight must obey the global ceiling; 8 stalled lanes took {elapsed:?} \
+             (serial N * 6s = 48s)"
+        );
+        assert!(
+            proxies.iter().all(|p| !pool.is_dead(&p.id())),
+            "a budget-cut partial batch must publish nothing"
+        );
+    }
+
     fn test_searcher() -> Searcher {
         // Hermetic: point disk cache/health at a throwaway dir so the
         // real user cache is neither read nor polluted, then clear the
@@ -1496,13 +1842,46 @@ mod tests {
     // (cached: true, provider preserved), never re-billing the
     // provider. The store/serve roundtrip is the mechanism the wiring
     // in search_tool relies on.
+    #[tokio::test]
+    async fn wave450_optional_search_stages_preserve_time_for_results() {
+        let cap = Duration::from_secs(30);
+        let reserve = Duration::from_secs(5);
+        assert_eq!(stage_budget(cap, reserve), cap);
+        SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_millis(200)),
+                async {
+                    assert_eq!(stage_budget(cap, reserve), Duration::ZERO);
+                },
+            )
+            .await;
+        SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_secs(8)),
+                async {
+                    let budget = stage_budget(cap, reserve);
+                    assert!(
+                        budget > Duration::from_secs(2) && budget <= Duration::from_secs(3),
+                        "{budget:?}"
+                    );
+                },
+            )
+            .await;
+        assert_eq!(
+            stage_budget(cap, reserve),
+            cap,
+            "deadline must not escape the call"
+        );
+    }
+
     #[test]
     fn byok_results_roundtrip_the_cache_with_provider_and_cached_flag() {
         let s = test_searcher();
         // Cold: nothing cached, so a caller must go bill the provider.
         assert!(s.byok_cache_get("quic test 42", Intent::Web, 3).is_none());
 
-        let out = byok_outcome("tinyfish", &["https://a.test/", "https://b.test/"]);
+        let mut out = byok_outcome("tinyfish", &["https://a.test/", "https://b.test/"]);
+        out.results[0].title = "QUIC test 42 transport evidence".into();
         s.byok_cache_put("quic test 42", &out);
 
         // Warm: served from cache, marked cached, provider intact.
@@ -1514,6 +1893,14 @@ mod tests {
         assert!(!hit.weak);
         assert_eq!(hit.results.len(), 2);
         assert_eq!(hit.results[0].url, "https://a.test/");
+        s.byok_cache_put("qwertyuiop unrelated gibberish", &out);
+        let unrelated = s
+            .byok_cache_get("qwertyuiop unrelated gibberish", Intent::Web, 3)
+            .unwrap();
+        assert!(
+            unrelated.weak,
+            "cached provider ranking cannot certify query relevance"
+        );
     }
 
     // The BYOK namespace must not collide with the local path: a
@@ -1631,7 +2018,12 @@ mod tests {
                 assert!(is_engine_fault(status));
             }
         }
-        for status in ["invalid-config", "no-results", "pacing-timeout"] {
+        for status in [
+            "invalid-config",
+            "invalid-config: proxy: unsupported scheme",
+            "no-results",
+            "pacing-timeout",
+        ] {
             assert!(!retry_engine_failure(status));
             assert!(!is_engine_fault(status));
         }
@@ -1891,7 +2283,37 @@ mod tests {
             }
         );
 
-        assert!(worker_result.expect("blocking job should join").is_ok());
+        assert!(
+            worker_result
+                .expect("blocking job should join")
+                .expect("job completed within budget")
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "rerank")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn report_audit_semantic_deadline_retains_lexical_evidence() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let result = SEARCH_DEADLINE
+            .scope(Some(deadline), async {
+                let (ranked, started) = tokio::join!(
+                    run_blocking_ranking(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        "semantic evidence"
+                    }),
+                    started_rx,
+                );
+                started.unwrap();
+                ranked.unwrap().unwrap_or("retrieved lexical evidence")
+            })
+            .await;
+        release_tx.send(()).unwrap();
+        assert_eq!(result, "retrieved lexical evidence");
+        assert!(tokio::time::Instant::now() < deadline);
     }
 
     #[test]
@@ -2149,7 +2571,7 @@ mod tests {
             "index-family count follows the route hint: {markdown}"
         );
         assert!(markdown.contains("A focused explanation"));
-        assert!(markdown.contains("Weak results : low cross-index agreement."));
+        assert!(markdown.contains("Weak results : low query relevance or cross-index agreement."));
         assert!(markdown.contains("Degraded retrieval : 1/2 backends available."));
         for diagnostic in [
             "engines:",

@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "4.4.3"
+version = "4.7.3"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
@@ -26,6 +26,7 @@ scraper = "0.27.0"
 encoding_rs = "0.8.35"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+httpdate = "1.0.3"
 config = { version = "0.15", default-features = false, features = ["toml"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
@@ -52,7 +53,7 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.238" }
+psl = { version = "=2.1.239" }
 # OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
 # below, never here: Cargo unions features across every matching target
 # section, so declaring it in more than one place is how `load-dynamic` once
@@ -89,11 +90,19 @@ http = ["dep:axum", "dep:tower-http"]
 windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Pipes"] }
 
 [dev-dependencies]
+# The owned-browser pixel test decodes a PNG; the optional runtime dep
+# rides the ocr feature, and no-feature test builds (CI linux-aarch64,
+# windows) must still compile the test.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Paused-time tests (Builder::start_paused via #[tokio::test]): the
+# stall-vs-wall semantics run against the real 30s constants without
+# sleeping 30 real seconds.
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 sha2 = "0.11"

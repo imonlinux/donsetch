@@ -9,6 +9,7 @@ pub enum Vendor {
     Cloudflare,
     DataDome,
     Akamai,
+    Kasada,
     PerimeterX,
     Imperva,
     Sucuri,
@@ -32,6 +33,227 @@ pub enum Verdict {
     Paywall,
     /// 404 or content-less page dressed as success.
     SoftNotFound,
+}
+
+/// Whether an HTTP denial warrants a browser observation. Explicit tier and
+/// deadline checks belong to the caller; this policy is shared by fetch/crawl.
+pub fn browser_recovery(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    verdict: Verdict,
+) -> bool {
+    if matches!(status, 401 | 402 | 404 | 410)
+        || matches!(
+            verdict,
+            Verdict::AuthWall | Verdict::Paywall | Verdict::SoftNotFound
+        )
+    {
+        return false;
+    }
+    if let Some(ct) = header(headers, "content-type") {
+        let mime = ct.split(';').next().unwrap_or_default().trim();
+        if !["text/html", "text/plain", "application/xhtml+xml"]
+            .iter()
+            .any(|allowed| mime.eq_ignore_ascii_case(allowed))
+        {
+            return false;
+        }
+    } else {
+        // A missing MIME type does not turn API JSON or binary denial data
+        // into a browser document. Inspect only a bounded prefix.
+        let prefix = &body[..body.len().min(512)];
+        let text = String::from_utf8_lossy(prefix);
+        if text.trim_start().starts_with(['{', '['])
+            || prefix.starts_with(b"%PDF-")
+            || prefix
+                .iter()
+                .any(|b| *b == 0 || (*b < 0x20 && !b.is_ascii_whitespace()))
+        {
+            return false;
+        }
+    }
+    if content_gate(body).is_some() {
+        return false;
+    }
+    matches!(verdict, Verdict::Challenge(_)) || (status == 403 && verdict == Verdict::Blocked)
+}
+
+#[cfg(test)]
+mod stealth_v3_tests {
+    use super::*;
+
+    #[test]
+    fn stealth_v3_kasada_bootstrap_is_not_content_or_not_found() {
+        let body = b"<html><body><script>window.KPSDK={};KPSDK.start=Date.now();</script><script src='/sensor/ips.js?x-kpsdk-im=opaque'></script><iframe src='javascript:;' style='display:none'></iframe></body></html>";
+        assert!(matches!(detect_dom_smart(body), Verdict::Challenge(_)));
+        let article = format!(
+            "<article><h1>Kasada integration</h1><p>{}</p></article><script>window.KPSDK={{}};</script><script src='/ips.js'></script>",
+            "Public documentation of an embedded monitoring script. ".repeat(40)
+        );
+        assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
+        assert_eq!(
+            detect_dom_smart(b"<p>KPSDK and ips.js are filenames in this example.</p>"),
+            Verdict::ContentOk
+        );
+    }
+
+    #[test]
+    fn stealth_v3_plain_html_403_can_receive_one_browser_observation() {
+        let body = b"<html><h1>Forbidden</h1><p>Request denied.</p></html>";
+        let verdict = detect(403, &[], body);
+        assert_eq!(verdict, Verdict::Blocked);
+        assert!(browser_recovery(403, &[], body, verdict));
+    }
+
+    #[test]
+    fn stealth_v3_http_denial_negative_cases_stay_terminal() {
+        for status in [401, 402, 404, 429, 500, 502, 503] {
+            let body = b"Request denied";
+            assert!(
+                !browser_recovery(status, &[], body, detect(status, &[], body)),
+                "status={status}"
+            );
+        }
+        for (content_type, body) in [
+            (
+                "application/json",
+                b"{\"error\":\"permission denied\"}".as_slice(),
+            ),
+            ("application/pdf", b"%PDF-1.7".as_slice()),
+            (
+                "text/html",
+                b"<title>Sign in</title><form><input type='password'></form>".as_slice(),
+            ),
+        ] {
+            let headers = vec![("Content-Type".into(), content_type.into())];
+            assert!(
+                !browser_recovery(403, &headers, body, detect(403, &headers, body)),
+                "type={content_type}"
+            );
+        }
+        let headers = vec![("Retry-After".into(), "60".into())];
+        assert!(!browser_recovery(
+            429,
+            &headers,
+            b"Too many requests",
+            Verdict::Blocked
+        ));
+    }
+
+    #[test]
+    fn stealth_v3_late_interactive_wall_is_terminal_but_article_is_content() {
+        let html = format!(
+            "<title>Prove your humanity</title><script>{}</script><h1>Prove your humanity</h1><form><div class='g-recaptcha'></div></form>",
+            "x".repeat(350_000)
+        );
+        assert!(matches!(
+            detect_dom_smart(html.as_bytes()),
+            Verdict::Challenge(_)
+        ));
+        assert!(
+            human_captcha(html.as_bytes()),
+            "late widget must be found in a large wall"
+        );
+        let article = format!(
+            "<article><h1>CAPTCHA tutorial</h1><p>{}</p><div class='g-recaptcha'></div></article>",
+            "This tutorial explains integration of a contact widget. ".repeat(40)
+        );
+        assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
+    }
+
+    #[test]
+    fn stealth_v3_human_touch_gate_is_not_an_article_with_help_text() {
+        let help = "Complete the verification shown below to continue browsing. The following advice explains how the browser can display the verification widget. ".repeat(40);
+        let wall = format!(
+            "<title>It needs a human touch</title><h1>It needs a human touch</h1><article><div id='px-captcha'><iframe></iframe></div><p>{help}</p></article>"
+        );
+        assert!(matches!(
+            detect_dom_smart(wall.as_bytes()),
+            Verdict::Challenge(Vendor::PerimeterX)
+        ));
+        assert!(human_captcha(wall.as_bytes()));
+        let article = format!(
+            "<title>Design needs a human touch</title><article><h1>Design needs a human touch</h1><p>{help}</p><div id='px-captcha'></div></article>"
+        );
+        assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
+        let inactive = format!(
+            "<title>Ordinary research article</title><h1>Ordinary research article</h1><script>let inactive = '<h1>It needs a human touch</h1><div id=px-captcha></div>';</script><article><p>{help}</p></article>"
+        );
+        assert_eq!(detect_dom_smart(inactive.as_bytes()), Verdict::ContentOk);
+        let quoted = format!(
+            "<title>It needs a human touch</title><style>#px-captcha{{display:none}}</style><script>let template = '<div id=px-captcha></div>';</script><article><h1>Research notes</h1><p>{help}</p></article>"
+        );
+        assert_eq!(detect_dom_smart(quoted.as_bytes()), Verdict::ContentOk);
+    }
+}
+
+#[cfg(test)]
+mod report_audit_tests {
+    use super::*;
+
+    #[test]
+    fn report_audit_google_human_captcha_never_satisfies_the_content_oracle() {
+        let help =
+            "Our systems have detected unusual traffic from your computer network. ".repeat(20);
+        let html = format!(
+            "<script src='https://www.google.com/recaptcha/api.js'></script><form id='captcha-form' action='index'><div class='g-recaptcha'></div></form><p>{help}</p>"
+        );
+        assert!(visible_text_count(html.as_bytes()) > 1000);
+        assert_eq!(
+            detect_dom_smart(html.as_bytes()),
+            Verdict::Challenge(Vendor::Generic)
+        );
+        assert!(human_captcha(html.as_bytes()));
+        let tutorial = format!("<article><h1>Google CAPTCHA integration</h1>{html}</article>");
+        assert_eq!(detect_dom_smart(tutorial.as_bytes()), Verdict::ContentOk);
+    }
+
+    #[test]
+    fn report_audit_soft_notfound_and_auth_gates_are_not_content() {
+        for html in [
+            "<html><title>404: This page could not be found.</title><body><h1>404</h1><p>This page could not be found.</p></body></html>",
+            "<html><title>Homepage Hero Thumbnail (1).jpg</title><body><h1>404: This page could not be found.</h1><p>This page could not be found.</p></body></html>",
+        ] {
+            assert_eq!(detect(200, &[], html.as_bytes()), Verdict::SoftNotFound);
+        }
+        let login = "<html><title>LinkedIn: Log In or Sign Up</title><body><h1>Welcome to your professional community</h1><form><input type='password'><button>Sign in</button></form></body></html>";
+        assert_eq!(detect(200, &[], login.as_bytes()), Verdict::AuthWall);
+        assert_eq!(
+            detect_dom_smart(
+                "<html><title>Login – Vercel</title><body><h1>Log in to Vercel</h1></body></html>"
+                    .as_bytes()
+            ),
+            Verdict::AuthWall
+        );
+        // Vercel appends its title after ~340 KiB of styles/flight data;
+        // the first DOM scan contains only the branded H1 and login form.
+        let late_title = format!(
+            "<html><head></head><body><h1>Log in to Vercel</h1><form><input type='email'></form><script>{}</script><title>Login – Vercel</title></body></html>",
+            "x".repeat(350_000)
+        );
+        assert_eq!(detect_dom_smart(late_title.as_bytes()), Verdict::AuthWall);
+        assert_eq!(detect_dom_smart(b"<h1>Log in to Vercel with CI</h1><article><p>A practical authentication tutorial with working code and deployment instructions for continuous integration.</p></article>"), Verdict::ContentOk);
+        assert_eq!(detect_dom_smart(b"<article><h1>Log in to Vercel with CI</h1><p>A practical authentication tutorial with working code and deployment instructions for continuous integration.</p><form><input type='email'></form></article>"), Verdict::ContentOk);
+        let late_form = format!(
+            "<title>Cloudflare Dashboard | Manage Your Account</title><style>{}</style><h1>Sign in to Cloudflare</h1><form action='/login'><input type='password'><button>Sign in</button></form>",
+            "x".repeat(90_000)
+        );
+        assert_eq!(detect_dom_smart(late_form.as_bytes()), Verdict::AuthWall);
+        assert_eq!(detect(200, &[], late_form.as_bytes()), Verdict::AuthWall);
+        let instagram = format!(
+            "<title>Instagram</title><script>{}</script><form id='login_form'><input type='password'><button>Log in</button></form>",
+            "x".repeat(450_000)
+        );
+        assert_eq!(detect(200, &[], instagram.as_bytes()), Verdict::AuthWall);
+        assert_eq!(detect_dom_smart(b"<title>Login form tutorial</title><article><h1>Authentication examples</h1><p>A public tutorial with examples of client and server authentication.</p><form id='login_form'><input type='password'><button>Log in</button></form></article>"), Verdict::ContentOk);
+        let article = "<html><title>How to handle a 404 or sign in</title><body><article><h1>Authentication guide</h1><p>Our tutorial explains the message 404: This page could not be found.</p><form><input type='password'></form></article></body></html>";
+        assert_eq!(
+            detect(200, &[], article.as_bytes()),
+            Verdict::ContentOk,
+            "quoted errors and embedded sign-in forms must remain content"
+        );
+    }
 }
 
 pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict {
@@ -58,7 +280,7 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
 
     match status {
         401 | 402 => return Verdict::AuthWall,
-        404 => return Verdict::SoftNotFound,
+        404 | 410 => return Verdict::SoftNotFound,
         403 | 429 | 503 => {
             return classify_wall(&text, headers, is_cf, status, true);
         }
@@ -77,6 +299,9 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
         // or DonSheet (PDF parse) downstream.
         if body.starts_with(b"%PDF-") || crate::fetch::guards::is_binary_body(body) {
             return Verdict::ContentOk;
+        }
+        if let Some(verdict) = content_gate(body) {
+            return verdict;
         }
         // Interstitials dressed as 200. Body markers only
         // count on SMALL pages: interstitials are tiny,
@@ -145,6 +370,9 @@ pub fn detect_dom(body: &[u8]) -> Verdict {
 /// Real pages have 80+ visible chars even when they embed
 /// challenge widgets in a small section.
 pub fn detect_dom_smart(body: &[u8]) -> Verdict {
+    if let Some(verdict) = content_gate(body) {
+        return verdict;
+    }
     // Interstitials first: the ≥80-visible-chars override below
     // must never whitewash a challenge page. Modern CF interstitials
     // ("Performing security verification") carry 300-400 chars of
@@ -160,10 +388,90 @@ pub fn detect_dom_smart(body: &[u8]) -> Verdict {
     detect_dom(body)
 }
 
+/// Error and authentication headings, excluding scripts' inactive route templates.
+pub fn content_gate(body: &[u8]) -> Option<Verdict> {
+    // SPA style/bootstrap data can precede the login form by hundreds of KiB.
+    // Wide DOM parsing is only needed for pages with little visible content;
+    // substantive articles keep the inexpensive heading window.
+    let scan = &body[..body.len().min(512 * 1024)];
+    let scan = if scan.len() > 64 * 1024 && visible_text_count(scan) > 1200 {
+        &scan[..64 * 1024]
+    } else {
+        scan
+    };
+    let text = String::from_utf8_lossy(scan);
+    let lower = text.to_lowercase();
+    if !["404", "not found", "log in", "login", "sign in"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || crate::extract::nesting::max_nesting(&text) > crate::extract::nesting::MAX_NESTING
+    {
+        return None;
+    }
+    let doc = scraper::Html::parse_document(&text);
+    let title = doc
+        .select(&scraper::Selector::parse("title").unwrap())
+        .next()
+        .map(crate::extract::inline::visible_text)
+        .unwrap_or_default()
+        .to_lowercase();
+    let h1 = doc
+        .select(&scraper::Selector::parse("h1").unwrap())
+        .next()
+        .map(crate::extract::inline::visible_text)
+        .unwrap_or_default()
+        .to_lowercase();
+    if [&title, &h1].iter().any(|heading| {
+        heading.as_str() == "404"
+            || heading.starts_with("404:")
+            || heading.starts_with("404 -")
+            || heading.as_str() == "page not found"
+            || heading.as_str() == "this page could not be found."
+    }) {
+        return Some(Verdict::SoftNotFound);
+    }
+    if doc.select(&scraper::Selector::parse("form#login_form input[type='password'], form[name='login-form'] input[type='password']").unwrap()).next().is_some()
+        && doc.select(&scraper::Selector::parse("article").unwrap()).next().is_none() {
+        return Some(Verdict::AuthWall);
+    }
+    let auth_heading = [
+        "sign in",
+        "log in",
+        "login",
+        "sign in to continue",
+        "log in to continue",
+        "log in or sign up",
+    ];
+    let title_suffix = title.rsplit(':').next().unwrap_or(&title).trim();
+    let title_prefix = [" – ", " - ", " | "]
+        .iter()
+        .find_map(|separator| title.split_once(separator).map(|(prefix, _)| prefix.trim()));
+    if auth_heading.contains(&title_suffix)
+        || auth_heading.contains(&h1.as_str())
+        || title_prefix.is_some_and(|prefix| auth_heading.contains(&prefix))
+        || (["sign in to ", "log in to ", "login to "]
+            .iter()
+            .any(|prefix| h1.starts_with(prefix))
+            && doc
+                .select(&scraper::Selector::parse("article").unwrap())
+                .next()
+                .is_none()
+            && doc
+                .select(&scraper::Selector::parse("form").unwrap())
+                .next()
+                .is_some())
+    {
+        return Some(Verdict::AuthWall);
+    }
+    None
+}
+
 /// Interstitial titles/phrases that vendor challenge pages use in
 /// `<title>` / `<h1>`. Real pages virtually never title themselves
 /// these : a page ABOUT Cloudflare has its own title.
 const INTERSTITIAL_TITLES: &[&str] = &[
+    "you've been blocked by network security",
+    "you are blocked by network security",
     "just a moment",
     "performing security verification",
     "checking your browser",
@@ -202,11 +510,25 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let scan = &body[..body.len().min(96 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
 
+    // Google's human CAPTCHA contains over 1000 visible chars of help text.
+    // Its actual form is decisive; the text-count oracle must not serve it.
+    if text.contains("unusual traffic") && text.contains("recaptcha") {
+        let doc = scraper::Html::parse_document(&text);
+        if doc
+            .select(&scraper::Selector::parse("form#captcha-form").unwrap())
+            .next()
+            .is_some()
+            && doc
+                .select(&scraper::Selector::parse("article").unwrap())
+                .next()
+                .is_none()
+        {
+            return Some(Vendor::Generic);
+        }
+    }
+
     // Title/H1 route: strongest signal, immune to visible-text counts.
-    let title = extract_title_or_h1(&text);
-    if let Some(t) = title
-        && INTERSTITIAL_TITLES.iter().any(|m| t.contains(m))
-    {
+    if interstitial_heading(&text) {
         return Some(vendor_from_markers(&text).unwrap_or(Vendor::Generic));
     }
 
@@ -221,6 +543,14 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let turnstile_shell =
         text.contains("challenges.cloudflare.com") && text.contains("cf-turnstile");
     let visible = visible_text_count(body);
+    if visible < 80
+        && text.contains("<script")
+        && text.contains("kpsdk")
+        && text.contains("/ips.js")
+        && !text.contains("<article")
+    {
+        return Some(Vendor::Kasada);
+    }
     if visible < 400
         && (turnstile_shell || INTERSTITIAL_MARKERS.iter().any(|m| text.contains(m)))
         && !text.contains("<form")
@@ -238,12 +568,30 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
 /// different failure codes (issue #282's `wall.captcha` vs
 /// `wall.challenge_unsolved`).
 pub fn interactive_captcha(body: &[u8]) -> bool {
-    let scan = &body[..body.len().min(64 * 1024)];
+    let scan = &body[..body.len().min(512 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
     [
         "recaptcha",
         "hcaptcha",
         "cf-turnstile",
+        "px-captcha",
+        "captcha-delivery",
+        "geetest",
+        "arkoselabs",
+        "funcaptcha",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
+/// A widget requiring an interactive human answer, rather than a challenge
+/// the browser can clear with its own first-party state. Call only after the
+/// page was classified as a captcha, never on ordinary embedded widgets.
+pub fn human_captcha(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&body[..body.len().min(512 * 1024)]).to_lowercase();
+    [
+        "hcaptcha",
+        "recaptcha",
         "px-captcha",
         "captcha-delivery",
         "geetest",
@@ -269,36 +617,85 @@ pub fn challenge_text(text: &str) -> bool {
         return false;
     }
     let lower = text.to_lowercase();
-    INTERSTITIAL_TITLES.iter().any(|m| lower.contains(m))
-        || lower.contains("complete the challenge below")
-        || lower.contains("enable javascript and cookies to continue")
+    lower.lines().any(|line| {
+        let line = line.trim().trim_start_matches('#').trim();
+        INTERSTITIAL_TITLES.iter().any(|m| line.starts_with(m))
+            || line.starts_with("complete the challenge below")
+            || line.starts_with("enable javascript and cookies to continue")
+    })
 }
 
-/// Best-effort `<title>` (head) or first `<h1>` text, lowercased.
-fn extract_title_or_h1(lower_text: &str) -> Option<String> {
+/// Short access screens, not articles quoting a login or block message.
+pub fn text_wall(text: &str) -> Option<Verdict> {
+    if text.chars().count() > 1200 {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    if lower.contains("blocked by network security")
+        && (lower.contains("reddit account") || lower.contains("developer token"))
+    {
+        return Some(Verdict::Blocked);
+    }
+    if lower.lines().any(|line| {
+        let heading = line.trim().trim_start_matches('#').trim();
+        [
+            "log in to continue",
+            "login to continue",
+            "sign in to continue",
+        ]
+        .iter()
+        .any(|phrase| heading.starts_with(phrase))
+    }) && text.chars().count() < 600
+    {
+        return Some(Verdict::AuthWall);
+    }
+    challenge_text(text).then_some(Verdict::Challenge(Vendor::Generic))
+}
+
+/// Inspect both the title and first H1, including text inside nested tags.
+fn interstitial_heading(lower_text: &str) -> bool {
     for (open, close) in [("<title", "</title>"), ("<h1", "</h1>")] {
-        let start = lower_text.find(open)?;
+        let Some(start) = lower_text.find(open) else {
+            continue;
+        };
         if let Some(content_start) = lower_text[start..].find('>') {
             let from = start + content_start + 1;
             if let Some(end) = lower_text[from..].find(close) {
                 let t = &lower_text[from..from + end];
                 // Strip nested tags inside the title (h1 can wrap spans).
+                let mut inside_tag = false;
                 let cleaned: String = t
                     .chars()
-                    .filter(|c| *c != '<')
-                    .collect::<String>()
-                    .split('<')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let cleaned = cleaned.trim();
-                if !cleaned.is_empty() {
-                    return Some(cleaned.to_string());
+                    .filter(|c| match c {
+                        '<' => {
+                            inside_tag = true;
+                            false
+                        }
+                        '>' => {
+                            inside_tag = false;
+                            false
+                        }
+                        _ => !inside_tag,
+                    })
+                    .collect();
+                // A PX human gate can put thousands of translated help
+                // characters inside <article>. Require the observed gate
+                // heading and a real widget element, not an inactive script.
+                if cleaned.trim() == "it needs a human touch"
+                    && scraper::Html::parse_document(lower_text)
+                        .select(&scraper::Selector::parse("#px-captcha").unwrap())
+                        .next()
+                        .is_some()
+                {
+                    return true;
+                }
+                if INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
+                    return true;
                 }
             }
         }
     }
-    None
+    false
 }
 
 fn vendor_from_markers(lower_text: &str) -> Option<Vendor> {
@@ -581,9 +978,10 @@ fn classify_wall(
         return Verdict::Challenge(Vendor::Generic);
     }
     // Reddit-style interstitials (often served as 200).
-    if text.contains("prove your humanity")
+    if (text.contains("prove your humanity")
         || text.contains("not for bots")
-        || text.contains("please wait for verification")
+        || text.contains("please wait for verification"))
+        && (interstitial_heading(text) || visible_text_count(text.as_bytes()) < 120)
     {
         return Verdict::Challenge(Vendor::Generic);
     }
@@ -634,6 +1032,43 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave450_short_quoted_challenge_article_is_content_at_both_layers() {
+        let text = "# Browser troubleshooting\n\nThe message prove your humanity asks a reader to authenticate. Here is how to diagnose that prompt without mistaking a troubleshooting article for the prompt itself.";
+        assert!(!challenge_text(text));
+        assert_eq!(text_wall(text), None);
+        let html = format!(
+            "<html><title>Browser troubleshooting</title><article><h1>Browser troubleshooting</h1><p>{text}</p></article></html>"
+        );
+        assert_eq!(detect(200, &[], html.as_bytes()), Verdict::ContentOk);
+        assert_eq!(detect_dom_smart(html.as_bytes()), Verdict::ContentOk);
+        assert!(challenge_text(
+            "# Prove your humanity\nComplete the challenge below."
+        ));
+    }
+
+    #[test]
+    fn wave450_wall_heading_survives_generic_title_and_nested_tags() {
+        let html = b"<html><title>Reddit</title><body><h1><span>Prove your humanity</span></h1><form><p>We are committed to safety and security. Complete the challenge below before continuing to the community discussion.</p><div class='g-recaptcha'></div></form></body></html>";
+        assert!(matches!(detect_dom_smart(html), Verdict::Challenge(_)));
+        let article = b"<html><title>Contact us</title><h1>Contact</h1><form><p>Please use this form to contact our team about product documentation and installation instructions.</p><div class='g-recaptcha'></div></form></html>";
+        assert_eq!(detect_dom_smart(article), Verdict::ContentOk);
+    }
+
+    #[test]
+    fn wave450_short_authentication_article_is_not_a_login_wall() {
+        assert_eq!(
+            text_wall(
+                "# Authentication guide\n\nThe message log in to continue prompts readers to authenticate. Here is how to configure login for your application."
+            ),
+            None
+        );
+        assert_eq!(
+            text_wall("# Log in to continue\n\nEnter your account credentials."),
+            Some(Verdict::AuthWall)
+        );
+    }
 
     // #282: the two content-quality failures keep their own codes so
     // an agent can tell "the page is a shell/login wall" from "the
@@ -1139,4 +1574,23 @@ fn instagram_logged_out_shell_is_auth_wall() {
         detect(200, &[], body.as_bytes()),
         Verdict::AuthWall
     ));
+}
+
+#[cfg(test)]
+mod gone_tests {
+    use super::*;
+    #[test]
+    fn v471_gone_is_terminal_not_a_bot_wall() {
+        for body in [
+            b"".as_slice(),
+            b"<h1>Gone</h1>",
+            b"<script src='/cdn-cgi/challenge-platform/x'></script>",
+        ] {
+            assert_eq!(detect(410, &[], body), Verdict::SoftNotFound);
+        }
+        assert_eq!(
+            detect(200, &[], b"<h1>Gone fishing</h1><p>We are open today.</p>"),
+            Verdict::ContentOk
+        );
+    }
 }

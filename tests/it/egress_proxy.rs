@@ -230,7 +230,7 @@ async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
 // commands ride. It used to pass `None` down to the redirect driver, so
 // on a host whose only route out is HTTP_PROXY (a container, a locked
 // down office network) every tool call died with "Network is
-// unreachable" while `donsetch doctor` and the archive fallback, which
+// unreachable" while `donsetch doctor` and other direct fetches, which
 // ride `fetch()`, reported egress healthy: two call chains into the
 // same dialer and only one of them resolved the ambient proxy.
 #[tokio::test(flavor = "multi_thread")]
@@ -428,5 +428,174 @@ async fn plaintext_http_through_socks5_uses_origin_form() {
     assert!(
         seen.iter().any(|h| h.starts_with("GET /plain ")),
         "origin-form GET expected through the tunnel, saw: {seen:?}"
+    );
+}
+#[tokio::test]
+async fn stealth_v3_invalid_ambient_proxy_never_dials_direct() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe {
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+        std::env::remove_var("DONSETCH_NO_ENV_PROXY");
+        std::env::set_var(
+            "HTTP_PROXY",
+            "socks4://alice:private-token@broken.invalid:1080",
+        );
+        std::env::set_var("NO_PROXY", "");
+        std::env::remove_var("no_proxy");
+    }
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/must-stay-proxied", origin.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), origin.accept()).await
+        {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 16384);
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\ndirect origin reached").await.unwrap();
+            true
+        } else {
+            false
+        }
+    });
+    let fetcher =
+        donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
+            .unwrap();
+    let result = fetcher.fetch_persona(&url, None).await;
+    let direct_reached = server.await.unwrap();
+    assert!(
+        !direct_reached,
+        "invalid required proxy silently reached the direct origin"
+    );
+    let Err(error) = result else {
+        panic!("invalid proxy must be an actionable error")
+    };
+    assert!(error.to_string().contains("proxy"));
+    assert!(
+        !error.to_string().contains("private-token") && !error.to_string().contains("alice"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_controls() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe {
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+        std::env::remove_var("DONSETCH_NO_ENV_PROXY");
+        std::env::set_var("HTTP_PROXY", "socks4://broken.invalid:1080");
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for ordinal in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 16384);
+                request.push(stream.read_u8().await.unwrap());
+            }
+            let request = String::from_utf8(request).unwrap();
+            let body = if ordinal == 0 {
+                assert!(request.starts_with("GET /owned HTTP/1.1\r\n"));
+                assert!(!request.contains("proxy-authorization:"));
+                "explicit direct bypass"
+            } else {
+                assert!(request.starts_with(&format!("GET http://{address}/owned HTTP/1.1\r\n")));
+                assert!(request.contains("proxy-authorization: Basic YWxpY2U6c2VjcmV0\r\n"));
+                "explicit proxy lane"
+            };
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher =
+        donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
+            .unwrap();
+    let url = format!("http://{address}/owned");
+    assert_eq!(
+        fetcher.fetch_persona(&url, None).await.unwrap().body,
+        b"explicit direct bypass"
+    );
+    unsafe { std::env::set_var("NO_PROXY", "") };
+    let proxy = donsetch::transport::proxy::Proxy::parse(&format!("http://alice:secret@{address}"))
+        .unwrap();
+    assert_eq!(
+        fetcher
+            .fetch_via_jar_ref(&url, Some(&proxy), true, None)
+            .await
+            .unwrap()
+            .body,
+        b"explicit proxy lane"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
+    use donsetch::search::egress::EgressPool;
+    use donsetch::transport::proxy::Proxy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe {
+        std::env::set_var("DONSETCH_FETCH_ROTATE", "1");
+        std::env::remove_var("DONSETCH_NO_FETCH_ROTATE");
+        std::env::set_var("DONSETCH_NO_ENV_PROXY", "1");
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+    }
+    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxies = [&a, &b].map(|listener| {
+        Proxy::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()
+    });
+    let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+    let fetcher = Fetcher::new(BrowserProfile::host_default())
+        .unwrap()
+        .with_egress(Arc::clone(&pool));
+    let url = "http://127.0.0.1:51999/selected-route-health";
+    let selected = fetcher.route_for_fetch(url);
+    assert_eq!(selected.proxy_for(url).unwrap().unwrap(), proxies[0]);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = a.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16384);
+            head.push(socket.read_u8().await.unwrap());
+        }
+        assert!(head.starts_with(b"GET http://127.0.0.1:51999/selected-route-health HTTP/1.1\r\n"));
+        socket
+            .write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fetcher.fetch_persona_on_route(url, None, Some(&selected)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(out.status, 429);
+    assert_eq!(out.route, selected);
+    assert_ne!(
+        pool.pick_fetch("127.0.0.1", false).unwrap().id,
+        proxies[0].id(),
+        "the actual selected proxy returned 429, so the next call must change lanes"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), b.accept())
+            .await
+            .is_err(),
+        "health feedback must not start a second request in this call"
     );
 }

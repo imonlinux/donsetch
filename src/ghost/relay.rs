@@ -20,12 +20,10 @@
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
-/// A running relay bound to one upstream lane. Dropping it aborts
-/// the accept loop (new connections are refused from then on);
-/// in-flight tunnels are their own tasks and end when their streams
-/// do, so a drop never cuts Chrome mid-connection.
+/// A running relay bound to one upstream lane. Dropping its owner closes
+/// the listener and all owned in-flight handshakes and tunnels.
 pub struct Relay {
     pub port: u16,
     handle: Option<JoinHandle<()>>,
@@ -54,6 +52,16 @@ impl StrikeCache {
 
     fn note_failure(&mut self, host_key: &str) {
         self.prune();
+        if !self.strikes.contains_key(host_key)
+            && self.strikes.len() >= 1024
+            && let Some(oldest) = self
+                .strikes
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(host, _)| host.clone())
+        {
+            self.strikes.remove(&oldest);
+        }
         let now = std::time::Instant::now();
         let (n, at) = self.strikes.entry(host_key.to_owned()).or_insert((0, now));
         // A strike that already expired counts as healed: restart the
@@ -89,17 +97,22 @@ const STRIKE_LIMIT: u8 = 3;
 const STRIKE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Relay {
-    /// Bind 127.0.0.1:0 and start the accept loop. `None` when the
-    /// listener cannot bind (port exhaustion?); the caller then
-    /// falls back to the raw, credential-less proxy arg so the
-    /// launch still proceeds exactly as before.
-    pub async fn spawn(proxy: Arc<crate::transport::proxy::Proxy>) -> Option<Relay> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
-        let port = listener.local_addr().ok()?.port();
+    /// Bind a loopback listener and own the bounded tunnel tasks.
+    /// Bind failures propagate; callers must retain the selected route.
+    pub async fn spawn(proxy: Arc<crate::transport::proxy::Proxy>) -> std::io::Result<Relay> {
+        Self::spawn_with_bypass(proxy, String::new()).await
+    }
+
+    pub(crate) async fn spawn_with_bypass(
+        proxy: Arc<crate::transport::proxy::Proxy>,
+        bypass: String,
+    ) -> std::io::Result<Relay> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
         let handle = tokio::spawn(async move {
-            accept_loop(listener, proxy).await;
+            accept_loop(listener, proxy, Arc::new(bypass)).await;
         });
-        Some(Relay {
+        Ok(Relay {
             port,
             handle: Some(handle),
         })
@@ -119,18 +132,34 @@ impl Drop for Relay {
     }
 }
 
-async fn accept_loop(listener: TcpListener, proxy: Arc<crate::transport::proxy::Proxy>) {
+const MAX_TUNNELS: usize = 64;
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn accept_loop(
+    listener: TcpListener,
+    proxy: Arc<crate::transport::proxy::Proxy>,
+    bypass: Arc<String>,
+) {
     let strikes = std::sync::Arc::new(std::sync::Mutex::new(StrikeCache::default()));
+    let mut tunnels = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        tokio::select! {
+            biased;
+            Some(_) = tunnels.join_next(), if !tunnels.is_empty() => {}
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { return };
+                if tunnels.len() >= MAX_TUNNELS {
+                    // Refuse excess work without retaining sockets or waiters.
+                    drop(stream);
+                    continue;
+                }
                 let proxy = Arc::clone(&proxy);
-                let strikes = std::sync::Arc::clone(&strikes);
-                tokio::spawn(async move {
-                    let _ = serve_socks5_client(stream, proxy, strikes).await;
+                let strikes = Arc::clone(&strikes);
+                let bypass = Arc::clone(&bypass);
+                tunnels.spawn(async move {
+                    let _ = serve_socks5_client(stream, proxy, strikes, bypass).await;
                 });
             }
-            Err(_) => return,
         }
     }
 }
@@ -139,49 +168,20 @@ async fn serve_socks5_client(
     mut client: TcpStream,
     proxy: Arc<crate::transport::proxy::Proxy>,
     strikes: std::sync::Arc<std::sync::Mutex<StrikeCache>>,
+    bypass: Arc<String>,
 ) -> std::io::Result<()> {
-    let mut greeting = [0u8; 2];
-    client.read_exact(&mut greeting).await?;
-    let [ver, nmethods] = greeting;
-    if ver != 5 || nmethods == 0 {
+    let Some((host, port)) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks5_target(&mut client))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "relay SOCKS handshake timed out",
+                )
+            })??
+    else {
         return Ok(());
-    }
-    let mut methods = vec![0u8; nmethods as usize];
-    client.read_exact(&mut methods).await?;
-    client.write_all(&[5u8, 0u8]).await?;
-
-    let mut head = [0u8; 4];
-    client.read_exact(&mut head).await?;
-    let [ver, cmd, _rsv, atyp] = head;
-    if ver != 5 || cmd != 1 {
-        let _ = client
-            .write_all(&[5u8, cmd.max(1), 0u8, 1u8, 0, 0, 0, 0, 0, 0])
-            .await;
-        return Ok(());
-    }
-    let host = match atyp {
-        1u8 => {
-            let mut octets = [0u8; 4];
-            client.read_exact(&mut octets).await?;
-            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
-        }
-        3u8 => {
-            let mut len = [0u8; 1];
-            client.read_exact(&mut len).await?;
-            let mut name = vec![0u8; len[0] as usize];
-            client.read_exact(&mut name).await?;
-            String::from_utf8_lossy(&name).into_owned()
-        }
-        4u8 => {
-            let mut octets = [0u8; 16];
-            client.read_exact(&mut octets).await?;
-            format_ipv6(&octets)
-        }
-        _ => return Ok(()),
     };
-    let mut port_bytes = [0u8; 2];
-    client.read_exact(&mut port_bytes).await?;
-    let port = u16::from_be_bytes(port_bytes);
 
     let host_key = format!("{host}:{port}");
     let refused = strikes
@@ -196,8 +196,19 @@ async fn serve_socks5_client(
         return Ok(());
     }
 
-    match proxy.connect(&host, port).await {
+    let connected = if crate::transport::proxy::no_proxy_match_value(&host, &bypass) {
+        crate::transport::tcp::happy_connect(&host, port).await
+    } else {
+        proxy.connect(&host, port).await
+    };
+    match connected {
         Ok(mut upstream) => {
+            // The route has healed when upstream connect succeeds, even if
+            // this browser tunnel remains active for the rest of the page.
+            strikes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note_success(&host_key);
             if client
                 .write_all(&[5u8, 0u8, 0u8, 1u8, 0, 0, 0, 0, 0, 0])
                 .await
@@ -206,13 +217,6 @@ async fn serve_socks5_client(
                 return Ok(());
             }
             let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-            // A successful connect clears the host's strikes: the
-            // outage that struck it is over, and a fast-reject held
-            // past the healing would starve the page forever.
-            strikes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .note_success(&host_key);
             Ok(())
         }
         Err(e) => {
@@ -232,6 +236,82 @@ async fn serve_socks5_client(
     }
 }
 
+async fn read_socks5_target(client: &mut TcpStream) -> std::io::Result<Option<(String, u16)>> {
+    let mut greeting = [0u8; 2];
+    client.read_exact(&mut greeting).await?;
+    let [ver, nmethods] = greeting;
+    if ver != 5 || nmethods == 0 {
+        return Ok(None);
+    }
+    let mut methods = vec![0u8; nmethods as usize];
+    client.read_exact(&mut methods).await?;
+    if !methods.contains(&0) {
+        client.write_all(&[5, 255]).await?;
+        return Ok(None);
+    }
+    client.write_all(&[5, 0]).await?;
+
+    let mut head = [0u8; 4];
+    client.read_exact(&mut head).await?;
+    let [ver, cmd, rsv, atyp] = head;
+    if ver != 5 || cmd != 1 || rsv != 0 {
+        let _ = client
+            .write_all(&[5, if cmd != 1 { 7 } else { 1 }, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Ok(None);
+    }
+    let host = match atyp {
+        1u8 => {
+            let mut octets = [0u8; 4];
+            client.read_exact(&mut octets).await?;
+            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+        }
+        3u8 => {
+            let mut len = [0u8; 1];
+            client.read_exact(&mut len).await?;
+            let mut name = vec![0u8; len[0] as usize];
+            client.read_exact(&mut name).await?;
+            let Ok(name) = String::from_utf8(name) else {
+                client.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                return Ok(None);
+            };
+            // Never repair invalid bytes or admit CONNECT request-line delimiters.
+            let labels = name.strip_suffix('.').unwrap_or(&name);
+            if labels.is_empty()
+                || labels.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || !label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                })
+            {
+                client.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                return Ok(None);
+            }
+            name
+        }
+        4u8 => {
+            let mut octets = [0u8; 16];
+            client.read_exact(&mut octets).await?;
+            format_ipv6(&octets)
+        }
+        _ => {
+            client.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            return Ok(None);
+        }
+    };
+    let mut port_bytes = [0u8; 2];
+    client.read_exact(&mut port_bytes).await?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    if port == 0 {
+        client.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        return Ok(None);
+    }
+    Ok(Some((host, port)))
+}
+
 fn format_ipv6(octets: &[u8; 16]) -> String {
     octets
         .as_chunks::<2>()
@@ -246,6 +326,396 @@ fn format_ipv6(octets: &[u8; 16]) -> String {
 mod relay_tests {
     use super::*;
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn stealth_v3_relay_bypass_keeps_other_hosts_on_selected_proxy() {
+        unsafe {
+            std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+        }
+        let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_port = direct.local_addr().unwrap().port();
+        let direct_peer = tokio::spawn(async move {
+            let (mut stream, _) = direct.accept().await.unwrap();
+            let mut ping = [0; 4];
+            stream.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b"direct-route").await.unwrap();
+        });
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Arc::new(
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                upstream.local_addr().unwrap()
+            ))
+            .unwrap(),
+        );
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reached.clone();
+        let proxy_peer = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(stream.read_u8().await.unwrap());
+            }
+            assert!(
+                head.starts_with(b"CONNECT example.org:80 HTTP/1.1\r\n"),
+                "{head:?}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Established\r\n\r\nproxy-route!")
+                .await
+                .unwrap();
+        });
+        let relay = Relay::spawn_with_bypass(proxy, "127.0.0.1:1".into())
+            .await
+            .unwrap();
+        async fn connect(port: u16, target: &[u8]) -> TcpStream {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            client.write_all(target).await.unwrap();
+            let mut result = [0; 10];
+            client.read_exact(&mut result).await.unwrap();
+            assert_eq!(&result[..2], &[5, 0]);
+            client
+        }
+        let mut target = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        target.extend_from_slice(&direct_port.to_be_bytes());
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connect(relay.port, &target),
+        )
+        .await
+        .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut content = [0; 12];
+        client.read_exact(&mut content).await.unwrap();
+        assert_eq!(&content, b"direct-route");
+        assert_eq!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bypassed origin must never dial the proxy"
+        );
+        drop(client);
+        direct_peer.await.unwrap();
+        let mut proxied = connect(relay.port, b"\x05\x01\x00\x03\x0bexample.org\x00\x50").await;
+        proxied.read_exact(&mut content).await.unwrap();
+        assert_eq!(&content, b"proxy-route!");
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
+        proxy_peer.await.unwrap();
+        drop(proxied);
+        drop(relay);
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_connected_tunnel_clears_strikes_before_close() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Arc::new(
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                upstream.local_addr().unwrap()
+            ))
+            .unwrap(),
+        );
+        let (release, released) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(stream.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"CONNECT example.org:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut ping = [0; 4];
+            stream.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            released.await.unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let strikes = Arc::new(std::sync::Mutex::new(StrikeCache::default()));
+        strikes.lock().unwrap().note_failure("example.org:443");
+        strikes.lock().unwrap().note_failure("example.org:443");
+        let observed = strikes.clone();
+        let tunnel = tokio::spawn(serve_socks5_client(
+            stream,
+            proxy,
+            strikes,
+            Arc::new(String::new()),
+        ));
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut answer = [0; 2];
+        client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [5, 0]);
+        client
+            .write_all(b"\x05\x01\x00\x03\x0bexample.org\x01\xbb")
+            .await
+            .unwrap();
+        let mut success = [0; 10];
+        client.read_exact(&mut success).await.unwrap();
+        assert_eq!(&success[..2], &[5, 0]);
+        client.write_all(b"ping").await.unwrap();
+        let mut pong = [0; 4];
+        client.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+        assert!(
+            !observed
+                .lock()
+                .unwrap()
+                .strikes
+                .contains_key("example.org:443"),
+            "an actual connected live tunnel must clear prior failures before it closes"
+        );
+        release.send(()).unwrap();
+        drop(client);
+        peer.await.unwrap();
+        tunnel.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_malformed_targets_never_dial_upstream() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            crate::transport::proxy::Proxy::parse(&format!("http://{}", up.local_addr().unwrap()))
+                .unwrap();
+        let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
+        let mut invalid = vec![
+            vec![5, 1, 1, 1, 127, 0, 0, 1, 1, 187],
+            vec![5, 2, 0, 1, 127, 0, 0, 1, 1, 187],
+            vec![5, 1, 0, 9],
+            vec![5, 1, 0, 1, 127, 0, 0, 1, 0, 0],
+        ];
+        for name in [
+            b"".as_slice(),
+            b"bad\r\nhost",
+            b"bad/host",
+            b"\xffhost",
+            b"two..labels",
+        ] {
+            let mut request = vec![5, 1, 0, 3, name.len() as u8];
+            request.extend_from_slice(name);
+            request.extend_from_slice(&443u16.to_be_bytes());
+            invalid.push(request);
+        }
+        for request in invalid {
+            let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut greeting = [0; 2];
+            client.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 0]);
+            client.write_all(&request).await.unwrap();
+            let mut reply = [0; 10];
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client.read_exact(&mut reply),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(reply[0], 5);
+            assert!(
+                matches!(reply[1], 1 | 7 | 8),
+                "invalid request must receive a real failure: {reply:?}"
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), up.accept())
+                    .await
+                    .is_err(),
+                "invalid request {request:?} must not reach the upstream listener"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_stalled_negotiation_expires() {
+        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:809").unwrap();
+        let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        let started = std::time::Instant::now();
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(12), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(9),
+            "normal clients retain the ten-second negotiation allowance"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_never_selects_an_unoffered_auth_method() {
+        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:809").unwrap();
+        let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        client.write_all(&[5, 1, 2]).await.unwrap();
+        let mut reply = [0; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            reply,
+            [5, 255],
+            "relay cannot select no-auth when only password auth was offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_drop_closes_actual_active_tunnel() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = crate::transport::proxy::Proxy::parse(&format!(
+            "http://alice:secret@{}",
+            up.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = up.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 4096);
+                head.push(peer.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("CONNECT owned.test:443 HTTP/1.1\r\n"));
+            assert!(head.contains("Proxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n"));
+            peer.write_all(b"HTTP/1.1 200 Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut payload = [0; 4];
+            peer.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            peer.write_all(b"pong").await.unwrap();
+            let mut extra = [0; 1];
+            assert_eq!(
+                peer.read(&mut extra).await.unwrap(),
+                0,
+                "relay retirement closes its upstream too"
+            );
+        });
+        let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        client.write_all(&[5, 2, 2, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        let mut request = vec![5, 1, 0, 3, 10];
+        request.extend_from_slice(b"owned.test");
+        request.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        client.write_all(b"ping").await.unwrap();
+        let mut payload = [0; 4];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(
+            &payload, b"pong",
+            "actual tunnel must be live before retirement"
+        );
+        drop(relay);
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client.read(&mut payload)
+            )
+            .await
+            .expect("active relay tunnel must not survive its owner")
+            .unwrap(),
+            0
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(300), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_bounds_stalled_clients_and_releases_them() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy =
+            crate::transport::proxy::Proxy::parse(&format!("http://{}", up.local_addr().unwrap()))
+                .unwrap();
+        let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..64 {
+            let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+            clients.push(client);
+        }
+        let mut excess = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                excess.read(&mut byte)
+            )
+            .await
+            .expect("excess connection must be refused immediately")
+            .unwrap(),
+            0
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), up.accept())
+                .await
+                .is_err(),
+            "stalled local greetings must not dial upstream"
+        );
+        let mut released = clients.pop().unwrap();
+        released.write_all(&[5, 2, 0, 1]).await.unwrap();
+        let mut failure = [0; 10];
+        released.read_exact(&mut failure).await.unwrap();
+        assert_eq!(failure[1], 7);
+        assert_eq!(released.read(&mut byte).await.unwrap(), 0);
+        let mut replacement = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        replacement.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            replacement.read_exact(&mut reply),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reply,
+            [5, 0],
+            "released capacity must accept a new handshake"
+        );
+        clients.push(replacement);
+        drop(relay);
+        for mut client in clients {
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    client.read(&mut byte)
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                0
+            );
+        }
+    }
 
     /// The relay turns Chrome's unauthenticated SOCKS5 into the
     /// lane's authenticated upstream handshake, then pipes bytes.
@@ -350,6 +820,25 @@ mod relay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_relay_failure_memory_stays_bounded() {
+        let mut cache = StrikeCache::default();
+        for ordinal in 0..1025 {
+            for _ in 0..STRIKE_LIMIT {
+                cache.note_failure(&format!("owned-{ordinal}.test:443"));
+            }
+        }
+        assert!(
+            cache.strikes.len() <= 1024,
+            "fresh hostile hosts must not grow memory for the entire TTL"
+        );
+        assert!(cache.refused("owned-1024.test:443"));
+        assert!(
+            !cache.refused("owned-0.test:443"),
+            "oldest row is the bounded eviction candidate"
+        );
+    }
 
     /// The strike cache must not punish a healed host: three fresh
     /// dial failures fast-reject, strikes expire after the TTL, a

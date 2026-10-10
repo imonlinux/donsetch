@@ -2,7 +2,7 @@
 //!
 //! Checks, each with a clean pass/warn/fail icon and a dim
 //! detail string. Auto-fixes what it can (creates missing dirs,
-//! removes stale lock files). Prints instructions for issues that
+//! backs up corrupt state). Prints instructions for issues that
 //! need manual intervention.
 //!
 //! The browser path must be BORING to install (50-case report):
@@ -27,6 +27,206 @@ enum CheckResult {
     Warn(String),
     Fail(String, String), // (detail, instructions)
     Fixed(String),
+}
+
+fn check_counts(checks: &[(String, String, String, String)]) -> (u32, u32, u32) {
+    checks
+        .iter()
+        .fold((0, 0, 0), |(p, w, f), (_, status, _, _)| {
+            match status.as_str() {
+                "pass" | "fixed" => (p + 1, w, f),
+                "warn" => (p, w + 1, f),
+                _ => (p, w, f + 1),
+            }
+        })
+}
+
+fn render_checks(checks: &[(String, String, String, String)]) {
+    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|w| w.parse::<usize>().ok())
+        .unwrap_or(96)
+        .clamp(60, 140);
+    let (passed, warnings, failed) = check_counts(checks);
+    println!("  {passed} passed   {warnings} warnings   {failed} failed");
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "Runtime & browser",
+            &[
+                "Binary integrity",
+                "Installation",
+                "Chrome/Chromium",
+                "Xvfb",
+                "Browser launch",
+                "Ghost profile",
+                "ONNX Runtime",
+                "PDFium",
+                "OCR models",
+                "Rerank model",
+            ],
+        ),
+        (
+            "Network & search",
+            &[
+                "Fetcher init",
+                "Network",
+                "TLS fingerprint",
+                "Fetch egress",
+                "Proxy pool",
+                "Egress lanes",
+                "DNS",
+                "Captive portal",
+                "Bright Data SERP",
+                "Bypass unlocker",
+                "Search plugins",
+                "Search health",
+            ],
+        ),
+        (
+            "Configuration & state",
+            &[
+                "Cache directory",
+                "Auth sessions",
+                "State permissions",
+                "Ghost state",
+                "Config posture",
+                "Clearance stores",
+                "Crawl stores",
+                "Legacy env vars",
+            ],
+        ),
+    ];
+    for (label, names) in groups {
+        println!("\n  {}", cli::bold(label));
+        // Put failures and warnings first within each stable group.
+        for severity in ["fail", "warn", "fixed", "pass"] {
+            for (name, status, detail, hint) in checks
+                .iter()
+                .filter(|(name, status, _, _)| names.contains(&name.as_str()) && status == severity)
+            {
+                let icon = match status.as_str() {
+                    "pass" | "fixed" => cli::icon_pass(),
+                    "warn" => cli::icon_warn(),
+                    _ => cli::icon_fail(),
+                };
+                let detail = if status == "fixed" {
+                    format!("fixed: {detail}")
+                } else {
+                    detail.clone()
+                };
+                let lines = wrap_detail(&detail, width - 30);
+                println!(
+                    "  {icon} {name:<24}  {}",
+                    cli::dim(lines.first().map(String::as_str).unwrap_or(""))
+                );
+                for line in lines.iter().skip(1) {
+                    println!("{:30}{}", "", cli::dim(line));
+                }
+                if status == "fail" && !hint.is_empty() {
+                    for line in wrap_detail(hint, width - 6) {
+                        println!("      {}", cli::yellow(&line));
+                    }
+                }
+            }
+        }
+    }
+    if checks.iter().any(|(_, s, _, _)| s == "fail") {
+        println!(
+            "\n  {}",
+            cli::bold(
+                "Next: donsetch doctor --fix (safe repairs), then follow any remaining instructions."
+            )
+        );
+    }
+    println!(
+        "\n  {}",
+        cli::dim("More: --deep for live probes · --mcp for client setup · --json for agents")
+    );
+}
+
+fn wrap_detail(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut cells = 0;
+    for word in text.split_whitespace() {
+        let word_cells: usize = word
+            .chars()
+            .filter(|c| !c.is_control())
+            .map(|c| if c.is_ascii() { 1 } else { 2 })
+            .sum();
+        if !line.is_empty() && cells + 1 + word_cells > width {
+            lines.push(std::mem::take(&mut line));
+            cells = 0;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            cells += 1;
+        }
+        for ch in word.chars().filter(|c| !c.is_control()) {
+            let size = if ch.is_ascii() { 1 } else { 2 };
+            if cells + size > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                cells = 0;
+            }
+            line.push(ch);
+            cells += size;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn installation_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let path = dir.join(if cfg!(windows) {
+            "donsetch.exe"
+        } else {
+            "donsetch"
+        });
+        if path.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if path
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 == 0)
+                {
+                    continue;
+                }
+            }
+            let canonical = path.canonicalize().unwrap_or(path);
+            if !paths.contains(&canonical) {
+                paths.push(canonical);
+            }
+        }
+    }
+    paths
+}
+
+fn check_installation() -> CheckResult {
+    let current = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| e.to_string());
+    let mut paths = installation_paths();
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if !paths.contains(&exe) {
+            paths.push(exe);
+        }
+    }
+    if paths.len() > 1 {
+        CheckResult::Warn(format!(
+            "{} distinct PATH installs; running {} at {current}. Pin this absolute path in MCP config (--mcp).",
+            paths.len(),
+            env!("CARGO_PKG_VERSION")
+        ))
+    } else {
+        CheckResult::Pass(format!("{} at {current}", env!("CARGO_PKG_VERSION")))
+    }
 }
 
 pub async fn run() {
@@ -62,12 +262,6 @@ pub async fn run() {
         std::process::exit(code);
     }
 
-    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
-    println!();
-
-    let mut p = 0u32; // passed
-    let mut w = 0u32; // warnings
-    let mut f = 0u32; // failed
     // (name, status, detail, hint) collected for --json and --fix.
     let mut collected: Vec<(String, String, String, String)> = Vec::new();
 
@@ -76,23 +270,15 @@ pub async fn run() {
             match $r {
                 CheckResult::Pass(d) => {
                     collected.push(($name.to_string(), "pass".into(), d.clone(), String::new()));
-                    cli::check_pass($name, &d);
-                    p += 1;
                 }
                 CheckResult::Warn(d) => {
                     collected.push(($name.to_string(), "warn".into(), d.clone(), String::new()));
-                    cli::check_warn($name, &d);
-                    w += 1;
                 }
                 CheckResult::Fail(d, i) => {
                     collected.push(($name.to_string(), "fail".into(), d.clone(), i.clone()));
-                    cli::check_fail($name, &d, &i);
-                    f += 1;
                 }
                 CheckResult::Fixed(d) => {
                     collected.push(($name.to_string(), "fixed".into(), d.clone(), String::new()));
-                    cli::check_fixed($name, &d);
-                    p += 1;
                 }
             }
         };
@@ -100,17 +286,12 @@ pub async fn run() {
 
     // 1. Binary integrity.
     report!("Binary integrity", check_binary());
+    report!("Installation", check_installation());
 
     // Create fetcher for network and TLS checks.
     let fetcher = match Fetcher::new(BrowserProfile::host_default()) {
         Ok(fm) => Some(fm),
         Err(e) => {
-            cli::check_fail(
-                "Fetcher init",
-                &e.to_string(),
-                "TLS initialization failed : check system CA certificates",
-            );
-            f += 1;
             collected.push((
                 "Fetcher init".into(),
                 "fail".into(),
@@ -155,10 +336,10 @@ pub async fn run() {
     // 6. Ghost profile.
     report!("Ghost profile", check_ghost_profile());
 
-    // 7. Browser launch: the only heavyweight probe. Fast mode
-    // (default) skips the seconds-long live launch; --deep runs it.
+    // Browser availability means a real launch and selftest, including in
+    // default mode. Deep adds network/provider probes.
+    report!("Browser launch", check_browser_launch().await);
     if deep {
-        report!("Browser launch", check_browser_launch().await);
         // Captive portal: generate_204 must stay 204. A hotel/airport
         // login page answering 200/302 is the classic "TLS works but
         // every fetch is a login form" failure.
@@ -166,9 +347,6 @@ pub async fn run() {
             "Captive portal",
             check_captive_portal(fetcher.as_ref()).await
         );
-    } else {
-        cli::check_dim("Browser launch", "skipped (--deep to run)");
-        cli::check_dim("Captive portal", "skipped (--deep to run)");
     }
 
     // 8. Cache directory.
@@ -198,8 +376,8 @@ pub async fn run() {
     // 15. Bright Data account keys (SERP + unlocker): the paid
     // layer gets more than a y/n. Default mode validates locally
     // (presence, shape, cap + cache state, kill switches); --deep
-    // adds a free live zone probe (route_ips costs nothing).
-    report!("Bright Data SERP", check_brightdata());
+    // adds a free account-zone check (no target request).
+    report!("Bright Data SERP", check_brightdata(deep));
     report!("Bypass unlocker", check_bypass(deep));
 
     // 15.5 BYOK plugins (user-registered executable adapters).
@@ -222,7 +400,9 @@ pub async fn run() {
     report!("DNS", check_dns());
 
     // 21. MCP client registration (detect + print blocks).
-    print_mcp_section();
+    if only_mcp {
+        print_mcp_section();
+    }
 
     // 22. Legacy env vars (the pre-v4 names): still honored, but
     // each one active in this shell gets ONE warning naming its
@@ -247,11 +427,15 @@ pub async fn run() {
     // ── Self-healing pass (--fix) ───────────────────────────
     if fix {
         println!();
-        let _ = apply_fixes(&mut collected).await;
+        apply_fixes(&mut collected);
     }
 
     // ── Summary ──────────────────────────────────────────────
     println!();
+    let (p, w, f) = check_counts(&collected);
+    if !json {
+        render_checks(&collected);
+    }
     let total = p + w + f;
     println!("  {p}/{total} passed, {w} warning(s), {f} failed");
     cli::print_footer();
@@ -383,7 +567,15 @@ fn check_fetch_egress() -> CheckResult {
     // unconditionally so the doctor's view matches the daemon's
     // (a TOML proxy with from_environment = false used to be
     // reported as direct egress).
-    let resolved = crate::transport::proxy::from_env_for("https://example.com");
+    let resolved = match crate::transport::proxy::from_env_for("https://example.com") {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            return CheckResult::Fail(
+                error.to_string(),
+                "Correct the configured proxy endpoint or proxy environment variable.".into(),
+            );
+        }
+    };
     let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
     let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
 
@@ -545,7 +737,7 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
     let summary = pool.lane_summary();
     if summary.is_empty() || (summary.len() == 1 && summary[0].is_direct) {
         return CheckResult::Pass(
-            "direct-only egress (no proxy pool; search/crawl/fetch share the home IP)".into(),
+            "direct-only egress (no proxy pool; every tool rides the home IP)".into(),
         );
     }
     let mut bits: Vec<String> = Vec::new();
@@ -573,10 +765,37 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
         bits.push(line);
     }
 
+    // Fetch posture rides the summary: with the opt-in off (the
+    // default) a configured pool does not touch web_fetch at all.
+    bits.insert(
+        0,
+        if crate::config::cfg().proxy.fetch_rotate {
+            "fetch: pooled (proxy.fetch_rotate)".to_string()
+        } else {
+            "fetch: direct; `donsetch proxy fetch on` opts in".to_string()
+        },
+    );
+    if !crate::config::cfg().proxy.crawl_rotate {
+        bits.insert(1, "crawl: direct (proxy.crawl_rotate=false)".to_string());
+    }
+
     if deep {
         let proxies = pool.proxies();
         if !proxies.is_empty() {
             let results = crate::cli::proxy::probe_all(&proxies).await;
+            // Every probe failing is inconclusive about the lanes: the
+            // shared probe endpoint itself may be down. Health state is
+            // left untouched: failed probes are not benched and prior
+            // bans are never revived away (the old "benches cleared"
+            // erased legitimate dead/auth evidence).
+            if results.iter().all(|r| !r.alive) {
+                bits.push(
+                    "all lanes failed the live probe (the probe endpoint may be down): \
+                     health state left untouched, no benches written or cleared"
+                        .into(),
+                );
+                return CheckResult::Warn(bits.join(" · "));
+            }
             let mut dead = 0usize;
             let mut slow = 0usize;
             for (px, r) in proxies.iter().zip(results.iter()) {
@@ -602,15 +821,6 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
                         r.error.as_deref().unwrap_or("probe failed")
                     ));
                 }
-            }
-            // All dead = probe endpoint died, not the pool.
-            if !proxies.is_empty() && dead == proxies.len() {
-                pool.revive_all();
-                bits.push(
-                    "all lanes failed the live probe (likely api.ipify.org down); benches cleared"
-                        .into(),
-                );
-                return CheckResult::Warn(bits.join(" · "));
             }
             if dead > 0 {
                 return CheckResult::Fail(
@@ -742,22 +952,13 @@ fn check_xvfb() -> CheckResult {
 /// the 50-case report's "a feature that works only when the
 /// user guesses the hidden prerequisite is not finished".
 async fn check_browser_launch() -> CheckResult {
+    let manager = crate::ghost::manager::GhostManager::new().await;
     let inner = async {
-        // Same Xvfb handling as GhostManager: start/reuse :99.
-        let xvfb = if crate::ghost::cloak::headless_mode_requested() {
-            None
-        } else {
-            crate::ghost::xvfb::Xvfb::start().await.ok()
-        };
-        let display = xvfb.as_ref().map(|x| x.display_env());
         let profile = BrowserProfile::host_default();
         let t0 = std::time::Instant::now();
-        let mut ghost = match crate::ghost::Ghost::launch(&profile, display.as_deref()).await {
+        let mut ghost = match manager.acquire(&profile).await {
             Ok(g) => g,
             Err(e) => {
-                if let Some(x) = xvfb {
-                    x.kill().await;
-                }
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
                     "Tier 2 browser fallback will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
@@ -767,10 +968,7 @@ async fn check_browser_launch() -> CheckResult {
         let launch_ms = t0.elapsed().as_millis();
 
         let fp = crate::ghost::ops::selftest(&mut ghost).await;
-        ghost.kill().await;
-        if let Some(x) = xvfb {
-            x.kill().await;
-        }
+        drop(ghost);
         match fp {
             Ok(json_str) => {
                 let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
@@ -837,17 +1035,15 @@ async fn check_browser_launch() -> CheckResult {
         }
     };
     // Hard bound: a wedged browser here must not hang doctor.
-    match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
         Ok(r) => r,
         Err(_) => CheckResult::Fail(
             "launch timed out after 40s".into(),
-            if cfg!(target_os = "linux") {
-                "A stale Chromium or Xvfb may be wedged: pkill -f chromium; rm -f /tmp/.X99-lock /tmp/.X11-unix/X99".into()
-            } else {
-                "A stale Chromium may be wedged: close all browser windows / kill all chrome processes, then retry".into()
-            },
+            "Run doctor --fix and inspect the browser/display checks. Close only a confirmed stale DonGhost process; preserve other browser sessions and live display sockets.".into(),
         ),
-    }
+    };
+    manager.shutdown().await;
+    result
 }
 
 /// Sets every regular file under `root` that others can read to
@@ -1052,30 +1248,30 @@ fn check_ghost_profile() -> CheckResult {
         };
     }
 
-    // Check writable.
-    let test = dir.join(".doctor-write-test");
-    match std::fs::write(&test, b"test") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&test);
-
-            // Check for stale singleton lock files.
-            let mut stale = 0;
-            for f in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-                let p = dir.join(f);
-                if p.exists() {
-                    let _ = std::fs::remove_file(&p);
-                    stale += 1;
-                }
-            }
-
-            if stale > 0 {
-                CheckResult::Fixed(format!("removed {stale} stale lock(s)"))
-            } else {
-                CheckResult::Pass("writable, no stale locks".into())
-            }
-        }
+    match probe_writable(&dir) {
+        Ok(()) => CheckResult::Pass("writable; profile locks preserved".into()),
         Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
     }
+}
+
+// Probe only a newly created file owned by this check. A fixed filename can
+// overwrite a user's file or follow a symlink; Chromium owns its own locks.
+fn probe_writable(dir: &Path) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!(".doctor-write-{}-{nonce}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    drop(file);
+    std::fs::remove_file(path)
 }
 
 fn check_auth_sessions() -> CheckResult {
@@ -1120,10 +1316,8 @@ fn check_cache_dir() -> CheckResult {
         };
     }
 
-    let test = dir.join(".doctor-write-test");
-    match std::fs::write(&test, b"test") {
+    match probe_writable(&dir) {
         Ok(()) => {
-            let _ = std::fs::remove_file(&test);
             let total = dir_size(&dir);
 
             // Breakdown by component : helps users understand what's
@@ -1315,6 +1509,22 @@ fn check_onnx() -> CheckResult {
 }
 
 fn check_ghost_state() -> CheckResult {
+    let path = paths::cache_dir().join("ghost-state.json");
+    if path.exists() {
+        match std::fs::read(&path) {
+            Ok(body) => {
+                if let Err(e) = serde_json::from_slice::<crate::ghost::cache::GhostState>(&body) {
+                    return CheckResult::Fail(format!("invalid state: {e}"), "Run `donsetch doctor --fix` to preserve the corrupt file as a backup and rebuild route memory.".into());
+                }
+            }
+            Err(e) => {
+                return CheckResult::Fail(
+                    format!("cannot read state: {e}"),
+                    "Check cache directory permissions.".into(),
+                );
+            }
+        }
+    }
     let state = crate::ghost::cache::GhostState::load();
     let domains = state.profiles.len();
     let renders = state.renders.len();
@@ -1626,23 +1836,35 @@ fn mask_key(k: &str) -> String {
 }
 
 /// Bright Data SERP key: local validation + a free live zone probe
-/// in --deep mode (route_ips costs nothing, so the check can
-/// confirm token + zone without spending a cent).
-fn check_brightdata() -> CheckResult {
+/// in --deep mode (account zone metadata confirms token access,
+/// zone existence and product type without a paid target request).
+fn check_brightdata(deep: bool) -> CheckResult {
     let cfg = crate::search::byok::store::ByokConfig::load();
     let Some(entry) = cfg
         .providers
         .iter()
         .find(|p| p.name == "brightdata")
-        .and_then(|p| p.keys.first())
+        .and_then(|p| {
+            p.keys
+                .iter()
+                .find(|k| k.state == crate::search::byok::store::KeyState::Active)
+                .or_else(|| p.keys.first())
+        })
     else {
         return CheckResult::Warn(
-            "not configured : keyless search still works, but SERP costs nothing to add via `donsetch keys add brightdata <token>[::zone]`"
+            "not configured (optional, paid search: donsetch keys add brightdata <token>::<SERP zone>)"
                 .to_string(),
         );
     };
-    let (_, zone) = crate::search::byok::brightdata_key_parts(&entry.key)
-        .unwrap_or_else(|_| (String::new(), String::new()));
+    let (token, zone) = match crate::search::byok::brightdata_key_parts(&entry.key) {
+        Ok(parts) => parts,
+        Err(e) => {
+            return CheckResult::Fail(
+                e,
+                "re-add the API token with the exact SERP zone name; see docs/brightdata.md".into(),
+            );
+        }
+    };
     let masked = mask_key(&entry.key);
     let state = match entry.state {
         crate::search::byok::store::KeyState::Active => "active",
@@ -1656,7 +1878,12 @@ fn check_brightdata() -> CheckResult {
             "`donsetch keys reset brightdata` re-activates the key after you fix the problem on Bright Data's side.".to_string(),
         );
     }
-    CheckResult::Pass(format!("{masked} on zone {zone}, {state}"))
+    let base = format!("{masked} on zone {zone}, {state}");
+    if deep {
+        check_zone_probe(base, token, zone, "serp")
+    } else {
+        CheckResult::Pass(base)
+    }
 }
 
 fn check_bypass(deep: bool) -> CheckResult {
@@ -1668,14 +1895,26 @@ fn check_bypass(deep: bool) -> CheckResult {
                 .to_string(),
         );
     }
-    let Some(key) = crate::fetch::bypass::active_unlocker_key(&cfg) else {
+    let usable = crate::fetch::bypass::active_unlocker_key(&cfg);
+    let stored = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == "unlocker")
+        .and_then(|p| p.keys.first());
+    let Some(key) = usable.clone().or_else(|| stored.map(|k| k.key.clone())) else {
         return CheckResult::Warn(
             "not configured (optional, opt-in: donsetch keys add unlocker <key>[::zone])"
                 .to_string(),
         );
     };
+    if usable.is_none() {
+        return CheckResult::Fail(
+            format!("unlocker configured but unavailable: {}", stored.expect("stored key selected").state.label()),
+            "wait for a rate-limit cooldown; after fixing token/balance, run `donsetch keys reset unlocker`".into(),
+        );
+    }
     let parsed = crate::fetch::bypass::parse_key(&key, crate::fetch::bypass::DEFAULT_ZONE);
-    let (_, zone) = match &parsed {
+    let (token, zone) = match &parsed {
         Ok((t, z)) => (t.clone(), z.clone()),
         Err(_) => (String::new(), String::new()),
     };
@@ -1716,109 +1955,55 @@ fn check_bypass(deep: bool) -> CheckResult {
         "{masked} on zone {zone}{cap_note}{cache_note}, render-on-solve {}",
         if bc.render { "on" } else { "off" }
     );
-    // --deep: live, free zone validation (route_ips endpoint).
+    // --deep: free account-zone validation.
     if deep {
-        let zone_for_probe = zone.clone();
-        let token_for_probe = key
-            .split_once("::")
-            .map(|(t, _)| t.to_string())
-            .unwrap_or_else(|| key.clone());
-        match std::thread::Builder::new()
-            .name("bd-probe".into())
-            .spawn(move || bright_zone_probe(&token_for_probe, &zone_for_probe))
-        {
-            Ok(handle) => match handle.join() {
-                Ok(ZoneProbeOut::Routed(n)) => {
-                    CheckResult::Pass(format!("{base} ; live zone probe OK ({n} IPs routed)"))
-                }
-                Ok(ZoneProbeOut::Skipped { reason }) => CheckResult::Pass(format!(
-                    "{base} ; live zone probe skipped: {reason} (no credits spent, nothing billed)"
-                )),
-                Ok(ZoneProbeOut::Failed { reason }) => CheckResult::Warn(format!(
-                    "{base} ; live zone probe failed: {reason} (free check, nothing billed)"
-                )),
-                Err(_) => CheckResult::Pass(base),
-            },
-            Err(_) => CheckResult::Pass(base),
-        }
+        check_zone_probe(base, token, zone, "unblocker")
     } else {
         CheckResult::Pass(base)
     }
 }
 
-/// The result of the free Bright Data zone probe.
+fn check_zone_probe(
+    base: String,
+    token: String,
+    zone: String,
+    product: &'static str,
+) -> CheckResult {
+    match std::thread::Builder::new()
+        .name("bd-probe".into())
+        .spawn(move || bright_zone_probe(&token, &zone, product))
+    {
+        Ok(handle) => match handle.join() {
+            Ok(ZoneProbeOut::Validated) => CheckResult::Pass(format!(
+                "{base} ; token, zone and product verified (free account check)"
+            )),
+            Ok(ZoneProbeOut::Skipped { reason }) => CheckResult::Warn(format!(
+                "{base} ; live zone probe skipped: {reason} (token and zone remain unverified)"
+            )),
+            Ok(ZoneProbeOut::Failed { reason }) => CheckResult::Warn(format!(
+                "{base} ; live zone probe failed: {reason} (free check, nothing billed)"
+            )),
+            Err(_) => CheckResult::Warn(format!("{base} ; live zone probe thread failed")),
+        },
+        Err(e) => CheckResult::Warn(format!("{base} ; live zone probe could not start: {e}")),
+    }
+}
+
+/// Result of the free account-zone check; no target request is made.
 #[derive(Debug, PartialEq, Eq)]
 enum ZoneProbeOut {
-    /// The zone answered with its IP count.
-    Routed(usize),
-    /// The zone is valid-shaped but has no static pool to list
-    /// (Web Access API and other dynamic-IP zones): Bright Data
-    /// answers 403 "Static routes not found". Not a failure; the
-    /// token simply cannot be exercised without spending a credit.
-    Skipped {
-        reason: String,
-    },
-    Failed {
-        reason: String,
-    },
+    Validated,
+    Skipped { reason: String },
+    Failed { reason: String },
 }
 
-/// Classify the route_ips HTTP answer before any JSON parsing.
-/// The distinction that matters: a 401 is a bad token, a 403 that
-/// says the zone has no static pool is a skip (never a failure),
-/// and every other non-200 stays a plain failure.
-fn classify_route_ips(status: u16, body: &str) -> ZoneProbeOut {
-    if status == 200 {
-        return ZoneProbeOut::Routed(0); // count parsed by the caller
-    }
-    if status == 401 {
-        return ZoneProbeOut::Failed {
-            reason: "the token was rejected (401) : check it in the Bright Data dashboard"
-                .to_string(),
-        };
-    }
-    if status == 403 {
-        let lower = body.to_ascii_lowercase();
-        if lower.contains("static routes") && lower.contains("not found") {
-            return ZoneProbeOut::Skipped {
-                reason: "the zone type has no static route pool (Bright Data: Static routes not found) : dynamic zones such as Web Access API cannot be pre-checked without spending a credit"
-                    .to_string(),
-            };
-        }
-        return ZoneProbeOut::Failed {
-            reason: "the zone name or access was refused (403) : check the zone spelling in the dashboard"
-                .to_string(),
-        };
-    }
-    ZoneProbeOut::Failed {
-        reason: format!("HTTP {status}"),
-    }
-}
-
-/// Bright Data API root. The route_ips endpoint is appended by
-/// `route_ips_url`; `bright_zone_probe_at` takes this root (the
-/// production value here, a local rig root in tests) and never the
-/// full endpoint, or the appended path would double.
 const BRIGHT_API_BASE: &str = "https://api.brightdata.com";
 
-/// The zone route_ips URL for a base. Kept separate so the ship
-/// path and the test rig build the URL the same way: pass the API
-/// ROOT, the endpoint path is appended exactly once.
-fn route_ips_url(base: &str, zone: &str) -> String {
-    format!("{base}/zone/route_ips?zone={zone}")
+fn bright_zone_probe(token: &str, zone: &str, product: &str) -> ZoneProbeOut {
+    bright_zone_probe_at(BRIGHT_API_BASE, token, zone, product)
 }
 
-/// Free Bright Data validation: the zone route_ips endpoint lists
-/// the zone's IP pool without making a request, so a dead token or
-/// wrong zone name shows up here before the first paid unlock.
-fn bright_zone_probe(token: &str, zone: &str) -> ZoneProbeOut {
-    bright_zone_probe_at(BRIGHT_API_BASE, token, zone)
-}
-
-/// The probe against an API base (the production root in the ship
-/// path, a local rig root in tests); the route_ips endpoint is
-/// appended by `route_ips_url`.
-fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+fn bright_zone_probe_at(base: &str, token: &str, zone: &str, product: &str) -> ZoneProbeOut {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1830,10 +2015,55 @@ fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
             };
         }
     };
-    rt.block_on(bright_zone_probe_async(base, token, zone))
+    rt.block_on(bright_zone_probe_async(base, token, zone, product))
 }
 
-async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+fn classify_zones(status: u16, body: &[u8], zone: &str, product: &str) -> ZoneProbeOut {
+    if status == 403 {
+        return ZoneProbeOut::Skipped {
+            reason: "token cannot list account zones (403); check its permissions in the dashboard"
+                .into(),
+        };
+    }
+    if status != 200 {
+        return ZoneProbeOut::Failed {
+            reason: format!(
+                "account-zone check returned HTTP {status}; check token and account access"
+            ),
+        };
+    }
+    let zones: Vec<serde_json::Value> = match serde_json::from_slice(body) {
+        Ok(zones) => zones,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("invalid account-zone response: {e}"),
+            };
+        }
+    };
+    let Some(found) = zones
+        .iter()
+        .find(|z| z.get("name").and_then(|v| v.as_str()) == Some(zone))
+    else {
+        return ZoneProbeOut::Failed {
+            reason: format!("zone {zone:?} not found; use the exact dashboard name after ::"),
+        };
+    };
+    if found.get("type").and_then(|v| v.as_str()) != Some(product) {
+        return ZoneProbeOut::Failed {
+            reason: format!(
+                "zone {zone:?} is not a {product} zone; use separate SERP API and Web Unlocker zones (docs/brightdata.md)"
+            ),
+        };
+    }
+    ZoneProbeOut::Validated
+}
+
+async fn bright_zone_probe_async(
+    base: &str,
+    token: &str,
+    zone: &str,
+    product: &str,
+) -> ZoneProbeOut {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1845,37 +2075,40 @@ async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZonePro
             };
         }
     };
-    let url = route_ips_url(base, zone);
-    let resp = match client.get(url).bearer_auth(token).send().await {
+    let mut resp = match client
+        .get(format!("{base}/zone/get_active_zones"))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             return ZoneProbeOut::Failed {
-                reason: format!("request: {e}"),
+                reason: format!("request: {}", e.without_url()),
             };
         }
     };
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    let mut out = classify_route_ips(status, &body);
-    if let ZoneProbeOut::Routed(ref mut n) = out {
-        *n = match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => {
-                if let Some(count) = v.get("ip_count").and_then(|x| x.as_u64()) {
-                    count as usize
-                } else if let Some(ips) = v.get("ips").and_then(|x| x.as_array()) {
-                    ips.len()
-                } else {
-                    0
-                }
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= 1024 * 1024 => {
+                body.extend_from_slice(&chunk)
             }
-            Err(e) => {
+            Ok(Some(_)) => {
                 return ZoneProbeOut::Failed {
-                    reason: format!("parse: {e}"),
+                    reason: "account-zone response exceeds 1 MiB".into(),
                 };
             }
-        };
+            Ok(None) => break,
+            Err(e) => {
+                return ZoneProbeOut::Failed {
+                    reason: format!("response read failed: {}", e.without_url()),
+                };
+            }
+        }
     }
-    out
+    classify_zones(status, &body, zone, product)
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -1964,7 +2197,7 @@ fn print_mcp_section() {
         .unwrap_or_else(|_| "donsetch".to_string());
     let npm_install =
         exe.contains("node_modules/donsetch/") || exe.contains("node_modules\\donsetch\\");
-    let command = if npm_install { "donsetch" } else { &exe };
+    let command = &exe;
     let found = detect_mcp_clients();
     if found.is_empty() {
         cli::check_dim("MCP clients", "none detected; generic stdio block below");
@@ -2022,6 +2255,7 @@ fn detect_mcp_clients() -> Vec<(String, std::path::PathBuf)> {
             h.join("AppData/Roaming/Claude/claude_desktop_config.json"),
         );
         add("OpenCode", h.join(".config/opencode/opencode.json"));
+        add("OpenCode", h.join(".config/opencode/opencode.jsonc"));
         add("Hermes", h.join(".hermes/config.yaml"));
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -2038,56 +2272,59 @@ fn detect_mcp_clients() -> Vec<(String, std::path::PathBuf)> {
 /// deletion, key removal) is deliberately out of scope: repair
 /// only what cannot hurt. Re-run repaired checks once to report
 /// the true post-repair state.
-async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Result<(), String> {
-    let failed: Vec<String> = collected
-        .iter()
-        .filter(|(_, status, _, _)| status == "fail")
-        .map(|(n, _, _, _)| n.clone())
-        .collect();
-    if failed.is_empty() {
-        println!("  {}: nothing to repair", cli::green("--fix"));
-        return Ok(());
-    }
-
-    for name in &failed {
-        match name.as_str() {
-            "Cache directory" => {
-                let dir = crate::paths::cache_dir();
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    cli::check_fixed("Cache directory", &format!("created {}", dir.display()));
-                }
-            }
+fn apply_fixes(collected: &mut [(String, String, String, String)]) {
+    for (name, status, detail, hint) in collected.iter_mut() {
+        if status != "fail" {
+            continue;
+        }
+        let repaired = match name.as_str() {
+            "Cache directory" => std::fs::create_dir_all(crate::paths::cache_dir())
+                .map(|_| check_cache_dir())
+                .map_err(|e| e.to_string()),
             "Ghost state" => {
-                // state file is designed to be resettable; the lock
-                // file is stale-safe. Remove both.
-                let dir = crate::paths::cache_dir();
-                let _ = std::fs::remove_file(dir.join("ghost-state.json"));
-                if let Ok(cwd) = std::env::current_dir() {
-                    let _ = std::fs::remove_file(cwd.join(".donsetch-ghost.lock"));
-                }
-                cli::check_fixed("Ghost state", "reset state; browser profile untouched");
-            }
-            "OCR models" | "Rerank model" => {
-                // Corrupt/missing models re-download automatically on
-                // first use; nothing to do here except confirm that.
-                if let Ok(dir) = std::fs::read_dir(crate::paths::cache_dir().join("ocr")) {
-                    for e in dir.flatten() {
-                        if e.path().is_file() && e.path().extension().is_none_or(|x| x != "json") {
-                            let _ = std::fs::remove_file(e.path());
+                let path = crate::paths::cache_dir().join("ghost-state.json");
+                let corrupt = std::fs::read(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        if serde_json::from_slice::<crate::ghost::cache::GhostState>(&bytes).is_ok()
+                        {
+                            Err("state is valid; repair its access permissions manually".into())
+                        } else {
+                            Ok(())
                         }
-                    }
-                }
-                cli::check_fixed(name, "corrupt models will re-download on next use");
+                    });
+                let backup = path.with_extension(format!(
+                    "json.{}.bak",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ));
+                corrupt
+                    .and_then(|_| std::fs::rename(&path, &backup).map_err(|e| e.to_string()))
+                    .map(|_| check_ghost_state())
             }
-            _ => {}
+            _ => continue,
+        };
+        match repaired {
+            Ok(CheckResult::Pass(d) | CheckResult::Fixed(d)) => {
+                *status = "fixed".into();
+                *detail = d;
+                hint.clear();
+            }
+            Ok(CheckResult::Warn(d)) => {
+                *status = "warn".into();
+                *detail = d;
+            }
+            Ok(CheckResult::Fail(d, h)) => {
+                *detail = d;
+                *hint = h;
+            }
+            Err(e) => {
+                *detail = format!("repair failed: {e}");
+            }
         }
     }
-    println!();
-    println!(
-        "  {}: re-run `donsetch doctor` to confirm",
-        cli::bold("done")
-    );
-    Ok(())
 }
 
 /// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
@@ -2250,6 +2487,90 @@ mod doctor_ultra_tests {
         let _ = std::fs::create_dir_all(&dir);
         unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
         tempfile_dir::TempDir { dir }
+    }
+
+    #[test]
+    fn wave450_doctor_fix_preserves_corrupt_state_and_recounts() {
+        // Nextest: each test owns its environment and a disposable cache.
+        let cache = isolated_cache();
+        let corrupt = b"{not json";
+        std::fs::write(cache.dir.join("ghost-state.json"), corrupt).unwrap();
+        std::fs::write(cache.dir.join("keep-model.bin"), b"valid unrelated model").unwrap();
+        assert!(matches!(check_ghost_state(), CheckResult::Fail(_, _)));
+        let mut checks = vec![(
+            "Ghost state".into(),
+            "fail".into(),
+            "corrupt".into(),
+            "repair".into(),
+        )];
+        assert_eq!(check_counts(&checks), (0, 0, 1));
+        apply_fixes(&mut checks);
+        assert_eq!(check_counts(&checks), (1, 0, 0));
+        assert_eq!(checks[0].1, "fixed");
+        assert_eq!(
+            std::fs::read(cache.dir.join("keep-model.bin")).unwrap(),
+            b"valid unrelated model"
+        );
+        let backups: Vec<_> = std::fs::read_dir(&cache.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bak"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), corrupt);
+        assert!(matches!(
+            check_ghost_state(),
+            CheckResult::Pass(_) | CheckResult::Warn(_)
+        ));
+        apply_fixes(&mut checks);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn wave450_doctor_wraps_long_paths_without_losing_information() {
+        let text = format!(
+            "Install browser at /{} then retry.",
+            "long-directory/".repeat(12)
+        );
+        let lines = wrap_detail(&text, 40);
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|l| l.len() <= 40));
+        assert_eq!(lines.concat().replace(' ', ""), text.replace(' ', ""));
+        assert!(
+            !wrap_detail("path\u{1b}[31m", 40)
+                .join("")
+                .contains('\u{1b}')
+        );
+    }
+
+    #[test]
+    fn wave450_doctor_preserves_profile_locks_and_existing_probe_file() {
+        let _cache = isolated_cache();
+        let profile = crate::ghost::profile_dir();
+        std::fs::create_dir_all(&profile).unwrap();
+        for name in [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            ".doctor-write-test",
+        ] {
+            std::fs::write(profile.join(name), b"owned by another process").unwrap();
+        }
+        assert!(matches!(
+            check_ghost_profile(),
+            CheckResult::Pass(_) | CheckResult::Warn(_)
+        ));
+        for name in [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            ".doctor-write-test",
+        ] {
+            assert_eq!(
+                std::fs::read(profile.join(name)).unwrap(),
+                b"owned by another process"
+            );
+        }
     }
 
     mod tempfile_dir {
@@ -2566,196 +2887,89 @@ mod mask_tests {
 
 #[cfg(test)]
 mod bright_probe_tests {
-    use super::{
-        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, json_escape,
-        route_ips_url,
-    };
+    use super::{ZoneProbeOut, bright_zone_probe_at, classify_zones, json_escape};
     use std::io::{Read, Write};
 
-    /// A one-request HTTP rig: serves `status` + `body`, records the
-    /// request head so the test can assert the auth and path shape.
-    fn serve_once(
-        status: u16,
-        reason: &str,
-        body: &str,
-    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+    #[test]
+    fn account_zones_require_the_exact_name_and_product() {
+        let body = br#"[{"name":"custom-serp","type":"serp"},{"name":"custom-unlocker","type":"unblocker"}]"#;
+        assert_eq!(
+            classify_zones(200, body, "custom-serp", "serp"),
+            ZoneProbeOut::Validated
+        );
+        assert_eq!(
+            classify_zones(200, body, "custom-unlocker", "unblocker"),
+            ZoneProbeOut::Validated
+        );
+        for (zone, kind) in [
+            ("serp_api1", "serp"),
+            ("custom-serp", "unblocker"),
+            ("custom-unlocker", "serp"),
+        ] {
+            assert!(matches!(
+                classify_zones(200, body, zone, kind),
+                ZoneProbeOut::Failed { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_zones(401, b"unauthorized", "any", "serp"),
+            ZoneProbeOut::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_zones(403, b"forbidden", "any", "serp"),
+            ZoneProbeOut::Skipped { .. }
+        ));
+        assert!(matches!(
+            classify_zones(200, b"{}", "any", "serp"),
+            ZoneProbeOut::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_zones(200, br#"[{"name":"any"}]"#, "any", "serp"),
+            ZoneProbeOut::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn wire_account_zone_check_is_authenticated_and_free() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base = format!("http://{addr}");
-        let reason = reason.to_string();
-        let body = body.to_string();
+        let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let mut head = Vec::new();
             let mut chunk = [0u8; 256];
             loop {
                 let n = sock.read(&mut chunk).unwrap();
-                if n == 0 {
-                    break;
-                }
+                assert!(n > 0);
                 head.extend_from_slice(&chunk[..n]);
                 if head.windows(4).any(|w| w == b"\r\n\r\n") {
                     break;
                 }
             }
-            let resp = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            let body = r#"[{"name":"zone-a","type":"unblocker"}]"#;
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            sock.write_all(resp.as_bytes()).unwrap();
-            head
+            )
+            .unwrap();
+            String::from_utf8(head).unwrap().to_ascii_lowercase()
         });
-        (base, handle)
-    }
-
-    #[test]
-    fn classify_static_routes_403_is_a_skip_not_a_failure() {
-        // The bug class: a valid dynamic zone (Web Access API) gets
-        // 403 "Static routes not found". Pre-fix this was a blanket
-        // 401/403 == token-rejected failure.
-        let cases: Vec<(u16, &str, ZoneProbeOut)> = vec![
-            (
-                403,
-                r#"{"message":"Static routes not found"}"#,
-                ZoneProbeOut::Skipped {
-                    reason: String::new(),
-                },
-            ),
-            (
-                403,
-                r#"{"error":{"code":"static_routes_not_found","message":"STATIC ROUTES NOT FOUND"}}"#,
-                ZoneProbeOut::Skipped {
-                    reason: String::new(),
-                },
-            ),
-            (
-                401,
-                r#"{"message":"unauthorized"}"#,
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                403,
-                r#"{"message":"Zone name is invalid"}"#,
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                403,
-                "",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                404,
-                "nope",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                429,
-                "slow down",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                500,
-                "boom",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-        ];
-        for (status, body, expected) in cases {
-            assert_eq!(
-                std::mem::discriminant(&classify_route_ips(status, body)),
-                std::mem::discriminant(&expected),
-                "status {status} body {body:?}"
-            );
-        }
-        // The skip reason carries the diagnosis, not a generic one.
-        match classify_route_ips(403, r#"{"message":"Static routes not found"}"#) {
-            ZoneProbeOut::Skipped { reason } => {
-                assert!(reason.contains("no static route pool"), "{reason}");
-            }
-            other => panic!("expected Skipped, got {other:?}"),
-        }
-        // 200 parse happens in the caller; the classifier only tags it.
-        assert_eq!(classify_route_ips(200, "{}"), ZoneProbeOut::Routed(0));
-    }
-
-    // The production probe must hit .../zone/route_ips exactly once.
-    // The ship base used to be the full endpoint while route_ips_url
-    // appends the endpoint again, so the real request went to
-    // /zone/route_ips/zone/route_ips (a 404) and every configured
-    // Bright Data zone read as a failed probe. The wire tests missed
-    // it because they pass a bare-root rig base. Pin the ship URL.
-    #[test]
-    fn production_route_ips_url_has_a_single_endpoint_path() {
-        let url = route_ips_url(BRIGHT_API_BASE, "web-access");
         assert_eq!(
-            url,
-            "https://api.brightdata.com/zone/route_ips?zone=web-access"
+            bright_zone_probe_at(&base, "test-token", "zone-a", "unblocker"),
+            ZoneProbeOut::Validated
         );
-        assert_eq!(
-            url.matches("/zone/route_ips").count(),
-            1,
-            "the endpoint path must not be doubled: {url}"
-        );
-    }
-
-    #[test]
-    fn wire_dynamic_zone_403_reports_skipped_not_failed() {
-        let (base, handle) = serve_once(
-            403,
-            "Forbidden",
-            r#"{"status":403,"message":"Static routes not found"}"#,
-        );
-        let out = bright_zone_probe_at(&base, "tok", "web-access");
-        match &out {
-            ZoneProbeOut::Skipped { reason } => {
-                assert!(reason.contains("no static route pool"), "{reason}");
-                assert!(!reason.contains("rejected"), "{reason}");
-            }
-            other => panic!("expected Skipped, got {other:?}"),
-        }
-        // The wire path really hit OUR rig with the right auth + path.
-        let head = String::from_utf8_lossy(&handle.join().unwrap()).into_owned();
-        let head_l = head.to_ascii_lowercase();
+        let head = handle.join().unwrap();
         assert!(
-            head_l.contains("get /zone/route_ips?zone=web-access http/1.1"),
+            head.starts_with("get /zone/get_active_zones http/1.1\r\n"),
             "{head}"
         );
-        assert!(head_l.contains("authorization: bearer tok"), "{head}");
-    }
-
-    #[test]
-    fn wire_200_returns_the_ip_count() {
-        let (base, handle) =
-            serve_once(200, "OK", r#"{"ips":[{"ip":"1.2.3.4"},{"ip":"5.6.7.8"}]}"#);
-        let out = bright_zone_probe_at(&base, "tok", "static-zone");
-        assert_eq!(out, ZoneProbeOut::Routed(2));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn wire_401_stays_a_failure() {
-        let (base, handle) = serve_once(401, "Unauthorized", r#"{"message":"bad token"}"#);
-        match bright_zone_probe_at(&base, "dead-token", "any-zone") {
-            ZoneProbeOut::Failed { reason } => assert!(reason.contains("401"), "{reason}"),
-            other => panic!("expected Failed, got {other:?}"),
-        }
-        handle.join().unwrap();
+        assert!(head.contains("authorization: bearer test-token"), "{head}");
+        assert!(!head.contains("/request"));
     }
 
     #[test]
     fn json_escape_handles_windows_paths() {
         let path = r#"C:\Users\A "B"\donsetch.exe"#;
-        assert_eq!(json_escape(path), r#""C:\\Users\\A \"B\"\\donsetch.exe""#);
+        assert_eq!(json_escape(path), serde_json::to_string(path).unwrap());
     }
 }

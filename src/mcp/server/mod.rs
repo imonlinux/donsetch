@@ -32,6 +32,9 @@ use crate::search::egress::EgressPool;
 use crate::search::intent::Intent;
 use crate::search::{self, Searcher};
 use errors::*;
+// The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
+// rendering paths branch on the same signal the wire carries.
+pub(crate) use errors::is_failure;
 use fetch_tool::*;
 use search_tool::*;
 
@@ -60,6 +63,12 @@ pub struct Daemon {
     /// Background route-memory prober handle (v4 phase 0.2);
     /// aborted on shutdown.
     probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Owned startup proxy probes; cancelled on shutdown or daemon drop.
+    preflight_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Background pre-solve handle (search wall hint): owned like the
+    /// prober; `pre_solve_busy` is taken BEFORE the spawn, so at most
+    /// one pre-solve exists and the slot holds the live handle.
+    pre_solve_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -90,7 +99,7 @@ impl Daemon {
                 Vec::new()
             };
             let replay = crate::ghost::cache::vault_over_jar(&sessions, &jar);
-            fetcher.import_cookies(&replay).await;
+            fetcher.import_vault_cookies(&replay).await;
         }
 
         // Build ghost escalation hook for the crawl: renders
@@ -115,8 +124,11 @@ impl Daemon {
             true,
         );
 
-        let (crawler, _gov) =
-            crawl_real::build(Arc::clone(&fetcher), std::sync::Arc::clone(&egress));
+        let (crawler, _gov) = crawl_real::build(
+            Arc::clone(&fetcher),
+            std::sync::Arc::clone(&egress),
+            Some(Arc::clone(&state)),
+        );
         let crawler = crawler.with_ghost(ghost_hook);
 
         let searcher = Arc::new(
@@ -126,7 +138,7 @@ impl Daemon {
             )
             .with_ghost(search_ghost),
         );
-        searcher.preflight();
+        let preflight_task = searcher.preflight();
 
         Ok(Self {
             fetcher,
@@ -143,6 +155,8 @@ impl Daemon {
             vault_seen: tokio::sync::Mutex::new(None),
             pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
             probe_task: std::sync::Mutex::new(None),
+            preflight_task: std::sync::Mutex::new(Some(preflight_task)),
+            pre_solve_task: std::sync::Mutex::new(None),
         })
     }
 
@@ -154,14 +168,51 @@ impl Daemon {
             return;
         }
         let handle = crate::ghost::probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
-        if let Ok(mut slot) = self.probe_task.lock() {
-            *slot = Some(handle);
+        let mut slot = self
+            .probe_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // One prober: a second start replaces (and cancels) the first.
+        if let Some(previous) = slot.take() {
+            previous.abort();
         }
+        *slot = Some(handle);
     }
 
     /// Shutdown: kill ghost browser + Xvfb (if owned).
     /// Called by the CLI before exit; by the MCP daemon on close.
     pub async fn shutdown(&self) {
+        // Every daemon-owned helper is cancelled AND joined: the startup
+        // probes, the route-memory prober, the background pre-solve. An
+        // orphaned helper would keep working for a retired daemon (and
+        // keep its Arcs alive).
+        let preflight = self
+            .preflight_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = preflight {
+            task.abort();
+            let _ = task.await;
+        }
+        let prober = self
+            .probe_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = prober {
+            task.abort();
+            let _ = task.await;
+        }
+        let pre_solve = self
+            .pre_solve_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = pre_solve {
+            task.abort();
+            let _ = task.await;
+        }
         self.ghost_mgr.shutdown().await;
     }
 
@@ -206,6 +257,24 @@ impl Daemon {
             };
             let cookies = crate::ghost::cache::vault_over_jar(&sessions, &jar);
             self.fetcher.reset_to(&cookies).await;
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        for slot in [
+            &mut self.preflight_task,
+            &mut self.probe_task,
+            &mut self.pre_solve_task,
+        ] {
+            if let Some(task) = slot
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                task.abort();
+            }
         }
     }
 }
@@ -493,9 +562,14 @@ pub(crate) async fn call_tool_ctx(
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // Clients may forward arguments without schema validation. Reject
+    // unknown fields and wrong types before any network or browser work.
+    if let Some(rejected) = invalid_args_error(name, &args) {
+        return Ok(rejected);
+    }
     match name {
-        "web_fetch" => Ok(fetch_tool::fetch_tool(daemon, &args, ctx).await),
-        "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
+        "web_fetch" => Ok(Box::pin(fetch_tool::fetch_tool(daemon, &args, ctx)).await),
+        "web_search" => Ok(Box::pin(search_tool::search_tool(daemon, &args, ctx)).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
         "web_screenshot" => Ok(web_screenshot_tool::web_screenshot_tool(daemon, &args, ctx).await),
         _ => Err((-32602, format!("unknown tool: {name}"))),
@@ -585,5 +659,168 @@ mod cancel_key_tests {
         assert_eq!(cancel_key(&json!("req-7")), cancel_key(&json!("req-7")));
         assert!(cancel_key(&json!(null)).is_none());
         assert!(cancel_key(&json!({"a": 1})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod preflight_lifecycle_tests {
+    use super::Daemon;
+    use tokio::io::AsyncReadExt;
+
+    async fn stop_pending_preflight(explicit_shutdown: bool) {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::fs::write(
+            crate::transport::proxy::config_path(),
+            format!("http://{}\n", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let daemon = Daemon::new().await.unwrap();
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16384);
+            head.push(socket.read_u8().await.unwrap());
+        }
+        assert!(head.starts_with(b"CONNECT api.ipify.org:443 HTTP/1.1\r\n"));
+        let abort = daemon
+            .preflight_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        if explicit_shutdown {
+            daemon.shutdown().await;
+            assert!(daemon.preflight_task.lock().unwrap().is_none());
+            assert!(
+                abort.is_finished(),
+                "shutdown must join the cancelled probe"
+            );
+        }
+        drop(daemon);
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            socket.read(&mut [0u8; 1]),
+        )
+        .await
+        .expect("owned CONNECT must close on daemon retirement");
+        assert_eq!(read.unwrap(), 0);
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_shutdown_joins_pending_connect() {
+        stop_pending_preflight(true).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_drop_aborts_pending_connect() {
+        stop_pending_preflight(false).await;
+    }
+}
+
+#[cfg(test)]
+mod prober_lifecycle_tests {
+    use super::Daemon;
+    use std::time::Duration;
+
+    async fn wait_finished(abort: &tokio::task::AbortHandle) {
+        for _ in 0..100 {
+            if abort.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the prober task was not cancelled");
+    }
+
+    async fn daemon_with_prober() -> (std::sync::Arc<Daemon>, tokio::task::AbortHandle) {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        config.browser.route_probes = true;
+        crate::config::install(config).unwrap();
+        let daemon = std::sync::Arc::new(Daemon::new().await.unwrap());
+        daemon.start_prober();
+        let abort = daemon
+            .probe_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("route_probes=true must own a prober task")
+            .abort_handle();
+        (daemon, abort)
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_prober_shutdown_joins_the_task() {
+        let (daemon, abort) = daemon_with_prober().await;
+        assert!(!abort.is_finished(), "the prober runs until cancelled");
+        daemon.shutdown().await;
+        assert!(
+            daemon.probe_task.lock().unwrap().is_none(),
+            "shutdown must take the owned prober"
+        );
+        wait_finished(&abort).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_prober_drop_aborts_the_task() {
+        let (daemon, abort) = daemon_with_prober().await;
+        assert!(!abort.is_finished());
+        drop(daemon);
+        wait_finished(&abort).await;
+    }
+}
+
+#[cfg(test)]
+mod pre_solve_lifecycle_tests {
+    use super::Daemon;
+    use std::time::Duration;
+
+    // The handle is tracked on the daemon (owned, never detached); a
+    // task that bails at its route check clears the busy guard; shutdown
+    // takes the slot. The full solve path launches browsers and is
+    // covered by the native fixture tests.
+    #[tokio::test]
+    async fn stealth_v3_pre_solve_handle_is_owned_and_cancelled() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let daemon = std::sync::Arc::new(Daemon::new().await.unwrap());
+        super::search_tool::maybe_pre_solve(&daemon, Some("http://owned-pre-solve.example/"));
+        assert!(
+            daemon.pre_solve_task.lock().unwrap().is_some(),
+            "the pre-solve must be tracked, not detached"
+        );
+        for _ in 0..100 {
+            if !daemon
+                .pre_solve_busy
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !daemon
+                .pre_solve_busy
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the route-check bail must clear the busy guard"
+        );
+        daemon.shutdown().await;
+        assert!(
+            daemon.pre_solve_task.lock().unwrap().is_none(),
+            "shutdown must take the owned pre-solve"
+        );
     }
 }

@@ -153,6 +153,17 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         }
     }
 
+    // Map mode: thin static inventories get one bounded rendered read
+    // of the seed through the same ghost path fetch/screenshot own;
+    // any failure keeps the static map (the renderer returns None).
+    if opts.mode == CrawlMode::Map {
+        let daemon = Arc::clone(daemon);
+        opts.render_html = Some(std::sync::Arc::new(move |url: String| {
+            let daemon = Arc::clone(&daemon);
+            Box::pin(async move { rendered_seed_html(&daemon, &url).await })
+        }));
+    }
+
     let requested_mode = opts.mode;
     let dataset = opts.dataset;
     let crawl_t0 = std::time::Instant::now();
@@ -184,7 +195,7 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
             } else {
                 (
                     "transient",
-                    "safe to retry immediately; if repeated, lower max_pages or widen deadline_s",
+                    "retry may work; if repeated, check network/access or use another source",
                 )
             };
             let mut trace = Trace::default();
@@ -201,7 +212,72 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         }
     };
 
-    render_crawl_result(&result, requested_mode, dataset)
+    let mut rendered = render_crawl_result(&result, requested_mode, dataset);
+    if !url.is_empty() && result.seed != url {
+        rendered["structuredContent"]["requested_seed"] = json!(url);
+        rendered["structuredContent"]["resolved_seed"] = json!(result.seed);
+    }
+    rendered
+}
+
+/// One rendered read of the seed for a thin map inventory. Returns
+/// (rendered HTML, final URL); None on any failure : the map keeps its
+/// static inventory and never dies because the browser cannot start.
+async fn rendered_seed_html(daemon: &Arc<Daemon>, url: &str) -> Option<(String, String)> {
+    let target = crate::fetch::guards::validate_url_basic(url).ok()?;
+    if crate::fetch::guards::ensure_url_safe(target.as_str())
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    let host = target.host_str()?.to_string();
+    let wire = {
+        let mut state = daemon.state.lock().await;
+        let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
+        state.ensure_persona(&host, &caps);
+        state.ensure_persona_egress(&host);
+        let mut wire = state
+            .personas
+            .get(&host)
+            .filter(|p| p.quarantine_reason.is_none())
+            .map(|p| p.ghost_wire())
+            .unwrap_or_default();
+        let route = daemon.fetcher.route_for_fetch(target.as_str());
+        wire.route = Some(route);
+        wire
+    };
+    let ghost = daemon
+        .ghost_mgr
+        .acquire_for_wire(&daemon.profile, Some(&host), wire)
+        .await
+        .ok()?;
+    let read = daemon
+        .ghost_mgr
+        .read_document(
+            ghost,
+            &daemon.profile,
+            target.as_str(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .ok()?;
+    let ghost = read.guard;
+    let html = ghost.outer_html().await.ok()?;
+    let final_url = ghost
+        .current_url()
+        .await
+        .unwrap_or_else(|_| url.to_string());
+    Some((html, final_url))
+}
+
+/// Queued URLs shown in the debug block. The queue itself holds up to
+/// `crawl::frontier::MAX_QUEUE`; the response shows the head and says
+/// how many there are.
+pub(super) const QUEUED_PREVIEW: usize = 100;
+
+fn queued_preview(queued: &[String]) -> Value {
+    json!(queued.iter().take(QUEUED_PREVIEW).collect::<Vec<_>>())
 }
 
 pub(super) fn render_crawl_result(
@@ -259,24 +335,36 @@ pub(super) fn render_crawl_result(
                 .filter(|url| !rendered.contains(url.as_str()))
                 .collect::<Vec<_>>();
             if !remaining.is_empty() {
-                text.push_str("## Discovered URLs not fetched\n");
-                for url in remaining {
-                    text.push_str(&format!("- {url}\n"));
-                }
+                text.push_str(&format!("## Discovered URLs not fetched\n{} URLs; inventory is in structuredContent.map.\n", remaining.len()));
             }
         }
     }
 
     let next_action = compute_crawl_next_action(result);
     let mut structured = json!({
+        "ok": true,
         "seed": result.seed,
-        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
+        "complete": crawl_complete(result, requested_mode),
         "pages": result.pages.iter().filter(|p| !p.duplicate).map(|p| json!({
             "url": p.url,
             "lastmod": p.lastmod,
+            "content_complete": p.next_offset.is_none() && p.partial.is_none(),
+            "partial": p.partial,
+            "next_offset": p.next_offset,
         })).collect::<Vec<_>>(),
         "stop": format!("{:?}", result.stop),
     });
+    if requested_mode != CrawlMode::Content {
+        structured["map"] = json!(result.map);
+    }
+    if requested_mode == CrawlMode::Map {
+        structured.as_object_mut().unwrap().remove("pages");
+        structured["mode"] = json!("map");
+        structured["discovered"] = json!(result.map.len());
+        if crawl_complete(result, requested_mode) {
+            structured["stop"] = json!("InventoryComplete");
+        }
+    }
     if let Some(resume) = &result.resume {
         structured["resume"] = json!(resume);
     }
@@ -286,7 +374,8 @@ pub(super) fn render_crawl_result(
     let debug = json!({
         "mode": format!("{:?}", requested_mode),
         "map": result.map,
-        "queued": result.queued,
+        "queued": queued_preview(&result.queued),
+        "queued_total": result.queued.len(),
         "filtered_out": result.filtered_out,
         "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
         "pages": result.pages.iter().map(|p| json!({
@@ -294,6 +383,7 @@ pub(super) fn render_crawl_result(
             "title": p.title,
             "kind": format!("{:?}", p.kind),
             "chars": p.chars,
+            "next_offset": p.next_offset,
             "quality": p.quality,
             "duplicate": p.duplicate,
             "parent": p.parent,
@@ -351,6 +441,7 @@ pub(super) fn render_crawl_dataset(
 
     let next_action = compute_crawl_next_action(result);
     let mut structured = json!({
+        "ok": true,
         "seed": result.seed,
         "dataset": true,
         // Schema marker (v4 F). Row shape: url/title/kind/markdown/
@@ -364,10 +455,19 @@ pub(super) fn render_crawl_dataset(
             .iter()
             .filter_map(|r| r.get("chars").and_then(|c| c.as_u64()))
             .sum::<u64>(),
-        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
+        "complete": crawl_complete(result, requested_mode),
         "stop": format!("{:?}", result.stop),
     });
-    if requested_mode == CrawlMode::Map {
+    let partial_pages = result
+        .pages
+        .iter()
+        .filter(|p| !p.duplicate && (p.next_offset.is_some() || p.partial.is_some()))
+        .map(|p| json!({"url": p.url, "next_offset": p.next_offset, "partial": p.partial}))
+        .collect::<Vec<_>>();
+    if !partial_pages.is_empty() {
+        structured["partial_pages"] = json!(partial_pages);
+    }
+    if requested_mode != CrawlMode::Content {
         structured["map"] = json!(result.map);
     }
     if let Some(resume) = &result.resume {
@@ -379,7 +479,8 @@ pub(super) fn render_crawl_dataset(
     let debug = json!({
         "mode": format!("{:?}", requested_mode),
         "rows": rows.len(),
-        "queued": result.queued,
+        "queued": queued_preview(&result.queued),
+        "queued_total": result.queued.len(),
         "filtered_out": result.filtered_out,
         "skipped": result
             .skipped
@@ -411,32 +512,35 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
     }
 
     // 0 pages : diagnose why.
-    if result.pages.is_empty() {
+    if result.pages.is_empty() && result.map.is_empty() {
         let skip_reasons: Vec<&str> = result.skipped.iter().map(|(_, w)| w.as_str()).collect();
-        let all_scope = skip_reasons
-            .iter()
-            .all(|r| r.contains("out of scope") || r.contains("filtered"));
-        let all_blocked = skip_reasons
-            .iter()
-            .all(|r| r.contains("Challenge") || r.contains("Blocked") || r.contains("wall"));
-        let all_404 = skip_reasons
-            .iter()
-            .all(|r| r.contains("404") || r.contains("NotFound"));
+        let all_scope = !skip_reasons.is_empty()
+            && skip_reasons
+                .iter()
+                .all(|r| r.contains("out of scope") || r.contains("filtered"));
+        let all_blocked = !skip_reasons.is_empty()
+            && skip_reasons
+                .iter()
+                .all(|r| r.contains("Challenge") || r.contains("Blocked") || r.contains("wall"));
+        let all_404 = !skip_reasons.is_empty()
+            && skip_reasons
+                .iter()
+                .all(|r| r.contains("404") || r.contains("NotFound"));
         let has_sitemap = !result.map.is_empty();
 
         if all_404 {
             return "seed URL returned 404 : check the URL is correct.".into();
         }
         if all_blocked {
-            return "the site blocked the crawler. Try respect_robots=false, or fetch the seed URL directly first to check access.".into();
+            return "the site blocked the crawler. Fetch the seed URL directly to check access, or retry from another permitted network.".into();
         }
         if all_scope && result.filtered_out > 0 {
-            return "all discovered URLs were outside the seed's path scope. Try broader include_paths, or same_host=false to crawl the whole host.".into();
+            return "all discovered URLs were outside the seed's path scope. Try broader include_paths; same_host=false permits other hosts.".into();
         }
         if !has_sitemap && result.map.is_empty() && result.filtered_out == 0 {
-            return "no sitemap found and no links discovered. Try mode=content to BFS from the seed, or check the seed URL is accessible.".into();
+            return "no URL inventory or readable pages were found. Check seed accessibility and scope; verify that the seed exposes readable links, or broaden include_paths.".into();
         }
-        return "crawl returned 0 pages. Try mode=content, broader include_paths, or a different seed URL.".into();
+        return "crawl returned 0 readable pages. Check seed access, broaden include_paths, or use a different seed URL.".into();
     }
 
     // Pages found but stopped early.
@@ -464,13 +568,101 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
     }
 }
 
+fn crawl_complete(result: &crate::crawl::CrawlResult, mode: CrawlMode) -> bool {
+    matches!(result.stop, crate::crawl::StopReason::FrontierEmpty)
+        && if mode == CrawlMode::Map {
+            !result.map.is_empty()
+        } else {
+            (!result.pages.is_empty() || !result.skipped.is_empty())
+                && result
+                    .pages
+                    .iter()
+                    .all(|p| p.next_offset.is_none() && p.partial.is_none())
+                && result.skipped.iter().all(|(_, why)| {
+                    why == "unchanged since last crawl" || why.contains("duplicate")
+                })
+        }
+}
+
 #[cfg(test)]
 mod crawl_output_contract_tests {
+    #[test]
+    fn report_audit_inventory_does_not_bloat_content_and_partial_pages_are_honest() {
+        let mut result = dataset_fixture();
+        result.map = (0..1000)
+            .map(|i| format!("https://example.com/page/{i}"))
+            .collect();
+        result.stop = StopReason::FrontierEmpty;
+        result.pages[0].next_offset = Some(400);
+        let content = render_crawl_result(&result, CrawlMode::Full, false);
+        assert!(content["content"][0]["text"].as_str().unwrap().len() < 1000);
+        assert_eq!(content["structuredContent"]["complete"], false);
+        assert_eq!(content["structuredContent"]["pages"][0]["next_offset"], 400);
+        let dataset = render_crawl_result(&result, CrawlMode::Full, true);
+        assert_eq!(
+            dataset["structuredContent"]["partial_pages"][0]["next_offset"],
+            400
+        );
+        result.pages[0].next_offset = None;
+        result.pages[0].partial = Some(crate::extract::PartialContent {
+            reason: "source returned a subset",
+            items_found: 3,
+            items_total: Some(20),
+        });
+        let subset = render_crawl_result(&result, CrawlMode::Full, false);
+        assert_eq!(subset["structuredContent"]["complete"], false);
+        assert_eq!(
+            subset["structuredContent"]["pages"][0]["content_complete"],
+            false
+        );
+        assert_eq!(
+            subset["structuredContent"]["pages"][0]["partial"]["items_total"],
+            20
+        );
+        let subset_data = render_crawl_result(&result, CrawlMode::Full, true);
+        assert_eq!(
+            subset_data["structuredContent"]["partial_pages"][0]["partial"]["items_found"],
+            3
+        );
+        let map = render_crawl_result(&result, CrawlMode::Map, false);
+        assert!(map["structuredContent"].get("pages").is_none());
+        assert_eq!(map["structuredContent"]["discovered"], 1000);
+        assert_eq!(map["structuredContent"]["stop"], "InventoryComplete");
+    }
+
     use super::render_crawl_result;
     use crate::crawl::{CrawlMode, CrawlPage, CrawlResult, StopReason};
     use crate::extract::ContentKind;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn wave450_map_inventory_is_model_state_without_false_404() {
+        let mut result = CrawlResult {
+            seed: "https://example.com/docs/".into(),
+            pages: vec![],
+            queued: vec![],
+            filtered_out: 0,
+            skipped: vec![],
+            stop: StopReason::FrontierEmpty,
+            elapsed: Duration::ZERO,
+            map: vec!["https://example.com/docs/a".into()],
+            crawl_delay: None,
+            resume: None,
+        };
+        let rendered = render_crawl_result(&result, CrawlMode::Map, false);
+        assert_eq!(rendered["structuredContent"]["map"], json!(result.map));
+        assert!(rendered["structuredContent"].get("next_action").is_none());
+        result.map.clear();
+        let empty = render_crawl_result(&result, CrawlMode::Content, false);
+        assert_eq!(empty["structuredContent"]["complete"], false);
+        assert!(
+            !empty["structuredContent"]["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("404")
+        );
+    }
 
     #[test]
     pub(super) fn crawl_renders_page_identity_once_and_keeps_resume_as_state() {
@@ -479,6 +671,8 @@ mod crawl_output_contract_tests {
             title: "Evidence page".into(),
             kind: ContentKind::Article,
             markdown: "# Evidence page\nhttps://example.com/docs/page\n\nUseful evidence.".into(),
+            next_offset: None,
+            partial: None,
             chars: 16,
             quality: 0.93,
             duplicate: false,
@@ -517,12 +711,46 @@ mod crawl_output_contract_tests {
         );
     }
 
+    // The debug block carried every queued URL: a wide crawl put
+    // thousands of them into each response. It carries a preview and
+    // the count.
+    #[test]
+    fn the_queued_list_in_the_response_is_a_bounded_preview() {
+        let result = CrawlResult {
+            seed: "https://example.com/".into(),
+            pages: vec![],
+            queued: (0..5_000)
+                .map(|i| format!("https://example.com/p/{i}"))
+                .collect(),
+            filtered_out: 0,
+            skipped: vec![],
+            stop: StopReason::MaxPages,
+            elapsed: Duration::from_millis(1),
+            map: vec![],
+            crawl_delay: None,
+            resume: Some("tok".into()),
+        };
+        for dataset in [false, true] {
+            let output = render_crawl_result(&result, CrawlMode::Full, dataset);
+            let debug = &output["_meta"]["com.donsetch/crawl-debug"];
+            let shown = debug["queued"].as_array().unwrap().len();
+            assert!(
+                shown <= super::QUEUED_PREVIEW,
+                "dataset={dataset}: {shown} queued URLs in the response"
+            );
+            assert_eq!(debug["queued_total"], json!(5_000), "dataset={dataset}");
+            assert_eq!(debug["queued"][0], "https://example.com/p/0");
+        }
+    }
+
     fn dataset_fixture() -> crate::crawl::CrawlResult {
         let page = |url: &str, title: &str, md: &str, dup: bool| CrawlPage {
             url: url.into(),
             title: title.into(),
             kind: crate::extract::ContentKind::Article,
             markdown: md.into(),
+            next_offset: None,
+            partial: None,
             chars: md.len(),
             quality: 0.9,
             duplicate: dup,
@@ -582,7 +810,7 @@ mod crawl_output_contract_tests {
         assert_eq!(out["structuredContent"]["rows"], 2);
         assert_eq!(out["structuredContent"]["dataset"], true);
         assert_eq!(out["structuredContent"]["dataset_version"], 1);
-        assert_eq!(out["structuredContent"]["complete"], true);
+        assert_eq!(out["structuredContent"]["complete"], false);
         // Skipped pages surface in debug, never as rows.
         assert_eq!(
             out["_meta"]["com.donsetch/crawl-debug"]["skipped"][0]["reason"],

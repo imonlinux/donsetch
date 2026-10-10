@@ -61,6 +61,7 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
                 format!("HTTP protocol error: {e}")
             }
         }
+        FetchError::ProxyConfig(msg) => format!("proxy configuration error: {msg}"),
         FetchError::Ghost(msg) => format!("browser automation error: {msg}"),
         // A name failure is not a policy block: the DNS variants carry
         // the honest message, and the code the agent reads comes from
@@ -78,7 +79,7 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
 pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String {
     match verdict {
         Verdict::AuthWall => {
-            format!("HTTP 401 at {url} : the server requires authentication")
+            format!("authentication required at {url} (HTTP {status})")
         }
         Verdict::Paywall => format!("paywall: {url} requires payment to view content"),
         Verdict::SoftNotFound => format!("not found: {url} returned HTTP {status}"),
@@ -209,6 +210,41 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
     tool_error_structured(message, kind, None)
 }
 
+/// Message sniffing reads symptoms, never data : error text quotes
+/// the URL we looked at, and the URL's own port (`:42945`), path
+/// (`/dns/`), or query (`?timeout=5`) must not be read as the
+/// failure. Strips every http(s) URL token before classification.
+/// (V24: a Cloudflare wall on port 42945 classified as a rate limit.)
+fn without_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let hit = match (rest.find("http://"), rest.find("https://")) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let Some(i) = hit else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..i]);
+        out.push(' ');
+        let url = &rest[i..];
+        let end = url.find(|c: char| c.is_whitespace()).unwrap_or(url.len());
+        rest = &url[end..];
+    }
+}
+
+/// True when `needle` occurs in `text` not embedded in a longer run
+/// of ASCII digits : a port (`:42945`) or a duration (`1429ms`) is
+/// not an HTTP status.
+fn has_standalone_digits(text: &str, needle: &str) -> bool {
+    let digit = |c: Option<char>| c.is_some_and(|d| d.is_ascii_digit());
+    text.match_indices(needle).any(|(i, _)| {
+        !digit(text[..i].chars().next_back()) && !digit(text[i + needle.len()..].chars().next())
+    })
+}
+
 /// Error with structure: the 50-case report asked for honest
 /// machine-readable failure state : status, verdict, url,
 /// next_action, and the escalation trace : so an agent can
@@ -220,14 +256,14 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
 /// | code | meaning |
 /// |---|---|
 /// | network.dns / network.timeout / network.ratelimit | transport |
+/// | browser.transport / browser.timeout | browser automation |
 /// | wall.challenge / wall.challenge_unsolved / wall.empty_shell / wall.captcha / wall.paywall / wall.auth | blocked |
 /// | cloak.suspected | tier-1 content is likely decoy |
-/// | content.notfound / content.binary / content.oversize / content.extract | body |
+/// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
 /// | guard.ssrf | blocked by design |
 /// | parse.encoding | charset-level failure |
-/// | archive.stale | served an old snapshot |
 /// | deadline.hit | time budget exhausted |
-/// | crawl.seed / crawl.resume / fetch.invalid | input errors |
+/// | crawl.seed / crawl.resume / fetch.invalid / search.invalid / crawl.invalid | input errors |
 pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, str> {
     // A producer that knows its own failure type outranks the text
     // classifier. The guard KNOWS a name it could not resolve is a name
@@ -240,12 +276,15 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
     {
         return Cow::Owned(code.to_string());
     }
-    let m = msg.to_ascii_lowercase();
+    let m = without_urls(&msg.to_ascii_lowercase());
     let v = structured
         .and_then(|s| s.get("verdict"))
         .and_then(Value::as_str)
         .unwrap_or("");
     Cow::Borrowed(match () {
+        _ if m.contains("proxy configuration:") || m.starts_with("proxy configuration error:") => {
+            "proxy.config"
+        }
         _ if m.contains("ssrf")
             || m.contains("private/loopback")
             || m.contains("blocked by design") =>
@@ -253,10 +292,25 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
             "guard.ssrf"
         }
         _ if m.contains("deadline") => "deadline.hit",
+        _ if m.contains("cdp timeout:")
+            || m.contains("cdp connect: ws handshake timeout")
+            || m.contains("devtools ws timeout") =>
+        {
+            "browser.timeout"
+        }
+        _ if m.contains("no devtools ws line")
+            || m.contains("cdp link closed")
+            || m.contains("cdp dropped:")
+            || m.contains("cdp send:")
+            || m.contains("cdp connect:") =>
+        {
+            "browser.transport"
+        }
         _ if m.contains("dns") => "network.dns",
         _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
-        _ if m.contains("rate limit") || m.contains("429") => "network.ratelimit",
+        _ if m.contains("rate limit") || has_standalone_digits(&m, "429") => "network.ratelimit",
         _ if m.contains("binary content") => "content.binary",
+        _ if v == "Incomplete" || m.contains("browser document incomplete") => "content.incomplete",
         _ if m.contains("too large") || m.contains("oversize") => "content.oversize",
         _ if m.contains("invalid url") => "fetch.invalid",
         _ if m.contains("bad seed") => "crawl.seed",
@@ -265,11 +319,11 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         _ if m.contains("anti-bot challenge that did not clear") => "wall.challenge_unsolved",
         _ if m.contains("navigation and login chrome") => "wall.empty_shell",
         _ if m.contains("captcha") => "wall.captcha",
-        _ if m.contains("archived copy") || m.contains("snapshot") => "archive.stale",
-        _ if v == "Challenge" => "wall.challenge",
+        _ if v.starts_with("Challenge") => "wall.challenge",
+        _ if v == "Blocked" => "wall.blocked",
         _ if v == "Paywall" => "wall.paywall",
-        _ if v == "AuthWall" => "wall.auth",
-        _ if v == "SoftNotFound" => "content.notfound",
+        _ if v == "AuthWall" || m.contains("authentication required") => "wall.auth",
+        _ if v == "SoftNotFound" || m.starts_with("not found:") => "content.notfound",
         _ if m.contains("tls error") && m.contains("certificate verification failed") => {
             "tls.verify"
         }
@@ -285,9 +339,33 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
 pub(super) fn tool_error_structured(
     message: impl Into<String>,
     kind: &str,
-    structured: Option<Value>,
+    mut structured: Option<Value>,
 ) -> Value {
     let mut text = message.into();
+    let code = error_code(&text, structured.as_ref());
+    let kind = if matches!(code.as_ref(), "browser.transport" | "browser.timeout") {
+        let state = structured.get_or_insert_with(|| json!({}));
+        if state["retry_safe"] == false {
+            state["next_action"] = json!(
+                "inspect the result with a plain fetch without actions; earlier actions may have completed, so do not replay them automatically"
+            );
+            "permanent"
+        } else {
+            state["next_action"] = json!(
+                "retry the read once; if it repeats, inspect browser diagnostics and available resources"
+            );
+            "transient"
+        }
+    } else if code == "proxy.config" {
+        let state = structured.get_or_insert_with(|| json!({}));
+        state["next_action"] = json!(
+            "correct the selected proxy in config or the proxy environment variable, then retry; run donsetch doctor to inspect proxy configuration"
+        );
+        state["retry_safe"] = json!(false);
+        "permanent"
+    } else {
+        kind
+    };
     // Fold next_action from structured into the text for clients
     // (Claude Code, VSCode) that drop text when structuredContent
     // is present. next_action is critical for agent recovery.
@@ -297,19 +375,106 @@ pub(super) fn tool_error_structured(
     {
         text.push_str(&format!("\n\nNext action: {action}"));
     }
-    let code = error_code(&text, structured.as_ref());
     let mut v = json!({
         "content": [{ "type": "text", "text": text }],
-        "isError": true,
+        "isError": false,
         "errorKind": kind,
         "code": code
     });
-    if let Some(mut s) = structured {
-        // The stable code lives where agents read it.
+    {
+        let mut s = structured.unwrap_or_else(|| json!({
+            "next_action": if kind == "permanent" { "correct the request before retrying" } else { "retry once; if the failure repeats, inspect the reported cause" }
+        }));
+        if s.get("next_action")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            s["next_action"] = json!(if kind == "permanent" {
+                "correct the request before retrying"
+            } else {
+                "retry once; if the failure repeats, inspect the reported cause"
+            });
+        }
+        // The stable code lives where agents read it (inside
+        // structuredContent so it survives the TextOnly [meta] fold,
+        // which clones structuredContent). v4.7 uniform envelope: a
+        // classified failure is a RETURNED result, never a throw :
+        // `ok:false` is the machine failure flag every consumer and
+        // client branches on.
         s["code"] = json!(code);
+        s["errorKind"] = json!(kind);
+        s["ok"] = json!(false);
+        if s.get("url").is_some() {
+            s["content_ok"] = json!(false);
+            s["read_status"] = json!(if kind == "walled" {
+                "walled"
+            } else if code == "content.notfound" {
+                "notfound"
+            } else if code == "content.incomplete" {
+                "incomplete"
+            } else {
+                "error"
+            });
+            s["content_complete"] = json!(false);
+            if code == "content.notfound"
+                && let Some(query) = s["url"].as_str().and_then(moved_page_query)
+            {
+                s["suggested_query"] = json!(query);
+            }
+        }
         v["structuredContent"] = s;
     }
     v
+}
+
+/// Use readable path words to locate a moved page. Never echo credentials,
+/// query parameters, fragments, or opaque percent-encoded path segments.
+fn moved_page_query(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    let words: Vec<_> = url
+        .path_segments()?
+        .filter(|part| !part.contains('%'))
+        .flat_map(|part| part.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| {
+            word.chars().any(char::is_alphabetic)
+                && word.len() <= 64
+                && !["html", "htm", "php", "aspx", "index"]
+                    .iter()
+                    .any(|noise| word.eq_ignore_ascii_case(noise))
+        })
+        .take(12)
+        .collect();
+    (!words.is_empty()).then(|| format!("site:{host} {}", words.join(" ")))
+}
+
+/// v4.7 uniform envelope: a classified failure is a NORMAL tool
+/// result whose envelope carries `ok:false`; nothing raises. Lives on
+/// structuredContent so it survives the TextOnly `[meta]` fold. The
+/// one predicate every consumer branches on (MCP wire, batch
+/// renderers, shot receipts, CLI exit codes).
+pub(crate) fn is_failure(result: &Value) -> bool {
+    result
+        .pointer("/structuredContent/ok")
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// The tool error for a call whose arguments fall outside the
+/// spec, with code `<cli_cmd>.invalid` (`fetch.invalid`, …). `None`
+/// when the arguments pass or the spec does not list the tool.
+pub(super) fn invalid_args_error(name: &str, args: &Value) -> Option<Value> {
+    let tool = crate::spec::TOOLS.iter().find(|t| t.name == name)?;
+    let problem = crate::spec::check_args(tool, args).err()?;
+    let cmd = tool.cli_cmd;
+    Some(tool_error_structured(
+        format!("{cmd}: {problem}"),
+        "permanent",
+        Some(json!({
+            "code": format!("{cmd}.invalid"),
+            "next_action": "correct the parameter using the current tools/list schema, or omit an optional parameter",
+        })),
+    ))
 }
 
 /// What should the agent DO next, given this failure? One line,
@@ -338,7 +503,7 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
             _ => "server rejected the request : retrying later sometimes works".into(),
         },
         _ if kind == "transient" => {
-            "transient network failure : safe to retry immediately".into()
+            "network failure : a retry may work; if repeated, check this host from another network or choose another source".into()
         }
         _ if kind == "walled" => {
             "no extractable content behind the wall : use an interactive agent browser for this site".into()
@@ -360,16 +525,47 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
 #[derive(Default)]
 pub(super) struct Trace {
     steps: Vec<Value>,
+    pub(super) browser_document: Option<crate::ghost::document::Document>,
+}
+
+tokio::task_local! {
+    /// A per-call witness survives cancellation of the fetch future. Ordinary
+    /// traces keep their own ordered steps; recursive adapters cannot replace
+    /// the evidence already observed by a deadline-bound caller.
+    pub(super) static FETCH_TRACE: std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
 }
 
 impl Trace {
+    pub(super) fn observe_browser(&mut self, document: &crate::ghost::document::Document) {
+        self.browser_document = Some(document.clone());
+        self.step(
+            "2",
+            "browser-document",
+            &format!(
+                "generation={} status={}",
+                document.generation,
+                document
+                    .status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unavailable".into())
+            ),
+            0,
+        );
+    }
     pub(super) fn step(&mut self, tier: &str, action: &str, outcome: &str, ms: u128) {
-        self.steps.push(json!({
+        let step = json!({
             "tier": tier,
             "action": action,
             "outcome": outcome,
             "ms": ms,
-        }));
+        });
+        let _ = FETCH_TRACE.try_with(|witness| {
+            witness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(step.clone());
+        });
+        self.steps.push(step);
     }
 
     pub(super) fn value(&self) -> Value {
@@ -422,6 +618,17 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
     }
 }
 
+/// Wire-level evidence for the per-host repeated-failure advice
+/// (`recent_network_failures`). The retryable kinds qualify outright;
+/// the `Http` protocol variant is the pipe itself dying mid-exchange
+/// (headers never arrived, message truncated), the same story for the
+/// caller. Policy (`Ssrf`, `InvalidUrl`), name (`Dns`) and site
+/// (`TooManyRedirects`) failures never count: the wire delivered an
+/// answer, the answer was "no".
+pub(super) fn transport_failure_evidence(e: &FetchError) -> bool {
+    fetch_error_kind(e) == "transient" || matches!(e, FetchError::Http(_))
+}
+
 /// The stable machine code for a transport failure, taken from the
 /// error's own variant instead of its prose. `None` means the variant
 /// carries no code of its own and the text classifier decides.
@@ -437,14 +644,14 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<&'static str> {
         // signal (DnsTimeout is transient).
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some("network.dns"),
         FetchError::Ssrf(_) => Some("guard.ssrf"),
+        FetchError::ProxyConfig(_) => Some("proxy.config"),
         _ => None,
     }
 }
 
 /// Machine class for a transport-level fetch failure, recorded in
-/// the error's structuredContent so callers (and the resurrection
-/// gate) can tell "the site is gone" from "the net is bad". Mirrors
-/// friendly_fetch_error's branching; the strings are API surface.
+/// the result state so callers can distinguish site failures from network
+/// failures. Mirrors friendly_fetch_error; the strings are API surface.
 pub(super) fn transport_class(e: &FetchError) -> &'static str {
     match e {
         FetchError::Timeout => "timeout",
@@ -455,6 +662,7 @@ pub(super) fn transport_class(e: &FetchError) -> &'static str {
         FetchError::InvalidUrl(_) => "invalid_url",
         FetchError::Ghost(_) => "ghost",
         FetchError::Http(_) => "protocol",
+        FetchError::ProxyConfig(_) => "configuration",
         FetchError::Tls(msg) => {
             let m = msg.to_lowercase();
             if m.contains("reset") || m.contains("eof") {
@@ -526,6 +734,80 @@ mod stitch_tests {
             fetch_error_kind(&classified("some exotic library error")),
             "permanent"
         );
+    }
+
+    // The repeated-failure advice counts wire evidence, not only the
+    // retryable kinds: a connection that dies mid-exchange is `Http`
+    // (the live broken-wire fixture), while policy and name failures
+    // are answers from the wire, not evidence about it (#248 family).
+    #[test]
+    pub(super) fn wire_failures_feed_the_repeated_failure_advice() {
+        assert!(transport_failure_evidence(&FetchError::Http(
+            "eof before headers".into()
+        )));
+        assert!(transport_failure_evidence(&FetchError::Timeout));
+        assert!(transport_failure_evidence(&FetchError::DnsTimeout(
+            "the resolver did not answer".into()
+        )));
+        assert!(transport_failure_evidence(&FetchError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer")
+        )));
+        assert!(!transport_failure_evidence(&FetchError::Ssrf(
+            "10.0.0.1 is a private/loopback address".into()
+        )));
+        assert!(!transport_failure_evidence(&FetchError::Dns(
+            "no such host".into()
+        )));
+        assert!(!transport_failure_evidence(&FetchError::InvalidUrl(
+            "not a url".into()
+        )));
+        assert!(!transport_failure_evidence(&FetchError::TooManyRedirects));
+    }
+
+    #[test]
+    fn stealth_v3_invalid_proxy_is_configuration_not_network_evidence() {
+        // Nextest owns the process-global configuration for this test.
+        let directory =
+            std::env::temp_dir().join(format!("donsetch-proxy-errors-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let config = directory.join("config.toml");
+        std::fs::write(&config, "[proxy]\nfrom_environment=true\n").unwrap();
+        unsafe {
+            std::env::set_var("DONSETCH_CONFIG", config);
+            std::env::remove_var("DONSETCH_NO_ENV_PROXY");
+            std::env::set_var(
+                "HTTP_PROXY",
+                "socks4://alice:private-token@broken.invalid:1080",
+            );
+            std::env::set_var("NO_PROXY", "");
+            std::env::remove_var("no_proxy");
+        }
+        let error = crate::transport::proxy::from_env_for("http://example.com/").unwrap_err();
+        assert!(
+            !transport_failure_evidence(&error),
+            "a configuration error must not teach a network failure"
+        );
+        assert_eq!(fetch_error_code(&error), Some("proxy.config"));
+        let response = tool_error_structured(
+            friendly_fetch_error(&error),
+            fetch_error_kind(&error),
+            Some(json!({"url":"http://example.com/", "code":fetch_error_code(&error)})),
+        );
+        assert_eq!(response["errorKind"], "permanent");
+        assert_eq!(response["structuredContent"]["code"], "proxy.config");
+        assert_eq!(response["structuredContent"]["retry_safe"], false);
+        let action = response["structuredContent"]["next_action"]
+            .as_str()
+            .unwrap();
+        assert!(
+            action.contains("proxy") && action.contains("config"),
+            "{action}"
+        );
+        assert!(
+            !response.to_string().contains("private-token")
+                && !response.to_string().contains("alice")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     // search_error used to hardcode errorKind: "transient" for every
@@ -616,8 +898,127 @@ mod stitch_tests {
 }
 #[cfg(test)]
 mod error_code_tests {
+    #[test]
+    fn report_audit_all_errors_supply_machine_state_and_next_action() {
+        let raw = tool_error("invalid URL: not-a-url");
+        assert_eq!(raw["isError"], false);
+        assert_eq!(raw["structuredContent"]["ok"], false);
+        assert_eq!(raw["structuredContent"]["code"], "fetch.invalid");
+        assert!(
+            !raw["structuredContent"]["next_action"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        let auth = tool_error("authentication required at https://example.com (HTTP 200)");
+        assert_eq!(auth["structuredContent"]["code"], "wall.auth");
+    }
+
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stealth_v3_incomplete_document_is_retryable_without_invented_notfound() {
+        let result = tool_error_structured(
+            "browser document incomplete: content did not settle",
+            "transient",
+            Some(json!({"url":"https://owned.test/empty", "status":200,
+                "verdict":"Incomplete"})),
+        );
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["ok"], false);
+        assert_eq!(result["errorKind"], "transient");
+        assert_eq!(result["code"], "content.incomplete");
+        let state = &result["structuredContent"];
+        assert_eq!(state["read_status"], "incomplete");
+        assert_eq!(state["status"], 200);
+        assert_eq!(state["content_ok"], false);
+        assert_eq!(state["content_complete"], false);
+        assert!(state.get("suggested_query").is_none());
+        assert!(!state["next_action"].as_str().unwrap().is_empty());
+        assert_eq!(error_code("not found: /missing", None), "content.notfound");
+        assert_eq!(
+            error_code("walled", Some(&json!({"verdict":"Challenge"}))),
+            "wall.challenge"
+        );
+    }
+
+    #[test]
+    fn stealth_v3_browser_transport_failure_is_not_content_or_previous_http_wall() {
+        for (message, expected) in [
+            (
+                "browser navigation error: ghost: cdp link closed while reading browser DOM: transport=websocket protocol error, browser=signal: 5 (SIGTRAP), generation=4",
+                "browser.transport",
+            ),
+            (
+                "browser navigation error: ghost: cdp dropped: Page.navigate (websocket eof)",
+                "browser.transport",
+            ),
+            (
+                "browser automation error: ghost: cdp send: Connection reset",
+                "browser.transport",
+            ),
+            (
+                "browser navigation error: ghost: cdp timeout: Page.navigate",
+                "browser.timeout",
+            ),
+            (
+                "browser launch failed: ghost: cdp connect: IO error: Connection refused",
+                "browser.transport",
+            ),
+            (
+                "browser launch failed: ghost: cdp connect: ws handshake timeout",
+                "browser.timeout",
+            ),
+            (
+                "web_screenshot: no browser: ghost: devtools ws timeout (browser said nothing)",
+                "browser.timeout",
+            ),
+            (
+                "browser launch failed: ghost: no devtools ws line (browser exited)",
+                "browser.transport",
+            ),
+        ] {
+            let result = tool_error_structured(
+                message,
+                "permanent",
+                Some(
+                    json!({"url":"https://owned.test/", "status":null, "verdict":"Challenge(Cloudflare)", "next_action":"check the URL; the site may be blocking"}),
+                ),
+            );
+            assert_eq!(result["code"], expected, "{message}");
+            assert_eq!(result["structuredContent"]["code"], expected);
+            assert_eq!(result["structuredContent"]["read_status"], "error");
+            assert_eq!(result["structuredContent"]["content_ok"], false);
+            assert_eq!(result["errorKind"], "transient");
+            let action = result["structuredContent"]["next_action"].as_str().unwrap();
+            assert!(action.contains("browser"), "{action}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(action));
+            assert!(!text.contains("site may be blocking"));
+        }
+        assert_eq!(
+            error_code("interactive captcha requires a human", None),
+            "wall.captcha"
+        );
+        assert_eq!(
+            error_code("SSRF guard: private/loopback", None),
+            "guard.ssrf"
+        );
+        let action_failure = tool_error_structured(
+            "actions[0] failed: ghost: cdp link closed",
+            "transient",
+            Some(json!({"url":"https://owned.test/", "retry_safe":false})),
+        );
+        assert_eq!(action_failure["errorKind"], "permanent");
+        assert_eq!(action_failure["structuredContent"]["retry_safe"], false);
+        assert!(
+            action_failure["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("do not replay")
+        );
+    }
 
     #[test]
     pub(super) fn codes_are_stable() {
@@ -651,6 +1052,117 @@ mod error_code_tests {
             "crawl.resume"
         );
         assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
+    }
+
+    // V24: sniffing reads symptoms, never data : a wall error quoting
+    // its URL made the classifier read a rate limit out of the wall's
+    // own PORT (live case: the V03 fixture server answered on 42945).
+    #[test]
+    pub(super) fn a_url_port_is_not_a_rate_limit() {
+        let wall = json!({"verdict": "Challenge(Cloudflare)", "status": 403});
+        assert_eq!(
+            error_code(
+                "bot wall: http://127.0.0.1:42945/wall is protected by Cloudflare (try fetch with tier=2 for headless browser)",
+                Some(&wall)
+            ),
+            "wall.challenge"
+        );
+        // A status that is not glued to other digits still classifies.
+        assert_eq!(
+            error_code("server answered HTTP 429", None),
+            "network.ratelimit"
+        );
+        assert_eq!(
+            error_code("rate limited: too many requests", None),
+            "network.ratelimit"
+        );
+    }
+
+    #[test]
+    pub(super) fn url_words_are_not_failure_signal() {
+        let wall = json!({"verdict": "Challenge(Cloudflare)", "status": 403});
+        assert_eq!(
+            error_code(
+                "bot wall: https://dns.example.com/x is protected by Cloudflare",
+                Some(&wall)
+            ),
+            "wall.challenge"
+        );
+        assert_eq!(
+            error_code(
+                "blocked: https://x.example/retry?timeout=5 returned a wall",
+                Some(&wall)
+            ),
+            "wall.challenge"
+        );
+        // Genuine transport prose still classifies.
+        assert_eq!(
+            error_code("dns error: failed to lookup address information", None),
+            "network.dns"
+        );
+        assert_eq!(
+            error_code("request timed out after 30s", None),
+            "network.timeout"
+        );
+    }
+
+    #[test]
+    pub(super) fn off_list_enum_args_are_a_tool_error() {
+        let args = json!({ "url": "https://example.com", "tier": "3" });
+        let v = invalid_args_error("web_fetch", &args).expect("tier=3 must be refused");
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["ok"], false);
+        assert_eq!(v["errorKind"], "permanent");
+        assert_eq!(v["code"], "fetch.invalid");
+        assert_eq!(v["structuredContent"]["code"], "fetch.invalid");
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(r#"fetch: tier must be one of "auto", "1", "2"; got "3""#),
+            "{text}"
+        );
+        assert!(text.contains("Next action:"), "{text}");
+
+        let args = json!({ "url": "https://example.com", "mode": "asdf" });
+        let v = invalid_args_error("web_fetch", &args).expect("mode=asdf must be refused");
+        assert_eq!(v["code"], "fetch.invalid");
+        let args = json!({ "query": "q", "intent": "asdf" });
+        let v = invalid_args_error("web_search", &args).expect("intent=asdf must be refused");
+        assert_eq!(v["code"], "search.invalid");
+        let args = json!({ "url": "https://example.com", "mode": "asdf" });
+        let v = invalid_args_error("web_crawl", &args).expect("mode=asdf must be refused");
+        assert_eq!(v["code"], "crawl.invalid");
+    }
+
+    #[test]
+    fn v47_failures_are_returned_envelopes_not_thrown() {
+        let v = tool_error_structured(
+            "fetch: deadline_ms exceeded at https://owned.test/",
+            "transient",
+            Some(json!({"url": "https://owned.test/", "code": "deadline.hit"})),
+        );
+        // Returned, never thrown: the wire shape stays a normal
+        // result; the envelope is the failure channel.
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["ok"], false);
+        assert_eq!(v["structuredContent"]["code"], "deadline.hit");
+        assert_eq!(v["structuredContent"]["errorKind"], "transient");
+        assert!(is_failure(&v));
+        let ok = json!({"content": [{"type": "text", "text": "page"}], "structuredContent": {"ok": true}});
+        assert!(!is_failure(&ok));
+        // A success envelope without the field is not a failure either.
+        let bare = json!({"content": [{"type": "text", "text": "x"}]});
+        assert!(!is_failure(&bare));
+    }
+
+    #[test]
+    pub(super) fn listed_enum_args_and_unknown_tools_pass_through() {
+        let args = json!({ "url": "https://example.com", "tier": "2" });
+        assert!(invalid_args_error("web_fetch", &args).is_none());
+        assert!(
+            invalid_args_error("web_fetch", &json!({ "url": "https://example.com" })).is_none()
+        );
+        // An unknown tool is the dispatcher's protocol error, not this one.
+        assert!(invalid_args_error("web_nope", &json!({ "tier": "3" })).is_none());
     }
 
     // #248: a host that does not resolve is a NAME failure, and a
@@ -746,6 +1258,115 @@ mod error_code_tests {
             )
             .as_ref(),
             "wall.empty_shell"
+        );
+    }
+}
+
+#[cfg(test)]
+mod v471_tests {
+    use super::*;
+    #[test]
+    fn v471_dead_page_suggests_topic_without_url_secrets() {
+        let url = "https://docs.example.com/guides/rust-async.html?token=secret#private";
+        let result = tool_error_structured(
+            format!("not found: {url} returned HTTP 404"),
+            "permanent",
+            Some(json!({"url":url})),
+        );
+        let query = result["structuredContent"]["suggested_query"]
+            .as_str()
+            .expect("useful topic query");
+        assert_eq!(query, "site:docs.example.com guides rust async");
+        assert!(!query.contains("secret") && !query.contains("private"));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn v471_argument_types_and_unknown_keys_are_rejected() {
+        for args in [
+            json!([]),
+            json!({"deadline_ms":"500"}),
+            json!({"deadline_ms":-1}),
+            json!({"focus":true}),
+            json!({"toc":"false"}),
+            json!({"url":[1]}),
+            json!({"actions":{}}),
+            json!({"archive":"only"}),
+            json!({"url":vec!["https://example.com";13]}),
+        ] {
+            let result = invalid_args_error("web_fetch", &args)
+                .expect("invalid arguments must not silently use defaults");
+            assert_eq!(result["structuredContent"]["code"], "fetch.invalid");
+            assert_eq!(result["structuredContent"]["ok"], false);
+        }
+        assert!(
+            invalid_args_error(
+                "web_fetch",
+                &json!({"url":"https://example.com","deadline_ms":500,"toc":false,"focus":null})
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn v471_topic_hint_is_absent_for_roots_and_opaque_paths() {
+        for url in [
+            "https://example.com/?token=secret",
+            "https://example.com/index.html",
+            "https://user:secret@example.com/INDEX.HTML?token=secret#private",
+            "https://example.com/%E6%97%A5?token=secret",
+        ] {
+            assert_eq!(moved_page_query(url), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_class_tests {
+    #[test]
+    fn transport_classes_separate_death_from_ambiguity() {
+        use super::transport_class;
+        use crate::error::FetchError;
+        // Certificate, DNS and connection failures retain distinct classes.
+        assert_eq!(
+            transport_class(&FetchError::Tls("certificate verify failed".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Tls("handshake failure".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "Name or service not known"
+            ))),
+            "dns"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("connection refused"))),
+            "refused"
+        );
+        // Timeouts and protocol failures retain their own retry signals.
+        assert_eq!(transport_class(&FetchError::Timeout), "timeout");
+        assert_eq!(
+            transport_class(&FetchError::Tls("connection reset by peer".into())),
+            "reset"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "connection timed out"
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Http("parser died".into())),
+            "protocol"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Ghost("no browser".into())),
+            "ghost"
         );
     }
 }

@@ -145,8 +145,21 @@ pub async fn solve(
     url: &str,
     timeout: Duration,
 ) -> Result<SolveOutcome, FetchError> {
+    let mut operation = ghost.operation();
+    let result = solve_inner(ghost, url, timeout).await;
+    operation.finish();
+    result
+}
+
+async fn solve_inner(
+    ghost: &mut Ghost,
+    url: &str,
+    timeout: Duration,
+) -> Result<SolveOutcome, FetchError> {
     let start = Instant::now();
-    ghost.navigate(url).await?;
+    tokio::time::timeout(timeout, ghost.navigate(url))
+        .await
+        .map_err(|_| FetchError::ghost("browser navigation deadline exceeded"))??;
     // No resource blocking : challenges need resources to load.
     let _ = ghost
         .cdp
@@ -179,18 +192,16 @@ pub async fn solve(
         // Require a real URL and real bytes before any
         // clear vote counts.
         let cur = ghost.current_url().await.unwrap_or_default();
-        let navigated = !cur.is_empty() && !cur.starts_with("about:") && html.len() > 500;
+        let navigated = !cur.is_empty() && !cur.starts_with("about:");
         if !navigated {
             continue;
         }
-        let verdict = walls::detect(200, &[], html.as_bytes());
-
-        // Interstitials are tiny (CF ~5-15KB, DataDome
-        // ~1.5KB, PX ~10KB). ≥30KB + markers = real page
-        // that mentions the vendor (nowsecure case).
-        let small = html.len() < 30_000;
+        let verdict = walls::detect_dom_smart(html.as_bytes());
         let marker_hit = matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked);
-        let challenged = small && marker_hit;
+        let challenged = marker_hit;
+        if challenged && walls::human_captcha(html.as_bytes()) {
+            return Ok(SolveOutcome::CaptchaWalled);
+        }
 
         if challenged {
             if vendor.is_none()
@@ -241,17 +252,7 @@ pub async fn solve(
             }
         }
 
-        // Captcha walls: honest dead end.
         let lower = html.to_lowercase();
-        if small
-            && (lower.contains("hcaptcha.com")
-                || lower.contains("g-recaptcha")
-                || lower.contains("www.google.com/recaptcha")
-                || lower.contains("captcha-delivery.com/captcha")
-                || lower.contains("px-captcha"))
-        {
-            return Ok(SolveOutcome::CaptchaWalled);
-        }
 
         // Turnstile-style checkbox: locate it on the page and click.
         // Fixed coordinates miss because Turnstile renders at
@@ -263,7 +264,7 @@ pub async fn solve(
         // a moment later: counting that click is what let a pass stop
         // trying before the thing it was aiming at existed. A fallback is a
         // fixed-point guess, so it is allowed once, as a last resort.
-        if small
+        if challenged
             && (lower.contains("challenges.cloudflare.com")
                 || lower.contains("turnstile")
                 || lower.contains("verify you are human"))
@@ -301,14 +302,44 @@ pub async fn solve(
 pub struct GhostPage {
     /// Live DOM after content-grade settle.
     pub html: String,
+    pub document: super::document::Document,
     /// Session + clearance cookies with real expiry.
     pub cookies: Vec<CookieRecord>,
     /// Challenge vendor seen during the wait (if any).
     pub vendor: Option<String>,
-    /// Interactive captcha : honest dead end.
-    pub captcha: bool,
+    pub outcome: BrowserOutcome,
     #[allow(dead_code)]
     pub took: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserOutcome {
+    Content,
+    ManagedChallenge,
+    HumanRequired,
+    AuthRequired,
+    Paywall,
+    NotFound,
+    Incomplete,
+}
+
+impl BrowserOutcome {
+    pub fn is_wall(self) -> bool {
+        matches!(self, Self::ManagedChallenge | Self::HumanRequired)
+    }
+
+    fn from_verdict(verdict: Verdict, body: &[u8]) -> Self {
+        match verdict {
+            Verdict::Challenge(_) | Verdict::Blocked if walls::human_captcha(body) => {
+                Self::HumanRequired
+            }
+            Verdict::Challenge(_) | Verdict::Blocked => Self::ManagedChallenge,
+            Verdict::AuthWall => Self::AuthRequired,
+            Verdict::Paywall => Self::Paywall,
+            Verdict::SoftNotFound => Self::NotFound,
+            Verdict::ContentOk => Self::Content,
+        }
+    }
 }
 
 /// Settle floor for small DOMs: the SPA hydration guard.
@@ -355,8 +386,70 @@ pub async fn ghost_fetch(
     url: &str,
     timeout: Duration,
 ) -> Result<GhostPage, FetchError> {
+    if ghost.link_dead() {
+        return Err(ghost.link_error("before browser pass"));
+    }
+    let mut operation = ghost.operation();
+    let started = Instant::now();
+    let mut last_html = String::new();
+    let mut last_document = super::document::Document::default();
+    let result = match tokio::time::timeout(
+        timeout,
+        ghost_fetch_inner(ghost, url, timeout, &mut last_html, &mut last_document),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // A CDP call can consume the final poll's budget. Preserve the
+            // wall we actually observed instead of replacing it with an
+            // uninformative navigation timeout. A content DOM still requires
+            // the normal settle oracle; timeout never upgrades it to success.
+            let verdict = walls::detect_dom_smart(last_html.as_bytes());
+            if matches!(
+                verdict,
+                Verdict::Challenge(_)
+                    | Verdict::Blocked
+                    | Verdict::AuthWall
+                    | Verdict::SoftNotFound
+                    | Verdict::Paywall
+            ) && last_document.generation == ghost.document().generation
+            {
+                let vendor = match verdict {
+                    Verdict::Challenge(v) => Some(format!("{v:?}").to_lowercase()),
+                    _ => None,
+                };
+                let outcome = BrowserOutcome::from_verdict(verdict, last_html.as_bytes());
+                Ok(GhostPage {
+                    html: last_html,
+                    document: last_document,
+                    cookies: Vec::new(),
+                    vendor,
+                    outcome,
+                    took: started.elapsed(),
+                })
+            } else {
+                Err(FetchError::ghost(
+                    "browser pass deadline exceeded before usable content",
+                ))
+            }
+        }
+    };
+    operation.finish();
+    result
+}
+
+async fn ghost_fetch_inner(
+    ghost: &mut Ghost,
+    url: &str,
+    timeout: Duration,
+    last_html: &mut String,
+    last_document: &mut super::document::Document,
+) -> Result<GhostPage, FetchError> {
     let start = Instant::now();
-    ghost.navigate(url).await?;
+    tokio::time::timeout(timeout, ghost.navigate(url))
+        .await
+        .map_err(|_| FetchError::ghost("browser navigation deadline exceeded"))??;
     // No resource blocking : challenges verify that resources
     // (images, fonts) load. Blocking them breaks Cloudflare
     // and DataDome challenge solving. The speed cost is small
@@ -372,7 +465,7 @@ pub async fn ghost_fetch(
     let mut settle_streak = 0u8;
     let mut dead_streak = 0u32; // consecutive polls: DOM static + visible < 80
     let mut prev_len = 0usize;
-    let mut html = String::new();
+    let html = last_html;
 
     while start.elapsed() < timeout {
         let poll = if start.elapsed() > Duration::from_secs(5) {
@@ -381,8 +474,12 @@ pub async fn ghost_fetch(
             200
         };
         tokio::time::sleep(Duration::from_millis(poll)).await;
-        html = match ghost.outer_html().await {
+        let before = ghost.document();
+        let observed_html = match ghost.outer_html().await {
             Ok(h) => h,
+            Err(_) if ghost.link_dead() => {
+                return Err(ghost.link_error("while reading browser DOM"));
+            }
             Err(e) => {
                 if crate::config::cfg().debug.ghost {
                     eprintln!(
@@ -393,27 +490,45 @@ pub async fn ghost_fetch(
                 continue;
             }
         };
+        let current = ghost.document();
+        if before.generation != current.generation {
+            html.clear();
+            settle_streak = 0;
+            dead_streak = 0;
+            prev_len = 0;
+            continue;
+        }
+        if last_document.generation != current.generation {
+            settle_streak = 0;
+            dead_streak = 0;
+            prev_len = 0;
+        }
+        *last_document = current;
+        *html = observed_html;
         // Mid-navigation guard.
-        let cur = ghost.current_url().await.unwrap_or_default();
-        if cur.is_empty() || cur.starts_with("about:") || html.len() < 500 {
+        let cur = &last_document.url;
+        if cur.is_empty() || cur.starts_with("about:") {
             continue;
         }
         let cur_len = html.len();
         let lower = html.to_lowercase();
 
-        // Interactive captcha: honest dead end.
-        if cur_len < 30_000
-            && (lower.contains("hcaptcha.com")
-                || lower.contains("g-recaptcha")
-                || lower.contains("www.google.com/recaptcha")
-                || lower.contains("captcha-delivery.com/captcha")
-                || lower.contains("px-captcha"))
+        let verdict = match last_document.status {
+            Some(401) => Verdict::AuthWall,
+            Some(402) => Verdict::Paywall,
+            Some(404) => Verdict::SoftNotFound,
+            _ => walls::detect_dom_smart(html.as_bytes()),
+        };
+        // Interactive captcha: honest dead end, including tiny widgets.
+        if matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked)
+            && walls::human_captcha(html.as_bytes())
         {
             return Ok(GhostPage {
-                html,
+                html: std::mem::take(html),
+                document: last_document.clone(),
                 cookies: Vec::new(),
                 vendor,
-                captcha: true,
+                outcome: BrowserOutcome::HumanRequired,
                 took: start.elapsed(),
             });
         }
@@ -426,7 +541,20 @@ pub async fn ghost_fetch(
         // poll, preventing the content oracle from ever running.
         // detect_dom_smart checks visible text first: ≥ 80 visible
         // chars = real content, skip challenge check.
-        let verdict = walls::detect_dom_smart(html.as_bytes());
+        if matches!(
+            verdict,
+            Verdict::AuthWall | Verdict::Paywall | Verdict::SoftNotFound
+        ) {
+            let outcome = BrowserOutcome::from_verdict(verdict, html.as_bytes());
+            return Ok(GhostPage {
+                html: std::mem::take(html),
+                document: last_document.clone(),
+                cookies: Vec::new(),
+                vendor,
+                outcome,
+                took: start.elapsed(),
+            });
+        }
         let challenged = matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked);
         if challenged {
             if vendor.is_none()
@@ -550,7 +678,7 @@ pub async fn ghost_fetch(
         // below that, one scroll kick fires to trigger lazy
         // hydration (infinite scroll + viewport-gated render).
         let big_dom = cur_len >= 50_000;
-        let visible = visible_text_len(&html);
+        let visible = visible_text_len(html);
         // An interstitial is never substantive, however much vendor
         // boilerplate it renders: settling on "Verifying your
         // browser…" shipped the challenge page as content (issue
@@ -575,12 +703,20 @@ pub async fn ghost_fetch(
                         .ok()
                         .and_then(|r| r.ok())
                         .unwrap_or_default();
+                if last_document.generation != ghost.document().generation {
+                    html.clear();
+                    settle_streak = 0;
+                    dead_streak = 0;
+                    prev_len = 0;
+                    continue;
+                }
                 ghost.touch();
                 return Ok(GhostPage {
-                    html,
+                    html: std::mem::take(html),
+                    document: last_document.clone(),
                     cookies,
                     vendor,
-                    captcha: false,
+                    outcome: BrowserOutcome::Content,
                     took: start.elapsed(),
                 });
             }
@@ -600,7 +736,19 @@ pub async fn ghost_fetch(
         // Adaptive threshold: tiny DOMs (< 5KB) exit faster (8 polls
         // ≈ 1.6s early / 4s late) : a 2KB DOM with 0 visible chars is
         // clearly dead. Larger DOMs get 15 polls (≈ 3s / 7.5s).
-        if prev_len > 0 && visible < 80 && cur_len.abs_diff(prev_len) < 100 {
+        //
+        // v4.6: the hydration floor gates this exit too. A small
+        // SCRIPTED shell (< 50KB with JS) is the shape that hydrates
+        // late; the settle gate above already holds its 4s floor, and
+        // letting the dead exit fire inside that window killed a shell
+        // 0.14s before its own script ran (Incomplete, dom=0KB). Large
+        // and scriptless DOMs keep floor ZERO, so the early-exit saving
+        // is untouched where it was earned.
+        if start.elapsed() >= min_settle
+            && prev_len > 0
+            && visible < 80
+            && cur_len.abs_diff(prev_len) < 100
+        {
             dead_streak += 1;
         } else {
             dead_streak = 0;
@@ -629,18 +777,13 @@ pub async fn ghost_fetch(
         }
     }
 
-    // Timeout: return whatever rendered : partial beats none,
-    // the caller's extraction yield decides success.
-    // Timeout: return whatever rendered : partial beats none,
-    // the caller's extraction yield decides success.
-    //
-    // BUT: if the final DOM is still a challenge/wall page, flag it
-    // as captcha so ghost_escalate doesn't extract and cache the
-    // interstitial as content (the Indeed false-positive bug).
-    // Use detect_dom_smart : a real page with an embedded challenge
-    // widget (Turnstile) has challenge markers but also visible text.
-    // detect_dom alone would flag it as captcha; detect_dom_smart
-    // checks visible text first.
+    // Preserve observed walls. An unsettled shell is incomplete; its byte
+    // size is neither proof of content nor evidence of a missing URL.
+    if last_document.generation != ghost.document().generation {
+        return Err(FetchError::ghost(
+            "document changed before browser content settled",
+        ));
+    }
     let final_verdict = walls::detect_dom_smart(html.as_bytes());
     if matches!(final_verdict, Verdict::Challenge(_) | Verdict::Blocked) {
         if crate::config::cfg().debug.ghost {
@@ -649,11 +792,13 @@ pub async fn ghost_fetch(
                 final_verdict
             );
         }
+        let outcome = BrowserOutcome::from_verdict(final_verdict, html.as_bytes());
         return Ok(GhostPage {
-            html,
+            html: std::mem::take(html),
+            document: last_document.clone(),
             cookies: Vec::new(),
             vendor,
-            captcha: true,
+            outcome,
             took: start.elapsed(),
         });
     }
@@ -664,10 +809,11 @@ pub async fn ghost_fetch(
         .unwrap_or_default();
     ghost.touch();
     Ok(GhostPage {
-        html,
+        html: std::mem::take(html),
+        document: last_document.clone(),
         cookies,
         vendor,
-        captcha: false,
+        outcome: BrowserOutcome::Incomplete,
         took: start.elapsed(),
     })
 }
@@ -726,8 +872,21 @@ fn find_ci(b: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// Success = outerHTML length stable across two polls :
 /// robust for SPAs, no Network domain needed.
 pub async fn render(ghost: &mut Ghost, url: &str, timeout: Duration) -> Result<String, FetchError> {
+    let mut operation = ghost.operation();
+    let result = render_inner(ghost, url, timeout).await;
+    operation.finish();
+    result
+}
+
+async fn render_inner(
+    ghost: &mut Ghost,
+    url: &str,
+    timeout: Duration,
+) -> Result<String, FetchError> {
     let start = Instant::now();
-    ghost.navigate(url).await?;
+    tokio::time::timeout(timeout, ghost.navigate(url))
+        .await
+        .map_err(|_| FetchError::ghost("browser navigation deadline exceeded"))??;
     let mut prev_len = 0usize;
     let mut stable = 0u8;
     let mut html = String::new();

@@ -31,15 +31,23 @@ const PROXY_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 /// True when `host` matches a NO_PROXY entry. Comma-separated
 /// suffix match: "example.com" matches "foo.example.com".
 /// "*" disables all proxying.
+#[cfg(test)]
 fn no_proxy_match(host: &str) -> bool {
+    no_proxy_match_value(host, &no_proxy_value())
+}
+
+pub(crate) fn no_proxy_value() -> String {
     let cfg = crate::config::cfg();
-    let no_proxy = if !cfg.proxy.no_proxy.is_empty() {
+    if !cfg.proxy.no_proxy.is_empty() {
         cfg.proxy.no_proxy.clone()
     } else {
         std::env::var("NO_PROXY")
             .or_else(|_| std::env::var("no_proxy"))
             .unwrap_or_default()
-    };
+    }
+}
+
+pub(crate) fn no_proxy_match_value(host: &str, no_proxy: &str) -> bool {
     if no_proxy.is_empty() {
         return false;
     }
@@ -50,6 +58,7 @@ fn no_proxy_match(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
+    let host = host_unbracketed.trim_end_matches('.');
     let host_ip: Option<std::net::IpAddr> = host_unbracketed.parse().ok();
     for entry in no_proxy.split(',') {
         let entry = entry.trim();
@@ -99,21 +108,30 @@ fn no_proxy_match(host: &str) -> bool {
         // Literal IP entry matches a literal IP host exactly (after
         // bracket stripping); a bare IPv6 entry like "::1" also lands
         // on this arm via host_unbracketed == entry.
-        if entry.parse::<std::net::IpAddr>().is_ok() && host_ip.is_some() {
-            if host_unbracketed == entry {
+        if let Ok(entry_ip) = entry.parse::<std::net::IpAddr>()
+            && host_ip.is_some()
+        {
+            if host_ip == Some(entry_ip) {
                 return true;
             }
             continue;
         }
-        let entry = entry.strip_prefix('.').unwrap_or(entry);
-        if host == entry || host_unbracketed == entry {
+        let entry = entry
+            .strip_prefix('.')
+            .unwrap_or(entry)
+            .trim_end_matches('.');
+        if entry.is_empty() {
+            continue;
+        }
+        if host.eq_ignore_ascii_case(entry) {
             return true;
         }
         // host.ends_with(&format!(".{entry}")) without the per-entry
         // allocation: the char before a matching suffix must be '.'.
-        // (Byte-identical semantics, including the empty-entry edge.)
         if host.len() > entry.len()
-            && host.ends_with(entry)
+            && host
+                .get(host.len() - entry.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(entry))
             && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
         {
             return true;
@@ -157,13 +175,13 @@ fn cidr_match(host: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProxyScheme {
     Http,
     Socks5,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Proxy {
     pub host: String,
     pub port: u16,
@@ -195,31 +213,18 @@ impl Proxy {
     ///   "user:pass@host:port"  (bare = HTTP CONNECT, backward compat)
     ///   "host:port"            (no auth, HTTP CONNECT)
     pub fn parse(s: &str) -> Result<Self, FetchError> {
-        // E5: an unsupported scheme ("socks4://host:1080") used to
-        // parse as HTTP with the scheme text inside the host, then
-        // fail at dial time with a confusing "bad addr" error. Reject
-        // any scheme:// line we don't serve, right here, where the
-        // user is looking.
-        if s.contains("://")
-            && let Some(scheme) = s.split("://").next()
-            && !scheme.is_empty()
-            && !matches!(
-                scheme.to_ascii_lowercase().as_str(),
-                "http" | "socks5" | "socks5h"
-            )
-        {
-            return Err(FetchError::Http(format!(
-                "proxy: unsupported scheme '{scheme}://' (supported: http://, socks5://, socks5h://)"
-            )));
-        }
-        let (scheme, rest) = if let Some(r) = s.strip_prefix("socks5://") {
-            (ProxyScheme::Socks5, r)
-        } else if let Some(r) = s.strip_prefix("socks5h://") {
-            (ProxyScheme::Socks5, r) // socks5h = remote DNS (same as our domain ATYP)
-        } else if let Some(r) = s.strip_prefix("http://") {
-            (ProxyScheme::Http, r)
-        } else {
-            (ProxyScheme::Http, s)
+        let (scheme, rest) = match s.split_once("://") {
+            Some((scheme, rest)) => match scheme.to_ascii_lowercase().as_str() {
+                "http" => (ProxyScheme::Http, rest),
+                "socks5" | "socks5h" => (ProxyScheme::Socks5, rest),
+                _ => {
+                    return Err(FetchError::Http(
+                        "proxy: unsupported scheme (supported: http://, socks5://, socks5h://)"
+                            .into(),
+                    ));
+                }
+            },
+            None => (ProxyScheme::Http, s),
         };
 
         // Split auth@addr : auth is optional. The address (host:port)
@@ -242,14 +247,31 @@ impl Proxy {
             .ok_or_else(|| FetchError::Http("proxy: bad address (expected host:port)".into()))?;
         // rsplit_once handles IPv6 brackets too: [::1]:1080 → ("[::1]", "1080")
         let port: u16 = port
-            .parse()
-            .map_err(|_| FetchError::Http("proxy: bad port (expected 1-65535)".into()))?;
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| FetchError::Http("proxy: bad port (expected 1-65535)".into()))?;
         // Strip IPv6 brackets if present.
-        let host = host
+        if host.is_empty()
+            || host
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(FetchError::Http("proxy: invalid host".into()));
+        }
+        let bare = host
             .strip_prefix('[')
             .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host)
-            .to_string();
+            .unwrap_or(host);
+        let host = if let Ok(address) = bare.parse::<std::net::Ipv6Addr>() {
+            address.to_string()
+        } else {
+            url::Host::parse(host)
+                .map_err(|_| FetchError::Http("proxy: invalid host".into()))?
+                .to_string()
+        };
 
         Ok(Self {
             host,
@@ -260,9 +282,29 @@ impl Proxy {
         })
     }
 
-    /// Stable id for pool keys and health tracking.
+    /// Endpoint id for lane health tracking.
     pub fn id(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Opaque connection identity including protocol and credentials.
+    /// Credential changes may select a different exit at the same endpoint.
+    pub fn connection_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update([match self.scheme {
+            ProxyScheme::Http => 0,
+            ProxyScheme::Socks5 => 1,
+        }]);
+        hash.update(self.port.to_be_bytes());
+        for field in [&self.host, &self.user, &self.pass] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// True when traffic goes through an HTTP CONNECT hop: these are
@@ -619,9 +661,8 @@ impl Proxy {
         }
     }
 
-    /// Chrome-compatible `--proxy-server` value (scheme://host:port, no
-    /// credentials : Chrome handles proxy auth via its own dialog or
-    /// `--proxy-auth` extension). Used for the Ghost browser tier.
+    /// Credential-free native proxy URI for Chromium's `--proxy-server` map.
+    /// Authenticated routes require the browser's owned credential relay.
     pub fn chrome_proxy_arg(&self) -> String {
         format!(
             "{}://{}:{}",
@@ -723,7 +764,7 @@ pub fn load_all() -> Vec<Proxy> {
 /// variable set to "" as unset, so `HTTPS_PROXY=""` must fall
 /// through to https_proxy / ALL_PROXY instead of short-circuiting the
 /// chain with an empty value.
-fn env_proxy_var(name: &str) -> Option<String> {
+pub(crate) fn env_proxy_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -739,58 +780,8 @@ fn env_proxy_var(name: &str) -> Option<String> {
 /// via `ALL_PROXY=socks5://host:port` are also supported. An empty
 /// value counts as unset (curl parity): it does not starve the
 /// fallbacks after it.
-pub fn from_env_for(url: &str) -> Option<Proxy> {
-    let parsed = url::Url::parse(url).ok()?;
-    let scheme = parsed.scheme();
-    let host = parsed.host_str()?;
-
-    // NO_PROXY bypass.
-    if no_proxy_match(host) {
-        return None;
-    }
-
-    // Resolution order: the explicit config slot ([proxy] https or
-    // [proxy] http) beats the config "all" slot, which beats the
-    // ambient env chain of the same scheme (upper, lower, ALL_PROXY,
-    // all_proxy). The ambient chain is gated by
-    // proxy.from_environment; config values stay live regardless.
-    // This is what doctor reports ("from_env_for consults the config
-    // layer first"); an earlier comment here described the reverse
-    // order, which the code has never implemented.
-    // Note (Q2): non-http(s) schemes fall into the HTTP_PROXY arm. DonSeTch
-    // never dials non-http(s) URLs (the URL gate rejects them first), so
-    // curl's "ALL_PROXY covers unknown schemes" rule is dormant here; the
-    // ALL_PROXY fallback below already covers both http and https.
-    let cfg = crate::config::cfg();
-    let (cfg_slot, env_name) = if scheme == "https" {
-        (&cfg.proxy.https, "HTTPS_PROXY")
-    } else {
-        (&cfg.proxy.http, "HTTP_PROXY")
-    };
-    let explicit = if !cfg_slot.trim().is_empty() {
-        Some(cfg_slot.trim())
-    } else if !cfg.proxy.all.trim().is_empty() {
-        Some(cfg.proxy.all.trim())
-    } else {
-        None
-    };
-    let env_val = match explicit {
-        Some(v) => v.to_string(),
-        // The ambient env layer is gated by proxy.from_environment:
-        // explicit [proxy] slots stay live even when the ambient
-        // convention is disabled (the gate must never starve a TOML
-        // proxy).
-        None if crate::config::cfg().proxy.from_environment => env_proxy_var(env_name)
-            .or_else(|| env_proxy_var(&env_name.to_lowercase()))
-            .or_else(|| env_proxy_var("ALL_PROXY"))
-            .or_else(|| env_proxy_var("all_proxy"))?,
-        None => return None,
-    };
-    let env_val = env_val.trim();
-    if env_val.is_empty() {
-        return None;
-    }
-    Proxy::parse(env_val).ok()
+pub fn from_env_for(url: &str) -> Result<Option<Proxy>, FetchError> {
+    super::request_route::RequestRoute::configured().proxy_for(url)
 }
 
 /// Save proxies to the config file. Atomic write (temp + rename).
@@ -839,6 +830,89 @@ pub(crate) fn base64(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stealth_v3_no_proxy_normalizes_host_case_and_ip_spelling() {
+        assert!(super::no_proxy_match_value(
+            "child.example.com",
+            ".EXAMPLE.COM:443"
+        ));
+        assert!(super::no_proxy_match_value(
+            "[::1]",
+            "[0:0:0:0:0:0:0:1]:8443"
+        ));
+        assert!(super::no_proxy_match_value("example.com.", "EXAMPLE.COM"));
+        for (host, bypass) in [
+            ("otherexample.com", "example.com"),
+            ("[::2]", "[::1]"),
+            ("example.com.", "."),
+        ] {
+            assert!(
+                !super::no_proxy_match_value(host, bypass),
+                "{host} must not bypass {bypass}"
+            );
+        }
+    }
+    #[test]
+    fn stealth_v3_proxy_endpoint_validation_rejects_invalid_hosts_and_zero_port() {
+        for raw in [
+            "http://:8080",
+            "http://proxy:0",
+            "http://proxy/path:8080",
+            "http://proxy\r\nInjected:8080",
+            "http://[not-ip]:8080",
+            "http://proxy:8080/",
+            "socks5://two words:1080",
+        ] {
+            assert!(
+                super::Proxy::parse(raw).is_err(),
+                "invalid proxy endpoint accepted: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stealth_v3_proxy_scheme_case_does_not_become_part_of_the_host() {
+        for (raw, expected) in [
+            ("HTTP://proxy:8080", super::ProxyScheme::Http),
+            ("SoCkS5H://[::1]:1080", super::ProxyScheme::Socks5),
+        ] {
+            let proxy = super::Proxy::parse(raw).unwrap();
+            assert_eq!(proxy.scheme, expected);
+            assert_eq!(
+                proxy.host,
+                if expected == super::ProxyScheme::Http {
+                    "proxy"
+                } else {
+                    "::1"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn stealth_v3_proxy_connection_identity_covers_protocol_and_each_credential_field() {
+        let original = super::Proxy::parse("http://alice:owned-secret@proxy.example:8080").unwrap();
+        let key = original.connection_key();
+        assert_eq!(key, original.clone().connection_key());
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for variant in [
+            "socks5://alice:owned-secret@proxy.example:8080",
+            "http://bob:owned-secret@proxy.example:8080",
+            "http://alice:changed-secret@proxy.example:8080",
+            "http://alice:owned-secret@other.example:8080",
+            "http://alice:owned-secret@proxy.example:8081",
+        ] {
+            assert_ne!(key, super::Proxy::parse(variant).unwrap().connection_key());
+        }
+        let left = super::Proxy::parse("http://a:bc@proxy.example:8080").unwrap();
+        let right = super::Proxy::parse("http://ab:c@proxy.example:8080").unwrap();
+        assert_ne!(
+            left.connection_key(),
+            right.connection_key(),
+            "field boundaries are part of identity"
+        );
+    }
 
     // E1: IPv6 literals (bracketed and bare), CIDR networks and
     // host:port entries in NO_PROXY.
@@ -1153,7 +1227,9 @@ u:p@also_valid:8080
             std::env::remove_var("no_proxy");
             std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
         }
-        let p = from_env_for("https://example.com/").expect("should detect proxy");
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
         assert_eq!(p.host, "proxy");
         assert_eq!(p.port, 8080);
         assert_eq!(p.scheme, ProxyScheme::Http);
@@ -1172,7 +1248,9 @@ u:p@also_valid:8080
             std::env::remove_var("no_proxy");
             std::env::set_var("HTTP_PROXY", "http://proxy:3128");
         }
-        let p = from_env_for("http://example.com/").expect("should detect proxy");
+        let p = from_env_for("http://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
         assert_eq!(p.host, "proxy");
         assert_eq!(p.port, 3128);
         unsafe {
@@ -1192,7 +1270,9 @@ u:p@also_valid:8080
             std::env::remove_var("http_proxy");
             std::env::set_var("ALL_PROXY", "socks5://proxy:1080");
         }
-        let p = from_env_for("https://example.com/").expect("should detect proxy");
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
         assert_eq!(p.host, "proxy");
         assert_eq!(p.port, 1080);
         assert_eq!(p.scheme, ProxyScheme::Socks5);
@@ -1212,7 +1292,9 @@ u:p@also_valid:8080
             std::env::remove_var("HTTPS_PROXY");
             std::env::set_var("https_proxy", "http://proxy:8080");
         }
-        let p = from_env_for("https://example.com/").expect("should detect lowercase proxy");
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect lowercase proxy");
         assert_eq!(p.host, "proxy");
         unsafe {
             std::env::remove_var("https_proxy");
@@ -1229,7 +1311,7 @@ u:p@also_valid:8080
             std::env::set_var("NO_PROXY", "example.com");
         }
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "NO_PROXY should bypass"
         );
         unsafe {
@@ -1248,7 +1330,7 @@ u:p@also_valid:8080
             std::env::set_var("NO_PROXY", "*");
         }
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "NO_PROXY=* should bypass all"
         );
         unsafe {
@@ -1267,15 +1349,15 @@ u:p@also_valid:8080
             std::env::set_var("NO_PROXY", ".example.com");
         }
         assert!(
-            from_env_for("https://foo.example.com/").is_none(),
+            from_env_for("https://foo.example.com/").unwrap().is_none(),
             "NO_PROXY=.example.com should match subdomain"
         );
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "NO_PROXY=.example.com should match root"
         );
         assert!(
-            from_env_for("https://other.com/").is_some(),
+            from_env_for("https://other.com/").unwrap().is_some(),
             "NO_PROXY should not match unrelated domain"
         );
         unsafe {
@@ -1298,7 +1380,7 @@ u:p@also_valid:8080
             std::env::remove_var("all_proxy");
         }
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "no env vars = no proxy"
         );
     }
@@ -1620,6 +1702,7 @@ u:p@also_valid:8080
             std::env::set_var("ALL_PROXY", "socks5://proxy:1080");
         }
         let p = from_env_for("https://example.com/")
+            .unwrap()
             .expect("an empty HTTPS_PROXY must not starve ALL_PROXY");
         assert_eq!(p.scheme, ProxyScheme::Socks5);
         assert_eq!(p.host, "proxy");

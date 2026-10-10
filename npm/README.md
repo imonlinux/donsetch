@@ -33,14 +33,23 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 npm install -g donsetch
 ```
 
+Optional Bright Data setup: [SERP API and Web Unlocker guide](https://github.com/dondai44423/donsetch/blob/master/docs/brightdata.md).
+Use separate zones and add the exact dashboard names:
+
+```sh
+donsetch keys add brightdata "<token>::<SERP zone>"
+donsetch keys add unlocker "<token>::<Web Unlocker zone>"
+donsetch doctor --deep
+```
+
 Downloads the prebuilt binary for your platform from [GitHub Releases](https://github.com/dondai44423/donsetch/releases) with SHA256 verification. No build tools needed.
 
 | Platform | Asset | OCR + rerank |
 |---|---|---|
 | Linux x86_64 (glibc >= 2.35) | `donsetch-linux-x64.tar.gz` | yes |
 | Linux ARM64 | `donsetch-linux-arm64.tar.gz` | no, and PDF is fragile (ONNX has no working aarch64 prebuilt) |
-| macOS Apple Silicon | `donsetch-darwin-arm64.tar.gz` | yes |
-| macOS Intel | `donsetch-darwin-x64.tar.gz` | no (ONNX has no working x64 prebuilt) |
+| macOS Apple Silicon (>= 13.4) | `donsetch-darwin-arm64.tar.gz` | yes |
+| macOS Intel (>= 13.4) | `donsetch-darwin-x64.tar.gz` | yes |
 | Windows x86_64 | `donsetch-win32-x64.tar.gz` | yes |
 | Windows ARM64 | same x64 asset, under emulation | yes |
 
@@ -72,7 +81,7 @@ Downloads the prebuilt binary for your platform from [GitHub Releases](https://g
 
 Prefer HTTP over stdio? `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth (`DONSETCH_HTTP_TOKEN`) and per-request timeouts are documented in `donsetch mcp --help`.
 
-If your client shows only half of each result (tool metadata but no page text, or text but no citable URLs), it is dropping one of the two MCP result surfaces. Claude Code, VS Code, OpenCode, and the Pi extension get the `[meta]` fold automatically; `DONSETCH_MCP_TEXT_ONLY=1 donsetch mcp` forces it for every other client.
+Every client gets the `[meta]` fold by default: compact state and source evidence arrive together in `content`, including for unknown bridges and OpenCode's generic `cli` handshake. Raw MCP returns content blocks; some bridges join them into a string. Parse the leading `[meta]` JSON line, then read the source text. See the full README for the explicit split-output option.
 
 ### 2. As a CLI (for humans and scripts)
 
@@ -89,10 +98,12 @@ donsetch update
 
 | Tool | What it does |
 |---|---|
-| `web_fetch` | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes, `archive` resurrection. |
+| `web_fetch` | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes. |
 | `web_search` | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | `web_crawl` | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 | `web_screenshot` | Rendered PNG of any URL through the same browser tier, with the usual URL safety guards. |
+
+MCP results default to self-contained text: leading `[meta]` JSON followed by source evidence, including for unknown client bridges. PNGs remain image blocks.
 
 Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `deadline.hit`, `network.dns`…), an `errorKind` (`permanent`, `transient`, `walled`) and a `next_action`, so agents branch on codes instead of parsing prose.
 
@@ -101,7 +112,7 @@ Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `d
 - **Search without keys.** Six keyless engines across four independent index families plus eight official verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv, StackExchange, MDN, Google News), merged by consensus and re-ranked locally by an ONNX cross-encoder. 95.5% answer-in-snippet over 110 questions across 11 niches with no keys at all.
 - **PDFs done properly.** A custom PDFium FFI, no Python subprocess. Tables and borders come from the rendered bitmap, text from the glyph stream, and the trust audit flags exactly the regions that need OCR.
 - **Crawl with manners.** Per-host adaptive pacing that honors `Retry-After` and robots `Crawl-delay`, cross-process politeness so two crawls do not double a site's rate, near-duplicate detection, resume tokens that survive restarts, and honest stop reasons.
-- **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, `archive.stale` with the snapshot's age, `decoy suspected` instead of silently passing a cloaked page. No fake success.
+- **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, `decoy suspected` instead of silently passing a cloaked page. No fake success.
 - **Login to walled sites.** `donsetch login x.com` opens YOUR browser, you sign in, and the session cookies land in the 0600 vault that tier-1 fetches and tier-2 renders already replay. Credentials never enter DonSeTch.
 - **Works everywhere.** Linux, macOS, Windows. npm, Homebrew, the Pi agent as a native extension, and the DeepSeek Harness as a first-class plugin.
 

@@ -96,6 +96,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&full, opts.offset, max);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: doc
             .select(&Selector::parse("h1.firstHeading").unwrap())
@@ -108,15 +109,18 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: fields.len(),
         blocks_shown: fields.len(),
-        tokens_est: total / 4,
         thin: false,
         content_kind: ContentKind::Article,
         lang: "en".to_string(),
         quality: 0.9,
         pdf_pages: None,
         images: Vec::new(),
-        fingerprint: None,
+        // Change tracking (since_last verdicts) needs the fingerprint
+        // the generic path records: sha256 of the full pre-pagination
+        // markdown.
+        fingerprint: Some(crate::pages::history::PageHistory::fingerprint(&full)),
         via: Some("adapter:wikipedia-infobox"),
+        partial: None,
     })
 }
 
@@ -162,7 +166,10 @@ fn field_value(td: ElementRef) -> String {
     let mut out = String::new();
     for child in td.children() {
         match child.value() {
-            scraper::Node::Text(t) => out.push_str(&t.text),
+            scraper::Node::Text(t) => {
+                out.push(' ');
+                out.push_str(&t.text);
+            }
             scraper::Node::Element(el) => {
                 let c = match ElementRef::wrap(child) {
                     Some(c) => c,
@@ -180,7 +187,10 @@ fn field_value(td: ElementRef) -> String {
                             .collect();
                         out.push_str(&items.join("; "));
                     }
-                    _ => out.push_str(&plain_text(c)),
+                    _ => {
+                        out.push(' ');
+                        out.push_str(&plain_text(c));
+                    }
                 }
             }
             _ => {}
@@ -201,7 +211,7 @@ fn field_value(td: ElementRef) -> String {
 fn plain_text(el: ElementRef) -> String {
     // Visible text only: a script/style subtree inside the element is
     // source, not content (#288).
-    inline::visible_text_raw(el).trim().to_string()
+    inline::visible_text(el)
 }
 
 /// Page furniture, checked on the element itself (selecting
@@ -259,7 +269,7 @@ pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &Extract
                 }
             }
             "pre" => {
-                let code = plain_text(el);
+                let code = inline::visible_text_raw(el).trim().to_string();
                 if !code.is_empty() {
                     let fence = crate::extract::render::code_fence(&code);
                     out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
@@ -314,6 +324,17 @@ fn render_wiki_table(table: ElementRef, url: &str, opts: &ExtractOptions, out: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_audit_infobox_keeps_name_and_date_boundaries() {
+        let html = Html::parse_fragment(
+            "<table><tr><td><span>January</span><span>26</span>, <span>2021</span><br><a>Ada Amodei</a><a>Bob Amodei</a><sup>[2]</sup></td></tr></table>",
+        );
+        let cell = html.select(&Selector::parse("td").unwrap()).next().unwrap();
+        let value = field_value(cell);
+        assert!(value.contains("January 26") && value.contains("Ada Amodei Bob Amodei"));
+        assert!(!value.contains("[2]"));
+    }
+
     use super::*;
 
     fn opts() -> ExtractOptions {
@@ -356,6 +377,23 @@ mod tests {
         // Body still present after the infobox.
         assert!(ex.markdown.contains("## History"));
         assert!(ex.markdown.contains("personal project in 2006"));
+    }
+
+    // V08: an adapter read must carry a change fingerprint so a
+    // since_last re-fetch can answer with a verdict; None silently
+    // disabled change tracking for every adapter page.
+    #[test]
+    fn an_infobox_read_carries_a_change_fingerprint() {
+        let url = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        let ex = extract(WIKI, url, &opts()).unwrap();
+        let fp = ex.fingerprint.expect("since_last needs a fingerprint");
+        // Stable across identical input.
+        let again = extract(WIKI, url, &opts()).unwrap();
+        assert_eq!(again.fingerprint.as_deref(), Some(fp.as_str()));
+        // Sensitive to content.
+        let edited = WIKI.replace("personal project in 2006", "personal project in 2007");
+        let other = extract(&edited, url, &opts()).unwrap();
+        assert_ne!(other.fingerprint.as_deref(), Some(fp.as_str()));
     }
 
     #[test]

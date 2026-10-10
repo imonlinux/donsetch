@@ -142,6 +142,806 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
 static ENV_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tokio::test]
+async fn stealth_v3_redirect_keeps_original_proxy_policy_when_ambient_changes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    unsafe {
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+        std::env::remove_var("DONSETCH_NO_ENV_PROXY");
+        std::env::set_var("HTTP_PROXY", format!("http://{address}"));
+        std::env::set_var("NO_PROXY", "");
+        std::env::remove_var("no_proxy");
+    }
+    let server = tokio::spawn(async move {
+        let mut heads = Vec::new();
+        for ordinal in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(stream.read_u8().await.unwrap());
+            }
+            heads.push(String::from_utf8(head).unwrap());
+            if ordinal == 0 {
+                unsafe {
+                    std::env::set_var("HTTP_PROXY", "socks4://broken.invalid:1080");
+                    std::env::set_var("NO_PROXY", "*");
+                }
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            } else {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nselected-policy").await.unwrap();
+            }
+        }
+        heads
+    });
+    let fetcher = Fetcher::new(BrowserProfile::host_default()).unwrap();
+    let outcome = fetcher
+        .fetch_persona(&format!("http://{address}/first"), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.body, b"selected-policy");
+    let heads = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(heads[0].starts_with(&format!("GET http://{address}/first HTTP/1.1\r\n")));
+    assert!(
+        heads[1].starts_with(&format!("GET http://{address}/next HTTP/1.1\r\n")),
+        "redirect escaped the selected proxy: {}",
+        heads[1]
+    );
+    assert_eq!(
+        outcome.route.proxy_for(&outcome.url).unwrap().unwrap().port,
+        address.port()
+    );
+}
+
+#[tokio::test]
+async fn stealth_v3_persona_revalidation_keeps_languages_separate() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Nextest isolates process-global configuration used by sandbox.
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/language", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let (tag, body) = if head.contains("accept-language: fr-FR,fr;q=0.9\r\n") {
+                ("fr", "document francais")
+            } else {
+                assert!(head.contains("accept-language: en-US,en;q=0.9\r\n"));
+                ("en", "english document")
+            };
+            let conditional = head.contains("if-none-match:");
+            if conditional {
+                assert!(
+                    head.contains(&format!("if-none-match: \"{tag}\"\r\n")),
+                    "{head}"
+                );
+            }
+            log.lock().unwrap().push(head);
+            let response = if conditional {
+                format!(
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"{tag}\"\r\nCache-Control: max-age=600\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"{tag}\"\r\nVary: Accept-Language\r\nCache-Control: max-age=0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    for (locale, body) in [
+        ("en-US,en;q=0.9", b"english document".as_slice()),
+        ("fr-FR,fr;q=0.9", b"document francais".as_slice()),
+    ] {
+        assert_eq!(
+            fetcher
+                .fetch_persona(&url, Some(locale))
+                .await
+                .unwrap()
+                .body,
+            body
+        );
+    }
+    for (locale, body) in [
+        ("en-US,en;q=0.9", b"english document".as_slice()),
+        ("fr-FR,fr;q=0.9", b"document francais".as_slice()),
+    ] {
+        let validated = fetcher.fetch_persona(&url, Some(locale)).await.unwrap();
+        assert_eq!(
+            validated.cache,
+            CacheState::Revalidated,
+            "persona path must send its validators"
+        );
+        assert_eq!(validated.body, body);
+        assert_eq!(validated.status, 200);
+        let fresh = fetcher.fetch_persona(&url, Some(locale)).await.unwrap();
+        assert_eq!(fresh.cache, CacheState::Fresh);
+        assert_eq!(fresh.body, body);
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        4,
+        "two cold reads and two validations, no fresh origin reads"
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stealth_v3_cookie_warm_retry_rejects_unsolicited_304() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned-warm", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=2 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(!head.contains("if-none-match:") && !head.contains("if-modified-since:"));
+            let response = if ordinal == 1 {
+                let body = "<h1>Just a moment...</h1><script src='/cdn-cgi/challenge-platform/cf-chl.js'></script>";
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nServer: cloudflare\r\nContent-Type: text/html\r\nSet-Cookie: clearance=warm; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                assert!(
+                    head.contains("cookie: clearance=warm\r\n"),
+                    "warm retry must actually carry the received cookie: {head}"
+                );
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".into()
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let Err(error) = fetcher.fetch(&url).await else {
+        panic!("unsolicited warm-retry 304 must be a protocol failure, not an empty wall");
+    };
+    assert!(error.to_string().contains("304"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stealth_v3_freshness_includes_actual_response_delay_and_validation_age() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned-delay", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            if ordinal == 1 {
+                assert!(!head.contains("if-none-match:"));
+            } else {
+                assert!(head.contains("if-none-match: \"delay\"\r\n"));
+            }
+            let response = if ordinal == 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"delay\"\r\nCache-Control: max-age=1\r\nAge: 0\r\nContent-Length: 10\r\nConnection: close\r\n\r\ndelay body"
+            } else if ordinal == 2 {
+                "HTTP/1.1 304 Not Modified\r\nETag: \"delay\"\r\nCache-Control: max-age=1\r\nAge: 2\r\nConnection: close\r\n\r\n"
+            } else {
+                "HTTP/1.1 304 Not Modified\r\nETag: \"delay\"\r\nCache-Control: max-age=600\r\nAge: 0\r\nConnection: close\r\n\r\n"
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"delay body");
+    for _ in 0..2 {
+        let out = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(
+            out.cache,
+            CacheState::Revalidated,
+            "expired wire time/Age requires actual validation"
+        );
+        assert_eq!(out.body, b"delay body");
+    }
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stealth_v3_304_changed_validators_fail_without_merging_a_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    for (old, updated, valid) in [
+        ("ETag: \"v1\"", "ETag: \"v2\"", false),
+        ("ETag: W/\"v1\"", "ETag: \"v1\"", false),
+        ("ETag: \"v1\"", "ETag: \"v1\"\r\nETag: \"v1\"", false),
+        (
+            "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT",
+            "Last-Modified: Sun, 06 Nov 1994 08:49:38 GMT",
+            false,
+        ),
+        (
+            "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT",
+            "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT",
+            true,
+        ),
+        ("ETag: \"v1\"", "ETag: W/\"v1\"", true),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned-validator", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for ordinal in 1..=if valid { 2 } else { 3 } {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16384);
+                    head.push(tcp.read_u8().await.unwrap());
+                }
+                let head = String::from_utf8(head).unwrap();
+                if ordinal == 2 {
+                    let expected = if old.starts_with("ETag:") {
+                        "if-none-match:"
+                    } else {
+                        "if-modified-since:"
+                    };
+                    assert!(head.contains(expected));
+                }
+                if ordinal == 3 {
+                    assert!(
+                        !head.contains("if-none-match:") && !head.contains("if-modified-since:"),
+                        "retry must be unconditional: {head}"
+                    );
+                }
+                let response = if ordinal == 1 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{old}\r\nContent-Length: 10\r\nConnection: close\r\n\r\nowned body"
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 304 Not Modified\r\n{updated}\r\nCache-Control: max-age=600\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                tcp.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+        assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"owned body");
+        let result = fetcher.fetch(&url).await;
+        if valid {
+            assert_eq!(
+                result.unwrap().body,
+                b"owned body",
+                "matching validator {updated}"
+            );
+        } else {
+            let Err(error) = result else {
+                panic!("changed validator must not authorize old body: {updated}");
+            };
+            assert!(error.to_string().contains("304"));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stealth_v3_304_refreshes_metadata_and_freshness_without_refetching_body() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=2 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            log.lock().unwrap().push(head.clone());
+            let response = if ordinal == 1 {
+                assert!(!head.contains("if-none-match:"));
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=0\r\nETag: \"v1\"\r\nX-Revision: old\r\nContent-Length: 15\r\nConnection: close\r\n\r\nowned body data"
+            } else {
+                assert!(head.contains("if-none-match: \"v1\"\r\n"));
+                "HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=600\r\nETag: \"v1\"\r\nX-Revision: validated\r\nConnection: close\r\n\r\n"
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"owned body data");
+    let validated = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(validated.cache, CacheState::Revalidated);
+    assert_eq!(validated.status, 200);
+    assert_eq!(validated.body, b"owned body data");
+    assert!(
+        validated
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-revision" && value == "validated")
+    );
+    let fresh = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(fresh.cache, CacheState::Fresh);
+    assert_eq!(fresh.body, b"owned body data");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stealth_v3_304_uses_its_validator_snapshot_without_overwriting_newer_body() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned", listener.local_addr().unwrap());
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut released = Some(released);
+        let mut peers = tokio::task::JoinSet::new();
+        for ordinal in 1..=3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let barrier = if ordinal == 2 {
+                Some((entered.take().unwrap(), released.take().unwrap()))
+            } else {
+                None
+            };
+            peers.spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16384);
+                    head.push(tcp.read_u8().await.unwrap());
+                }
+                let head = String::from_utf8(head).unwrap();
+                if ordinal > 1 {
+                    assert!(head.contains("if-none-match: \"v1\"\r\n"));
+                }
+                if let Some((entered, released)) = barrier {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                }
+                let response = match ordinal {
+                    1 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\nContent-Length: 11\r\nConnection: close\r\n\r\nold version",
+                    2 => "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: max-age=600\r\nX-Revision: old-validated\r\nConnection: close\r\n\r\n",
+                    _ => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"v2\"\r\nCache-Control: max-age=600\r\nX-Revision: new\r\nContent-Length: 11\r\nConnection: close\r\n\r\nnew version",
+                };
+                tcp.write_all(response.as_bytes()).await.unwrap();
+                head
+            });
+        }
+        let mut heads = Vec::new();
+        while let Some(result) = peers.join_next().await {
+            heads.push(result.unwrap());
+        }
+        heads
+    });
+    let fetcher = Arc::new(Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap());
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"old version");
+    let delayed = {
+        let fetcher = fetcher.clone();
+        let url = url.clone();
+        tokio::spawn(async move { fetcher.fetch(&url).await.unwrap() })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"new version");
+    release.send(()).unwrap();
+    let validated = delayed.await.unwrap();
+    assert_eq!(validated.cache, CacheState::Revalidated);
+    assert_eq!(
+        validated.body, b"old version",
+        "304 validates the exact body sent in its precondition, not a concurrent replacement"
+    );
+    let fresh = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(fresh.cache, CacheState::Fresh);
+    assert_eq!(
+        fresh.body, b"new version",
+        "old validation must not overwrite a newer committed representation"
+    );
+    let heads = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(heads.len(), 3);
+}
+
+#[tokio::test]
+async fn stealth_v3_late_304_cannot_resurrect_content_after_a_new_404() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/deleted", listener.local_addr().unwrap());
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut released = Some(released);
+        let mut peers = tokio::task::JoinSet::new();
+        for ordinal in 1..=4 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let barrier = if ordinal == 2 {
+                Some((entered.take().unwrap(), released.take().unwrap()))
+            } else {
+                None
+            };
+            peers.spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16384);
+                    head.push(tcp.read_u8().await.unwrap());
+                }
+                let head = String::from_utf8(head).unwrap();
+                if ordinal == 2 || ordinal == 3 {
+                    assert!(head.contains("if-none-match: \"v1\"\r\n"));
+                } else { assert!(!head.contains("if-none-match:")); }
+                if let Some((entered, released)) = barrier {
+                    entered.send(()).unwrap(); released.await.unwrap();
+                }
+                let response = match ordinal {
+                    1 => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"v1\"\r\nContent-Length: 10\r\nConnection: close\r\n\r\nowned body",
+                    2 => "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: max-age=600\r\nConnection: close\r\n\r\n",
+                    _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                };
+                tcp.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+        while let Some(result) = peers.join_next().await {
+            result.unwrap();
+        }
+    });
+    let fetcher = Arc::new(Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap());
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"owned body");
+    let delayed = {
+        let fetcher = fetcher.clone();
+        let url = url.clone();
+        tokio::spawn(async move { fetcher.fetch(&url).await.unwrap() })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().status, 404);
+    release.send(()).unwrap();
+    assert_eq!(
+        delayed.await.unwrap().body,
+        b"owned body",
+        "old read can finish from its own snapshot"
+    );
+    let current = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(
+        current.status, 404,
+        "late validation must not cache content known to be deleted"
+    );
+    assert_eq!(current.cache, CacheState::None);
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stealth_v3_unsolicited_304_after_redirect_cannot_reuse_original_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/original", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            if ordinal == 3 {
+                assert!(head.starts_with("GET /other "));
+                assert!(!head.contains("if-none-match:") && !head.contains("if-modified-since:"));
+            }
+            let response = match ordinal {
+                1 => {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"v1\"\r\nContent-Length: 13\r\nConnection: close\r\n\r\noriginal body"
+                }
+                2 => {
+                    "HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                }
+                _ => "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"original body");
+    let Err(error) = fetcher.fetch(&url).await else {
+        panic!("an unsolicited redirected 304 has no validator snapshot");
+    };
+    assert!(error.to_string().contains("304"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stealth_v3_revalidation_new_200_replaces_the_original_request_context() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let count = {
+                let mut log = log.lock().unwrap();
+                log.push(head);
+                log.len()
+            };
+            let (body, age, tag) = if count == 1 {
+                ("old representation", 0, "v1")
+            } else {
+                ("new representation", 600, "v2")
+            };
+            tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age={age}\r\nETag: \"{tag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(
+        fetcher.fetch(&url).await.unwrap().body,
+        b"old representation"
+    );
+    assert_eq!(
+        fetcher.fetch(&url).await.unwrap().body,
+        b"new representation"
+    );
+    let fresh = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(fresh.body, b"new representation");
+    assert_eq!(
+        fresh.cache,
+        CacheState::Fresh,
+        "a conditional request returning 200 must replace the initial entry"
+    );
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(log.len(), 2);
+    assert!(!log[0].contains("if-none-match:"));
+    assert!(log[1].contains("if-none-match: \"v1\"\r\n"));
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stealth_v3_cache_tracks_sent_cookie_and_referer_not_jar_mode() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/article", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            log.lock().unwrap().push(head.clone());
+            let body = if head.contains("cookie: session=alice\r\n") {
+                "alice representation"
+            } else if head.contains("referer: ") {
+                "linked representation"
+            } else {
+                "anonymous representation"
+            };
+            tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nVary: Cookie, Referer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let anonymous = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(anonymous.body, b"anonymous representation");
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    let cookie = donsetch::ghost::cache::CookieRecord {
+        name: "session".into(),
+        value: "alice".into(),
+        domain: "127.0.0.1".into(),
+        path: "/".into(),
+        expires_at: None,
+        secure: false,
+        http_only: true,
+        same_site: "Lax".into(),
+    };
+    fetcher.reset_to(std::slice::from_ref(&cookie)).await;
+    let alice = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(
+        alice.body, b"alice representation",
+        "a login must not read the anonymous fresh entry"
+    );
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    // Unsent cookies must not invalidate this origin's fresh representation.
+    let unrelated = donsetch::ghost::cache::CookieRecord {
+        domain: "other.invalid".into(),
+        ..cookie.clone()
+    };
+    fetcher.import_cookies(&[unrelated]).await;
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    fetcher.reset_to(&[]).await;
+    let logged_out = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(
+        logged_out.body, b"anonymous representation",
+        "logout must not serve Alice's body"
+    );
+    let linked = fetcher
+        .fetch_via_jar_ref(&url, None, true, Some("https://referrer.test/path"))
+        .await
+        .unwrap();
+    assert_eq!(
+        linked.body, b"linked representation",
+        "Vary Referer requires a distinct entry"
+    );
+    assert_eq!(
+        fetcher
+            .fetch_via_jar_ref(&url, None, true, Some("https://referrer.test/path"))
+            .await
+            .unwrap()
+            .cache,
+        CacheState::Fresh
+    );
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "each actual request context must warm exactly once"
+    );
+    assert!(requests[1].contains("cookie: session=alice\r\n"));
+    assert!(requests[2].contains("referer: https://referrer.test/\r\n"));
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stealth_v3_cache_tracks_exact_proxy_credentials_and_direct_route() {
+    use donsetch::fetch::client::CacheState;
+    use donsetch::transport::proxy::Proxy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let body = if head.contains("proxy-authorization: Basic YWxpY2U6b25l\r\n") {
+                "alice exit"
+            } else if head.contains("proxy-authorization: Basic Ym9iOnR3bw==\r\n") {
+                "bob exit"
+            } else {
+                "direct exit"
+            };
+            seen.push(head);
+            tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        seen
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let url = format!("http://{addr}/article");
+    for (credentials, body) in [
+        ("alice:one", b"alice exit".as_slice()),
+        ("bob:two", b"bob exit".as_slice()),
+    ] {
+        let proxy = Proxy::parse(&format!("http://{credentials}@{addr}")).unwrap();
+        let response = fetcher
+            .fetch_via_jar_ref(&url, Some(&proxy), false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.body, body,
+            "fresh content must belong to this exact route"
+        );
+        assert_eq!(
+            fetcher
+                .fetch_via_jar_ref(&url, Some(&proxy), false, None)
+                .await
+                .unwrap()
+                .cache,
+            CacheState::Fresh
+        );
+    }
+    let direct = fetcher
+        .fetch_via_jar_ref(&url, None, false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        direct.body, b"direct exit",
+        "direct must not inherit a proxy representation"
+    );
+    assert_eq!(
+        fetcher
+            .fetch_via_jar_ref(&url, None, false, None)
+            .await
+            .unwrap()
+            .cache,
+        CacheState::Fresh
+    );
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[..2].iter().all(|h| h.starts_with("GET http://")));
+    assert!(seen[2].starts_with("GET /article "));
+}
+
+#[tokio::test]
 async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
     crate::sandbox();
     // Atomic test-order gate (cargo test runs both tests on one
@@ -222,4 +1022,58 @@ async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
 
     unsafe { std::env::remove_var("HTTP_PROXY") };
     unsafe { std::env::remove_var("NO_PROXY") };
+}
+
+#[tokio::test]
+async fn v471_mismatched_304_refetches_once_without_validators() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned-mismatch", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let conditional =
+                head.contains("if-none-match:") || head.contains("if-modified-since:");
+            assert_eq!(conditional, ordinal == 2, "request {ordinal}: {head}");
+            let response = if ordinal == 2 {
+                "HTTP/1.1 304 Not Modified\r\nETag: \"other\"\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            } else {
+                let body = if ordinal == 1 {
+                    "old body"
+                } else {
+                    "fresh body"
+                };
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=0\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+            tcp.shutdown().await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"old body");
+    let fresh = fetcher
+        .fetch(&url)
+        .await
+        .expect("mismatched 304 must recover with an unconditional GET");
+    assert_eq!(fresh.status, 200);
+    assert_eq!(
+        fresh.body, b"fresh body",
+        "never return the unvalidated stale body"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
 }

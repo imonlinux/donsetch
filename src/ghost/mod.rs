@@ -17,6 +17,8 @@ pub mod actions;
 pub mod cache;
 pub mod cdp;
 pub mod cloak;
+pub mod document;
+mod lifecycle;
 pub mod manager;
 pub mod ops;
 pub mod probe;
@@ -33,7 +35,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 #[cfg(linux_like)]
 use std::os::unix::process::CommandExt as _;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 
 use crate::error::FetchError;
@@ -68,42 +70,64 @@ pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_s
 #[cfg(windows)]
 pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Set when the LAST ghost render returned Chrome's own network
-/// error page (a dead/broken egress lane renders as a stable,
-/// tiny-text DOM extraction cannot use: the old path scored it
-/// "rendered a 180KB DOM, no content" and failed the fetch).
-/// The fetch escalation reads it for one direct retry; per
-/// attempt, never sticky.
-static LAST_GHOST_CHROME_ERROR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Launch override: skip proxy lanes entirely (direct). Set for
-/// one ghost escalation retry when the previous render hit a
-/// Chrome error page.
-static GHOST_DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Chrome's own error pages (ERR_* rendered as HTML). A content
-/// page never contains these strings; an error page never
-/// contains real content.
+/// Chrome's network error document. Require its DOM structure as well as
+/// an error code, so troubleshooting articles remain readable.
 pub fn is_chrome_error_html(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    lower.contains("err_socks_connection_failed")
-        || lower.contains("err_proxy_connection_failed")
-        || lower.contains("err_tunnel_connection_failed")
-        || lower.contains("this site can't be reached")
-        || lower.contains("the proxy server is refusing connections")
+    lower.contains("main-frame-error") && lower.contains("error-code") && lower.contains("err_")
 }
 
-pub fn note_last_ghost_chrome_error(on: bool) {
-    LAST_GHOST_CHROME_ERROR.store(on, std::sync::atomic::Ordering::SeqCst);
-}
+#[cfg(test)]
+mod wave450_retry_tests {
 
-pub fn last_ghost_chrome_error() -> bool {
-    LAST_GHOST_CHROME_ERROR.load(std::sync::atomic::Ordering::SeqCst)
-}
+    #[tokio::test]
+    async fn stealth_v3_cancelled_operation_marks_browser_dirty_during_sleep() {
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let flag = dirty.clone();
+        let task = tokio::spawn(async move {
+            let mut operation = Operation {
+                dirty: flag,
+                finished: false,
+            };
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            operation.finish();
+        });
+        started_rx.await.unwrap();
+        assert!(!dirty.load(std::sync::atomic::Ordering::Acquire));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(dirty.load(std::sync::atomic::Ordering::Acquire));
+        let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut operation = Operation {
+            dirty: clean.clone(),
+            finished: false,
+        };
+        operation.finish();
+        drop(operation);
+        assert!(!clean.load(std::sync::atomic::Ordering::Acquire));
+    }
 
-pub fn set_ghost_direct(on: bool) {
-    GHOST_DIRECT.store(on, std::sync::atomic::Ordering::SeqCst);
+    #[test]
+    fn wave450_each_browser_slot_owns_a_unique_temporary_profile() {
+        let paths: Vec<_> = (0..16).map(|_| temporary_profile_dir()).collect();
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            16
+        );
+    }
+    use super::*;
+
+    #[test]
+    fn wave450_network_error_quotation_is_not_a_browser_error_page() {
+        assert!(!is_chrome_error_html(
+            "<article><h1>Network troubleshooting</h1><p>The message this site can't be reached or ERR_PROXY_CONNECTION_FAILED can occur when a proxy is offline.</p></article>"
+        ));
+        assert!(is_chrome_error_html(
+            "<div id='main-frame-error'><p class='error-code'>ERR_PROXY_CONNECTION_FAILED</p></div>"
+        ));
+    }
 }
 
 pub struct Ghost {
@@ -116,6 +140,11 @@ pub struct Ghost {
     target: String,
     frozen: bool,
     pub last_used: Instant,
+    /// Vault epoch when this browser launched (vault ordering): a
+    /// session cleared at or after this epoch must not be harvested
+    /// back into the vault by this browser's reap — the browser
+    /// predates the clear and only holds a dead session.
+    pub launched_epoch: u64,
     /// Holds an flock on the shared profile dir. Kept alive for
     /// the Ghost's lifetime so concurrent donsetch processes see
     /// the lock and fall back to a temp profile instead of
@@ -129,7 +158,9 @@ pub struct Ghost {
     /// (including those triggered by browser actions) and enforces
     /// `fetch::guards::ensure_url_safe` before it hits the network.
     /// Aborted in Drop so it cannot leak after Chrome is reaped.
-    fetch_guard: Option<tokio::task::JoinHandle<()>>,
+    fetch_guard: Option<lifecycle::OwnedTask>,
+    stderr_reader: Option<lifecycle::OwnedTask>,
+    stderr_tail: lifecycle::StderrTail,
     /// The browser window found at launch (None when no window was
     /// found) and whether it is currently minimized. Captures
     /// restore the window for their call and re-minimize after;
@@ -147,24 +178,53 @@ pub struct Ghost {
     /// another daemon's staleness check (see WINLOCK_HEARTBEAT).
     /// Aborted in Drop, same as fetch_guard.
     #[cfg(windows)]
-    winlock_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    winlock_heartbeat: Option<lifecycle::OwnedTask>,
     /// Persona-coherent wire identity (v4 E2): viewport + locale used
     /// for launch args, CDP languages, and device metrics.
     wire: GhostWire,
-    /// Local credential relay when the egress lane requires auth
-    /// (Chrome cannot authenticate proxies itself). Owns the
-    /// listener: dropped with the Ghost.
+    /// Owned relays for proxy credentials and configured target bypasses.
+    /// Dropping the Ghost closes their listeners and active tunnels.
     #[allow(dead_code)] // held for its lifetime; Drop aborts the relay
-    relay: Option<relay::Relay>,
+    relays: Vec<relay::Relay>,
+    dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A cancelled browser operation can leave navigation or paused requests in
+/// flight. Its process must not be handed to another job. Normal errors finish
+/// the operation too; a transport-dead browser is retired separately.
+pub(crate) struct Operation {
+    dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+
+impl Operation {
+    pub(crate) fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Per-persona ghost wire identity (v4 E2). Defaults are the old
 /// hardcoded 1920x1080 / en-US so callers that have no persona stay
 /// byte-identical.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GhostWire {
     pub viewport: (u32, u32),
     pub locale: String,
+    /// Persona timezone for the browser process (`TZ`), sanitized; empty
+    /// keeps the host timezone (legacy callers).
+    pub tz: String,
+    /// An explicit direct override changes routing and therefore pool identity.
+    pub direct: bool,
+    /// Selected immutable HTTP/browser policy; absent only for legacy callers.
+    pub route: Option<crate::transport::request_route::RequestRoute>,
 }
 
 impl Default for GhostWire {
@@ -172,6 +232,9 @@ impl Default for GhostWire {
         Self {
             viewport: (1920, 1080),
             locale: "en-US".into(),
+            tz: String::new(),
+            direct: false,
+            route: None,
         }
     }
 }
@@ -189,6 +252,9 @@ impl GhostWire {
         Self {
             viewport: (w, h),
             locale,
+            tz: crate::persona::sanitize_tz(&p.tz),
+            direct: false,
+            route: None,
         }
     }
 }
@@ -197,6 +263,19 @@ impl GhostWire {
 /// easier, and clearance cookies survive daemon restarts.
 pub fn profile_dir() -> PathBuf {
     crate::paths::cache_dir().join("ghost-profile")
+}
+
+fn temporary_profile_dir() -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "donsetch-ghost-{}-{nonce}-{sequence}",
+        std::process::id()
+    ))
 }
 
 /// Default Chrome launch args (without sandbox flags).
@@ -217,13 +296,17 @@ pub fn default_chrome_args_wire(
     wire: &GhostWire,
 ) -> Vec<String> {
     let (vw, vh) = wire.viewport;
-    vec![
+    let locale = crate::persona::sanitize_locale(&wire.locale);
+    let mut args = vec![
         "--remote-debugging-port=0".into(),
         format!("--user-data-dir={}", dir.display()),
         format!("--user-agent={}", profile.user_agent),
         format!("--window-size={vw},{vh}"),
         "--window-position=-32000,-32000".into(),
-        format!("--lang={}", wire.locale),
+        format!("--lang={locale}"),
+        // Chromium's native network/DOM language preference is separate from
+        // its UI locale; --lang alone leaves non-English personas inconsistent.
+        format!("--accept-lang={locale}"),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-background-networking".into(),
@@ -253,15 +336,18 @@ pub fn default_chrome_args_wire(
         // This window is the only one this tool has; keep it
         // rendering. (Playwright ships the same switch.)
         "--disable-backgrounding-occluded-windows".into(),
-        // Software WebGL: a GPU-less box (Xvfb, VM, container)
-        // must still expose a renderer string. WebGL=null is a
-        // headless-only signature real desktops never produce;
-        // SwiftShader always initialises, so the page reads
-        // "Google SwiftShader" exactly like real Chrome on a
-        // machine without dedicated graphics.
-        "--use-gl=swiftshader".into(),
-        "--enable-unsafe-swiftshader".into(),
-    ]
+        // Headless Chromium otherwise suppresses hardware GPU support.
+        // This retains the browser's driver blocklist and sandbox.
+        "--enable-gpu".into(),
+    ];
+    if cfg!(target_os = "linux") {
+        // ANGLE's EGL backend can use the real render device without an
+        // X11 GPU surface. Owned headless/Xvfb draw/readback qualified it;
+        // unsupported drivers still report their native capability failure.
+        args.push("--use-gl=angle".into());
+        args.push("--use-angle=gl-egl".into());
+    }
+    args
 }
 
 /// Whether sandbox is disabled via explicit opt-in.
@@ -878,7 +964,7 @@ impl WindowRestore {
     /// Only a window that was never minimized can skip the wait: a
     /// failed restore leaves the window un-presented too, and a
     /// capture against it fails the same instant way.
-    fn needs_surface_wait(self) -> bool {
+    fn needs_surface_wait(&self) -> bool {
         !matches!(self, Self::NotMinimized)
     }
 }
@@ -906,6 +992,18 @@ impl Ghost {
         display: Option<&str>,
         wire: &GhostWire,
     ) -> Result<Self, FetchError> {
+        let mut selected_wire = wire.clone();
+        if selected_wire.direct {
+            selected_wire.route = Some(crate::transport::request_route::RequestRoute::direct());
+        } else if selected_wire.route.is_none() {
+            selected_wire.route = Some(crate::transport::request_route::RequestRoute::configured());
+        }
+        let wire = &selected_wire;
+        let (http_proxy, https_proxy, bypass) = wire
+            .route
+            .as_ref()
+            .expect("route selected")
+            .browser_proxies()?;
         // Unused on macOS/Windows (Xvfb is Linux-only) : clippy -Dwarnings errors on it.
         #[cfg(not(linux_like))]
         let _ = display;
@@ -946,10 +1044,15 @@ impl Ghost {
                         let got =
                             unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                         if got == 0 {
+                            if crate::config::cfg().debug.ghost {
+                                eprintln!("[ghost] profile lock acquired: shared profile");
+                            }
                             (profile_dir(), None, None::<std::path::PathBuf>)
                         } else {
-                            let t = std::env::temp_dir()
-                                .join(format!("donsetch-ghost-{}", std::process::id()));
+                            if crate::config::cfg().debug.ghost {
+                                eprintln!("[ghost] profile lock contended: temp profile");
+                            }
+                            let t = temporary_profile_dir();
                             (t.clone(), Some(t), None::<std::path::PathBuf>)
                         }
                     }
@@ -998,13 +1101,11 @@ impl Ghost {
                                     if take_lock(&lock_path).is_ok() {
                                         (profile_dir(), None, Some(lock_path))
                                     } else {
-                                        let t = std::env::temp_dir()
-                                            .join(format!("donsetch-ghost-{}", std::process::id()));
+                                        let t = temporary_profile_dir();
                                         (t.clone(), Some(t), None::<std::path::PathBuf>)
                                     }
                                 } else {
-                                    let t = std::env::temp_dir()
-                                        .join(format!("donsetch-ghost-{}", std::process::id()));
+                                    let t = temporary_profile_dir();
                                     (t.clone(), Some(t), None::<std::path::PathBuf>)
                                 }
                             }
@@ -1017,8 +1118,7 @@ impl Ghost {
                     }
                 }
                 None => {
-                    let t =
-                        std::env::temp_dir().join(format!("donsetch-ghost-{}", std::process::id()));
+                    let t = temporary_profile_dir();
                     (t.clone(), Some(t), None::<std::path::PathBuf>)
                 }
             };
@@ -1033,7 +1133,7 @@ impl Ghost {
         // this can't just rely on WINLOCK_STALE_AFTER alone.
         #[cfg(windows)]
         let winlock_heartbeat = winlock.clone().map(|p| {
-            tokio::spawn(async move {
+            lifecycle::OwnedTask(tokio::spawn(async move {
                 use std::os::windows::fs::OpenOptionsExt;
                 loop {
                     tokio::time::sleep(WINLOCK_HEARTBEAT).await;
@@ -1047,7 +1147,7 @@ impl Ghost {
                         let _ = f.set_modified(std::time::SystemTime::now());
                     }
                 }
-            })
+            }))
         });
 
         std::fs::create_dir_all(&dir)
@@ -1060,7 +1160,17 @@ impl Ghost {
                 let _ = std::fs::remove_file(dir.join(f));
             }
         }
-        let mut cmd = Command::new(bin);
+        // Linux Chromium takes its application/ICU locale from gettext's
+        // LANGUAGE preference, rather than --lang. Include the base
+        // language so a region without its own UI bundle selects the
+        // same language before the desktop's fallback locale. Applied to
+        // every launch attempt below.
+        #[cfg(target_os = "linux")]
+        let language_env = {
+            let locale = crate::persona::sanitize_locale(&wire.locale);
+            let language = locale.split('-').next().unwrap_or("en");
+            format!("{}:{language}", locale.replace('-', "_"))
+        };
         let mut chrome_args: Vec<String> = default_chrome_args_wire(&dir, profile, wire);
         let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;
         if browser.backend == cloak::BrowserBackend::CloakBrowser {
@@ -1091,48 +1201,53 @@ impl Ghost {
             chrome_args.push("--no-sandbox".into());
             chrome_args.push("--disable-setuid-sandbox".into());
         }
-        // ── HTTP proxy ──
-        // Prefer a sticky lane from the shared egress pool (v4 A2)
-        // so the browser exit matches the rest of the fabric. Fall
-        // back to env/slot. Chrome CANNOT authenticate a proxy
-        // itself: --proxy-server carries no credentials and no
-        // dialog we can drive headless, so an authenticated lane
-        // made Chrome render its own ERR_SOCKS_CONNECTION_FAILED
-        // error page and the whole tier-2 attempt died. Authed
-        // lanes now ride a local relay: Chrome speaks plain socks5
-        // to 127.0.0.1, the relay performs the upstream handshake
-        // with the lane's own credentials (exactly what the tier-1
-        // client does) and pipes bytes.
-        let pool_proxy = if GHOST_DIRECT.load(std::sync::atomic::Ordering::SeqCst) {
-            // Direct retry after a Chrome error page: no lanes at
-            // all, direct is the only chance left.
-            None
+        let mut relays = Vec::new();
+        if http_proxy.is_none() && https_proxy.is_none() {
+            chrome_args.push("--no-proxy-server".into());
         } else {
-            crate::search::egress::global().and_then(|pool| {
-                if !pool.has_proxies() || !crate::config::cfg().proxy.fetch_rotate {
-                    return None;
+            let mut endpoints = Vec::new();
+            for proxy in [http_proxy.as_ref(), https_proxy.as_ref()] {
+                let Some(proxy) = proxy else {
+                    endpoints.push("direct://".to_owned());
+                    continue;
+                };
+                // Identical protocol routes share a single credential relay.
+                if endpoints.len() == 1 && http_proxy == https_proxy {
+                    endpoints.push(endpoints[0].clone());
+                    continue;
                 }
-                pool.pick_fetch("ghost.local", true).and_then(|e| e.proxy)
-            })
-        };
-        let mut relay: Option<relay::Relay> = None;
-        if let Some(p) =
-            pool_proxy.or_else(|| crate::transport::proxy::from_env_for("https://ghost.local/"))
-        {
-            let authed = !p.user.is_empty() || !p.pass.is_empty();
-            let arg = if authed {
-                match relay::Relay::spawn(std::sync::Arc::new(p.clone())).await {
-                    Some(r) => {
-                        let arg = r.chrome_arg();
-                        relay = Some(r);
-                        arg
-                    }
-                    None => p.chrome_proxy_arg(),
+                let endpoint =
+                    if !proxy.user.is_empty() || !proxy.pass.is_empty() || !bypass.is_empty() {
+                        let relay = relay::Relay::spawn_with_bypass(
+                            std::sync::Arc::new(proxy.clone()),
+                            bypass.clone(),
+                        )
+                        .await
+                        .map_err(|e| FetchError::ghost(format!("proxy relay bind failed: {e}")))?;
+                        let endpoint = format!("socks5://127.0.0.1:{}", relay.port);
+                        relays.push(relay);
+                        endpoint
+                    } else {
+                        proxy.chrome_proxy_arg()
+                    };
+                endpoints.push(endpoint);
+            }
+            // Preserve Chromium's HTTPS-before-HTTP choice for WebSockets.
+            // No direct fallback is added to a selected proxy's list.
+            chrome_args.push(format!(
+                "--proxy-server=http={};https={};socks={}",
+                endpoints[0],
+                endpoints[1],
+                if https_proxy.is_some() {
+                    &endpoints[1]
+                } else {
+                    &endpoints[0]
                 }
-            } else {
-                p.chrome_proxy_arg()
-            };
-            chrome_args.push(arg);
+            ));
+            // The request guard still enforces URL/DNS policy. Disable Chrome's
+            // implicit local bypass so an explicit proxy is actually honored.
+            // Configured NO_PROXY is evaluated by our relay with HTTP's matcher.
+            chrome_args.push("--proxy-bypass-list=<-loopback>".into());
         }
         // ── Stealth mode selection ──
         //
@@ -1144,40 +1259,43 @@ impl Ghost {
         //
         // macOS / Windows: no Xvfb, but headful Chrome with the
         //   window positioned at -32000,-32000 (far off-screen).
-        //   The window exists, has real GPU, real WebGL : but the
-        //   user never sees it. This is strictly better than
-        //   --headless=new, which uses SwiftShader (detectable).
+        //   The native window remains off-screen. GPU capability belongs
+        //   to the installed browser/driver, in headful and headless modes.
         //
         // Fallback (no display, no platform support): --headless=new.
 
         #[cfg(linux_like)]
-        {
-            if force_headless {
-                chrome_args.push("--headless=new".into());
-            } else if let Some(disp) = display {
-                // Linux + Xvfb: headful on virtual display.
-                cmd.env("DISPLAY", disp);
-                chrome_args.push("--ozone-platform=x11".into());
-            } else {
-                // No Xvfb available (Termux, headless server, WSL
-                // without X11). Fall back to headless mode.
-                // --headless=new is less stealthy than headful on
-                // Xvfb (SwiftShader WebGL, detectable), but it's
-                // the only option without a display.
-                chrome_args.push("--headless=new".into());
-            }
-        }
-
+        let want_headless = force_headless || display.is_none();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if force_headless {
-            chrome_args.push("--headless=new".into());
-        }
-
+        let want_headless = force_headless;
         // Unknown platforms (not Linux/Android/macOS/Windows): headless
         // fallback. Android is covered by linux_like above.
         #[cfg(not(any(linux_like, target_os = "macos", target_os = "windows")))]
-        {
+        let want_headless = true;
+        if want_headless {
+            // No display to run against (Xvfb absent, Termux, WSL
+            // without X11, forced headless). Native GPU support remains
+            // enabled when available.
             chrome_args.push("--headless=new".into());
+        }
+        #[cfg(linux_like)]
+        if !want_headless {
+            // Linux + Xvfb: headful on the virtual display.
+            chrome_args.push("--ozone-platform=x11".into());
+        }
+        // DISPLAY for the primary headful attempt (Linux + Xvfb only).
+        // The headless retry below runs without it.
+        #[cfg(linux_like)]
+        let primary_display: Option<&str> = if want_headless { None } else { display };
+        #[cfg(not(linux_like))]
+        let primary_display: Option<&str> = None;
+        let hidden_surface = chrome_args.iter().any(|a| a == "--headless=new")
+            || (cfg!(linux_like) && display.is_some());
+        if hidden_surface {
+            // These surfaces are already invisible. Minimizing prevents
+            // frame/input acknowledgements (measured 5s per mouse event).
+            chrome_args.retain(|a| !a.starts_with("--window-position="));
+            chrome_args.push("--window-position=0,0".into());
         }
         // Modern Chrome (136+) sets navigator.webdriver
         // under --headless/--remote-debugging-port even
@@ -1185,60 +1303,121 @@ impl Ghost {
         // browser default; not JS-enumerable.
         chrome_args.push("--disable-blink-features=AutomationControlled".into());
         chrome_args.push("about:blank".into());
-        cmd.args(&chrome_args);
-        // Own process group (Unix) / Job Object (Windows):
-        // freeze/thaw/kill the whole browser tree.
-        proc::Proc::prepare_cmd(&mut cmd);
-        // stdin MUST be null: a child inheriting the parent's
-        // controlling terminal gets SIGTTIN the moment it reads
-        // stdin (a daemon running attached to a tty), and the whole
-        // browser tree freezes in state T = the DevTools handshake
-        // never completes (live case: the daemon's chromiums sat in
-        // Tl for hours; every tier-2 attempt died with "devtools ws
-        // timeout").
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        // No orphans even if donsetch dies hard. Linux/Android:
-        // prctl(PR_SET_PDEATHSIG). macOS has no prctl; Windows
-        // uses the Job Object's KILL_ON_JOB_CLOSE.
-        #[cfg(linux_like)]
-        unsafe {
-            cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec());
-        }
-        let mut child = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| FetchError::ghost(format!("spawn: {e}")))?;
-        let proc = proc::Proc::from_child(&child)?;
+        // ── Launch loop ──
+        // One primary attempt in the selected mode. A platform-init
+        // failure (headful Chrome handed an unusable X/Wayland display:
+        // "Missing X server or $DISPLAY" / "The platform failed to
+        // initialize") retries once in headless mode, which needs no
+        // display at all. The user-visible contract: a dead display
+        // degrades the quality of the render, never the availability of
+        // the browser.
+        let mut attempt = 0u8;
+        let (mut child, proc, ws_url, reader, stderr_tail) = loop {
+            let retry = attempt > 0;
+            let args = if retry {
+                headless_retry_args(&chrome_args)
+            } else {
+                chrome_args.clone()
+            };
+            let mut cmd = Command::new(&bin);
+            #[cfg(target_os = "linux")]
+            cmd.env("LANGUAGE", &language_env);
+            // The persona's timezone reaches Blink through the TZ the
+            // process starts with: ICU's default zone reads it, so a host
+            // browser shows the machine's zone and diverges from the
+            // persona. An empty wire tz leaves the host untouched.
+            if !wire.tz.is_empty() {
+                cmd.env("TZ", &wire.tz);
+            }
+            if retry {
+                // The failed display must not leak into the retry:
+                // headless initializes its own surfaces, and xcb probes
+                // against a dead X socket only add noise.
+                cmd.env_remove("DISPLAY");
+            } else if let Some(disp) = primary_display {
+                cmd.env("DISPLAY", disp);
+            }
+            cmd.args(&args);
+            // Own process group (Unix) / Job Object (Windows):
+            // freeze/thaw/kill the whole browser tree.
+            proc::Proc::prepare_cmd(&mut cmd);
+            // stdin MUST be null: a child inheriting the parent's
+            // controlling terminal gets SIGTTIN the moment it reads
+            // stdin (a daemon running attached to a tty), and the whole
+            // browser tree freezes in state T = the DevTools handshake
+            // never completes (live case: the daemon's chromiums sat in
+            // Tl for hours; every tier-2 attempt died with "devtools ws
+            // timeout").
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            // No orphans even if donsetch dies hard. Linux/Android:
+            // prctl(PR_SET_PDEATHSIG). macOS has no prctl; Windows
+            // uses the Job Object's KILL_ON_JOB_CLOSE.
+            #[cfg(linux_like)]
+            unsafe {
+                cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec());
+            }
+            let mut child = cmd
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| FetchError::ghost(format!("spawn: {e}")))?;
+            let proc = proc::Proc::from_child(&child)?;
 
-        // The ws endpoint arrives on stderr:
-        // "DevTools listening on ws://127.0.0.1:PORT/..."
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
-        let mut reader = BufReader::new(stderr);
-        let mut stderr_tail: Vec<String> = Vec::new();
-        let ws_url = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            scan_for_ws_url(&mut reader, &mut stderr_tail),
-        )
-        .await
-        .map_err(|_| {
-            FetchError::ghost(format!(
-                "devtools ws timeout ({})",
-                launch_failure_detail(&stderr_tail)
-            ))
-        })?
-        .ok_or_else(|| {
-            FetchError::ghost(format!(
-                "no devtools ws line ({})",
-                launch_failure_detail(&stderr_tail)
-            ))
-        })?;
+            // The ws endpoint arrives on stderr:
+            // "DevTools listening on ws://127.0.0.1:PORT/..."
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
+            let mut reader = BufReader::new(stderr);
+            let mut stderr_tail: Vec<String> = Vec::new();
+            let scanned = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                scan_for_ws_url(&mut reader, &mut stderr_tail),
+            )
+            .await;
+            if let Ok(Some(ws_url)) = scanned {
+                break (child, proc, ws_url, reader, stderr_tail);
+            }
+            let timed_out = scanned.is_err();
+            let detail = launch_failure_detail(&stderr_tail);
+            let _ = child.kill().await;
+            if !retry && !want_headless && is_platform_init_failure(&detail) {
+                eprintln!("[ghost] headful launch failed ({detail}); retrying headless");
+                attempt += 1;
+                continue;
+            }
+            return Err(FetchError::ghost(if timed_out {
+                format!("devtools ws timeout ({detail})")
+            } else {
+                format!("no devtools ws line ({detail})")
+            }));
+        };
 
-        let cdp = cdp::Cdp::connect(&ws_url).await?;
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(stderr_tail));
+        let stderr_reader = lifecycle::OwnedTask(tokio::spawn(lifecycle::drain_stderr(
+            reader,
+            stderr_tail.clone(),
+        )));
+        let mut setup_error = |error: FetchError| {
+            if crate::config::cfg().debug.ghost {
+                let exit = match child.try_wait() {
+                    Ok(Some(status)) => status.to_string(),
+                    Ok(None) => "not observed".into(),
+                    Err(error) => format!("wait error: {error}"),
+                };
+                let tail = stderr_tail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                eprintln!(
+                    "[ghost] setup CDP error: {error}; browser={exit}; stderr={}",
+                    launch_failure_detail(&tail)
+                );
+            }
+            error
+        };
+        let cdp = cdp::Cdp::connect(&ws_url).await.map_err(&mut setup_error)?;
         // Replant the session vault: login/session cookies harvested
         // from earlier browser runs. Best-effort by design: a walled
         // or hostile cookie shape can never fail a launch. Only the
@@ -1247,16 +1426,20 @@ impl Ghost {
         // session, or a vendor that binds sessions to fingerprints
         // sees the same login riding two profiles.
         if temp_profile.is_none() {
+            Self::purge_cleared_session_cookies(&cdp).await;
             Self::restore_session_cookies(&cdp).await;
+        } else if crate::config::cfg().debug.ghost {
+            eprintln!("[ghost] temp profile: purge + replant skipped");
         }
 
         // One page target, attached flat.
         let target = cdp
             .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
-            .await?
+            .await
+            .map_err(&mut setup_error)?
             .get("targetId")
             .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no targetId"))?
+            .ok_or_else(|| setup_error(FetchError::ghost("no targetId")))?
             .to_string();
         let session = cdp
             .call(
@@ -1264,10 +1447,11 @@ impl Ghost {
                 "Target.attachToTarget",
                 json!({ "targetId": target, "flatten": true }),
             )
-            .await?
+            .await
+            .map_err(&mut setup_error)?
             .get("sessionId")
             .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no sessionId"))?
+            .ok_or_else(|| setup_error(FetchError::ghost("no sessionId")))?
             .to_string();
         // Focused browser network SSRF guard: intercept every request
         // at the CDP Fetch layer before it hits the network. This
@@ -1285,7 +1469,7 @@ impl Ghost {
         // (reusing validated IPs for the connect) there is a residual
         // window. The transport layer re-validates at connect time,
         // but the browser's network stack does its own resolution.
-        let fetch_guard = cdp.spawn_fetch_guard(session.clone());
+        let fetch_guard = lifecycle::OwnedTask(cdp.spawn_fetch_guard(session.clone()));
         if let Err(e) = cdp
             .call(
                 Some(&session),
@@ -1297,10 +1481,15 @@ impl Ghost {
             // The guard was started before enabling interception so no
             // request-paused event can be missed. Stop it on setup failure
             // so a partially initialized Ghost never leaves a task behind.
-            fetch_guard.abort();
-            return Err(FetchError::ghost(format!("Fetch.enable: {e}")));
+            return Err(setup_error(FetchError::ghost(format!("Fetch.enable: {e}"))));
         }
-        cdp.call(Some(&session), "Page.enable", json!({})).await?;
+        cdp.track_document(session.clone());
+        cdp.call(Some(&session), "Page.enable", json!({}))
+            .await
+            .map_err(&mut setup_error)?;
+        cdp.call(Some(&session), "Network.enable", json!({}))
+            .await
+            .map_err(&mut setup_error)?;
 
         // No script is injected before page scripts, deliberately.
         //
@@ -1312,8 +1501,8 @@ impl Ghost {
         // there, and every patch that fired moved the page FURTHER from a
         // real one:
         //
-        // - `navigator.languages` already read ["en-US","en"] from
-        //   `--lang`; the patch only added an own accessor on the
+        // - `navigator.languages` already read ["en-US","en"] on the
+        //   English control; the patch only added an own accessor on the
         //   navigator instance, and real Chrome has NO own properties on
         //   `navigator` at all. The added property is itself the
         //   fingerprint.
@@ -1333,13 +1522,8 @@ impl Ghost {
         // `--disable-blink-features=AutomationControlled` covers the
         // headless case without defining anything.
         // invisible even on macOS (Dock) and Windows (taskbar).
-        // Combined with --window-position=-32000,-32000, the
-        // window is both off-screen and minimized. Chrome still
-        // renders normally (minimized ≠ background tab; the
-        // active tab's visibilityState stays "visible").
-        // The state is kept: a capture un-minimizes the window for
-        // its call and re-minimizes after (a minimized window
-        // presents no frames, issue #331).
+        // Native desktop windows remain off-screen/minimized. Virtual
+        // and headless surfaces stay normal so input and rendering work.
         let mut window_id: Option<i64> = None;
         let mut window_minimized = false;
         if let Ok(win) = cdp
@@ -1352,17 +1536,21 @@ impl Ghost {
             && let Some(id) = win.get("windowId").and_then(Value::as_i64)
         {
             window_id = Some(id);
-            let _ = cdp
-                .call(
-                    None,
-                    "Browser.setWindowBounds",
-                    json!({
-                        "windowId": id,
-                        "bounds": { "windowState": "minimized" }
-                    }),
-                )
-                .await;
-            window_minimized = true;
+            if !hidden_surface
+                && cdp
+                    .call(
+                        None,
+                        "Browser.setWindowBounds",
+                        json!({
+                            "windowId": id,
+                            "bounds": { "windowState": "minimized" }
+                        }),
+                    )
+                    .await
+                    .is_ok()
+            {
+                window_minimized = true;
+            }
         }
 
         // The layout viewport is pinned whenever the renderer has no real
@@ -1405,7 +1593,8 @@ impl Ghost {
                         "screenHeight": vh
                     }),
                 )
-                .await?;
+                .await
+                .map_err(&mut setup_error)?;
             }
         }
 
@@ -1432,7 +1621,8 @@ impl Ghost {
                     json!({ "url": "https://example.com/" }),
                     35,
                 )
-                .await;
+                .await
+                .map_err(&mut setup_error);
         }
 
         Ok(Self {
@@ -1443,9 +1633,12 @@ impl Ghost {
             target,
             frozen: false,
             last_used: Instant::now(),
+            launched_epoch: crate::ghost::cache::disk_epoch_now(),
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
+            stderr_reader: Some(stderr_reader),
+            stderr_tail,
             window_id,
             window_minimized: std::sync::atomic::AtomicBool::new(window_minimized),
             #[cfg(windows)]
@@ -1453,7 +1646,8 @@ impl Ghost {
             #[cfg(windows)]
             winlock_heartbeat,
             wire: wire.clone(),
-            relay,
+            relays,
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1505,10 +1699,46 @@ impl Ghost {
         self.cdp.is_dead()
     }
 
-    /// Reap the browser entirely : the whole process tree,
-    /// plus crashpad handlers on Unix (they daemonize into
-    /// their own groups and escape the group kill; on Windows
-    /// the Job Object already owns them).
+    pub fn document(&self) -> document::Document {
+        self.cdp.document()
+    }
+
+    pub(crate) fn link_error(&mut self, context: &str) -> FetchError {
+        let exit = match self.child.try_wait() {
+            Ok(Some(status)) => status.to_string(),
+            Ok(None) => "running".into(),
+            Err(_) => "unavailable".into(),
+        };
+        if crate::config::cfg().debug.ghost {
+            let tail = self.stderr_tail.lock().unwrap_or_else(|p| p.into_inner());
+            eprintln!(
+                "[ghost] transport={} exit={exit} generation={} frozen={} {}",
+                self.cdp.failure().unwrap_or("unavailable"),
+                self.document().generation,
+                self.frozen,
+                launch_failure_detail(&tail)
+            );
+        }
+        FetchError::ghost(format!(
+            "cdp link closed {context}: transport={}, browser={exit}, generation={}",
+            self.cdp.failure().unwrap_or("unavailable"),
+            self.document().generation
+        ))
+    }
+
+    pub(crate) fn operation(&self) -> Operation {
+        Operation {
+            dirty: self.dirty.clone(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Acquire) || self.cdp.was_cancelled()
+    }
+
+    /// Reap the owned browser tree. Native crash handlers close with their
+    /// browser client connection; unrelated processes are never scanned.
     ///
     /// Graceful first, hard kill only as the fallback. Chromium
     /// checkpoints the cookie DB, Local Storage, session files and
@@ -1540,6 +1770,11 @@ impl Ghost {
             && let Ok(Ok(list)) =
                 tokio::time::timeout(std::time::Duration::from_secs(3), self.cookies()).await
         {
+            // A pooled browser can outlive a logout for one of its
+            // domains: only cookies a browser launched at
+            // `launched_epoch` may still claim survive the filter, so
+            // this reap cannot re-vault a dead session.
+            let list = cache::session_cookies_since(&list, self.launched_epoch);
             cache::store_session_cookies(&list);
         }
         let cdp = self.cdp.clone();
@@ -1557,12 +1792,10 @@ impl Ghost {
             .await
             .is_ok()
         {
-            sweep_crashpad();
             return;
         }
         // Hard fallback: hung browser. Last-resort only.
         self.proc.kill_group();
-        sweep_crashpad();
         let _ = self.child.wait().await;
     }
 
@@ -1578,19 +1811,20 @@ impl Ghost {
     /// commits normally. Waiting on that response therefore hangs
     /// until the generic 20s CDP timeout, blocking tier-2 entirely.
     ///
-    /// Fix: dispatch `Page.navigate` but do NOT block on its
-    /// response. Poll `current_url()` instead : it uses the
-    /// browser-level `Target.getTargetInfo`, which is routed
-    /// separately from the page session and still returns the
-    /// advancing URL. This succeeds on both healthy Chrome (fast
-    /// response) and the buggy 151/152 builds (no response at all).
+    /// Bound the `Page.navigate` response wait, retaining any errorText.
+    /// Observe main-frame commit events after a response timeout. They
+    /// identify the new loader without another queued page-session call;
+    /// the previous page's nonblank URL cannot complete this navigation.
     pub async fn navigate(&self, url: &str) -> Result<(), FetchError> {
         // Centralized SSRF guard for browser tier: validates scheme,
         // credentials, literal IP ranges and (async) DNS resolution.
         // This is the sole gate for all Ghost navigations - solve,
         // render, ghost_fetch and actions all flow through here, so
         // tier=2 cannot bypass it.
-        self.navigate_raw(url, true).await
+        let mut operation = self.operation();
+        let result = self.navigate_raw(url, true).await;
+        operation.finish();
+        result
     }
 
     /// Navigate without the SSRF guard. Internal use only
@@ -1619,6 +1853,8 @@ impl Ghost {
         // BlockedByClient, DNS failure) is recorded: the poll loop
         // below only knows "URL never advanced", which used to hide
         // the actual cause behind a generic 20s timeout message.
+        let before = self.document();
+        let mut expected_loader = None;
         let nav_err: Option<String> = match self
             .cdp
             .call_with_timeout(
@@ -1629,19 +1865,44 @@ impl Ghost {
             )
             .await
         {
-            Err(e) if !e.to_string().contains("cdp timeout") => Some(e.to_string()),
+            Ok(reply) => {
+                expected_loader = reply
+                    .get("loaderId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                reply
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+            }
+            // Keep automation transport errors intact: the bounded read
+            // recovery must distinguish them from Chrome's errorText below.
+            Err(e) if !e.to_string().contains("cdp timeout") => return Err(e),
             // Settle-window timeouts are the documented queue
             // behavior above; the poll loop is the real referee.
             _ => None,
         };
 
-        // Poll the target URL until it advances off the initial
-        // blank page (about:blank is what createTarget starts at).
+        if let Some(why) = nav_err.as_ref() {
+            return Err(FetchError::ghost(format!("navigate failed: {why}")));
+        }
+
+        // A reused target already has a nonblank URL. Require a commit for
+        // this navigation, including reloads and legitimate redirects.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            let cur = self.current_url().await.unwrap_or_default();
-            let advanced = !cur.is_empty() && !cur.starts_with("about:blank");
-            if advanced {
+            if self.link_dead() {
+                return Err(FetchError::ghost("cdp link closed during navigation"));
+            }
+            if let Some(current) =
+                self.cdp
+                    .navigation_committed(&before, expected_loader.as_deref(), url)
+            {
+                let cur = current.url;
+                if cur.starts_with("chrome-error:") {
+                    return Err(FetchError::ghost("navigate failed: Chrome network error"));
+                }
                 // Re-check redirect target: Chrome follows redirects
                 // automatically; a public URL that redirects to a
                 // private/loopback address must be blocked even if the
@@ -1654,12 +1915,9 @@ impl Ghost {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err(FetchError::ghost(match &nav_err {
-                    Some(why) => {
-                        format!("navigate: target URL never advanced past about:blank ({why})")
-                    }
-                    None => "navigate: target URL never advanced past about:blank".into(),
-                }));
+                return Err(FetchError::ghost(
+                    "navigate: no committed document for requested navigation",
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
@@ -1668,33 +1926,13 @@ impl Ghost {
     /// Current document HTML. DOM domain only : no Runtime,
     /// no script execution.
     ///
-    /// Both calls are bounded to 3s per leg: session-scoped CDP
+    /// Calls are bounded to 3s for the root and 5s for its HTML: session-scoped CDP
     /// responses can queue for many seconds behind a settling
     /// navigation (Debian chromium 151). A bounded miss just costs
     /// one poll iteration; an unbounded one eats the whole render
     /// window and turns a recoverable stall into a hard failure.
     pub async fn outer_html(&self) -> Result<String, FetchError> {
-        let root = self
-            .cdp
-            .call_with_timeout(Some(&self.session), "DOM.getDocument", json!({}), 3)
-            .await?
-            .get("root")
-            .and_then(|r| r.get("nodeId"))
-            .and_then(Value::as_i64)
-            .ok_or_else(|| FetchError::ghost("no root node"))?;
-        Ok(self
-            .cdp
-            .call_with_timeout(
-                Some(&self.session),
-                "DOM.getOuterHTML",
-                json!({ "nodeId": root }),
-                5,
-            )
-            .await?
-            .get("outerHTML")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+        read_document_html(&self.cdp, &self.session).await
     }
 
     /// Current page URL (targetInfo : no Runtime).
@@ -1760,6 +1998,92 @@ impl Ghost {
     pub async fn cookies(&self) -> Result<Vec<cache::CookieRecord>, FetchError> {
         let res = self.cdp.call(None, "Storage.getCookies", json!({})).await?;
         Ok(Self::parse_cdp_cookies(&res))
+    }
+
+    /// Drop browser cookies whose domain's session was cleared. The
+    /// shared profile outlives logouts by days, and a dead session
+    /// cookie (server-side invalid) must not ride into a new browser.
+    /// Runs before the vault replant, so a re-authenticated domain
+    /// ends with exactly the vault's fresh set. Best-effort: a cookie
+    /// that refuses to delete must never fail a launch.
+    async fn purge_cleared_session_cookies(cdp: &cdp::Cdp) {
+        let state = crate::ghost::cache::GhostState::load();
+        let cleared: Vec<String> = state
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.session_cleared_epoch > 0)
+            .map(|(host, _)| host.clone())
+            .collect();
+        if crate::config::cfg().debug.ghost {
+            eprintln!("[ghost] purge entry: {} cleared domain(s)", cleared.len());
+        }
+        if cleared.is_empty() {
+            return;
+        }
+        let Ok(res) = cdp.call(None, "Storage.getCookies", json!({})).await else {
+            if crate::config::cfg().debug.ghost {
+                eprintln!("[ghost] purge: Storage.getCookies failed");
+            }
+            return;
+        };
+        let cookies = Self::parse_cdp_cookies(&res);
+        if crate::config::cfg().debug.ghost {
+            eprintln!(
+                "[ghost] purge: {} cleared domain(s), {} browser cookies",
+                cleared.len(),
+                cookies.len()
+            );
+        }
+        // The browser endpoint exposes Storage.setCookies but not
+        // Network.deleteCookies ("wasn't found" on the browser session),
+        // so a cleared cookie is expired: an expiry in the past makes
+        // the browser drop it and never send it again.
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(86_400) as f64;
+        for cookie in cookies {
+            let domain = cookie.domain.trim_start_matches('.');
+            if !cleared
+                .iter()
+                .any(|d| crate::auth::cookie_belongs_to(d, domain))
+            {
+                continue;
+            }
+            let path = if cookie.path.is_empty() {
+                "/"
+            } else {
+                cookie.path.as_str()
+            };
+            if let Err(error) = cdp
+                .call(
+                    None,
+                    "Storage.setCookies",
+                    json!({ "cookies": [{
+                        "name": cookie.name,
+                        "value": "",
+                        "domain": cookie.domain,
+                        "path": path,
+                        "secure": cookie.secure,
+                        "httpOnly": cookie.http_only,
+                        "sameSite": if cookie.same_site.is_empty() {
+                            "Lax".to_string()
+                        } else {
+                            cookie.same_site.clone()
+                        },
+                        "expires": past,
+                    }] }),
+                )
+                .await
+                && crate::config::cfg().debug.ghost
+            {
+                eprintln!(
+                    "[ghost] purge expire {} {}: {error}",
+                    cookie.name, cookie.domain
+                );
+            }
+        }
     }
 
     /// Replant the session vault into a fresh browser. Best-effort:
@@ -1840,7 +2164,20 @@ impl Ghost {
     /// either way, so the capture un-minimizes it for its call and
     /// puts it back after; the invisibility the minimize bought is
     /// unchanged.
-    async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
+    async fn capture_screenshot_data(
+        &self,
+        params: Value,
+    ) -> Result<(String, document::Document), FetchError> {
+        let mut operation = self.operation();
+        let result = self.capture_screenshot_inner(params).await;
+        operation.finish();
+        result
+    }
+
+    async fn capture_screenshot_inner(
+        &self,
+        params: Value,
+    ) -> Result<(String, document::Document), FetchError> {
         let restore = self.unminimize_for_capture().await;
         // macOS only: the measured state-flip/surface race lives there; other
         // platforms keep their pre-wait behavior and lean on the single retry.
@@ -1849,11 +2186,7 @@ impl Ghost {
         }
         let mut result = self
             .cdp
-            .call(
-                Some(&self.session),
-                "Page.captureScreenshot",
-                params.clone(),
-            )
+            .capture_screenshot(&self.session, params.clone())
             .await;
         // One retry, no loop: restoring the window and the compositor
         // actually presenting its first frame are not the same instant,
@@ -1867,17 +2200,12 @@ impl Ghost {
             && Self::is_capture_surface_failure(e)
         {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            result = self
-                .cdp
-                .call(Some(&self.session), "Page.captureScreenshot", params)
-                .await;
+            result = self.cdp.capture_screenshot(&self.session, params).await;
         }
-        self.reminimize_after_capture().await;
-        result?
-            .get("data")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| FetchError::ghost("no screenshot data"))
+        if restore.needs_surface_wait() {
+            self.reminimize_after_capture().await;
+        }
+        result
     }
 
     /// Un-minimize a window we minimized at launch, best-effort.
@@ -1999,7 +2327,7 @@ impl Ghost {
     pub async fn screenshot(&self, path: &str) -> Result<(), FetchError> {
         let dest = crate::paths::resolve_screenshot_path(path)
             .map_err(|e| FetchError::ghost(format!("screenshot path rejected: {e}")))?;
-        let data = self
+        let (data, _) = self
             .capture_screenshot_data(json!({ "format": "png" }))
             .await?;
         let bytes = decode_screenshot_data(&data)?;
@@ -2010,16 +2338,37 @@ impl Ghost {
     /// #171). `full_page` asks CDP to capture beyond the viewport;
     /// everything else is the same capture as [`Self::screenshot`].
     pub async fn screenshot_bytes(&self, full_page: bool) -> Result<Vec<u8>, FetchError> {
-        let data = self
+        self.screenshot_document(full_page)
+            .await
+            .map(|(png, _)| png)
+    }
+
+    /// PNG bytes with the main-document receipt observed during their capture.
+    pub(crate) async fn screenshot_document(
+        &self,
+        full_page: bool,
+    ) -> Result<(Vec<u8>, document::Document), FetchError> {
+        let (data, document) = self
             .capture_screenshot_data(json!({ "format": "png", "captureBeyondViewport": full_page }))
             .await?;
-        decode_screenshot_data(&data)
+        Ok((decode_screenshot_data(&data)?, document))
     }
 
     /// One trusted click with a human-ish pre-move path.
     /// CDP input events are isTrusted=true; detection is
     /// behavioral, so the path curves and overshoots.
     pub async fn click(&self, x: f64, y: f64) -> Result<(), FetchError> {
+        let mut operation = self.operation();
+        let restore = self.unminimize_for_capture().await;
+        let result = self.click_inner(x, y).await;
+        if restore.needs_surface_wait() {
+            self.reminimize_after_capture().await;
+        }
+        operation.finish();
+        result
+    }
+
+    async fn click_inner(&self, x: f64, y: f64) -> Result<(), FetchError> {
         // Pre-movement: bezier-ish arc from a random offset.
         let mut rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2071,6 +2420,17 @@ impl Ghost {
     /// Move the mouse to (x, y) along the human path WITHOUT
     /// pressing : hover. Reuses the click pre-move geometry.
     pub async fn hover(&self, x: f64, y: f64) -> Result<(), FetchError> {
+        let mut operation = self.operation();
+        let restore = self.unminimize_for_capture().await;
+        let result = self.hover_inner(x, y).await;
+        if restore.needs_surface_wait() {
+            self.reminimize_after_capture().await;
+        }
+        operation.finish();
+        result
+    }
+
+    async fn hover_inner(&self, x: f64, y: f64) -> Result<(), FetchError> {
         let mut rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -2361,9 +2721,8 @@ impl Drop for Ghost {
         // Abort the Fetch request guard so it cannot leak after
         // Chrome is reaped. The JoinHandle is cancellable; abort
         // is safe even if the task already completed.
-        if let Some(handle) = self.fetch_guard.take() {
-            handle.abort();
-        }
+        drop(self.fetch_guard.take());
+        drop(self.stderr_reader.take());
         // Safety net: kill_group sends SIGKILL to the whole
         // browser tree (process group on Unix, Job Object on
         // Windows). If kill().await was already called (reaper,
@@ -2375,13 +2734,10 @@ impl Drop for Ghost {
         // dropped the Ghost, but without a Drop impl the tokio
         // Child was dropped without killing Chrome.
         self.proc.kill_group();
-        sweep_crashpad();
         // Stop refreshing the winlock's mtime before removing it :
         // same abort-then-cleanup order as fetch_guard above.
         #[cfg(windows)]
-        if let Some(handle) = self.winlock_heartbeat.take() {
-            handle.abort();
-        }
+        drop(self.winlock_heartbeat.take());
         // Release the Windows profile-exclusion lockfile (unix
         // flock releases itself when this handle closes).
         #[cfg(windows)]
@@ -2490,38 +2846,8 @@ fn named_key(key: &str) -> Option<(&'static str, i64)> {
     })
 }
 
-/// Kill chrome_crashpad processes belonging to our
-/// ghost profile (they daemonize into their own
-/// process groups and escape group kills). Linux-only:
-/// uses /proc; macOS has no /proc and Windows's Job
-/// Object already owns the crashpad handlers.
-#[cfg(linux_like)]
-fn sweep_crashpad() {
-    let marker = profile_dir().to_string_lossy().into_owned();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
-            continue;
-        };
-        let Ok(cmdline) = std::fs::read_to_string(e.path().join("cmdline")) else {
-            continue;
-        };
-        if cmdline.contains("crashpad") && cmdline.contains(&marker) {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-#[cfg(not(linux_like))]
-fn sweep_crashpad() {}
-
 /// Writes a captured image to `dest`, readable by its owner only.
-fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
+pub(crate) fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
     // The ghost renders with the session vault replanted, so the
     // image can show a logged-in page: same seal as the stores that
     // hold the session itself.
@@ -2540,6 +2866,42 @@ fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, FetchError> {
         .map_err(|e| FetchError::ghost(format!("screenshot data is not base64: {e}")))
 }
 
+// Navigation can invalidate the root between these two read-only calls.
+// Reacquire once only for Chromium's stale-node error; the fetch loop still
+// checks document generation before accepting the resulting HTML.
+async fn read_document_html(cdp: &cdp::Cdp, session: &str) -> Result<String, FetchError> {
+    for attempt in 0..2 {
+        let root = cdp
+            .call_with_timeout(Some(session), "DOM.getDocument", json!({}), 3)
+            .await?
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| FetchError::ghost("no root node"))?;
+        let reply = cdp
+            .call_with_timeout(
+                Some(session),
+                "DOM.getOuterHTML",
+                json!({ "nodeId": root }),
+                5,
+            )
+            .await;
+        match reply {
+            Err(FetchError::Ghost(ref message))
+                if attempt == 0 && message.contains("Could not find node with given id") => {}
+            result => {
+                return result?
+                    .get("outerHTML")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| FetchError::ghost("DOM.getOuterHTML missing HTML"));
+            }
+        }
+    }
+    unreachable!("the second DOM read always returns")
+}
+
 /// Scan Chrome's stderr for the "DevTools listening on ws://…"
 /// endpoint line. Lossy per line : Chrome's pre-DevTools chatter
 /// can carry raw non-UTF-8 bytes (fontconfig/library paths on odd
@@ -2555,22 +2917,15 @@ async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(
 ) -> Option<String> {
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
-            Ok(0) | Err(_) => return None,
-            Ok(_) => {}
+        match lifecycle::stderr_line(reader, &mut buf).await {
+            Ok(false) | Err(_) => return None,
+            Ok(true) => {}
         }
         let line = String::from_utf8_lossy(&buf);
         if let Some(i) = line.find("ws://") {
             return Some(line[i..].trim().to_string());
         }
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            tail.push(trimmed.chars().take(200).collect());
-            if tail.len() > 6 {
-                tail.remove(0);
-            }
-        }
+        lifecycle::retain_stderr(tail, &buf);
     }
 }
 
@@ -2588,10 +2943,164 @@ fn launch_failure_detail(tail: &[String]) -> String {
     }
 }
 
+/// A platform-initialization failure: Chromium never opened a window
+/// system (no usable X server, no Wayland platform, ozone init
+/// failed). `launch_wire` retries this class once in headless mode,
+/// which needs no display at all; a dead virtual display therefore
+/// degrades the render quality, never the availability of the browser.
+/// The manager reads the same classifier to retire a display that a
+/// launch proved unusable.
+pub(crate) fn is_platform_init_failure(detail: &str) -> bool {
+    detail.contains("Missing X server or $DISPLAY")
+        || detail.contains("Failed to initialize Wayland platform")
+        || detail.contains("The platform failed to initialize")
+}
+
+/// The same launch forced into headless mode: the X11/ozone selection
+/// is dropped and `--headless=new` is appended. Persona, proxy and
+/// blink flags ride unchanged.
+fn headless_retry_args(args: &[String]) -> Vec<String> {
+    let mut retry: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--ozone-platform"))
+        .cloned()
+        .collect();
+    retry.push("--headless=new".into());
+    retry
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    // The headless retry must produce exactly the same launch minus the
+    // display selection: persona/proxy/blink flags survive, the X11
+    // ozone target is gone, and headless appears exactly once.
+    #[test]
+    fn headless_retry_drops_x11_and_adds_headless() {
+        let args = vec![
+            "--user-agent=UA".to_string(),
+            "--ozone-platform=x11".to_string(),
+            "--proxy-server=http=direct://".to_string(),
+            "--window-position=0,0".to_string(),
+        ];
+        let retry = super::headless_retry_args(&args);
+        assert!(!retry.iter().any(|a| a.starts_with("--ozone-platform")));
+        assert_eq!(
+            retry
+                .iter()
+                .filter(|a| a.as_str() == "--headless=new")
+                .count(),
+            1
+        );
+        assert!(retry.iter().any(|a| a == "--user-agent=UA"));
+        assert!(retry.iter().any(|a| a == "--proxy-server=http=direct://"));
+        assert_eq!(retry.last().map(String::as_str), Some("--headless=new"));
+    }
+
+    // The exact stderr classes that mean "no window system": the retry
+    // class. Transport and other failures must NOT trigger a retry.
+    #[test]
+    fn platform_init_failure_class_matches_the_display_errors() {
+        assert!(super::is_platform_init_failure(
+            "browser said: [1:1:ERROR:ui/ozone/platform/x11/ozone_platform_x11.cc:257] Missing X server or $DISPLAY | [1:1:ERROR:ui/aura/env.cc:246] The platform failed to initialize.  Exiting."
+        ));
+        assert!(super::is_platform_init_failure(
+            "browser said: Failed to initialize Wayland platform"
+        ));
+        assert!(!super::is_platform_init_failure("devtools ws timeout"));
+        assert!(!super::is_platform_init_failure("browser said nothing"));
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_dom_read_reacquires_only_a_stale_root_once() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (error, second_reply, expected_calls, expected_html) in [
+            (
+                Some("Could not find node with given id"),
+                json!({"result": {"outerHTML": "<html>new document</html>"}}),
+                4,
+                Some("<html>new document</html>"),
+            ),
+            (
+                Some("Could not find node with given id"),
+                json!({"error": {"message": "Could not find node with given id"}}),
+                4,
+                None,
+            ),
+            (
+                Some("Session with given id not found"),
+                json!({"result": {}}),
+                2,
+                None,
+            ),
+            (None, json!({"result": {}}), 2, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut calls = Vec::new();
+                while calls.len() < expected_calls {
+                    let request: Value =
+                        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                            .unwrap();
+                    let index = calls.len();
+                    assert_eq!(request["sessionId"], "owned");
+                    assert_eq!(
+                        request["method"],
+                        if index % 2 == 0 {
+                            "DOM.getDocument"
+                        } else {
+                            "DOM.getOuterHTML"
+                        }
+                    );
+                    let mut reply = if index % 2 == 0 {
+                        json!({"result": {"root": {"nodeId": index / 2 + 1}}})
+                    } else if index == 1 {
+                        error.map_or_else(
+                            || json!({"result": {}}),
+                            |message| json!({"error": {"message": message}}),
+                        )
+                    } else {
+                        second_reply.clone()
+                    };
+                    if index % 2 == 1 {
+                        assert_eq!(request["params"]["nodeId"], index / 2 + 1);
+                    }
+                    reply["id"] = request["id"].clone();
+                    ws.send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                    calls.push(request);
+                }
+                calls
+            });
+            let cdp = cdp::Cdp::connect(&format!("ws://{addr}")).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_document_html(&cdp, "owned"),
+            )
+            .await
+            .unwrap();
+            let calls = server.await.unwrap();
+            assert_eq!(calls.len(), expected_calls);
+            match expected_html {
+                Some(html) => assert_eq!(result.unwrap(), html),
+                None => {
+                    let message = result.unwrap_err().to_string();
+                    assert!(
+                        message.contains(error.unwrap_or("missing HTML")),
+                        "{message}"
+                    );
+                }
+            }
+        }
+    }
 
     // Chrome's pre-DevTools stderr chatter can carry raw non-UTF-8
     // bytes (fontconfig/library paths on odd locales). Lines::
@@ -2648,6 +3157,29 @@ mod sandbox_tests {
             !args.iter().any(|a| a == "--disable-setuid-sandbox"),
             "default args must not contain --disable-setuid-sandbox"
         );
+    }
+
+    #[test]
+    fn default_args_native_language_is_sanitized() {
+        let profile = BrowserProfile::chrome_150(crate::profile::Platform::Linux);
+        for (locale, expected) in [
+            ("fr-FR", "fr-FR"),
+            ("en-US\r\nBad", "en-US"),
+            ("fr--", "en-US"),
+        ] {
+            let wire = GhostWire {
+                locale: locale.into(),
+                ..Default::default()
+            };
+            let args =
+                default_chrome_args_wire(std::path::Path::new("owned-profile"), &profile, &wire);
+            assert!(args.contains(&format!("--lang={expected}")), "{args:?}");
+            assert!(
+                args.contains(&format!("--accept-lang={expected}")),
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|arg| arg.contains(['\r', '\n'])));
+        }
     }
 
     // A minimized window presents no frames, and the classic capture

@@ -119,8 +119,11 @@ impl MockSite {
         let content_types = Arc::new(self.content_types);
         let referers = Arc::clone(&self.referers);
         let hits2 = Arc::clone(&hits);
-        let f: PageFetcher =
-            Arc::new(move |url: String, _lane: String, referer: Option<String>| {
+        let f: PageFetcher = Arc::new(
+            move |url: String,
+                  _lane: String,
+                  referer: Option<String>,
+                  _gate: Option<crate::fetch::client::RedirectGate>| {
                 let pages = Arc::clone(&pages);
                 let throttles = Arc::clone(&throttles);
                 let transients = Arc::clone(&transients);
@@ -144,6 +147,8 @@ impl MockSite {
                     {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
+                            lane: _lane.clone(),
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 429,
                             headers: vec![],
@@ -163,6 +168,8 @@ impl MockSite {
                     {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
+                            lane: _lane.clone(),
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 500,
                             headers: vec![],
@@ -179,6 +186,8 @@ impl MockSite {
                         .unwrap_or_else(|| "text/html".to_string());
                     match pages.get(&url) {
                         Some((status, body)) => FetchedPage {
+                            lane: _lane.clone(),
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: *status,
                             headers: vec![("content-type".into(), ct)],
@@ -189,6 +198,8 @@ impl MockSite {
                             error_hint: None,
                         },
                         None => FetchedPage {
+                            lane: _lane,
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 404,
                             headers: vec![],
@@ -201,7 +212,8 @@ impl MockSite {
                     }
                 }
                 .boxed()
-            });
+            },
+        );
         (f, hits)
     }
 }
@@ -225,6 +237,535 @@ fn html(title: &str, body: &str) -> String {
         "<html lang=\"en\"><head><title>{title}</title></head><body><article><h1>{title}</h1><p>{body} {}</p></article></body></html>",
         "Long enough paragraph content to pass extraction thresholds and look like a real document for the extractor.".repeat(3)
     )
+}
+
+fn classifying_fetcher(inner: PageFetcher) -> PageFetcher {
+    Arc::new(move |url, lane, referer, gate| {
+        let inner = Arc::clone(&inner);
+        async move {
+            let mut page = inner(url, lane, referer, gate).await;
+            page.verdict = crate::detect::walls::detect(page.status, &page.headers, &page.body);
+            page
+        }
+        .boxed()
+    })
+}
+
+#[tokio::test]
+async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
+    for thin in [false, true] {
+        for stalled in [false, true] {
+            let seed = "https://ex.com/start";
+            let shell = format!(
+                "<html><body><div id='app'></div><script>{}</script></body></html>",
+                "/* owned shell */".repeat(400)
+            );
+            let (fetch, hits) = MockSite::new()
+                .page(
+                    seed,
+                    if thin { 200 } else { 403 },
+                    if thin { &shell } else { "Access denied" },
+                )
+                .fetcher();
+            let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
+                let fetch = Arc::clone(&fetch);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    fetch(url, lane, referer, gate).await
+                }
+                .boxed()
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reached = Arc::clone(&calls);
+            let cancelled = Arc::new(Mutex::new(None));
+            let cancelled_hook = Arc::clone(&cancelled);
+            let started = std::time::Instant::now();
+            let budget = Duration::from_millis(250);
+            let hook: super::GhostHook = Arc::new(move |request| {
+                let reached = Arc::clone(&reached);
+                let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+                *cancelled_hook.lock().unwrap() = Some(receiver);
+                async move {
+                    let _held_until_cancelled = sender;
+                    reached.fetch_add(1, Ordering::SeqCst);
+                    // Account for synchronous setup before crawl starts, while
+                    // rejecting a renewed budget after the 40ms HTTP read.
+                    assert!(request.deadline <= started + budget + Duration::from_millis(10));
+                    if stalled {
+                        futures_util::future::pending::<()>().await;
+                    }
+                    Ok(super::GhostRender {
+                        html: html(
+                            "Bounded browser content",
+                            "Useful evidence within the caller's remaining time.",
+                        ),
+                        document: crate::ghost::document::Document {
+                            url: request.url,
+                            status: Some(201),
+                            generation: 7,
+                            ..Default::default()
+                        },
+                    })
+                }
+                .boxed()
+            });
+            let result = Crawler::new(classifying_fetcher(fetch), gov())
+                .with_ghost(hook)
+                .crawl(
+                    seed,
+                    CrawlOptions {
+                        mode: CrawlMode::Content,
+                        respect_robots: false,
+                        max_pages: 1,
+                        max_depth: 0,
+                        deadline: budget,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "thin={thin}, stalled={stalled}"
+            );
+            assert_eq!(hits.lock().unwrap().as_slice(), [seed]);
+            assert!(started.elapsed() < budget + Duration::from_millis(300));
+            assert!(matches!(
+                cancelled.lock().unwrap().as_mut().unwrap().try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ));
+            if stalled {
+                assert_eq!(result.stop, StopReason::Deadline);
+                assert!(
+                    !result
+                        .pages
+                        .iter()
+                        .any(|page| page.markdown.contains("Bounded browser content"))
+                );
+            } else {
+                assert_eq!(result.pages.len(), 1);
+                assert!(result.pages[0].markdown.contains("Bounded browser content"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stealth_v3_browser_redirects_obey_scope_host_and_robots_for_wall_and_thin_pages() {
+    for thin in [false, true] {
+        for target in [
+            "https://ex.com/outside",
+            "https://other.example/allowed",
+            "https://ex.com/robots-denied",
+        ] {
+            let seed = "https://ex.com/start";
+            let shell = format!(
+                "<html><body><div id='app'></div><script>{}</script></body></html>",
+                "/* owned shell */".repeat(400)
+            );
+            let (fetch, _) = MockSite::new()
+                .page(
+                    "https://ex.com/robots.txt",
+                    200,
+                    "User-agent: *\nDisallow: /robots-denied\n",
+                )
+                .page(
+                    seed,
+                    if thin { 200 } else { 403 },
+                    if thin {
+                        &shell
+                    } else {
+                        "<html><body>Access denied</body></html>"
+                    },
+                )
+                .fetcher();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reached = Arc::clone(&calls);
+            let hook: super::GhostHook = Arc::new(move |_| {
+                reached.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Ok(super::GhostRender {
+                        html: html(
+                            "Owned browser document",
+                            "The final browser document supplies its own evidence.",
+                        ),
+                        document: crate::ghost::document::Document {
+                            url: target.into(),
+                            status: Some(201),
+                            generation: 7,
+                            ..Default::default()
+                        },
+                    })
+                }
+                .boxed()
+            });
+            let result = Crawler::new(classifying_fetcher(fetch), gov())
+                .with_ghost(hook)
+                .crawl(
+                    seed,
+                    CrawlOptions {
+                        mode: CrawlMode::Content,
+                        deadline: Duration::from_secs(30),
+                        include_paths: vec!["/*".into()],
+                        exclude_paths: vec!["/outside".into()],
+                        max_pages: 1,
+                        max_depth: 0,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "browser branch not reached: thin={thin}, target={target}"
+            );
+            assert!(
+                result.pages.is_empty(),
+                "out-of-scope browser content returned: thin={thin}, target={target}"
+            );
+            assert!(
+                result
+                    .skipped
+                    .iter()
+                    .any(|(_, reason)| reason.contains("redirected out of scope")),
+                "{:?}",
+                result.skipped
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stealth_v3_allowed_browser_redirect_owns_url_and_relative_links() {
+    for thin in [false, true] {
+        let seed = "https://ex.com/start";
+        let final_url = "https://ex.com/allowed/final";
+        let shell = format!(
+            "<html><body><div id='app'></div><script>{}</script></body></html>",
+            "/* owned shell */".repeat(400)
+        );
+        let (fetch, hits) = MockSite::new()
+            .page(
+                seed,
+                if thin { 200 } else { 403 },
+                if thin {
+                    &shell
+                } else {
+                    "<html><body>Access denied</body></html>"
+                },
+            )
+            .page(
+                "https://ex.com/allowed/next",
+                200,
+                &html(
+                    "Distinct child",
+                    "A second document with independent research evidence.",
+                ),
+            )
+            .fetcher();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::clone(&calls);
+        let hook: super::GhostHook = Arc::new(move |_| {
+            reached.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(super::GhostRender {
+                    html: html(
+                        "Owned final document",
+                        "The browser final URL owns this content.",
+                    ) + "<a href='next'>Next chapter</a><a href='final'>Self document</a>",
+                    document: crate::ghost::document::Document {
+                        url: final_url.into(),
+                        status: Some(201),
+                        generation: 7,
+                        ..Default::default()
+                    },
+                })
+            }
+            .boxed()
+        });
+        let result = Crawler::new(classifying_fetcher(fetch), gov())
+            .with_ghost(hook)
+            .crawl(
+                seed,
+                CrawlOptions {
+                    mode: CrawlMode::Content,
+                    deadline: Duration::from_secs(30),
+                    respect_robots: false,
+                    include_paths: vec!["/*".into()],
+                    max_pages: 2,
+                    max_depth: 1,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(result.pages.iter().any(|page| page.url == final_url && page.markdown.contains("Owned final document")),
+            "thin={thin}, pages={:?}, skipped={:?}", result.pages.iter().map(|page| (&page.url, &page.markdown)).collect::<Vec<_>>(), result.skipped);
+        assert!(
+            result
+                .pages
+                .iter()
+                .any(|page| page.url == "https://ex.com/allowed/next")
+        );
+        assert_eq!(
+            result
+                .pages
+                .iter()
+                .find(|page| page.url == "https://ex.com/allowed/next")
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some(final_url)
+        );
+        assert!(!result.pages.iter().any(|page| page.url == seed));
+        assert!(
+            !result.queued.iter().any(|url| url == final_url),
+            "the browser final document is already visited"
+        );
+        assert!(
+            !hits.lock().unwrap().iter().any(|url| url == final_url),
+            "the browser final document must not be fetched again"
+        );
+        assert!(
+            hits.lock()
+                .unwrap()
+                .iter()
+                .any(|url| url == "https://ex.com/allowed/next")
+        );
+    }
+}
+
+#[tokio::test]
+async fn stealth_v3_browser_unknown_status_never_inherits_http_denial() {
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/", 403, "Access denied")
+        .fetcher();
+    let mut page = fetch("https://ex.com/".into(), "owned-lane".into(), None, None).await;
+    let route = page.route.clone();
+    page.apply_render(super::GhostRender {
+        html: html("Owned browser", "Content with no observed network status."),
+        document: crate::ghost::document::Document {
+            url: "https://ex.com/final".into(),
+            status: None,
+            generation: 3,
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        page.status, 0,
+        "zero is unknown, not a synthesized200 or inherited403"
+    );
+    assert_eq!(page.url, "https://ex.com/final");
+    assert_eq!(page.route, route);
+    assert_eq!(page.lane, "owned-lane");
+    assert!(
+        String::from_utf8(page.body)
+            .unwrap()
+            .contains("Owned browser")
+    );
+}
+
+#[tokio::test]
+async fn stealth_v3_http_redirect_outside_scope_does_not_start_browser() {
+    let seed = "https://ex.com/start";
+    let (inner, hits) = MockSite::new().page(seed, 403, "Access denied").fetcher();
+    let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
+        let inner = Arc::clone(&inner);
+        async move {
+            let mut page = inner(url, lane, referer, gate).await;
+            page.url = "https://ex.com/outside".into();
+            page.verdict = Verdict::Blocked;
+            page
+        }
+        .boxed()
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reached = Arc::clone(&calls);
+    let hook: super::GhostHook = Arc::new(move |_| {
+        reached.fetch_add(1, Ordering::SeqCst);
+        async { Err("out-of-scope browser must not start".into()) }.boxed()
+    });
+    let result = Crawler::new(fetch, gov())
+        .with_ghost(hook)
+        .crawl(
+            seed,
+            CrawlOptions {
+                mode: CrawlMode::Content,
+                respect_robots: false,
+                deadline: Duration::from_secs(30),
+                include_paths: vec!["/*".into()],
+                exclude_paths: vec!["/outside".into()],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.lock().unwrap().as_slice(), [seed]);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(result.pages.is_empty());
+    assert!(
+        result
+            .skipped
+            .iter()
+            .any(|(_, reason)| reason == "redirected out of scope -> https://ex.com/outside")
+    );
+}
+
+#[tokio::test]
+async fn wave450_seed_preflight_uses_an_available_governor_lane() {
+    let (inner, _) = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &html(
+                "Proxy source",
+                "Research evidence on the only configured lane.",
+            ),
+        )
+        .fetcher();
+    let lanes = Arc::new(Mutex::new(Vec::new()));
+    let recorded = lanes.clone();
+    let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
+        recorded.lock().unwrap().push(lane.clone());
+        inner(url, lane, referer, gate)
+    });
+    let governor = Arc::new(Governor::new(vec![Lane {
+        id: "proxy-only".into(),
+        kind: LaneKind::Proxy,
+    }]));
+    let result = Crawler::new(fetch, governor)
+        .crawl(
+            "https://ex.com/",
+            CrawlOptions {
+                mode: CrawlMode::Content,
+                respect_robots: false,
+                ..opts()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!result.pages.is_empty());
+    assert!(
+        lanes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|lane| lane == "proxy-only"),
+        "{:?}",
+        lanes.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn wave450_seed_redirect_relocates_scope_and_reuses_response() {
+    let seed = "https://old.example/docs/";
+    let resolved = "https://new.example/guide/";
+    let (inner, hits) = MockSite::new()
+        .page(
+            seed,
+            200,
+            &html("Relocated guide", "The guide now lives at its new address."),
+        )
+        .page(
+            "https://new.example/guide/chapter",
+            200,
+            &html(
+                "Chapter",
+                "A distinct chapter with detailed examples and installation instructions.",
+            ),
+        )
+        .fetcher();
+    let fetch: PageFetcher = Arc::new(move |u, lane, referer, gate| {
+        let inner = inner.clone();
+        async move {
+            let mut p = inner(u.clone(), lane, referer, gate).await;
+            if u == seed {
+                p.url = resolved.into();
+                p.body
+                    .extend_from_slice(b"<a href='/guide/chapter'>Chapter</a>");
+            }
+            p
+        }
+        .boxed()
+    });
+    let out = Crawler::new(fetch, gov())
+        .crawl(
+            seed,
+            CrawlOptions {
+                mode: CrawlMode::Content,
+                respect_robots: false,
+                ..opts()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.seed, resolved);
+    assert!(out.pages.iter().any(|p| p.url == resolved));
+    assert!(out.pages.iter().any(|p| p.url.ends_with("/guide/chapter")));
+    assert_eq!(
+        hits.lock()
+            .unwrap()
+            .iter()
+            .filter(|u| u.as_str() == seed)
+            .count(),
+        1
+    );
+    assert!(
+        !hits.lock().unwrap().iter().any(|u| u == resolved),
+        "reuse the resolved seed response"
+    );
+}
+
+#[tokio::test]
+async fn wave450_deadline_bounds_discovery_and_page_io() {
+    let called = Arc::new(AtomicUsize::new(0));
+    let counts = called.clone();
+    let fetch: PageFetcher = Arc::new(move |url, lane, _, _gate| {
+        let called = counts.clone();
+        async move {
+            called.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            FetchedPage {
+                lane,
+                route: Some(crate::transport::request_route::RequestRoute::direct()),
+                url,
+                status: 200,
+                headers: vec![],
+                body: b"slow".to_vec(),
+                verdict: Verdict::ContentOk,
+                latency: Duration::from_secs(2),
+                cached: false,
+                error_hint: None,
+            }
+        }
+        .boxed()
+    });
+    let started = std::time::Instant::now();
+    let out = Crawler::new(fetch, gov())
+        .crawl(
+            "https://slow.example/",
+            CrawlOptions {
+                mode: CrawlMode::Map,
+                deadline: Duration::from_millis(80),
+                ..opts()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(called.load(Ordering::SeqCst) > 0);
+    assert_eq!(out.stop, StopReason::Deadline);
+    assert!(started.elapsed() < Duration::from_millis(600));
+    assert!(out.pages.is_empty());
 }
 
 // ── Hub seeds (issue #249) ────────────────────────────────
@@ -410,6 +951,223 @@ async fn map_mode_focus_filters() {
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     assert_eq!(r.map.len(), 1);
     assert!(r.map[0].contains("migration"));
+}
+
+// V05: a sitemap-less origin must not read as an empty site in map
+// mode. The seed page is already in the buffer (identity hop), so
+// map falls back to harvesting its links : the same discovery full
+// starts from, without fetching any page of its own.
+#[tokio::test]
+async fn map_mode_falls_back_to_seed_links_without_a_sitemap() {
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/a\">Page A</a><a href=\"/b\">Page B</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/", 200, seed);
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert_eq!(r.pages.len(), 0, "map stays inventory-only");
+    assert!(
+        r.map.iter().any(|u| u.ends_with("/a")) && r.map.iter().any(|u| u.ends_with("/b")),
+        "map must fall back to the seed page's links, got {:?} (skipped={:?})",
+        r.map,
+        r.skipped
+    );
+    // The fallback must not fetch the linked pages themselves.
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(!hits.iter().any(|h| h.ends_with("/a")));
+    assert!(!hits.iter().any(|h| h.ends_with("/b")));
+}
+
+// The audit's "5 URLs from a rich site": JS-built navigation (mdBook
+// sidebars) never appears in raw HTML, so a thin static map merges one
+// rendered read of the seed through the same filter. Render failure or
+// absence keeps the static map : the browser is an enhancement, never
+// a dependency.
+#[tokio::test]
+async fn map_mode_merges_a_rendered_inventory_when_static_is_thin() {
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/a\">Page A</a><a href=\"/b\">Page B</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/", 200, seed);
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    o.deadline = Duration::from_secs(120); // the render guard needs headroom
+    let rendered = "<html><body><a href=\"/c\">C</a><a href=\"/d\">D</a>\
+        <a href=\"/e\">E</a></body></html>"
+        .to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in = Arc::clone(&calls);
+    o.render_html = Some(Arc::new(move |_url: String| {
+        let rendered = rendered.clone();
+        let calls = Arc::clone(&calls_in);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some((rendered, "https://ex.com/".to_string()))
+        })
+    }));
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "one bounded render");
+    for path in ["/a", "/b", "/c", "/d", "/e"] {
+        assert!(
+            r.map.iter().any(|u| u.ends_with(path)),
+            "missing {path}: {:?}",
+            r.map
+        );
+    }
+    // The rendered read must not fetch the linked pages themselves.
+    {
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!hits.iter().any(|h| h.ends_with("/c")));
+    }
+
+    // Without a renderer the static map stands unchanged.
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/", 200, seed);
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert!(r.map.iter().any(|u| u.ends_with("/a")));
+    assert!(!r.map.iter().any(|u| u.ends_with("/c")));
+}
+
+// V06: the map is relevance-ranked against the seed, not a pure
+// recency slice. A topic seed pulls its own neighborhood to the
+// front of the inventory; ranking reorders, it never filters.
+#[tokio::test]
+async fn map_mode_ranks_seed_relevant_urls_first() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/docs/alpha_thing</loc></url>
+<url><loc>https://ex.com/docs/beta_thing</loc></url>
+<url><loc>https://ex.com/docs/gamma_thing</loc></url>
+<url><loc>https://ex.com/docs/delta_thing</loc></url>
+<url><loc>https://ex.com/docs/webgpu_api</loc></url>
+<url><loc>https://ex.com/docs/using_webgpu</loc></url>
+</urlset>"#;
+    let site = MockSite::new().page("https://ex.com/sitemap.xml", 200, sitemap);
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = crawler
+        .crawl("https://ex.com/docs/webgpu_api", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.map.len(), 6, "ranking reorders, never filters");
+    assert!(
+        r.map[0].contains("webgpu") && r.map[1].contains("webgpu"),
+        "seed-relevant URLs first, got {:?}",
+        r.map
+    );
+}
+
+// V10: with no focus set, the links the seed page itself carries are
+// the crawl's topic neighborhood. Without a seed-provenance boost
+// they tie the generic sitemap flood at equal depth and lose to its
+// recency order, so a docs crawl drifted into sibling nav (the
+// audit's WebGPU seed fetched RTCRtpTransceiver-class pages first).
+#[tokio::test]
+async fn a_seeded_crawl_prefers_the_seeds_own_neighborhood() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/a</loc></url>
+<url><loc>https://ex.com/b</loc></url>
+<url><loc>https://ex.com/c</loc></url>
+</urlset>"#;
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/topic/one\">Topic One</a>\
+        <a href=\"/topic/two\">Topic Two</a>\
+        </article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, seed)
+        .page(
+            "https://ex.com/topic/one",
+            200,
+            &html("One", "topic one body words for the extractor threshold"),
+        )
+        .page(
+            "https://ex.com/topic/two",
+            200,
+            &html("Two", "topic two body words for the extractor threshold"),
+        )
+        .page("https://ex.com/a", 200, &html("A", "generic a body words"))
+        .page("https://ex.com/b", 200, &html("B", "generic b body words"))
+        .page("https://ex.com/c", 200, &html("C", "generic c body words"));
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.shape = false; // exact-order semantics; jitter is tested elsewhere
+    o.max_pages = 3; // seed + 2 : the seeds own neighborhood must win
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    let urls: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        urls.contains(&"https://ex.com/topic/one") && urls.contains(&"https://ex.com/topic/two"),
+        "the seed's own neighborhood must be fetched before the sitemap flood, got {urls:?}"
+    );
+}
+
+// V10b: the sitemap often queues the seed's own links first (MDN's
+// section sitemap lists every API page), at recency scores. The
+// seed's harvest must RAISE those already-queued entries instead of
+// being swallowed by the dedup, or the boost never lands on exactly
+// the pages the flood pinned.
+#[tokio::test]
+async fn a_seed_link_raises_a_sitemap_queued_entry() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/a</loc></url>
+<url><loc>https://ex.com/b</loc></url>
+<url><loc>https://ex.com/topic/one</loc></url>
+<url><loc>https://ex.com/topic/two</loc></url>
+</urlset>"#;
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/topic/one\">Topic One</a>\
+        <a href=\"/topic/two\">Topic Two</a>\
+        </article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, seed)
+        .page(
+            "https://ex.com/topic/one",
+            200,
+            &html("One", "topic one body words for the extractor threshold"),
+        )
+        .page(
+            "https://ex.com/topic/two",
+            200,
+            &html("Two", "topic two body words for the extractor threshold"),
+        )
+        .page("https://ex.com/a", 200, &html("A", "generic a body words"))
+        .page("https://ex.com/b", 200, &html("B", "generic b body words"));
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.shape = false;
+    o.max_pages = 3;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    let urls: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        urls.contains(&"https://ex.com/topic/one") && urls.contains(&"https://ex.com/topic/two"),
+        "a seed link must raise its sitemap-queued entry above the flood, got {urls:?}"
+    );
 }
 
 // ── Basic crawl ───────────────────────────────────────────
@@ -696,6 +1454,156 @@ async fn crawl_robots_rules_see_the_query_string() {
     );
 }
 
+// A seed on a non-default port (or plain http) must read ITS OWN
+// robots.txt: discovery used to build `https://<host>/robots.txt`
+// from the bare hostname, so a ported seed's rules were never seen
+// and its Disallow was never applied (#345).
+#[tokio::test]
+async fn crawl_reads_robots_from_the_seed_origin() {
+    let robots = "User-agent: *\nDisallow: /alpha/\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/page.html\">a</a><a href=\"/ok\">ok</a></article></body></html>";
+    let site = MockSite::new()
+        .page("http://seed.example:8001/robots.txt", 200, robots)
+        .page("http://seed.example:8001/", 200, seed)
+        .page(
+            "http://seed.example:8001/alpha/page.html",
+            200,
+            &html("A", "alpha"),
+        )
+        .page("http://seed.example:8001/ok", 200, &html("Ok", "ok"));
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    o.respect_robots = true;
+    let r = crawler
+        .crawl("http://seed.example:8001/", o, None)
+        .await
+        .unwrap();
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        hits.iter()
+            .any(|h| h == "http://seed.example:8001/robots.txt"),
+        "robots must be read from the seed's own origin; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.contains("/alpha/")),
+        "the seed origin's Disallow must hold; hits: {hits:?}"
+    );
+    assert!(r.pages.iter().any(|p| p.url.ends_with("/ok")));
+}
+
+// With --any-host (same_host false), another host's pages must be
+// checked against THAT host's robots.txt: every robots check used to
+// read the seed's one file, so a foreign Disallow was ignored while
+// the seed's Disallow leaked onto other hosts (#344).
+#[tokio::test]
+async fn crawl_any_host_reads_each_origins_own_robots() {
+    let robots_a = "User-agent: *\nDisallow: /alpha/\n";
+    let robots_b = "User-agent: *\nDisallow: /beta/\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/a.html\">a</a><a href=\"/ok\">ok</a><a href=\"http://b.example:8002/ok/page.html\">b-ok</a><a href=\"http://b.example:8002/alpha/page.html\">b-alpha</a><a href=\"http://b.example:8002/beta/page.html\">b-beta</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://a.example/robots.txt", 200, robots_a)
+        .page("https://a.example/", 200, seed)
+        .page("https://a.example/ok", 200, &html("Ok", "ok"))
+        .page("http://b.example:8002/robots.txt", 200, robots_b)
+        .page(
+            "http://b.example:8002/ok/page.html",
+            200,
+            &html("B1", "ok page"),
+        )
+        .page(
+            "http://b.example:8002/alpha/page.html",
+            200,
+            &html("B2", "alpha page"),
+        )
+        .page(
+            "http://b.example:8002/beta/page.html",
+            200,
+            &html("B3", "beta page"),
+        );
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 20;
+    o.respect_robots = true;
+    o.same_host = false;
+    let r = crawler.crawl("https://a.example/", o, None).await.unwrap();
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let i_b_robots = hits
+        .iter()
+        .position(|h| h == "http://b.example:8002/robots.txt")
+        .expect("the other host's robots.txt must be fetched before its pages");
+    let i_first_b_page = hits
+        .iter()
+        .position(|h| h.starts_with("http://b.example:8002/") && !h.ends_with("/robots.txt"))
+        .expect("B pages must be fetched");
+    assert!(
+        i_b_robots < i_first_b_page,
+        "robots before the first request to the host; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.contains("b.example:8002/beta/")),
+        "B's own Disallow must hold on B; hits: {hits:?}"
+    );
+    assert!(
+        r.pages
+            .iter()
+            .any(|p| p.url.contains("b.example:8002/alpha/")),
+        "the seed host's Disallow must not leak onto B; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h == "https://a.example/alpha/a.html"),
+        "A's Disallow must still hold on A; hits: {hits:?}"
+    );
+}
+
+// RFC 9309 §2.3.1.4: a robots.txt that answers 5xx is "unreachable",
+// and the crawler must assume it may not fetch anything from that
+// origin. It used to fail open on every non-200. A 4xx stays the
+// "unavailable" case: allow.
+#[tokio::test]
+async fn robots_unreachable_stops_the_crawl_but_4xx_does_not() {
+    for (robots_status, expect_seed) in [(503u16, false), (404u16, true)] {
+        let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/a\">a</a></article></body></html>";
+        let site = MockSite::new()
+            .page("https://ex.com/robots.txt", robots_status, "no rules")
+            .page("https://ex.com/", 200, seed)
+            .page("https://ex.com/a", 200, &html("A", "a"));
+        let (fetch, hits) = site.fetcher();
+        let crawler = Crawler::new(fetch, gov());
+        let mut o = opts();
+        o.mode = CrawlMode::Content;
+        o.max_pages = 5;
+        o.respect_robots = true;
+        let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expect_seed {
+            assert!(
+                r.pages.iter().any(|p| p.url == "https://ex.com/"),
+                "a robots.txt 4xx is unavailable, not unreachable: the crawl continues; hits: {hits:?}"
+            );
+        } else {
+            assert!(
+                r.pages.is_empty(),
+                "a robots.txt 5xx must stop the crawl; hits: {hits:?}"
+            );
+            assert!(
+                hits.iter().all(|h| h.ends_with("/robots.txt")),
+                "nothing beyond robots.txt may be fetched under a 5xx; hits: {hits:?}"
+            );
+        }
+    }
+}
+
 // `Crawl-delay` was parsed with a bare `f64` parse and fed straight
 // to `Duration::from_secs_f64`, which panics on `inf`/huge values:
 // one hostile (or sloppy) robots.txt aborted the crawl worker, and
@@ -704,13 +1612,19 @@ async fn crawl_robots_rules_see_the_query_string() {
 fn robots_crawl_delay_is_finite_and_clamped() {
     use super::sitemap::Robots;
     for bad in ["inf", "-inf", "nan", "-5", "abc"] {
-        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {bad}\n"), "ex.com");
+        let r = Robots::parse(
+            &format!("User-agent: *\nCrawl-delay: {bad}\n"),
+            "https://ex.com",
+        );
         assert_eq!(r.crawl_delay, None, "{bad}");
     }
-    let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "ex.com");
+    let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "https://ex.com");
     assert_eq!(r.crawl_delay, Some(2.5));
     for huge in ["86400", "1e300"] {
-        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {huge}\n"), "ex.com");
+        let r = Robots::parse(
+            &format!("User-agent: *\nCrawl-delay: {huge}\n"),
+            "https://ex.com",
+        );
         assert_eq!(
             r.crawl_delay,
             Some(super::sitemap::MAX_CRAWL_DELAY_SECS),
@@ -1555,4 +2469,155 @@ fn resume_token_traversal_is_refused() {
         "a traversal token must not delete an outside file"
     );
     let _ = std::fs::remove_dir_all(&iso);
+}
+
+#[tokio::test]
+async fn wave450_invalid_seed_does_not_consume_a_resume_token() {
+    let token = "c450badseed";
+    let state = super::ResumeState {
+        seed: "https://ex.com/docs/".into(),
+        queue: Vec::new(),
+        seen: Vec::new(),
+    };
+    super::resume_store_issue(token, &state);
+    let site = MockSite::new();
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    assert!(
+        crawler
+            .crawl("this is not a URL", CrawlOptions::default(), Some(token))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        super::resume_store_take(token)
+            .expect("invalid input must preserve the token")
+            .seed,
+        state.seed
+    );
+}
+
+#[tokio::test]
+async fn report_audit_crawl_budgets_are_hard_under_parallel_workers() {
+    let mut site = MockSite::new();
+    for i in 0..8 {
+        let body = format!(
+            "<html><title>Page {i}</title><body><article><h1>Page {i}</h1><p>{}</p>{}</article></body></html>",
+            format!("Distinct evidence on page {i}. ").repeat(900),
+            (0..8)
+                .map(|j| format!("<a href='/p{j}'>Page {j}</a>"))
+                .collect::<String>()
+        );
+        site = site.page(&format!("https://ex.com/p{i}"), 200, &body);
+    }
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut options = opts();
+    options.mode = CrawlMode::Content;
+    options.max_pages = 8;
+    options.concurrency = 4;
+    options.include_paths = vec!["/*".into()];
+    options.per_page_max = 800;
+    options.max_total_chars = 1600;
+    options.respect_robots = false;
+    let history_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writes = history_writes.clone();
+    options.on_page = Some(Arc::new(move |_, _, _, _| {
+        writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let result = crawler
+        .crawl("https://ex.com/p0", options, None)
+        .await
+        .unwrap();
+    assert!(
+        !result.pages.is_empty(),
+        "assertions must inspect fetched evidence"
+    );
+    assert!(
+        result
+            .pages
+            .iter()
+            .all(|p| p.markdown.chars().count() <= 800),
+        "per-page body exceeded requested limit"
+    );
+    assert!(
+        result
+            .pages
+            .iter()
+            .filter(|p| !p.duplicate)
+            .map(|p| p.markdown.chars().count())
+            .sum::<usize>()
+            <= 1600,
+        "parallel workers overshot the total budget"
+    );
+    assert_eq!(result.stop, StopReason::CharBudget);
+    assert!(result.pages.iter().all(|p| p.next_offset.is_some()));
+    assert_eq!(
+        history_writes.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "capped content must not be recorded as a full baseline"
+    );
+}
+
+#[tokio::test]
+async fn report_audit_slow_seed_keeps_descendants_alive_and_page_cap_is_exact() {
+    let site = MockSite::new()
+        .page("https://ex.com/root", 200, &format!("<article><h1>Root</h1><p>{}</p><a href='/one'>One</a><a href='/two'>Two</a><a href='/three'>Three</a></article>", "Root substantive evidence. ".repeat(30)))
+        .page("https://ex.com/one", 200, &format!("<article><h1>One</h1><p>{}</p></article>", "First child substantive evidence. ".repeat(30)))
+        .page("https://ex.com/two", 200, &format!("<article><h1>Two</h1><p>{}</p></article>", "Second child substantive evidence. ".repeat(30)))
+        .page("https://ex.com/three", 200, &format!("<article><h1>Three</h1><p>{}</p></article>", "Third child substantive evidence. ".repeat(30)));
+    let (fetch, _) = site.fetcher();
+    let delayed: PageFetcher = Arc::new(move |url, lane, referer, gate| {
+        let fetch = fetch.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            fetch(url, lane, referer, gate).await
+        }
+        .boxed()
+    });
+    let crawler = Crawler::new(delayed, gov());
+    let mut options = opts();
+    options.mode = CrawlMode::Content;
+    options.max_pages = 2;
+    options.concurrency = 4;
+    options.include_paths = vec!["/*".into()];
+    options.respect_robots = false;
+    let result = crawler
+        .crawl("https://ex.com/root", options.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.pages.len(),
+        2,
+        "slow seed must not lose its children; simultaneous completions must respect the page cap"
+    );
+    assert_eq!(result.stop, StopReason::MaxPages);
+    let resume = result.resume.unwrap();
+    let next = crawler.crawl("", options, Some(&resume)).await.unwrap();
+    assert_eq!(
+        next.pages.len(),
+        2,
+        "in-flight pages withheld by a cap must survive resume"
+    );
+    assert!(
+        next.pages
+            .iter()
+            .all(|p| result.pages.iter().all(|old| old.url != p.url))
+    );
+}
+
+#[tokio::test]
+async fn v471_map_keeps_scoped_seed_links() {
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/read", 200, "<html><title>Guide</title><article><p>Readable guide.</p><a href='/read/second'>Second page</a></article></html>");
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut options = opts();
+    options.mode = CrawlMode::Map;
+    let result = crawler
+        .crawl("https://ex.com/read", options, None)
+        .await
+        .unwrap();
+    assert_eq!(result.map, ["https://ex.com/read/second"]);
 }

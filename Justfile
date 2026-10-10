@@ -32,7 +32,7 @@
 #   just smoke        bin + doctor + fetch + search
 #   just loop-report  measure this ladder on this box, right now
 #   just fuzz extract 30s fuzz burst on one target
-#   just clean-bloat  drop profiles the loop never uses + fuzz cache
+#   just clean-bloat  reclaim all that regrows (incremental, worktrees)
 #
 # A hung test is caught by nextest's own per-test slow-timeout; a long
 # COLD build is caught by the CI step timeout, which has to clear the
@@ -57,19 +57,18 @@
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
 feat := "--features ocr,rerank,http"
 
-# Cargo never GCs stale artifacts: caches grow without bound across dep
-# bumps (110G caught; ~99G was bloat). This clears everything except the
-# warm loop profiles.
-clean-bloat:
-	rm -rf target/debug target/release fuzz/target target/x86_64-pc-windows-gnu
-
-# Hard storage guard: the target dir never gets to blow past 25G.
-# One du + compare (~2s), prune-through only when bloat exists.
+# Storage guard: one implementation, three entry points (scripts/guard.sh).
+# Cargo never GCs stale artifacts; how the bloat actually regrew, and why
+# the previous fixed-profile-list guard went green while doing nothing, is
+# in the script header. Ceiling 80G; the floor under it is legitimate warm
+# artifacts (fast+ci deps, sccache's own 10G cap, receipts).
 guard:
-	@if [ -d target ] && [ "$(du -sm target | cut -f1)" -gt 25000 ]; then \
-		echo "guard: pruning bloat profiles (target > 25G)"; \
-		rm -rf target/debug target/release fuzz/target target/x86_64-pc-windows-gnu; \
-	fi
+	@sh scripts/guard.sh
+
+# Unconditional reclaim: whatever the guard would drop, now. Use when
+# space is the question rather than the loop.
+clean-bloat:
+	@sh scripts/guard.sh --force
 
 # Instant size report: what each shell of target/ costs.
 space:
@@ -142,6 +141,7 @@ _win-check-prereqs:
 win-check-full: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
     BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
+    CMAKE_TOOLCHAIN_FILE="{{justfile_directory()}}/scripts/mingw-cross-toolchain.cmake" \
     ORT_SKIP_DOWNLOAD=1 \
     {{budget}} cargo clippy --target x86_64-pc-windows-gnu --all-targets {{feat}} -- -Dwarnings
 
@@ -151,6 +151,7 @@ win-check-full: _win-check-prereqs
 win-check-core: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
     BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
+    CMAKE_TOOLCHAIN_FILE="{{justfile_directory()}}/scripts/mingw-cross-toolchain.cmake" \
     {{budget}} cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets -- -Dwarnings
 
 # Heavy by nature: soak holds the process for minutes, corpus and
@@ -167,6 +168,11 @@ test:
 # Scoped run: `just t crawl::frontier` runs only what matches.
 t expression:
     {{budget}} cargo nextest run --cargo-profile fast {{feat}} -E 'test({{expression}})'
+
+# Explicit native qualification: only the requested ignored test scope, using
+# fresh owned browser profiles. Never part of an ordinary local test run.
+t-native expression:
+    {{budget}} cargo nextest run --cargo-profile fast {{feat}} --run-ignored only -E 'test({{expression}})'
 
 # Scoped run on the ci profile (release opts, panic=abort): use when the
 # question is release-profile behavior, not "does it pass".

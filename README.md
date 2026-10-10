@@ -36,6 +36,7 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 > **https://get.brightdata.com/ivqwoicrrlbr**
 > Bright Data plugs into the tool itself: the `bd` SERP provider, the Web
 > Unlocker tier-3 bypass and the `unlocker` key type.
+> [Bright Data setup guide](docs/brightdata.md): zones, API token, HTML/JSON and troubleshooting.
 
 ## ✨ Why it's different
 
@@ -49,7 +50,7 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 | 📄 **Pixel-fusion PDF** | Glyphs and rendered pixels come from the same content stream and are fused deterministically, with a per-region trust audit. Scanned PDFs auto-OCR. |
 | 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control, priority), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
 | 🔗 **Token control** | Links render as `[text](L12)`, results as `S1…Sn`, and `fetch S3` just works: 3 tokens instead of 80. `focus`, `toc`, `section`, `must_contain` and `since_last` each cut a page down to what the agent actually needs. |
-| 🪶 **~2.4k tool schema** | All four tools, measured from `tools/list`. Every token earns its place. |
+| 🪶 **~2.4k tool schema** | All four tools: 2,369 tokens (`o200k_base`, compact `tools/list` JSON). |
 | 🩺 **`doctor`** | One command sweeps config, search health, egress, TLS, browser, DNS, captive portal, secret-store permissions, and fixes what is mechanically fixable. |
 
 ## 🎬 Demo
@@ -74,9 +75,9 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 <div align="center">
 
-<a href="https://fluxionai.world/register?source=github&campaign=github-donsetch&promo=DONSETCH"><img src="assets/sponsors/fluxion-ai-partner-banner.png" alt="Fluxion AI: one gateway to the world's leading AI models. Get $3 in API credit through the DonSeTch partner link." width="100%"></a>
+<a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH"><img src="assets/sponsors/sidrune-ai-partner-banner.png" alt="Sidrune AI: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through the DonSeTch partner link." width="100%"></a>
 
-**Fluxion AI** provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing, and get $3 in API credits when you sign up through [this link](https://fluxionai.world/register?source=github&campaign=github-donsetch&promo=DONSETCH).
+**Sidrune AI**: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through [this link](https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH).
 
 </div>
 
@@ -133,10 +134,11 @@ Homebrew and dsh auto-track published releases.
 **Verify the install:**
 
 ```bash
-donsetch doctor          # fast local sweep, ~1 second
-donsetch doctor --deep   # adds live browser + egress probes
+donsetch doctor          # grouped health checks, including a real browser launch
+donsetch doctor --deep   # adds live egress, provider and captive-portal probes
 donsetch doctor --fix    # repairs mechanical problems automatically
-donsetch doctor --json   # machine-readable, also prints MCP registration blocks for your client
+donsetch doctor --json   # appends machine-readable check results
+donsetch doctor --mcp    # detects clients and prints absolute-path registration blocks
 ```
 
 <details>
@@ -231,26 +233,35 @@ donsetch crawl https://docs.python.org --mode map --topic asyncio
 ```
 
 <details>
-<summary><b>If your client shows only half the result (the <code>[meta]</code> fold)</b></summary>
+<summary><b>MCP results and client bridges</b></summary>
 
-An MCP result has two surfaces: `content` (the page markdown) and `structuredContent` (raw URLs behind the `S3` handles, `next_offset`, resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP never said which one a client renders, so clients drop one: Claude Code and VS Code keep `structuredContent` and discard `content`, OpenCode v1 (tested on 1.18.3) keeps `content` and discards `structuredContent`, and OpenCode 2 (Code Mode on by default, tested on 2.0.16) keeps `structuredContent` and discards `content`, like Claude Code. The Pi extension is another shape: it hands the model `content` only (`structuredContent` never reaches the model there), so the document arrives without the URLs behind the handles.
+By default, every client receives evidence and actionable state together in
+`content`: a leading `[meta] {JSON}` line followed by source markdown. This
+also works for unknown wrappers and OpenCode's generic `cli` handshake.
+`structuredContent` is omitted so a bridge cannot select metadata and drop
+the document. PNG captures remain image content blocks; diagnostics stay in
+`_meta`. The same contract applies over stdio and HTTP.
 
-Symptoms: tool metadata but no page text, or page text but no citable URL behind an `S3` handle, no pagination, no error codes. The fix is the same for all of them: DonSeTch folds the state into a compact leading `[meta]` text block, keeps the markdown as a clean block behind it, and omits `structuredContent`. The known clients get the fold automatically, detected by `clientInfo.name` at the handshake: Claude Code, VS Code, OpenCode, and the Pi extension (`pi-donsetch`). Any other client (a wrapper or fork under a different name, `claude-code-proxy` say) is not detected and keeps the token-optimal split:
+Raw MCP returns a result object with a `content` array. Some agent bridges
+flatten its text blocks into a string. Handle both at the integration boundary:
 
-```bash
-DONSETCH_MCP__TEXT_ONLY=1 donsetch mcp   # force the fold for every client
+```js
+const text = typeof result === "string"
+  ? result
+  : result.content.filter(block => block.type === "text")
+      .map(block => block.text).join("\n\n");
+const end = text.indexOf("\n");
+if (!text.startsWith("[meta] ") || end < 0) throw new Error("Missing result state");
+const state = JSON.parse(text.slice(7, end));
+const markdown = text.slice(end + 1).trimStart();
+// Inspect state.ok, content_ok, next_offset, resume or next_action.
 ```
 
-or in `donsetch.toml`:
-
-```toml
-[mcp]
-text_only = true
-```
-
-Fail-closed like the other flags: only an explicit `1`/`true` turns it on; the legacy `DONSETCH_MCP_TEXT_ONLY` name still works (`donsetch config show --legacy` maps the old names).
-
-**OpenCode 2.x needs one of those today.** It reports `clientInfo.name` as `cli` (its `process.env.OPENCODE_CLIENT ?? "cli"` default, which `serve` never overrides), too generic to claim in the name list, and its Code Mode shows the model `structuredContent` only. Until OpenCode restores a usable name upstream, set `text_only` for it.
+For integrations that deliberately consume both surfaces, `[mcp] text_only =
+false` restores the split result for unrecognized clients. Known clients that
+drop one surface retain compatibility folding. The typed
+`DONSETCH_MCP__TEXT_ONLY` setting and legacy `DONSETCH_MCP_TEXT_ONLY=1`
+remain supported. The default requires no client-specific configuration.
 
 </details>
 
@@ -258,12 +269,12 @@ Fail-closed like the other flags: only an explicit `1`/`true` turns it on; the l
 
 | Tool | What it does |
 |---|---|
-| 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes, `archive` resurrection. |
+| 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes. |
 | 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 | 📸 **`web_screenshot`** | Rendered PNG of any URL through the same tier-2 browser. URL goes through the usual safety guards. CLI twin: `donsetch screenshot URL [--out PATH]`. |
 
-Tool schemas: `donsetch tools` (same JSON as MCP `tools/list`). Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `deadline.hit`, `archive.stale`, `network.dns`…), an `errorKind` (`permanent`, `transient`, `walled`), and a `next_action` line, so agents branch on codes instead of parsing prose. The model surface carries evidence and the state that changes the next action; transport telemetry (tier, quality, escalation trace, timings, engines) stays under `_meta`, for example `_meta["com.donsetch/fetch-debug"]`.
+Tool schemas: `donsetch tools` (same JSON as MCP `tools/list`). Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `deadline.hit`, `network.dns`…), an `errorKind` (`permanent`, `transient`, `walled`), and a `next_action` line, so agents branch on codes instead of parsing prose. The model surface carries evidence and the state that changes the next action; transport telemetry (tier, quality, escalation trace, timings, engines) stays under `_meta`, for example `_meta["com.donsetch/fetch-debug"]`.
 
 ## 🌐 Fetch
 
@@ -271,19 +282,82 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 
 **DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
 
-- **`focus`**: BM25-relevant blocks only, which cuts context by 80%+ on long pages. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`focus`**: BM25-relevant passages with section context. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`selector`**: extract only matching HTML subtrees. A miss returns `selector.nomatch` with the inspected element count; invalid syntax returns `selector.invalid`. Non-HTML responses cannot satisfy a CSS scope.
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
 - **Classification**: `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page`, a 0-1 quality score, and inline trust signals (focus-miss, JS-shell warning, empty content).
 - **Page memory**: every fetch is fingerprinted, so a re-fetch reports `changed` with section-level diffs, and `since_last=true` collapses a re-check to one line (~30 tokens).
 - **`must_contain`**: verifies a claim against the full page but returns MATCH/NO-MATCH plus up to 3 excerpts (~60 tokens instead of 4k).
-- **`archive=auto`**: a dead link serves the nearest Wayback snapshot, honestly labeled with its age.
-- **`stitch=true`**: walks `rel=next` into one call with part markers.
+- **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
+- **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 extracted bytes; explicit `max_chars` wins. The source title/URL header and structured metadata sit outside this body budget. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
 - **`deadline_ms` everywhere**: real MCP cancellation, progress notifications, ms cost footer. Nothing can silently hang.
+- **API/JSON endpoints**: `.json` URLs and JSON responses are terminal at HTTP at any tier; for other API paths pin `tier:1` to keep the read on plain HTTP.
 - **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
 - **Anti-cloak check**: on decoy-prone domains, tier-1 responses are equivalence-checked against a headless render, so `decoy suspected` is stamped instead of silently passing as content.
 
-**Tier 3 bypass (opt-in).** When the ghost itself hits a hard wall, fetch falls back to Bright Data Web Unlocker if a key is configured (`donsetch keys add unlocker <key>[::zone]`). The unlocker solves server-side, captchas included, and returns rendered HTML into the normal pipeline. Failures carry exact guidance (token rejected, zone not found, balance empty, rate limit, target still walled) on the escalation trace, and `donsetch doctor --deep` validates token and zone for free before the first paid call. Every successful unlock is cached locally (URL-hash keyed, sliding 6h TTL, 200 entries, parallel fetches share one paid call), so the same page inside the TTL costs nothing. All of it lives in the `[bypass]` config section: `donsetch config show`. DonSeTch works identically without it.
+`read_status` describes the returned projection: `content` has no remaining
+rendered bytes, `partial` has withheld bytes or a source subset, `probe` is a
+MATCH/NO-MATCH answer, `unchanged` is a history comparison, and `thin` is a
+suspected shell. Failures use `walled`, `notfound`, or `error`. Always pair it
+with `content_complete`: a projection can be exhausted while the source is
+incomplete. `next_offset` is a byte offset into collected markdown, not a page
+number. `links` and `media` share the rendered markdown budget, including their
+markup; `budget_scope` makes that accounting explicit.
+
+For parallel reads, pass an array to `web_fetch`: successful siblings remain
+available beside individual error rows. Classified failures return normally
+with `ok:false`, `code`, and `next_action`; protocol errors remain JSON-RPC
+errors. Inspect each result before using its evidence.
+
+`shot` always returns a receipt (`requested`, `saved_to`, `reason`), including
+when no captcha capture was needed. `web_screenshot` returns the inline PNG
+and a private local `path` containing the same bytes; remote clients should
+use the inline image because the path belongs to the server host.
+
+**Wall time and freshness (observed).** Plain HTTP reads 0.3-2s; search
+0.7-2.9s; guards are instant (an SSRF block ~13ms, a solve-cooldown
+refusal ~33ms); auth-wall refusals 11-14s; a browser escalation 17-31s;
+an interactive-captcha give-up 41-42s (the suite worst case). Dead URLs return the live failure directly; automatic archive recovery has
+been removed. A readable URL path may supply a `suggested_query` for locating
+a moved copy; query parameters and fragments are excluded. Repeat calls
+are cache-backed: a repeated search returned in ~10ms against ~5.0s
+cold, a re-fetched page 1.5s against ~11.9s cold. `changed` and
+`since_last` verdicts compare stored history, not a live revalidation:
+fast and fresh are different axes.
+
+**A worked reading ladder** (approximate costs): search, then `toc`
+(~170 tokens for the outline), then `section` on the right part (~840
+tokens, a complete read), or `must_contain` for a yes/no (~70 tokens).
+`focus` is a convenience reducer; `toc` -> `section` is the guaranteed
+one. Truncated output resumes with `next_offset` (same URL, offset
+verbatim); a stopped crawl resumes with `resume` alone.
+
+Stack Overflow question reads use the public question API with answers and
+comments. Empty, failed or incompatible API responses retain the website
+fallback; service-declared backoff is honored. Deleted/private questions and
+login-only dashboards require their own access. Fetch keeps its direct-IP
+default even with a configured proxy pool; search and crawl retain their pool
+routing.
+
+Crawl caps apply to each page's rendered markdown and the aggregate page
+content. Headers and inventory metadata are separate. A capped page carries
+`next_offset` and `content_complete: false`; it never becomes a full-content
+history baseline. Full crawl output summarizes the unfetched inventory;
+structured `map` retains the URLs. Map mode reports `mode: "map"`, `discovered`,
+and `InventoryComplete` when finished, without an empty content-page array.
+Map is sitemap-backed when the site has one; without a sitemap it falls
+back to the seed page's links.
+Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
+
+Search reports `requested_results`, `returned_results`, and `underfilled`
+when engines cannot supply the requested count. `weak` considers lexical
+query coverage as well as engine agreement; it is a retrieval warning, not a
+fact-check. `source_type` identifies video, community, paper, reference,
+publisher, official, institutional, and general web sources from known hosts.
+It does not certify a page's claims or assign trust to lookalike domains.
+
+**Tier 3 bypass (opt-in).** When the ghost itself hits a hard wall, fetch falls back to Bright Data Web Unlocker if a key is configured (`donsetch keys add unlocker "<token>::<Web Unlocker zone>"`). It returns HTML into the normal extraction pipeline; a challenge or empty shell remains a failed fetch. Failures carry recovery guidance on the escalation trace. `donsetch doctor --deep` checks token access, zone name and product type for free; tokens without account-zone read permission report an unverified check. Successful responses are cached locally (URL and render-mode keyed, sliding 6h TTL, 200 entries); concurrent calls within one daemon share the cache. The daily cap counts every API attempt, including retries, and the whole operation shares one timeout. A timed-out paid request is not replayed automatically. Settings live in `[bypass]`: `donsetch config show`. See the [setup guide](docs/brightdata.md). DonSeTch works without it.
 
 <details>
 <summary><b>Anti-bot results (headless tier)</b></summary>
@@ -292,7 +366,8 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 |---|---|---|
 | Cloudflare-protected sites | interstitial | ✅ 200 OK |
 | DataDome sites | DataDome | ✅ 200 OK |
-| Stack Overflow / Medium | Cloudflare | ✅ 200 OK |
+| Stack Overflow | Cloudflare | Public questions use the keyless API first; HTML remains a fallback |
+| Medium | Cloudflare | Challenge-dependent; unresolved walls are reported honestly |
 | Reddit | bot detection | ✅ 200 OK |
 | Interactive captchas | hCaptcha / reCAPTCHA / Turnstile | ⛔ honest block without a key (with an unlocker key: ✅) |
 
@@ -353,8 +428,8 @@ donsetch keys add serpbase sb-...       # SerpBase Google SERP (100 free searche
 donsetch keys add bravesearch ...       # Brave Search API
 donsetch keys add tinyfish sk-...       # TinyFish (free tier)
 donsetch keys add parallel nKil3...     # Parallel AI (fast mode)
-donsetch keys add bd 576d013c...        # Bright Data SERP
-donsetch keys add unlocker <key>[::zone]  # Bright Data Web Unlocker
+donsetch keys add bd "<token>::<SERP zone>"           # Bright Data SERP
+donsetch keys add unlocker "<token>::<Unlocker zone>" # Bright Data Web Unlocker
 donsetch keys default local             # dispatch order: keyless first
 ```
 
@@ -585,7 +660,7 @@ Thin adapter over the same engine the MCP server uses.
 | `donsetch doctor` | Health check and auto-fix (`--deep`, `--json`, `--fix`) |
 | `donsetch status` | Version, keys, proxies, cache, health overview |
 | `donsetch keys` | BYOK providers and plugins (`add`, `list`, `default`, `export`) |
-| `donsetch proxy` | Proxy management (`add`, `list`, `check`, `remove`, `clear`) |
+| `donsetch proxy` | Proxy management (`add`, `list`, `check`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
 | `donsetch login` | Authenticated sessions for walled sites (`--list`, `--status`, `--logout`, `--import`) |
 | `donsetch config` | `show`, `--markdown`, `--legacy` |
 | `donsetch tools` | Tool schemas as JSON, same as MCP `tools/list` |
@@ -601,13 +676,17 @@ Thin adapter over the same engine the MCP server uses.
 - `SSL_CERT_FILE` / `SSL_CERT_DIR` load into the trust store, which is the only way re-signed certificates verify in an intercepting network, exactly like curl.
 - `donsetch doctor` reports the whole posture: resolved env proxy, kill-switch state, system and environment trust stores, plus a live check that names the interception fix when it fails.
 
-**Search and crawl** rotate proxies across lanes, each with durable health: sticky per-host lanes, persona-exclusive exits, RTT-aware pacing, burned lanes remembered across restarts. A direct dial that fails is not a dead link, and a lane that dies does not silently take a domain with it.
+**The proxy pool is opt-in for fetch.** `donsetch proxy fetch on` lets `web_fetch` (and its browser escalation) ride the pool lanes, sticky per host, rotating on 429/407/dead/timeout; `donsetch proxy fetch off` puts it back on your own IP, which is the default. A one-shot read does not need a shared exit, and the pool's exit IPs are not better than yours for it.
+
+**Search and crawl** rotate proxies across lanes, each with durable health: sticky per-host lanes, persona-exclusive exits, RTT-aware pacing, burned lanes remembered across restarts. A direct dial that fails is not a dead link, and a lane that dies does not silently take a domain with it. Crawl rides the lanes by default; `donsetch proxy crawl off` leaves every crawl request on your IP.
 
 ```bash
 donsetch proxy add <url>            # rotate-able proxy entry
 DONSEEK_PROXIES="url1,url2"         # env form, comma separated
 donsetch proxy list                 # list, credentials masked
 donsetch proxy check                # live connectivity test
+donsetch proxy fetch on             # opt web_fetch into the pool (default: your IP)
+donsetch proxy crawl off            # keep crawl on your IP
 donsetch proxy remove <n> && donsetch proxy clear
 ```
 

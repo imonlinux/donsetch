@@ -1,9 +1,8 @@
-//! Xvfb virtual display manager : the stealth foundation.
+//! Xvfb virtual display manager.
 //!
-//! Headless Chrome (`--headless=new`) is detectable: SwiftShader
-//! WebGL, missing `window.chrome`, screen dimension mismatches.
-//! Headful Chrome on a virtual X display is NOT : it has real
-//! GPU compositing, real window objects, real screen geometry.
+//! A virtual X display lets headful Chromium render without a visible
+//! desktop window. GPU capabilities depend on the installed browser,
+//! driver and launch policy in both headful and headless modes.
 //!
 //! This module starts one Xvfb at daemon init and keeps it warm.
 //! Ghost launches headful Chrome on this display. The display
@@ -483,7 +482,9 @@ mod linux {
     /// listening on its X11 socket, in either namespace. A stale
     /// socket (from a killed Xvfb process) will still have the
     /// file but no server: connecting fails with ECONNREFUSED.
-    async fn display_alive() -> bool {
+    /// Used by GhostManager to revalidate a cached display before
+    /// every launch (a dead display must be replaced, not replayed).
+    pub async fn display_alive() -> bool {
         if !x_socket_alive() {
             return false;
         }
@@ -575,6 +576,11 @@ mod other {
         }
         #[allow(dead_code)]
         pub async fn kill(self) {}
+    }
+
+    /// Non-Linux family: there is no virtual display to check.
+    pub async fn display_alive() -> bool {
+        false
     }
 
     pub fn is_available() -> bool {
@@ -902,8 +908,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn reaper_shutdown_kills_and_reaps() {
-        let child = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
+        // Like Xvfb, the fixture is the owned executable, not a shell
+        // whose orphaned grandchild can keep the test's output pipes open.
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
             .spawn()
             .expect("spawn");
         let pid = child.id().expect("pid");
