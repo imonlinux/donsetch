@@ -60,6 +60,15 @@
             "minItems": 1,
             "type": "array"
           },
+          "archive": {
+            "description": "Archived-page policy: auto (default) falls back when the live page is unavailable; only skips the live page; off disables archive recovery.",
+            "enum": [
+              "auto",
+              "only",
+              "off"
+            ],
+            "type": "string"
+          },
           "budget_tokens": {
             "description": "Shared output-token limit for a URL batch (200-500000). Omit for one URL. Truncated members return continuation information.",
             "type": "integer"

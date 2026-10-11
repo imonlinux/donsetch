@@ -561,7 +561,14 @@ pub(crate) async fn call_tool_ctx(
     ctx: Option<ToolCtx>,
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // Clients without a schema validator stringify scalar arguments;
+    // numeric strings on integer parameters are rewritten to the
+    // integers they name so the strict check below judges the value,
+    // not the client's serializer.
+    if let Some(tool) = crate::spec::TOOLS.iter().find(|t| t.name == name) {
+        crate::spec::coerce_args(tool, &mut args);
+    }
     // Clients may forward arguments without schema validation. Reject
     // unknown fields and wrong types before any network or browser work.
     if let Some(rejected) = invalid_args_error(name, &args) {

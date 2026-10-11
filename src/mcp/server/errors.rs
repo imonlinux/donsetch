@@ -1294,7 +1294,6 @@ mod boundary_tests {
             json!({"toc":"false"}),
             json!({"url":[1]}),
             json!({"actions":{}}),
-            json!({"archive":"only"}),
             json!({"url":vec!["https://example.com";13]}),
         ] {
             let result = invalid_args_error("web_fetch", &args)
@@ -1306,6 +1305,15 @@ mod boundary_tests {
             invalid_args_error(
                 "web_fetch",
                 &json!({"url":"https://example.com","deadline_ms":500,"toc":false,"focus":null})
+            )
+            .is_none()
+        );
+        // archive is a valid enum parameter again (restored in the fork);
+        // its values pass validation exactly like any other enum.
+        assert!(
+            invalid_args_error(
+                "web_fetch",
+                &json!({"url":"https://example.com","archive":"only"})
             )
             .is_none()
         );
