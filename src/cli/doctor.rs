@@ -91,6 +91,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "State permissions",
                 "Ghost state",
                 "Config posture",
+                "Local rules",
                 "Clearance stores",
                 "Crawl stores",
                 "Legacy env vars",
@@ -229,14 +230,33 @@ fn check_installation() -> CheckResult {
     }
 }
 
-pub async fn run() {
+pub async fn run(args: &[String]) {
     cli::init();
 
     // Flags: --json (structured output for agents/CI), --deep
     // (full live-probe suite), --fix (apply safe repairs after the
     // checks), --fast (default: skip slow probes). --mcp prints
     // MCP client registration blocks for any detected client.
-    let args: Vec<String> = std::env::args().skip(2).collect();
+    // --stealth / --stealth-record / --parity drive the drift
+    // scorecard. An unknown flag is refused, never ignored: a typo
+    // like `--depp` used to buy a silent shallow run.
+    cli::args::Spec::new(
+        "doctor",
+        "donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]",
+        &[
+            "--json",
+            "--deep",
+            "--fix",
+            "--mcp",
+            "--improve",
+            "--fast",
+            "--stealth",
+            "--stealth-record",
+            "--parity",
+        ],
+    )
+    .reject(&args[2..]);
+    let args: Vec<String> = args[2..].to_vec();
     let json = args.iter().any(|a| a == "--json");
     let deep = args.iter().any(|a| a == "--deep");
     let fix = args.iter().any(|a| a == "--fix");
@@ -385,6 +405,9 @@ pub async fn run() {
 
     // 16. Config posture: layer conflicts, missing files, redaction.
     report!("Config posture", check_config_posture());
+
+    // 16b. Local rules: how many, and whether they are enforced.
+    report!("Local rules", check_rules());
 
     // 17. Search health snapshot (local, fast): trust, quarantine,
     // quality/outcome receipts, BYOK key states, C kill switches.
@@ -617,28 +640,58 @@ fn check_fetch_egress() -> CheckResult {
 /// network. Named fix when every proxy lane is currently benched.
 fn check_proxy_pool() -> CheckResult {
     let proxy = &crate::config::cfg().proxy;
-    let pool_n = proxy.pool.iter().filter(|s| !s.trim().is_empty()).count();
+    // The pool is the union of the proxy FILE (`donsetch proxy add` writes
+    // cache_dir/proxies.txt) and the config/env layer (`[proxy] pool`,
+    // DONSEEK_PROXIES). Counting only the config layer told every user who
+    // added proxies with the CLI "pool empty ... direct-only egress" while
+    // their lanes were live and in use, and left the all-benched warning
+    // below unable to fire for them at all.
+    let (file_proxies, file_skipped) = crate::transport::proxy::load_config_verbose();
+    let from_config_n = proxy.pool.iter().filter(|s| !s.trim().is_empty()).count();
+    let lane_n = crate::transport::proxy::load_all().len();
     let persist = proxy.egress_persist && !crate::config::cfg().state.no_disk_state;
     let mut bits = Vec::new();
-    if pool_n == 0 {
-        bits.push("pool empty (DONSEEK_PROXIES or [proxy] pool; direct-only egress)".to_string());
+    if lane_n == 0 {
+        bits.push(
+            "pool empty (`donsetch proxy add <url>`, [proxy] pool or DONSEEK_PROXIES; direct-only egress)"
+                .to_string(),
+        );
     } else {
-        bits.push(format!("{pool_n} proxy lane(s) configured"));
+        bits.push(format!(
+            "{lane_n} proxy lane(s) ({} from {}, {from_config_n} from [proxy] pool/DONSEEK_PROXIES)",
+            file_proxies.len(),
+            crate::transport::proxy::config_path().display()
+        ));
+    }
+    // A file line that did not parse is a proxy the user believes is
+    // configured: that is a warn, never a quiet pass (Q1 semantics).
+    let unparsed = file_skipped > 0;
+    if unparsed {
+        bits.push(format!(
+            "{file_skipped} line(s) in the proxy file did not parse and are NOT lanes (`donsetch proxy list` shows what loaded)"
+        ));
     }
     bits.push(if persist {
         "egress health persisted".into()
     } else {
         "egress health NOT persisted (proxy.egress_persist=false or state.no_disk_state)".into()
     });
+    let verdict = |bits: Vec<String>| {
+        if unparsed {
+            CheckResult::Warn(bits.join(" · "))
+        } else {
+            CheckResult::Pass(bits.join(" · "))
+        }
+    };
 
     if !persist {
-        return CheckResult::Pass(bits.join(" · "));
+        return verdict(bits);
     }
 
     let path = paths::cache_dir().join("egress-health.json");
     if !path.exists() {
         bits.push("no egress-health.json yet (benches appear after the first burn)".into());
-        return CheckResult::Pass(bits.join(" · "));
+        return verdict(bits);
     }
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
@@ -653,16 +706,16 @@ fn check_proxy_pool() -> CheckResult {
         .and_then(|v| v.get("dead").and_then(|d| d.as_array()).map(|a| a.len()))
         .unwrap_or(0);
 
-    if pool_n > 0 && dead_n >= pool_n {
+    if lane_n > 0 && dead_n >= lane_n {
         bits.push(format!(
-            "all {pool_n} proxy lane(s) benched in egress-health.json: run `donsetch proxy check` and fix creds/network"
+            "all {lane_n} proxy lane(s) benched in egress-health.json: run `donsetch proxy check` and fix creds/network"
         ));
         return CheckResult::Warn(bits.join(" · "));
     }
     bits.push(format!(
         "learned benches: {burned} burned pair marker(s), {dead_n} dead lane(s)"
     ));
-    CheckResult::Pass(bits.join(" · "))
+    verdict(bits)
 }
 
 /// `donsetch doctor --improve`: the self-improvement loop in plain
@@ -1633,6 +1686,44 @@ fn check_config_posture() -> CheckResult {
     CheckResult::Pass(format!("layers: {}", layers.join(" + ")))
 }
 
+/// The local `[rules]` table: the rule count and the `mode`, with the
+/// layer `mode` came from. Warns when rules exist but `mode` is off.
+/// An uncompilable pattern never reaches this check: it fails the
+/// config load before doctor runs.
+fn check_rules() -> CheckResult {
+    // The installed config keeps no per-leaf origins, so the layers are
+    // loaded again for the mode's. Doctor applies no CLI override to
+    // `[rules]`, so both loads see the same mode.
+    let origin = match crate::config::load() {
+        Ok(loaded) => loaded
+            .origin_of_path(&["rules", "mode"])
+            .unwrap_or("default")
+            .to_string(),
+        Err(_) => "origin unknown".to_string(),
+    };
+    rules_check(&crate::config::cfg().rules, &origin)
+}
+
+fn rules_check(section: &crate::rules::RulesSection, mode_origin: &str) -> CheckResult {
+    let total = section.url.len();
+    let disabled = section.url.values().filter(|r| !r.enabled).count();
+    let plural = if total == 1 { "" } else { "s" };
+    let count = if disabled == 0 {
+        format!("{total} rule{plural}")
+    } else {
+        format!("{total} rule{plural} ({disabled} disabled)")
+    };
+    let detail = format!("{count} · mode={} ({mode_origin})", section.mode.as_str());
+    // Off with live rules is the state a forgotten
+    // DONSETCH_RULES__MODE=off leaves behind: the operator believes a
+    // protection is in place that is not.
+    if section.mode == crate::rules::RulesMode::Off && total > disabled {
+        CheckResult::Warn(format!("{detail}: no rule is enforced"))
+    } else {
+        CheckResult::Pass(detail)
+    }
+}
+
 /// Search engine + learning receipts, local-only and fast. One
 /// line an agent can trust: is the roster healthy, is learning
 /// on, are the new C kill switches armed.
@@ -2343,15 +2434,15 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
     let fetcher = match Fetcher::new(crate::profile::BrowserProfile::host_default()) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("  fetcher init failed: {e}");
+            crate::diag!("  fetcher init failed: {e}");
             return 1;
         }
     };
     let live = match scorecard::capture(&fetcher).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("  capture failed: {e}");
-            eprintln!("  (the echo endpoint is unreachable; retry or check egress)");
+            crate::diag!("  capture failed: {e}");
+            crate::diag!("  (the echo endpoint is unreachable; retry or check egress)");
             return 1;
         }
     };
@@ -2377,13 +2468,13 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
                     println!("  parity: tier 1 matches the local browser. Evergreen.");
                     0
                 } else {
-                    eprintln!("  {bad} layer(s) diverged from the local browser.");
+                    crate::diag!("  {bad} layer(s) diverged from the local browser.");
                     1
                 }
             }
             Err(e) => {
-                eprintln!("  ghost parity unavailable: {e}");
-                eprintln!("  (need a local Chrome: ghost must render the echo once)");
+                crate::diag!("  ghost parity unavailable: {e}");
+                crate::diag!("  (need a local Chrome: ghost must render the echo once)");
                 // Parity is best-effort evergreen, not the fixture gate.
                 1
             }
@@ -2401,7 +2492,7 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
         match serde_json::to_string_pretty(&fixture) {
             Ok(text) => {
                 if let Err(e) = std::fs::write(path, format!("{text}\n")) {
-                    eprintln!("  could not write {path}: {e}");
+                    crate::diag!("  could not write {path}: {e}");
                     return 1;
                 }
                 println!("  baseline recorded to {path}");
@@ -2409,7 +2500,7 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
                 return 0;
             }
             Err(e) => {
-                eprintln!("  could not serialize fixture: {e}");
+                crate::diag!("  could not serialize fixture: {e}");
                 return 1;
             }
         }
@@ -2418,7 +2509,7 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
     let baseline = match scorecard::baseline_fixture() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("  {e}");
+            crate::diag!("  {e}");
             return 1;
         }
     };
@@ -2669,6 +2760,89 @@ mod doctor_ultra_tests {
             }
             other => panic!("expected Fail, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn proxy_pool_check_counts_the_cli_written_proxy_file() {
+        let _g = isolated_cache();
+        // `donsetch proxy add` writes cache_dir/proxies.txt and that file IS
+        // part of the pool: doctor must not call the pool empty while the CLI
+        // says "3 proxies configured" (and its all-benched warning has to be
+        // able to fire for a file-configured pool).
+        let path = crate::transport::proxy::config_path();
+        std::fs::write(
+            &path,
+            "socks5://127.0.0.1:1080\nhttp://user:pass@proxy.example:3128\n",
+        )
+        .unwrap();
+        match check_proxy_pool() {
+            CheckResult::Pass(detail) => {
+                assert!(detail.contains("2 proxy lane(s)"), "{detail}");
+                assert!(!detail.contains("pool empty"), "{detail}");
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+        // A line that does not parse is a proxy the user thinks is live.
+        std::fs::write(&path, "socks5://127.0.0.1:1080\nnot a proxy\n").unwrap();
+        match check_proxy_pool() {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("1 proxy lane(s)"), "{detail}");
+                assert!(detail.contains("did not parse"), "{detail}");
+            }
+            other => panic!("expected Warn for the unparsed line, got {other:?}"),
+        }
+    }
+
+    fn rules_section(
+        mode: crate::rules::RulesMode,
+        enabled: &[bool],
+    ) -> crate::rules::RulesSection {
+        let mut s = crate::rules::RulesSection {
+            mode,
+            ..Default::default()
+        };
+        for (i, on) in enabled.iter().enumerate() {
+            s.url.insert(
+                format!("host{i}.example"),
+                crate::rules::UrlRule {
+                    enabled: *on,
+                    ..Default::default()
+                },
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn rules_row_warns_when_mode_is_off_with_live_rules() {
+        let s = rules_section(crate::rules::RulesMode::Off, &[true, false]);
+        match rules_check(&s, "DONSETCH_RULES__MODE") {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("2 rules (1 disabled)"), "{detail}");
+                assert!(
+                    detail.contains("mode=off (DONSETCH_RULES__MODE)"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rules_row_passes_when_enforced_or_when_nothing_is_switched_off() {
+        let enforced = rules_section(crate::rules::RulesMode::Enforce, &[true]);
+        match rules_check(&enforced, "default") {
+            CheckResult::Pass(detail) => {
+                assert_eq!(detail, "1 rule · mode=enforce (default)");
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+        // Off with no live rule switches nothing off.
+        let empty = rules_section(crate::rules::RulesMode::Off, &[]);
+        assert!(
+            matches!(rules_check(&empty, "default"), CheckResult::Pass(_)),
+            "an empty table with mode off must not warn"
+        );
     }
 
     #[test]

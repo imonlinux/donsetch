@@ -2,7 +2,8 @@
 //! stale lock files. Use after a crash or when Chrome processes
 //! from a previous session are still resident.
 
-pub fn run() {
+pub fn run(args: &[String]) {
+    crate::cli::args::Spec::new("stop", "donsetch stop", &[]).reject(&args[2..]);
     let profile = crate::ghost::profile_dir();
 
     #[cfg(unix)]
@@ -24,14 +25,14 @@ pub fn run() {
             .output();
         match out {
             Ok(o) if o.status.success() => {
-                eprintln!("[ghost] killed orphaned Chrome instances");
+                crate::diag!("[ghost] killed orphaned Chrome instances");
             }
             Ok(_) => {
                 // pkill exit 1 = no processes matched: not an error.
-                eprintln!("[ghost] no orphaned Chrome instances found");
+                crate::diag!("[ghost] no orphaned Chrome instances found");
             }
             Err(_) => {
-                eprintln!("[ghost] pkill not available, checking manually");
+                crate::diag!("[ghost] pkill not available, checking manually");
             }
         }
     }
@@ -45,7 +46,7 @@ pub fn run() {
     // Sweep temp profiles left behind by a crash.
     sweep_temp_profiles(&std::env::temp_dir());
 
-    eprintln!("[ghost] cleaned stale locks and temp profiles");
+    crate::diag!("[ghost] cleaned stale locks and temp profiles");
 }
 
 /// Escape POSIX extended-regular-expression metacharacters so a

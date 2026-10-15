@@ -5,6 +5,282 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.10.1] - 2026-10-14
+
+### Added
+
+- `donsetch status --json`: the same overview as one JSON document on stdout
+  (version, update state, search mode, proxy count and skipped lines, cache
+  bytes, browser, health, route memory, improve counters). The human view is a
+  rendering of those fields, so the two cannot disagree, and unlike
+  `doctor --json` (whose document follows the human report) this output is the
+  whole of stdout, so `donsetch status --json | jq .version` works.
+- `donsetch -V` as the short form of `--version` (lowercase `-v` already
+  worked, the conventional uppercase form did not).
+- A sponsor line in the human `donsetch proxy` output (the help text and the
+  empty-pool state): one labelled, dim line naming Proxy-Seller, its URL and
+  promo code, removable with `DONSETCH_NO_SPONSOR=1`. Hard lines: it is never
+  a fake pool lane, and it never appears in `--json`, `proxy export`,
+  `doctor`, `status`, or any MCP tool result or tool definition.
+
+### Fixed
+
+- The management commands ignored flags they did not recognize, while the
+  clap-parsed agent tools refused them. `donsetch doctor --frobnicate` ran the
+  whole health check and exited 0, a typo like `--depp` bought a silent shallow
+  run, and `status --json`, `proxy list --json`, `keys list --json`,
+  `adapters --json` and `version --json` all printed human output. Every
+  management command now refuses an unknown flag with the offending argument,
+  the nearest known one (`tip: a similar argument exists: '--deep'`), its usage
+  line, and exit 1: the answer the tools already gave.
+- `donsetch help <command>` printed a stale second copy of the command's help
+  (the proxy copy knew nothing of `proxy fetch|crawl on|off`). Both routes now
+  print the command's own text, and a test pins them byte-for-byte.
+- `donsetch login` without a terminal launched a real browser and only then
+  reported the closed stdin. It refuses before spawning anything now, names the
+  non-interactive branches (`--list`, `--status`, `--logout`, `--import`), and
+  exits 1.
+- `donsetch help <unknown>` printed the command index and exited 0, so a typo
+  read as success. Unknown commands and unknown subcommands are usage errors
+  now (exit 1) and name the nearest match (`tip: a similar command exists:
+  'fetch'`).
+- `donsetch proxy <unknown>` printed the help and exited 0. It exits 1.
+- `donsetch proxy export` on an empty pool printed nothing at all, which is
+  indistinguishable from a failure. It explains itself on stderr and keeps
+  stdout empty for piping.
+
+### Changed
+
+- The top-level help aligns the `screenshot` row with the other columns (the
+  name column was sized for nine characters) and drops the doubled colon in its
+  header line.
+- The setting behind the sponsor line, `DONSETCH_NO_SPONSOR`, is reserved: it
+  is a behaviour switch, not a config knob, so setting it no longer prints
+  `ignoring DONSETCH_NO_SPONSOR: expected DONSETCH_<SECTION>__<KEY>`.
+
+### Security
+
+- `rustls` 0.23.45 to 0.23.46, clearing four advisories published against the
+  version this crate pinned (RUSTSEC-2026-0346 through 0349: TLS secrets
+  reachable through `Debug` impls, buffered application data sent after an ECH
+  rejection, brotli certificate decompression allocating up to 1 GiB before
+  authentication, and an unauthenticated ServerHello downgrading later
+  connections). The advisory database's own fix is the patch bump.
+
+## [4.10.0] - 2026-10-14
+
+### Added
+
+- A proxy guide in the README: one-command setup, every accepted URL form,
+  bulk `add` / `import` / `export`, `proxy test` before saving, where the pool
+  lives (`proxies.txt`, `[proxy] pool`, `DONSEEK_PROXIES`), a table of which
+  tool uses the pool and which does not, and the environment-proxy conventions.
+
+### Fixed
+
+- `donsetch doctor` told every user who configured proxies with `donsetch
+  proxy add` that the pool was empty ("pool empty ... direct-only egress"):
+  the check counted only `[proxy] pool` / `DONSEEK_PROXIES`, never the
+  `proxies.txt` the CLI writes, while `donsetch status` and the live lanes
+  disagreed with it. It now counts the merged pool, names where each lane came
+  from, warns when a `proxies.txt` line did not parse, and its
+  all-lanes-benched warning can fire for a file-configured pool.
+- A malformed proxy reference is reported as a proxy configuration error with
+  its own next action (`proxy.config`) instead of a generic HTTP error, so
+  `donsetch proxy add` prints `Invalid proxy URL: proxy configuration: bad port
+  (expected 1-65535)` rather than `Invalid proxy URL: http: proxy: bad port`,
+  and an agent branching on the error code gets the config fix it can make.
+
+### Changed
+
+- The README states crawl's real egress rule: each host's first request leaves
+  on the direct lane, later requests spread across the pool lanes as their
+  pacing allows, and a host that blocks or throttles direct moves off it. The
+  previous "crawl rides the lanes by default" overstated it. Crawl's behavior
+  is unchanged, and the rule is now pinned by a test beside the code.
+- `config show --markdown` documents `[proxy] pool` as a list (`DONSEEK_PROXIES`
+  stays comma-separated).
+
+## [4.9.0] - 2026-10-14
+
+### Added
+
+- `web_crawl` / `crawl --map-limit` exposes the inventory output limit
+  (default 120, maximum 50,000 URLs). Inventory provenance and incomplete
+  discovery are reported explicitly; hitting a cap never claims completeness.
+- Crawl page state includes focus omission and block counts. Dataset JSON
+  Lines advance to `dataset_version:2` with per-row focus receipts.
+
+### Fixed
+
+- Explicit logins and cookie imports preserve opaque persistent session
+  cookies, including Facebook's `c_user` and `xs` (#367), throughout storage,
+  reload, browser replay and HTTP replay. Independent cookie paths survive;
+  automatic harvest caps and stale daemon saves cannot erase explicit logins.
+- Live daemons detect cookie replacements even when file size and timestamps
+  match. Warm browsers replant updated logins before navigation; account DOM
+  caches and old browser harvests cannot resurrect the previous session.
+- IPv6 login targets retain their literal host through cookie replay and probe
+  URL construction; unrelated hosts and paths stay isolated.
+- Login probes no longer mistake a public home-page HTTP 200 for verified
+  authentication. Stored names are shown without values; failed writes,
+  unusable imports, capture failures and closed input report their actual
+  outcomes. Login profile locking protects long sessions and precedes `--fresh`;
+  CDP attaches only after Enter. Browser logs and profile permissions are private.
+- Crawl character budgets honor small requested limits and remain enforced
+  under concurrent workers. Short deadlines are no longer silently extended
+  to five seconds; discovery, rendering and extraction share the same clock.
+- Delta crawls retain full-source fingerprints across output pagination without
+  storing a truncated passage as complete baseline text. Unchanged pages still
+  expose descendants to discovery.
+- Map discovery reads past the old 10,000-entry per-sitemap cut, discloses
+  discovery guards and distinguishes a published inventory from observed
+  seed-page links. Conventional fallback probes stop after finding a sitemap.
+- Links survive loose text, headings and table cells when requested. Link/media
+  projections share a neutral source fingerprint, preventing false change reports.
+- Explicit HTTP-only fetch errors recommend an untried browser tier accurately.
+  Known human-only CAPTCHA walls skip an unnecessary browser launch while
+  managed challenges remain eligible for browser recovery. Exact-URL human
+  refusals are remembered for five minutes, scoped to route and cookie identity;
+  explicit tiers can recheck them and login/logout invalidates them.
+- Crawl DNS failures retain their cause across the robots boundary; an unresolved
+  name is permanent, while a temporary resolver failure remains retryable.
+- Probe replies omit unrelated content-kind/language and unsolicited change
+  commentary, retaining the match, access and completion signals.
+
+## [4.8.1] - 2026-10-13
+
+### Fixed
+
+- Focus scoring no longer treats inherited heading breadcrumbs as evidence
+  in every paragraph. Repeated subject terms yield to more specific query
+  terms, and incidental weak matches no longer pull in unrelated sections.
+  API identifiers also match prose headings (TaskGroup / task groups).
+  Heading context and source order are preserved; repeated heading names
+  resolve to their actual ancestors. Genuine misses and broad queries still
+  return labeled full content.
+- Focus can select individual table rows with their headers and complete
+  cells, and unordered list items with their nested conditions. Omitted rows
+  and items are counted, and a narrowed result does not claim the whole source
+  is complete. Small enumerations stay intact; ordered procedures retain their
+  numbering and steps.
+- HTML data tables no longer discard everything after row 40 or cut cells at
+  120 characters before focus, probes or pagination can read them. Output
+  budgets and resumable offsets apply to the complete extracted table. Later
+  rows also retain extra cells when earlier rows have fewer columns.
+- A short successful focus result no longer labels a complete source page as
+  a JavaScript shell or triggers unnecessary browser recovery. Shell detection
+  uses the source extraction yield.
+- `web_fetch` actions help now leads with the browser routing cost and tells
+  agents to omit actions for static reads (#365). The tool description also
+  distinguishes JavaScript rendering from page interaction. Actions remain
+  optional; their schema bounds and runtime behavior are unchanged.
+
+## [4.8.0] - 2026-10-13
+
+### Added
+
+- Local per-domain rules: a `[rules.url."<pattern>"]` table in
+  `donsetch.toml` that can refuse a URL before any request or pin the
+  fetch tier for a host. DonSeTch ships no rules. A `deny` rule refuses
+  the URL on `web_fetch`, `web_crawl` and `web_screenshot`, redirect hops
+  and adapter rewrites included, and serves no cached copy of it; the
+  agent gets a structured `ok:false` result with code
+  `policy.denied.<reason>` (`policy.denied.unspecified` without a
+  `reason`), the rule's key, its `kind` (`walled` or `permanent`) as
+  `errorKind`, and the operator's `message` verbatim as `next_action`. A
+  crawl skips denied URLs without fetching them and lists them, grouped by
+  rule with the rule's message, in a trailing "Excluded by the operator's
+  local DonSeTch rules" section; a denied seed fails the crawl, and so does
+  a seed that redirects into a denied host, with the refused hop as
+  `landing_url`. A
+  `tier` rule acts as if the call had passed that tier, and
+  `tier_enforce = true` lets it win over an explicit per-call tier;
+  `tier = "auto"` with `tier_enforce = true` makes a host ignore the tier
+  an agent asks for, and a tier `"1"` pin also keeps `web_search`'s
+  background browser solve off that host. Patterns match the host (with
+  its subdomains, or exactly with a leading `.`) and optionally the
+  scheme; an IPv4 rule also matches the address written as IPv4-mapped
+  IPv6. A key with a port, path, query, `*`, a non-normal spelling, a
+  `deny` without a message, or any other malformed rule fails the config
+  load with a message naming the key and what to write instead. Rules
+  never change search ranking: a denied search result is not prefetched
+  and keeps its place, and a search engine or vertical a rule refuses is
+  not counted as a failing engine. Rules are a guardrail, not a security
+  boundary. See [docs/rules.md](docs/rules.md).
+- `donsetch rules test <url>` explains, offline, what the rules do with
+  one URL: every matching rule in precedence order, the winner, and the
+  winner's fields with the config layer each came from. It says first
+  when rules are off, and warns when a tier `"2"` rule covers a
+  PDF-shaped URL.
+- `--ignore-rules` on `donsetch fetch`, `crawl` and `screenshot` runs the
+  command as if the rule table were empty. It is CLI only: an
+  `ignore_rules` argument over MCP is an unknown-parameter error.
+- `donsetch doctor` has a "Local rules" row with the rule count and the
+  rules mode with its origin, and warns when the mode is `off` while a
+  rule is enabled.
+- `[rules]` knobs: `rules.mode` (`enforce` or `off`, env
+  `DONSETCH_RULES__MODE`) and `rules.crawl_denied_urls_per_rule` (URLs
+  listed per rule in a crawl's denied section, 0 to 200, default 20, env
+  `DONSETCH_RULES__CRAWL_DENIED_URLS_PER_RULE`). Rules themselves come from
+  the file only; any other `DONSETCH_RULES*` environment name fails the
+  load.
+
+### Changed
+
+- A crawl whose seed failed with nothing else to fetch is now a
+  structured error instead of a zero-page result. Its code is the one
+  `web_fetch` gives the same failure (`content.notfound` with
+  `read_status: "notfound"` and a `suggested_query` for a 404 or 410,
+  `wall.*` for a wall, a challenge served as a 429 or 5xx included,
+  `network.*` for a network failure, `network.ratelimit` for a plain
+  429), or else `crawl.robots_disallow`,
+  `crawl.robots_unreachable` or `crawl.seed_failed`. The error carries
+  the seed's `status`, `verdict`, `error` and robots evidence, and
+  `landing_url` when the seed redirected. A seed robots.txt disallows
+  gets the `respect_robots=false` bypass hint; an unreachable robots.txt
+  gets none, since it is read as disallow-all on purpose. A crawl the
+  deadline cut short, and a resumed crawl, keep their zero-page result.
+- A `web_fetch` batch where every URL failed now carries the `code` and
+  `errorKind` its URLs agree on, instead of a code guessed from the joined
+  error texts and a kind of `transient` unless all were `permanent`. For
+  example three bot-walled URLs now read `wall.blocked` rather than
+  `content.extract`, and `errorKind` `walled`, the kind behind exit code
+  3, rather than `transient`, the kind behind exit code 2. Mixed codes
+  keep the old derivation, mixed kinds stay `transient`.
+- A crawl skip reason for a redirect to a non-http(s) scheme drops a
+  doubled prefix: `invalid redirect target: blocked redirect to
+  non-http(s) scheme: mailto` instead of `invalid redirect target: http:
+  blocked redirect to non-http(s) scheme: mailto`.
+
+### Fixed
+
+- `web_crawl` map mode no longer renders a seed that robots.txt
+  disallows. A map whose static inventory was thin made one browser read
+  of the seed even when robots were respected and the seed's own
+  robots.txt refused it.
+- `web_crawl` map mode no longer builds a map from the links of a seed
+  page that the browser read as a 404 or a wall. The rendered read of the
+  seed now counts only when the browser read it as content (complete or
+  still settling) with a 2xx or unknown status, as the static harvest
+  already required; a dead seed's site header and footer links used to
+  come back as a complete map. Such a seed now gets the failed-seed error.
+
+- A diagnostic whose write fails no longer kills the process. Rust's
+  stderr printing macros panic on a failed write and the shipped
+  profile is `panic = "abort"`, so an MCP client that closed its
+  stderr read end aborted the daemon with SIGABRT mid-session; the
+  ghost tier's Xvfb install hint was the line that hit it in the
+  field report (issue #364). Every diagnostic in the daemon and the
+  CLI now goes through one fallible writer that drops a failed
+  write, and a package lint (`clippy::print_stderr`) fails the gate
+  on a raw stderr print so the class cannot come back. The text, the
+  order and every diagnostic on a healthy stderr are unchanged. A CLI
+  command other than `mcp` still restores SIGPIPE's default
+  disposition, so a pipeline that closes its pipe still ends the
+  process with exit 141 the way `rg` and `curl` do: that is the shell
+  convention, not a panic.
+
 ## [4.7.4] - 2026-10-10
 
 ### Added

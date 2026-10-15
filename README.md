@@ -10,6 +10,7 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
 
+[![Become a sponsor](https://img.shields.io/badge/sponsor-become%20a%20sponsor-ea4aaa?logo=githubsponsors&logoColor=white)](#-sponsor-this-project)
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
@@ -79,6 +80,12 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 **Sidrune AI**: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through [this link](https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH).
 
+<a href="https://proxy-seller.com/"><img src="assets/sponsors/proxy-seller-banner.png" alt="Proxy-Seller: private residential, mobile, ISP and datacenter proxies with HTTP(S) and SOCKS5 support. Promo code DON15 for 15% off." width="100%"></a>
+
+**Proxy-Seller**: private residential, mobile (4G/5G/LTE), ISP, and datacenter IPv4/IPv6 proxies with HTTP(S) and SOCKS5 support, 47M+ residential IPs in 220+ locations, precise country/city/ISP targeting, 99.7% uptime, and 24/7 support. Promo code **DON15** takes 15% off.
+
+**Want your name or logo here?** [Sponsorship tiers](#-sponsor-this-project).
+
 </div>
 
 ## 🤝 Sponsor this project
@@ -91,11 +98,11 @@ DonSeTch is free and open source, and stays that way. Sponsorship pays for the t
 | 🥈 Silver | $25/mo | Small logo + link in Our Sponsors |
 | 🥇 Gold | $49/mo | Large logo + link, pinned at the top of Our Sponsors |
 
-Prepaid monthly, cancel anytime. One-time sponsorships are welcome at any amount.
+If your product is part of this space (proxy platforms, search infrastructure, BYO providers, anything a DonSeTch user would plug in), Gold goes one step further: fit natively inside DonSeTch and you get the placement plus an official integration shipped in the binary itself.
 
-Pricing goes up as the project grows. It is early now, so a Gold at $49/mo is near-zero investment for any company whose product touches agent web research. If your product is part of this space (proxy platforms, search infrastructure, BYO providers, anything a DonSeTch user would plug in), Gold goes one step further: fit natively inside DonSeTch and you get the placement plus an official integration shipped in the binary itself.
+**How to sponsor.** Email **bhandaribishesh879@gmail.com**, or use the ♥ **Sponsor** button on this repo. GitHub Sponsors payouts aren't available in my region yet, so email is the reliable route: write me, I'll share my PayPal, and we go through the steps. One-time sponsorships are welcome at any amount.
 
-Email **bhandaribishesh879@gmail.com** to become a sponsor.
+**Prepay to lock your rate.** You can pay for any number of months in one go at today's price, and that rate is fixed for the whole term, so 6 months of Gold at today's $49/mo is $294, and a later increase (even to $150/mo) never touches it. Price changes only ever apply to sponsorships started after them.
 
 ## 📦 Install
 
@@ -283,7 +290,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 
 **DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
 
-- **`focus`**: BM25-relevant passages with section context. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`focus`**: BM25-relevant passages with heading context. Scores use each passage's own text; a repeated page title or common subject cannot make every paragraph relevant. Tables keep selected rows with their headers and complete cells; unordered lists keep selected items with their nested conditions. Omitted blocks, rows and items are counted. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
 - **`selector`**: extract only matching HTML subtrees. A miss returns `selector.nomatch` with the inspected element count; invalid syntax returns `selector.invalid`. Non-HTML responses cannot satisfy a CSS scope.
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
@@ -358,6 +365,8 @@ fact-check. `source_type` identifies video, community, paper, reference,
 publisher, official, institutional, and general web sources from known hosts.
 It does not certify a page's claims or assign trust to lookalike domains.
 
+The diagnostic domain-profile route `cold` means ordinary HTTP without verified bot-wall clearance cookies. Repeated successful reads can stay on that route while reusing connections; it does not mean transport caching or learning failed.
+
 **Tier 3 bypass (opt-in).** When the ghost itself hits a hard wall, fetch falls back to Bright Data Web Unlocker if a key is configured (`donsetch keys add unlocker "<token>::<Web Unlocker zone>"`). It returns HTML into the normal extraction pipeline; a challenge or empty shell remains a failed fetch. Failures carry recovery guidance on the escalation trace. `donsetch doctor --deep` checks token access, zone name and product type for free; tokens without account-zone read permission report an unverified check. Successful responses are cached locally (URL and render-mode keyed, sliding 6h TTL, 200 entries); concurrent calls within one daemon share the cache. The daily cap counts every API attempt, including retries, and the whole operation shares one timeout. A timed-out paid request is not replayed automatically. Settings live in `[bypass]`: `donsetch config show`. See the [setup guide](docs/brightdata.md). DonSeTch works without it.
 
 <details>
@@ -390,7 +399,11 @@ Same-domain, best-first. Two phases: sitemap discovery (cheap URL inventory), th
 - **Crawl-shape**: frontier pops get a seeded reader-like jitter so repeated crawls never replay one identical, score-eager order into server logs. Ordering only, payloads untouched. Kill switch: `DONSETCH_NO_CRAWL_SHAPE=1`.
 - **Resume tokens**: a stopped crawl resumes in one call, valid 30 minutes, survives restarts.
 - **Near-duplicate detection**: title plus first 200 chars, hashed.
-- **Honest stop reasons**: `FrontierEmpty`, `MaxPages`, `CharBudget`, `DepthLimit`, `Deadline`, `ThrottledOut`.
+- **Budgets**: `per_page_max` and `max_total_chars` honor positive character limits down to 1, including concurrent workers. `deadline_s` accepts 1-600 seconds and bounds discovery, page reads, browser handoffs and extraction. A sliced page carries `next_offset`; use `web_fetch` with that offset to continue it.
+- **Inventory**: `map_limit` controls returned URLs (default 120, up to 50,000). `inventory.complete=false` discloses output caps, unavailable sitemaps and discovery safety bounds (100,000 URLs, 32 sitemap reads). A map derived from seed-page links cannot establish site-wide completeness. Narrow `focus`/`include_paths` for large sites.
+- **Change tracking**: `since_last=true` rechecks sources, then suppresses unchanged pages using per-URL fingerprints from earlier fetches or crawls. Pagination does not prevent recording a full-source fingerprint; partial output never becomes full baseline text.
+- **Focus receipts**: page state records whether passages were omitted and the block counts. Dataset JSON Lines use `dataset_version:2`, adding the per-row focus receipt.
+- **Honest stop reasons**: `FrontierEmpty`, `MaxPages`, `CharBudget`, `DepthLimit`, `Deadline`, `ThrottledOut`, `Cancelled`, `InventoryLimit`. A drained frontier is complete only when the requested evidence was obtained without failures or excluded pages.
 - **Cross-process politeness**: one host-pace store shared by every crawler on the box, so two runs against one site do not double the rate.
 
 <div align="center">
@@ -627,7 +640,7 @@ Every runtime knob lives in one typed config (`src/config.rs`), layered, later w
 3. **`donsetch.toml`** at `<config-dir>/donsetch/donsetch.toml`, or anywhere via `DONSETCH_CONFIG=/path/file.toml`. Unknown keys and bad values are hard errors naming the file. `DONSETCH_NO_CONFIG_FILE=1` skips the file layer (setting both is an error).
 4. **New env names**: `DONSETCH_<SECTION>__<KEY>`, so `DONSETCH_FETCH__PDF_MAX_MB=25`.
 
-Sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`, `fetch`, `bypass`, `search`, `browser`, `debug`.
+Sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`, `fetch`, `bypass`, `search`, `browser`, `debug`, `rules`.
 
 ```toml
 [fetch]
@@ -647,6 +660,23 @@ Booleans take `true`/`false`, enums take their listed spellings.
 - `donsetch config show --legacy` maps every old env name to its config key.
 - `donsetch doctor` warns about the legacy vars active in your shell, mapped to their keys.
 
+### Local rules: deny a site, or pin its tier
+
+Some sites treat any automated traffic as hostile, however well it is disguised. The block lands on your IP, sometimes on your whole network, outlasts the session that caused it, and also locks you out in your own browser. A note in the agent's instructions file ("never fetch site X") helps only if the model reads it and obeys it every time, and one forgotten turn is enough to get banned. Other sites need a particular tier every time, and the agent has no way to know that in advance. [Pick the right tool](#-pick-the-right-tool) covers which task shapes draw these blocks. Local rules enforce your answer inside DonSeTch, whatever the model decides.
+
+Per-host rules in `donsetch.toml` can refuse a URL before any request, handing the agent your own instructions in place of the page, or pin the fetch tier for a host. DonSeTch ships none; the table is empty until you write one.
+
+```toml
+[rules.url."example.org"]        # the host and every subdomain, http and https
+action  = "deny"
+reason  = "ip_ban"               # error code policy.denied.ip_ban
+message = "do not fetch this site with curl, scripts or another HTTP client: it bans our IP for automated access. Find file elsewhere, or ask the human operator to download it"
+```
+
+`web_fetch`, `web_crawl` and `web_screenshot` then refuse that site, redirects and cached copies included, and the agent reads `message` as its `Next action:`, so lead with what to do instead, and say why when the reason rules out workarounds. The most specific matching rule wins in full: a narrower rule that only sets `tier` also cancels a broader deny. `donsetch rules test <url>` shows which rule a URL gets and why, offline.
+
+Rules are a guardrail, not a security boundary: no MCP argument can switch them off, but an agent with a shell can run `donsetch fetch --ignore-rules`, set `DONSETCH_RULES__MODE=off`, or edit `donsetch.toml`. Pattern grammar, load errors, precedence, tier pins, what the agent sees and the known limits: [local rules](docs/rules.md).
+
 ## 💻 CLI
 
 Thin adapter over the same engine the MCP server uses.
@@ -659,37 +689,56 @@ Thin adapter over the same engine the MCP server uses.
 | `donsetch screenshot <url>` | Render to PNG (`--out`) |
 | `donsetch mcp` | MCP server (stdio, or `--http --port N`) |
 | `donsetch doctor` | Health check and auto-fix (`--deep`, `--json`, `--fix`) |
-| `donsetch status` | Version, keys, proxies, cache, health overview |
+| `donsetch status` | Version, keys, proxies, cache, health overview (`--json` for scripts and agents) |
 | `donsetch keys` | BYOK providers and plugins (`add`, `list`, `default`, `export`) |
-| `donsetch proxy` | Proxy management (`add`, `list`, `check`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
+| `donsetch proxy` | Proxy management (`add`, `list`, `check`, `test`, `import`, `export`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
 | `donsetch login` | Authenticated sessions for walled sites (`--list`, `--status`, `--logout`, `--import`) |
 | `donsetch config` | `show`, `--markdown`, `--legacy` |
+| `donsetch rules test <url>` | Explain what the local rules do with a URL, offline |
 | `donsetch tools` | Tool schemas as JSON, same as MCP `tools/list` |
 | `donsetch update` / `rollback` | Self-update from GitHub Releases, and revert |
 
+Every management command validates its flags: an unknown one is refused with the nearest known match and exits 1. A usage error is never a silent run. The `proxy` help and its empty-pool state carry one labelled sponsor line (Proxy-Seller); `DONSETCH_NO_SPONSOR=1` removes it, and it never appears in `--json`, `proxy export`, or any MCP result or tool definition.
+
 ## 🔀 Proxies
 
-**Fetch** dials direct by default, which keeps the stealth guarantee intact: a proxy you configured is a proxy that sees your traffic. But it follows the curl/openssl convention when the environment asks for it:
-
-- `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (any case) route fetches through that proxy, and `NO_PROXY` exempts.
-- `DONSETCH_NO_ENV_PROXY=1` disables the convention entirely.
-- HTTP CONNECT proxies get an interception-safe handshake (no GREASE/ALPS/ECH/compress-cert), because TLS-terminating middleboxes re-sign with their own stack and some reset on exotic ClientHellos. SOCKS5 keeps the Chrome-true handshake, TLS rides end-to-end.
-- `SSL_CERT_FILE` / `SSL_CERT_DIR` load into the trust store, which is the only way re-signed certificates verify in an intercepting network, exactly like curl.
-- `donsetch doctor` reports the whole posture: resolved env proxy, kill-switch state, system and environment trust stores, plus a live check that names the interception fix when it fails.
-
-**The proxy pool is opt-in for fetch.** `donsetch proxy fetch on` lets `web_fetch` (and its browser escalation) ride the pool lanes, sticky per host, rotating on 429/407/dead/timeout; `donsetch proxy fetch off` puts it back on your own IP, which is the default. A one-shot read does not need a shared exit, and the pool's exit IPs are not better than yours for it.
-
-**Search and crawl** rotate proxies across lanes, each with durable health: sticky per-host lanes, persona-exclusive exits, RTT-aware pacing, burned lanes remembered across restarts. A direct dial that fails is not a dead link, and a lane that dies does not silently take a domain with it. Crawl rides the lanes by default; `donsetch proxy crawl off` leaves every crawl request on your IP.
+Adding a proxy is one command. Nothing else is required.
 
 ```bash
-donsetch proxy add <url>            # rotate-able proxy entry
-DONSEEK_PROXIES="url1,url2"         # env form, comma separated
-donsetch proxy list                 # list, credentials masked
-donsetch proxy check                # live connectivity test
-donsetch proxy fetch on             # opt web_fetch into the pool (default: your IP)
-donsetch proxy crawl off            # keep crawl on your IP
-donsetch proxy remove <n> && donsetch proxy clear
+donsetch proxy add socks5://user:pass@1.2.3.4:1080   # validated, probed, then saved
+donsetch proxy list                                  # what is configured (credentials masked)
+donsetch proxy check                                 # live probe: latency + real exit IP
 ```
+
+- **Formats**: `http://host:port` (HTTP CONNECT, credentials optional as `user:pass@`), `socks5://host:port` and its `socks5h://` alias (SOCKS5 sends the target as a name, so the proxy resolves DNS and your resolver never sees the host). A bare `host:port` is HTTP CONNECT. Anything else is refused with the reason.
+- **Many at once**: `donsetch proxy add url1 url2 url3`, or a whole file with `donsetch proxy import proxies.txt` (one URL per line, `#` comments) — `donsetch proxy export` writes that file back out. `--no-check` skips the probe when you are adding hundreds.
+- **Try before you add**: `donsetch proxy test <url>` probes one proxy without saving it.
+- **Where they live**: `donsetch proxy add` appends `<cache-dir>/proxies.txt` (mode 0600, credentials included). `DONSEEK_PROXIES="url1,url2"` in the environment and `[proxy] pool = ["url1", "url2"]` in `donsetch.toml` are the other two doors; all three merge, and an environment/config entry replaces a file entry with the same `host:port`. The pool is read at startup, so restart the MCP server to pick up a change.
+- **Removing**: `donsetch proxy remove 1` (the index `proxy list` prints, or `host:port`) and `donsetch proxy clear`.
+- **Checking is a tunnel, not a TCP handshake**: the probe connects through the proxy to `api.ipify.org` and prints the exit IP, so a proxy that accepts the connection and then cannot carry traffic is reported dead. `donsetch status` shows the count, `donsetch doctor` shows every lane and its health.
+
+### What uses the pool, and what does not
+
+A proxy you configure is a proxy that sees your traffic, so nothing uses one by accident.
+
+| Tool | Default | Off switch |
+|---|---|---|
+| `web_search` | always rotates the pool: one lane per engine, sticky per host, so a fan-out search does not hit nine engines from one IP | — |
+| `web_crawl` | each host starts on the direct lane; its later requests spread across the pool lanes as their pacing allows, and a host that blocks or throttles direct moves off it | `donsetch proxy crawl off` |
+| `web_fetch` | your own IP | `donsetch proxy fetch on` |
+
+`donsetch proxy fetch on` makes `web_fetch` (and its browser escalation) sticky to a pool lane per host, rotating on 429/407/dead/timeout. A one-shot read does not need a shared exit, which is why fetch is opt-in while search and crawl are not.
+
+Crawl is where the first request decides things: a host that bans on contact has already seen your own IP before a lane can take over. When a site must never see your address at all, keep it off entirely with a **[local rule](#local-rules-deny-a-site-or-pin-its-tier)** rather than leaning on the pool.
+
+### Riding your own proxy network
+
+Set the environment and every fetch follows the curl convention:
+
+- `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (any case) route fetches through that proxy, and `NO_PROXY` exempts hosts (suffix match, `*`, `host:port`, CIDR). `DONSETCH_NO_ENV_PROXY=1` disables the convention entirely. `[proxy] http` / `https` / `all` in `donsetch.toml` do the same thing without environment variables.
+- A configured proxy is a promise: if it cannot be dialled the fetch fails and says so, instead of quietly leaving on your own IP. Same for a pool lane: a dead lane is benched, not replaced by a direct read of a host it was carrying.
+- In an intercepting network (a TLS-terminating middlebox), HTTP CONNECT gets an interception-safe handshake (no GREASE/ALPS/ECH/compress-cert, which some middleboxes reset on) and `SSL_CERT_FILE` / `SSL_CERT_DIR` load into the trust store, exactly like curl. SOCKS5 keeps the Chrome-true handshake with TLS end to end. `donsetch doctor` reports the whole posture and names the interception fix when a live check fails.
+- Authenticated lanes work in the browser tier too: Chrome cannot carry proxy credentials, so it is pointed at a local credential-free relay that authenticates upstream, instead of dying as `ERR_SOCKS_CONNECTION_FAILED`.
 
 ## 🔐 Logged-in sessions
 
@@ -704,9 +753,11 @@ donsetch login --import cookies.txt x.com   # servers and CI, Netscape format
 ```
 
 - Credentials never enter DonSeTch. It opens a real Chromium on your display in a dedicated profile, never the automation one. You type into the browser. No keystroke capture, no screenshots, no CDP attach until you press Enter.
-- Afterwards the cookies are harvested, filtered to session-worthy ones, and stored in the same 0600 vault the fetch engine already replays, so tier-1 fetches and tier-2 renders of that domain carry your login immediately, with no daemon restart. A post-login probe verifies wall detection (redirect to /login, 401/403) and surfaces it in `--list`.
+- Afterwards, cookies selected by your domain or explicit import are stored regardless of whether their names look like authentication tokens. Known analytics and clearance cookies, expired records and invalid values are excluded. Names and paths retain their identity, including opaque persistent names such as `c_user`, `xs` and `li_at`. Cookie values stay in the private vault; `Saved`/`Imported` lists names only. Tier-1 fetches and warm tier-2 browsers reload the session without a daemon restart. Login changes invalidate cached account documents; captures from older browsers cannot overwrite the replacement session.
+- A named-domain post-login probe checks reachability and reports login/access redirects as unverified. A public home-page HTTP 200 cannot prove authentication, so it never earns a verified checkmark. Multi-site saves avoid one probe per domain. Verify the actual protected page you need with `web_fetch`.
+- Failed writes and captures return an error instead of reporting success. EOF and Ctrl+C save nothing to the vault; `--fresh` waits for the exclusive profile lock before wiping it. The dedicated browser profile may retain its own cookies until cleared with `--fresh`.
 - The registry (`auth-state.json`) stores metadata only: names, counts, expiries, probe verdicts. Never values.
-- Multi-site: run bare `donsetch login`, sign into as many tabs as you like, press Enter once.
+- Multi-site: run bare `donsetch login`, sign into as many tabs as you like, press Enter once. New cookies and rotated values are captured, including opaque persistent cookies.
 
 ## 🐳 Docker
 

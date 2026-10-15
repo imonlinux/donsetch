@@ -111,6 +111,8 @@ pub struct Extracted {
     pub next_offset: Option<usize>,
     pub blocks_total: usize,
     pub blocks_shown: usize,
+    /// Focus deliberately omitted source blocks, rows or unordered items.
+    pub focus_omitted: bool,
     /// Rough token estimate (chars / 4) of the returned markdown.
     pub tokens_est: usize,
     /// True when the page was large but almost no content
@@ -479,6 +481,7 @@ pub fn extract(
                 content_kind: ContentKind::Page,
                 blocks_total: 1,
                 blocks_shown: 1,
+                focus_omitted: false,
                 lang: "unknown".to_string(),
                 quality: 1.0,
                 pdf_pages: None,
@@ -501,6 +504,7 @@ pub fn extract(
             next_offset: next,
             blocks_total: 1,
             blocks_shown: 1,
+            focus_omitted: false,
             thin: false,
             content_kind: ContentKind::Page,
             lang: "unknown".to_string(),
@@ -529,6 +533,7 @@ pub fn extract(
                     url,
                     opts,
                     max_chars,
+                    None,
                 );
             }
             Err(crate::pdf::PdfFailure::Encrypted) => {
@@ -643,6 +648,25 @@ pub fn extract(
         blocks::segment(*root, &base, opts, &mut all_blocks);
     }
 
+    let neutral_identity = if opts.include_links || opts.include_media {
+        let neutral = ExtractOptions {
+            selector: opts.selector.clone(),
+            ..Default::default()
+        };
+        let mut neutral_blocks = Vec::new();
+        for root in &roots {
+            blocks::segment(*root, &base, &neutral, &mut neutral_blocks);
+        }
+        Some(render::render(
+            &meta,
+            url,
+            &neutral_blocks.iter().collect::<Vec<_>>(),
+            &neutral,
+        ))
+    } else {
+        None
+    };
+
     let extracted = downstream(
         &meta,
         all_blocks,
@@ -655,6 +679,7 @@ pub fn extract(
         url,
         opts,
         max_chars,
+        neutral_identity,
     )?;
 
     // A TOC is a complete projection, not a failed short extraction. Once
@@ -737,6 +762,7 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
         next_offset: None,
         blocks_total: 0,
         blocks_shown: 0,
+        focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Page,
         lang: "unknown".to_string(),
@@ -766,13 +792,16 @@ fn downstream(
     url: &str,
     opts: &ExtractOptions,
     max_chars: usize,
+    neutral_identity: Option<String>,
 ) -> Result<Extracted, ExtractError> {
-    let identity = render::render(
-        meta,
-        url,
-        &all_blocks.iter().collect::<Vec<_>>(),
-        &ExtractOptions::default(),
-    );
+    let identity = neutral_identity.unwrap_or_else(|| {
+        render::render(
+            meta,
+            url,
+            &all_blocks.iter().collect::<Vec<_>>(),
+            &ExtractOptions::default(),
+        )
+    });
     if pdf_pages.is_none()
         && let Some(v) = crate::detect::walls::text_wall(&identity)
     {
@@ -819,6 +848,7 @@ fn downstream(
             next_offset: next,
             blocks_total: all_blocks.len(),
             blocks_shown: shown,
+            focus_omitted: false,
             thin: false,
             content_kind: ContentKind::Page,
             lang: lang_info.code.clone(),
@@ -922,6 +952,20 @@ fn downstream(
         None
     };
 
+    // Refine tables/lists only after section selection: the selected rows
+    // carry their headers and complete nested items, plus an omission count.
+    let refined = opts
+        .focus
+        .as_ref()
+        .filter(|_| !focus_fell_back)
+        .map(|query| focus::refine_structured(&all_blocks, &kept, query, &lang_info));
+    let mut focus_omitted =
+        dropped_note.is_some() || refined.as_ref().is_some_and(|(_, note)| note.is_some());
+    let mut kept: Vec<&blocks::Block> = match &refined {
+        Some((blocks, _)) => blocks.iter().collect(),
+        None => kept,
+    };
+
     // Render markdown (frontmatter + blocks) then paginate.
     let mut full = render::render(meta, url, &kept, opts);
 
@@ -950,6 +994,10 @@ fn downstream(
     // are rarer and more important) but before any body content.
     if let Some(m) = dropped_note {
         full = format!("*[{m}]*\n\n{full}");
+    }
+
+    if let Some((_, Some(note))) = &refined {
+        full = format!("*[{note}]*\n\n{full}");
     }
 
     // Broad matches can cost more than a plain read once context and the
@@ -981,6 +1029,8 @@ fn downstream(
             unfocused
         );
         blocks_shown = blocks_total;
+        focus_omitted = false;
+        kept = all_blocks.iter().collect();
     }
     // JS-shell warning: agent must know the content
     // below is likely incomplete. On tier=auto the MCP
@@ -1008,12 +1058,15 @@ fn downstream(
     // exactly this slice. Shell detection must not fire on it (a
     // small section on a 400KB page used to escalate to ghost and
     // return the full page instead of the section).
+    // Shell detection measures source yield, never the deliberately narrowed
+    // focus projection. Otherwise a successful focus triggers browser recovery.
+    let source_len = identity.len();
     let density = if raw_len > 0 {
-        full.len() as f64 / raw_len as f64
+        source_len as f64 / raw_len as f64
     } else {
         1.0
     };
-    let is_shell = raw_len > 20_000 && density < 0.05 && full.len() < 3_000;
+    let is_shell = raw_len > 20_000 && density < 0.05 && source_len < 3_000;
     // A PDF can legitimately contain only a few words. It is already parsed
     // from a complete binary document, so HTML shell heuristics must never
     // label a short PDF as a JS-rendered page.
@@ -1021,8 +1074,8 @@ fn downstream(
     let thin = !is_pdf
         && opts.selector.is_none()
         && !section_hit
-        && ((full.len() < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
-            || (thin_flag && has_skeletons && full.len() < 4000)
+        && ((source_len < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
+            || (thin_flag && has_skeletons && source_len < 4000)
             || is_shell);
     if thin {
         full = format!(
@@ -1056,6 +1109,7 @@ fn downstream(
             site: meta.site.clone(),
             blocks_total,
             blocks_shown,
+            focus_omitted,
             lang: lang_info.code.clone(),
             quality,
             pdf_pages,
@@ -1076,6 +1130,7 @@ fn downstream(
         next_offset: next,
         blocks_total,
         blocks_shown,
+        focus_omitted,
         tokens_est,
         thin,
         content_kind,

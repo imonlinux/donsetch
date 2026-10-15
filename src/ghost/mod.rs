@@ -145,6 +145,10 @@ pub struct Ghost {
     /// back into the vault by this browser's reap — the browser
     /// predates the clear and only holds a dead session.
     pub launched_epoch: u64,
+    session_stamp: String,
+    auth_revision: String,
+    applied_auth_epoch: u64,
+    session_host: Option<String>,
     /// Holds an flock on the shared profile dir. Kept alive for
     /// the Ghost's lifetime so concurrent donsetch processes see
     /// the lock and fall back to a temp profile instead of
@@ -1045,12 +1049,12 @@ impl Ghost {
                             unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                         if got == 0 {
                             if crate::config::cfg().debug.ghost {
-                                eprintln!("[ghost] profile lock acquired: shared profile");
+                                crate::diag!("[ghost] profile lock acquired: shared profile");
                             }
                             (profile_dir(), None, None::<std::path::PathBuf>)
                         } else {
                             if crate::config::cfg().debug.ghost {
-                                eprintln!("[ghost] profile lock contended: temp profile");
+                                crate::diag!("[ghost] profile lock contended: temp profile");
                             }
                             let t = temporary_profile_dir();
                             (t.clone(), Some(t), None::<std::path::PathBuf>)
@@ -1195,7 +1199,7 @@ impl Ghost {
         // or AppArmor restrictions). Never enabled by default :
         // requires explicit env var and prints a loud warning.
         if crate::config::cfg().browser.no_sandbox {
-            eprintln!(
+            crate::diag!(
                 "[ghost] WARNING: DONGHOST_NO_SANDBOX=1 : launching Chrome with --no-sandbox and --disable-setuid-sandbox. This disables the Chromium sandbox and is UNSAFE. Only use in isolated containers."
             );
             chrome_args.push("--no-sandbox".into());
@@ -1384,7 +1388,7 @@ impl Ghost {
             let detail = launch_failure_detail(&stderr_tail);
             let _ = child.kill().await;
             if !retry && !want_headless && is_platform_init_failure(&detail) {
-                eprintln!("[ghost] headful launch failed ({detail}); retrying headless");
+                crate::diag!("[ghost] headful launch failed ({detail}); retrying headless");
                 attempt += 1;
                 continue;
             }
@@ -1410,7 +1414,7 @@ impl Ghost {
                 let tail = stderr_tail
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                eprintln!(
+                crate::diag!(
                     "[ghost] setup CDP error: {error}; browser={exit}; stderr={}",
                     launch_failure_detail(&tail)
                 );
@@ -1429,7 +1433,7 @@ impl Ghost {
             Self::purge_cleared_session_cookies(&cdp).await;
             Self::restore_session_cookies(&cdp).await;
         } else if crate::config::cfg().debug.ghost {
-            eprintln!("[ghost] temp profile: purge + replant skipped");
+            crate::diag!("[ghost] temp profile: purge + replant skipped");
         }
 
         // One page target, attached flat.
@@ -1634,6 +1638,10 @@ impl Ghost {
             frozen: false,
             last_used: Instant::now(),
             launched_epoch: crate::ghost::cache::disk_epoch_now(),
+            session_stamp: String::new(),
+            auth_revision: String::new(),
+            applied_auth_epoch: 0,
+            session_host: None,
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
@@ -1711,7 +1719,7 @@ impl Ghost {
         };
         if crate::config::cfg().debug.ghost {
             let tail = self.stderr_tail.lock().unwrap_or_else(|p| p.into_inner());
-            eprintln!(
+            crate::diag!(
                 "[ghost] transport={} exit={exit} generation={} frozen={} {}",
                 self.cdp.failure().unwrap_or("unavailable"),
                 self.document().generation,
@@ -2015,20 +2023,20 @@ impl Ghost {
             .map(|(host, _)| host.clone())
             .collect();
         if crate::config::cfg().debug.ghost {
-            eprintln!("[ghost] purge entry: {} cleared domain(s)", cleared.len());
+            crate::diag!("[ghost] purge entry: {} cleared domain(s)", cleared.len());
         }
         if cleared.is_empty() {
             return;
         }
         let Ok(res) = cdp.call(None, "Storage.getCookies", json!({})).await else {
             if crate::config::cfg().debug.ghost {
-                eprintln!("[ghost] purge: Storage.getCookies failed");
+                crate::diag!("[ghost] purge: Storage.getCookies failed");
             }
             return;
         };
         let cookies = Self::parse_cdp_cookies(&res);
         if crate::config::cfg().debug.ghost {
-            eprintln!(
+            crate::diag!(
                 "[ghost] purge: {} cleared domain(s), {} browser cookies",
                 cleared.len(),
                 cookies.len()
@@ -2078,9 +2086,10 @@ impl Ghost {
                 .await
                 && crate::config::cfg().debug.ghost
             {
-                eprintln!(
+                crate::diag!(
                     "[ghost] purge expire {} {}: {error}",
-                    cookie.name, cookie.domain
+                    cookie.name,
+                    cookie.domain
                 );
             }
         }
@@ -2152,6 +2161,157 @@ impl Ghost {
                 .await;
             }
         }
+    }
+
+    /// Refresh an acquired browser from one vault snapshot before navigation.
+    /// Explicit operator sessions also replay into temporary profiles; automatic
+    /// browser harvests remain restricted to the canonical profile.
+    pub(crate) async fn refresh_session_vault(
+        &mut self,
+        host: Option<&str>,
+    ) -> Result<(), FetchError> {
+        let Some(stamp) = cache::disk_session_stamp() else {
+            return Ok(());
+        };
+        if self.session_stamp == stamp && self.session_host.as_deref() == host {
+            return Ok(());
+        }
+        let state = cache::GhostState::load();
+        let consent_changed = self.auth_revision != state.auth_revision;
+        if consent_changed || self.session_stamp.is_empty() {
+            let cleared: Vec<_> = state
+                .profiles
+                .iter()
+                .filter(|(_, p)| p.session_cleared_epoch > self.applied_auth_epoch)
+                .map(|(domain, _)| domain.as_str())
+                .collect();
+            if !cleared.is_empty() {
+                let cookies = self.cookies().await?;
+                for cookie in cookies {
+                    if cleared.iter().any(|domain| {
+                        crate::auth::cookie_belongs_to(
+                            domain,
+                            cookie.domain.trim_start_matches('.'),
+                        )
+                    }) {
+                        let mut value = Self::session_cookie_params(&cookie);
+                        value["expires"] = json!(1);
+                        self.cdp
+                            .call(None, "Storage.setCookies", json!({"cookies": [value]}))
+                            .await?;
+                    }
+                }
+            }
+        }
+        let selected: Vec<_> = state
+            .profiles
+            .values()
+            .filter(|p| self.temp_profile.is_none() || p.session_explicit)
+            .flat_map(|p| {
+                p.session_cookies
+                    .iter()
+                    .map(move |c| (c, p.session_explicit))
+            })
+            .filter(|(c, _)| cache::is_session_usable(c))
+            .collect();
+        let batch: Vec<_> = selected
+            .iter()
+            .map(|(c, _)| Self::session_cookie_params(c))
+            .collect();
+        if !batch.is_empty()
+            && self
+                .cdp
+                .call(None, "Storage.setCookies", json!({"cookies": batch}))
+                .await
+                .is_err()
+        {
+            for (c, explicit) in &selected {
+                let result = self
+                    .cdp
+                    .call(
+                        None,
+                        "Storage.setCookies",
+                        json!({"cookies": [Self::session_cookie_params(c)]}),
+                    )
+                    .await;
+                if result.is_err()
+                    && *explicit
+                    && host.is_some_and(|h| Self::session_cookie_applies(c, h))
+                {
+                    return Err(FetchError::ghost(
+                        "explicit login cookie could not be restored",
+                    ));
+                }
+            }
+        }
+        // A successful RPC can silently reject a malformed cookie. Confirm only
+        // operator-owned cookies applicable to this destination, without exposing values.
+        let expected: Vec<_> = selected
+            .iter()
+            .filter(|(c, explicit)| {
+                *explicit && host.is_some_and(|h| Self::session_cookie_applies(c, h))
+            })
+            .collect();
+        if !expected.is_empty() {
+            let actual = self.cookies().await?;
+            for (c, _) in expected {
+                if !actual.iter().any(|a| {
+                    a.name == c.name
+                        && a.domain.trim_start_matches('.') == c.domain.trim_start_matches('.')
+                        && a.path == (if c.path.is_empty() { "/" } else { &c.path })
+                        && a.value == c.value
+                }) {
+                    return Err(FetchError::ghost(
+                        "explicit login cookie was not retained by the browser",
+                    ));
+                }
+            }
+        }
+        if consent_changed || self.session_stamp.is_empty() {
+            self.launched_epoch = state.vault_epoch;
+            self.applied_auth_epoch = state.vault_epoch;
+        }
+        self.auth_revision = state.auth_revision.clone();
+        self.session_stamp = state.session_stamp();
+        self.session_host = host.map(str::to_owned);
+        Ok(())
+    }
+
+    fn session_cookie_applies(c: &cache::CookieRecord, host: &str) -> bool {
+        let domain = c.domain.trim_start_matches('.').trim_matches(['[', ']']);
+        let host = host.trim_matches(['[', ']']);
+        host.eq_ignore_ascii_case(domain)
+            || (c.domain.starts_with('.')
+                && host
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(".{}", domain.to_ascii_lowercase())))
+    }
+
+    fn session_cookie_params(c: &cache::CookieRecord) -> Value {
+        let mut value = json!({
+            "name": c.name, "value": c.value,
+            "path": if c.path.is_empty() { "/" } else { &c.path },
+            "secure": c.secure, "httpOnly": c.http_only,
+            "sameSite": if c.same_site.is_empty() { "Lax" } else { &c.same_site },
+        });
+        if c.domain.starts_with('.') {
+            value["domain"] = json!(c.domain);
+        } else {
+            let host = c.domain.trim_matches(['[', ']']);
+            let host = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+            value["url"] = json!(format!(
+                "{}://{host}/",
+                if c.secure { "https" } else { "http" }
+            ));
+        }
+        if let Some(expires) = c.expires_at {
+            value["expires"] = json!(expires);
+        }
+        value
     }
 
     /// `Page.captureScreenshot` bytes (base64), with the window

@@ -127,7 +127,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Relevance query : selects matching passages with section context using BM25. A cached cross-encoder may rescue a lexical miss on pages of at most 8 blocks; fetch never downloads a model. No match or less than 20% saving returns full content with a notice; toc + section narrows deterministically when focus falls back.",
+        help: "Relevance query : selects matching passages, table rows and unordered list items with section context using BM25. A cached cross-encoder may rescue a lexical miss on pages of at most 8 blocks; fetch never downloads a model. No match or less than 20% saving returns full content with a notice; toc + section narrows deterministically when focus falls back.",
         mcp_help: Some(
             "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
         ),
@@ -301,7 +301,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         required: false,
         help: "Browser steps to run BEFORE extraction : page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in the headless browser (tier auto/2, never 1); after them the page is extracted normally : focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
         mcp_help: Some(
-            "Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
+            "Any action routes the fetch through the browser tier; omit for static reads. Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
         ),
     },
     ParamSpec {
@@ -421,6 +421,15 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         mcp_help: None,
     },
     ParamSpec {
+        name: "map_limit",
+        flag: "map-limit",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Max URLs returned in the inventory (default 120, range 1-50000). A capped inventory is incomplete; narrow focus/include_paths for large sites.",
+        mcp_help: None,
+    },
+    ParamSpec {
         name: "max_depth",
         flag: "max-depth",
         kind: ParamKind::Usize,
@@ -435,7 +444,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Total extracted-char budget across all pages (default 60000, range 4000-500000).",
+        help: "Total extracted-char budget across all pages (default 60000, range 1-500000).",
         mcp_help: None,
     },
     ParamSpec {
@@ -444,7 +453,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Max markdown chars per page (default 8000, range 400-40000).",
+        help: "Max markdown chars per page (default 8000, range 1-40000).",
         mcp_help: None,
     },
     ParamSpec {
@@ -489,7 +498,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Hard crawl deadline in seconds (default 120, range 5-600). Partial results return after.",
+        help: "Hard crawl deadline in seconds (default 120, range 1-600). Partial results return after.",
         mcp_help: None,
     },
     ParamSpec {
@@ -500,7 +509,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         required: false,
         help: "Delta crawl: pages are re-checked against fingerprint memory; only new/changed pages are returned. Monitoring and re-crawls at a fraction of the cost.",
         mcp_help: Some(
-            "Return only pages new or changed since the last crawl of this site (a site-wide baseline; web_fetch's since_last tracks per URL). Use for monitoring or a repeated crawl, not a first visit.",
+            "Re-fetch pages and return only new or changed source fingerprints. Prior crawls or fetches supply per-URL baselines. Saves output, not verification requests; use for repeated reads.",
         ),
     },
     ParamSpec {
@@ -575,7 +584,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_fetch",
         cli_cmd: "fetch",
         summary: "Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)",
-        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] : deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
+        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). At tier=auto, JS-only pages can escalate to the browser; use actions only when page interaction is needed. Any action forces the browser tier. Deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
         mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
         params: FETCH_PARAMS,
         examples: &[
@@ -811,9 +820,16 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
 
 // ── CLI generation ───────────────────────────────────────────
 
+/// The CLI commands that take `--ignore-rules`: the tools that fetch
+/// a caller's URL, which a local rule can deny or pin to a tier.
+pub const IGNORE_RULES_COMMANDS: &[&str] = &["fetch", "crawl", "screenshot"];
+
 /// Build the clap subcommand for one tool. `--json` and
 /// `--quiet` are CLI-adapter flags (not MCP params), appended
-/// to every tool command.
+/// to every tool command; `--ignore-rules` is one too, appended
+/// to the commands in [`IGNORE_RULES_COMMANDS`]. None of them is
+/// in the tool-arguments JSON (`matches_to_json` reads only the
+/// param table).
 pub fn cli_command(tool: &ToolSpec) -> clap::Command {
     // CLI --help speaks to a human in a terminal; the full agent
     // contract stays in the MCP description field. Same facts,
@@ -863,19 +879,37 @@ you can pass with --resume to continue later."
     for p in tool.params {
         cmd = cmd.arg(cli_arg(p));
     }
-    cmd.arg(
-        Arg::new("json")
-            .long("json")
-            .action(ArgAction::SetTrue)
-            .help("Print the full JSON envelope on stdout (content + all metadata)."),
-    )
-    .arg(
-        Arg::new("quiet")
-            .long("quiet")
-            .short('q')
-            .action(ArgAction::SetTrue)
-            .help("Suppress the stderr stats line."),
-    )
+    cmd = cmd
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Print the full JSON envelope on stdout (content + all metadata)."),
+        )
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .short('q')
+                .action(ArgAction::SetTrue)
+                .help("Suppress the stderr stats line."),
+        );
+    // The escape hatch stays out of the param table on purpose: the
+    // MCP schema is built from that table, so a model never sees the
+    // flag, and `check_args` refuses an `ignore_rules` argument as an
+    // unknown parameter. main.rs applies it by switching `[rules]
+    // mode` off before the config is installed.
+    if IGNORE_RULES_COMMANDS.contains(&tool.cli_cmd) {
+        cmd = cmd.arg(
+            Arg::new("ignore_rules")
+                .long("ignore-rules")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Run as if the local DonSeTch rules ([rules] in donsetch.toml) were empty: \
+                     no rule denies the URL or pins its tier. CLI only.",
+                ),
+        );
+    }
+    cmd
 }
 
 fn cli_arg(p: &ParamSpec) -> Arg {
@@ -1247,6 +1281,17 @@ mod tests {
     fn action_field_describes_the_runtime_shape() {
         let schema = mcp_schema(fetch_tool());
         let actions = &schema["inputSchema"]["properties"]["actions"];
+        let help = actions["description"].as_str().unwrap();
+        assert!(help.starts_with(
+            "Any action routes the fetch through the browser tier; omit for static reads."
+        ));
+        assert!(
+            !schema["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "actions")
+        );
         assert_eq!(actions["type"], "array");
         assert_eq!(actions["minItems"], 1);
         assert_eq!(actions["maxItems"], 16);
@@ -1265,5 +1310,54 @@ mod tests {
                 "scroll"
             ])
         );
+    }
+
+    #[test]
+    fn ignore_rules_is_a_cli_flag_that_never_reaches_the_tool_arguments() {
+        for (name, argv) in [
+            (
+                "web_fetch",
+                ["fetch", "https://example.com", "--ignore-rules"],
+            ),
+            (
+                "web_crawl",
+                ["crawl", "https://example.com", "--ignore-rules"],
+            ),
+            (
+                "web_screenshot",
+                ["screenshot", "https://example.com", "--ignore-rules"],
+            ),
+        ] {
+            let tool = TOOLS.iter().find(|t| t.name == name).unwrap();
+            let matches = cli_command(tool)
+                .try_get_matches_from(argv)
+                .unwrap_or_else(|e| panic!("{name} must accept --ignore-rules: {e}"));
+            assert!(matches.get_flag("ignore_rules"), "{name}");
+            let args = matches_to_json(tool, &matches);
+            assert!(args.get("ignore_rules").is_none(), "{name}: {args}");
+            assert!(
+                mcp_schema(tool)["inputSchema"]["properties"]
+                    .get("ignore_rules")
+                    .is_none(),
+                "{name}: the escape hatch must stay out of the MCP schema"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_rules_is_refused_where_no_rule_applies_and_over_mcp() {
+        // search fetches no caller URL, so the flag is not declared there.
+        let err = cli_command(search_tool())
+            .try_get_matches_from(["search", "rust", "--ignore-rules"])
+            .expect_err("search must not take --ignore-rules");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        // A model that sends the key over MCP gets an unknown-parameter
+        // error, not a silent bypass.
+        let err = check_args(
+            fetch_tool(),
+            &json!({ "url": "https://example.com", "ignore_rules": true }),
+        )
+        .expect_err("ignore_rules must not be an MCP argument");
+        assert!(err.contains("unknown parameter"), "{err}");
     }
 }

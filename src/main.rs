@@ -9,12 +9,12 @@ fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
     let mut loaded = match config::load() {
         Ok(loaded) => {
             for w in &loaded.warnings {
-                eprintln!("[donsetch config] {w}");
+                donsetch::diag!("[donsetch config] {w}");
             }
             loaded
         }
         Err(e) => {
-            eprintln!("donsetch: {e}");
+            donsetch::diag!("donsetch: {e}");
             std::process::exit(1);
         }
     };
@@ -29,13 +29,24 @@ fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
         match p.parse::<u16>() {
             Ok(port) if port != 0 => c.transport.port = port,
             _ => {
-                eprintln!("donsetch: invalid --port {p:?}");
+                donsetch::diag!("donsetch: invalid --port {p:?}");
                 std::process::exit(1);
             }
         }
     }
+    // `--ignore-rules` is the same switch as `[rules] mode = "off"`, so
+    // the two cannot drift apart: tier pins go with the denies. Only the
+    // commands that declare the flag honor it; clap rejects it anywhere
+    // else before any work runs.
+    if args
+        .get(1)
+        .is_some_and(|cmd| donsetch::spec::IGNORE_RULES_COMMANDS.contains(&cmd.as_str()))
+        && args.iter().skip(2).any(|a| a == "--ignore-rules")
+    {
+        c.rules.mode = donsetch::rules::RulesMode::Off;
+    }
     if let Err(e) = config::install_loaded(loaded) {
-        eprintln!("donsetch: {e}");
+        donsetch::diag!("donsetch: {e}");
         std::process::exit(1);
     }
     config::cfg()
@@ -51,7 +62,7 @@ fn config_cli(args: &[String]) {
     match config::load() {
         Ok(loaded) => {
             for w in &loaded.warnings {
-                eprintln!("[donsetch config] {w}");
+                donsetch::diag!("[donsetch config] {w}");
             }
             if rest.iter().any(|a| a == "--markdown") {
                 println!("{}", config::show_markdown());
@@ -60,7 +71,7 @@ fn config_cli(args: &[String]) {
             }
         }
         Err(e) => {
-            eprintln!("donsetch: {e}");
+            donsetch::diag!("donsetch: {e}");
             std::process::exit(1);
         }
     }
@@ -81,6 +92,29 @@ fn config_cli(args: &[String]) {
 /// are used.
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Every top-level command, for the suggestion on a typo.
+const KNOWN_COMMANDS: &[&str] = &[
+    "fetch",
+    "search",
+    "crawl",
+    "screenshot",
+    "tools",
+    "mcp",
+    "keys",
+    "login",
+    "proxy",
+    "rules",
+    "status",
+    "adapters",
+    "stop",
+    "doctor",
+    "update",
+    "rollback",
+    "version",
+    "config",
+    "help",
+];
+
 fn main() {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -89,7 +123,7 @@ fn main() {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("donsetch: cannot start the async runtime: {e}");
+            donsetch::diag!("donsetch: cannot start the async runtime: {e}");
             std::process::exit(1);
         }
     };
@@ -148,7 +182,7 @@ async fn run() {
     // version read no config at all.
     if !matches!(
         cmd,
-        "config" | "help" | "--help" | "-h" | "version" | "-v" | "--version"
+        "config" | "help" | "--help" | "-h" | "version" | "-v" | "-V" | "--version"
     ) {
         load_and_install_config(&args);
     }
@@ -161,14 +195,31 @@ async fn run() {
         }
 
         // ── Discovery ──
-        "tools" => cli::tool::print_tools_json(),
+        "tools" => {
+            cli::args::Spec::new("tools", "donsetch tools [--json]", &["--json"])
+                .reject(&args[2..]);
+            cli::tool::print_tools_json()
+        }
 
         // ── Management ──
         "config" => {
+            cli::args::Spec::new(
+                "config",
+                "donsetch config show [--markdown] [--legacy]",
+                &["--markdown", "--legacy", "show"],
+            )
+            .reject(&args[2..]);
             config_cli(&args);
         }
         "mcp" => {
-            eprintln!(
+            cli::args::Spec::new(
+                "mcp",
+                "donsetch mcp [--http] [--host HOST] [--port PORT] [--supervised]",
+                &["--http", "--supervised"],
+            )
+            .with_valued(&["--host", "--port"])
+            .reject(&args[2..]);
+            donsetch::diag!(
                 "[mcp] donsetch {} · {}",
                 env!("CARGO_PKG_VERSION"),
                 std::env::current_exe()
@@ -185,9 +236,9 @@ async fn run() {
             if config::cfg().transport.kind == config::TransportKind::Http {
                 let host = config::cfg().transport.host.clone();
                 let port = config::cfg().transport.port;
-                eprintln!("[mcp] starting HTTP server on {}:{}", host, port);
+                donsetch::diag!("[mcp] starting HTTP server on {}:{}", host, port);
                 if let Err(e) = mcp::http::run(host, port).await {
-                    eprintln!("mcp HTTP server: {e}");
+                    donsetch::diag!("mcp HTTP server: {e}");
                     std::process::exit(1);
                 }
                 return;
@@ -198,7 +249,7 @@ async fn run() {
             // and macOS-x64 prebuilt binaries are core-only.)
             #[cfg(not(feature = "http"))]
             if config::cfg().transport.kind == config::TransportKind::Http {
-                eprintln!(
+                donsetch::diag!(
                     "mcp: HTTP transport requested (--http / transport.kind = http), but this \
                      binary was built without the `http` cargo feature. Rebuild with \
                      --features http, or use a prebuilt binary that includes it."
@@ -212,30 +263,36 @@ async fn run() {
                 // the whole MCP session) restarts the child instead.
                 // Persistent state (handles, history, profiles) reloads
                 // from disk; the client sees a blip, not a death.
-                eprintln!("[supervisor] donsetch mcp --supervised");
+                donsetch::diag!("[supervisor] donsetch mcp --supervised");
                 if let Err(e) = mcp::supervisor::run() {
-                    eprintln!("[supervisor] {e}");
+                    donsetch::diag!("[supervisor] {e}");
                     std::process::exit(1);
                 }
             } else if let Err(e) = mcp::server::run().await {
-                eprintln!("mcp daemon: {e}");
+                donsetch::diag!("mcp daemon: {e}");
                 std::process::exit(1);
             }
         }
         "keys" => cli::keys::run(&args).await,
+        "rules" => cli::rules::run(&args),
 
-        "login" => cli::login::run(&args).await,
+        "login" => {
+            if let Err(e) = cli::login::run(&args).await {
+                donsetch::diag!("donsetch login: {e}");
+                std::process::exit(1);
+            }
+        }
         "proxy" => cli::proxy::run(&args).await,
-        "status" => cli::status::run().await,
+        "status" => cli::status::run(&args).await,
         "adapters" => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => cli::adapters::help(),
-            _ => cli::adapters::run(),
+            _ => cli::adapters::run(&args),
         },
-        "stop" => cli::stop::run(),
-        "doctor" | "--doctor" => cli::doctor::run().await,
-        "update" | "-u" | "--update" => cli::update::run().await,
-        "rollback" | "--rollback" => cli::rollback::run(),
-        "version" | "-v" | "--version" => cli::version::run().await,
+        "stop" => cli::stop::run(&args),
+        "doctor" | "--doctor" => cli::doctor::run(&args).await,
+        "update" | "-u" | "--update" => cli::update::run(&args).await,
+        "rollback" | "--rollback" => cli::rollback::run(&args),
+        "version" | "-v" | "-V" | "--version" => cli::version::run(&args).await,
 
         // ── Dev/internal (hidden from --help) ──
         "dev" => dev::dispatch(&args[2..]).await,
@@ -252,11 +309,7 @@ async fn run() {
                 cli::tool::print_top_help();
             }
         }
-        _ => {
-            eprintln!("donsetch: unknown command '{cmd}'\n");
-            cli::tool::print_top_help();
-            std::process::exit(1);
-        }
+        _ => cli::args::unknown_command(cmd, KNOWN_COMMANDS),
     }
 }
 
@@ -271,49 +324,17 @@ async fn route_help(cmd: &str) {
             let help_args = vec!["--help".to_string()];
             let _ = cli::tool::run(cmd, &help_args).await;
         }
-        "keys" => {
-            cli::keys::run(&["donsetch".into(), "keys".into(), "help".into()]).await;
-        }
+        "keys" => cli::keys::help(),
         "adapters" => cli::adapters::help(),
-        "proxy" => {
-            // proxy::run is async, but print_help is sync.
-            // Just call the help directly.
-            println!("Usage: donsetch proxy <subcommand> [args]");
-            println!();
-            println!("Subcommands:");
-            println!(
-                "  add <url> [url...] [--no-check]  Add proxies (validated, optionally probed)"
-            );
-            println!("  remove <id> [id...]              Remove proxies by index or host:port");
-            println!("  list                             Show all configured proxies");
-            println!(
-                "  check                            Probe all proxies (connectivity + exit IP)"
-            );
-            println!("  clear                            Remove all proxies");
-            println!("  test <url>                       Test a proxy without adding it");
-            println!("  import <file>                    Import from file (one URL per line)");
-            println!("  export [file]                    Export to file (default: stdout)");
-            println!();
-            println!("Proxy URL format:");
-            println!("  socks5://user:pass@host:port     SOCKS5 with auth (remote DNS, no leak)");
-            println!("  socks5://host:port               SOCKS5 without auth");
-            println!("  http://user:pass@host:port       HTTP CONNECT with auth");
-            println!("  http://host:port                 HTTP CONNECT without auth");
-            println!("  user:pass@host:port              Bare = HTTP CONNECT (backward compat)");
-            println!("  host:port                        No auth, HTTP CONNECT");
-            println!();
-            println!("Config: cache_dir/proxies.txt (one URL per line, # comments)");
-            println!(
-                "Env:   DONSEEK_PROXIES (comma-separated, overrides config for same host:port)"
-            );
-        }
-        "status" => {
-            println!("Usage: donsetch status");
-            println!();
-            println!("  Shows a quick overview: version, search config, proxies, cache, health.");
-            println!("  No probes, no browser launch : fast.");
-            println!("  For full diagnostics, run `donsetch doctor`.");
-        }
+        "rules" => cli::rules::help(),
+        "status" => cli::status::help(),
+        // `proxy`, `keys` and `login` carry their own text; routing here
+        // means `donsetch help proxy` and `donsetch proxy --help` cannot
+        // drift apart again (the copy that used to live here had gone
+        // stale: it knew nothing of `proxy fetch|crawl on|off`).
+        "proxy" => cli::proxy::help(),
+        "login" => cli::login::help(),
+        "--help" | "-h" => cli::tool::print_top_help(),
         "config" => {
             println!("Usage: donsetch config show [--markdown] [--legacy]");
             println!();
@@ -330,7 +351,8 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]");
             println!();
             println!("  Health checks: binary, network, TLS, browser, Xvfb, ghost profile,");
-            println!("  cache, permissions, PDFium, OCR models, rerank model, egress lanes.");
+            println!("  cache, permissions, PDFium, OCR models, rerank model, egress lanes,");
+            println!("  local rules.");
             println!("  Auto-fixes what it can. Reports issues with instructions.");
             println!("  --deep     live browser launch + proxy lane probes");
             println!("  --improve  explain the local self-improvement loop + receipts");
@@ -388,23 +410,11 @@ async fn route_help(cmd: &str) {
             println!("Legacy names (DONSETCH_TRANSPORT, DONSETCH_HTTP_*, ...) still");
             println!("work and map to the keys above; `donsetch doctor` lists them.");
         }
-        "login" => {
-            println!("Usage: donsetch login [domain]");
-            println!();
-            println!("  Opens a real browser for you to sign into a site. Press Enter");
-            println!("  when done: the session is stored (vault, 0600) and every later");
-            println!("  fetch of that domain replays it, tier 1 and tier 2 alike.");
-            println!();
-            println!("  donsetch login --list      Show stored sessions (masked).");
-            println!("  donsetch login --status D  Detail one domain.");
-            println!("  donsetch login --logout D  Forget a domain.");
-            println!("  donsetch login --import F  Import a Netscape cookies.txt export.");
-            println!("  Credentials never enter donsetch: you type them into the browser.");
-        }
         "tools" => {
-            println!("Usage: donsetch tools");
+            println!("Usage: donsetch tools [--json]");
             println!();
             println!("  Prints the tool schemas as JSON (same as MCP tools/list).");
+            println!("  --json is accepted and redundant: this output is always JSON.");
         }
         "stop" => {
             println!("Usage: donsetch stop");
@@ -413,9 +423,7 @@ async fn route_help(cmd: &str) {
             println!("  temp profiles. Run after a hard interrupt; harmless when there is");
             println!("  nothing to clean.");
         }
-        _ => {
-            cli::tool::print_top_help();
-        }
+        _ => cli::args::unknown_command(cmd, KNOWN_COMMANDS),
     }
 }
 

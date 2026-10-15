@@ -36,12 +36,14 @@ use sitemap::SitemapEntry;
 const SEED_NEIGHBOR_BOOST: f64 = 1.5;
 
 /// A fetched page as the orchestrator sees it.
+#[derive(Clone)]
 pub struct FetchedPage {
     /// Governor assignment that produced this page, including buffered reads.
     pub lane: String,
     /// The actual HTTP policy; absent when no request produced a response.
     pub route: Option<crate::transport::request_route::RequestRoute>,
-    /// Final URL after redirects.
+    /// Final URL after redirects; for a rule refusal, the refused URL
+    /// (a redirect hop's target when the refusal came mid-chain).
     pub url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -53,6 +55,257 @@ pub struct FetchedPage {
     pub cached: bool,
     /// Human-readable failure note (network error, etc.).
     pub error_hint: Option<String>,
+    /// Set when a local DonSeTch rule refused the fetch (the URL, its
+    /// adapter rewrite or a redirect hop); `status` is then 0. Such a
+    /// page is final: the worker never retries it.
+    pub denied: Option<crate::rules::Denial>,
+}
+
+/// The skip reason a crawl records for a page a local rule refused:
+/// `<policy code>: excluded by the operator's local DonSeTch rules `<key>``.
+pub(crate) fn policy_skip_reason(d: &crate::rules::Denial) -> String {
+    format!(
+        "{}: excluded by the operator's local DonSeTch rules `{}`",
+        d.code(),
+        d.rule
+    )
+}
+
+/// The URLs one rule denied in a crawl.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DeniedGroup {
+    /// The rule's pattern key.
+    pub rule: String,
+    /// `"walled"` or `"permanent"`.
+    pub kind: String,
+    /// The operator's message, verbatim.
+    pub message: String,
+    /// Every denial recorded under this rule.
+    pub count: usize,
+    /// The first `[rules] crawl_denied_urls_per_rule` URLs only.
+    pub urls: Vec<String>,
+}
+
+/// URLs a crawl refused to queue because a local rule denies them (or
+/// their adapter rewrite), grouped by rule. Bounded: per rule it keeps a
+/// count and a capped URL list.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DeniedLog {
+    /// One group per rule, in first-seen order.
+    pub groups: Vec<DeniedGroup>,
+}
+
+impl DeniedLog {
+    /// Denials recorded across every rule.
+    pub fn total(&self) -> usize {
+        self.groups.iter().map(|g| g.count).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// Count one denial of `url` under `d`'s rule, keeping the URL only
+    /// while the group lists fewer than `cap`. Callers record each URL
+    /// once; this does not dedup.
+    pub fn record(&mut self, url: &str, d: &crate::rules::Denial, cap: usize) {
+        let index = match self.groups.iter().position(|g| g.rule == d.rule) {
+            Some(index) => index,
+            None => {
+                self.groups.push(DeniedGroup {
+                    rule: d.rule.clone(),
+                    kind: d.kind.clone(),
+                    message: d.message.clone(),
+                    count: 0,
+                    urls: Vec::new(),
+                });
+                self.groups.len() - 1
+            }
+        };
+        let group = &mut self.groups[index];
+        group.count += 1;
+        if group.urls.len() < cap {
+            group.urls.push(url.to_string());
+        }
+    }
+}
+
+/// Why the seed produced nothing in a crawl that had nothing else to
+/// fetch. `crawl()` still returns `Ok`; the tool turns this into its
+/// error. Never set for a resumed crawl.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeedFailure {
+    /// The seed as the caller gave it.
+    pub requested: String,
+    /// Where the seed fetch ended, when that differs from `requested`.
+    pub landing: Option<String>,
+    /// HTTP status of the failing seed fetch; 0 = no response.
+    pub status: u16,
+    /// The fetch's verdict, `{:?}`-formatted; None when not fetched.
+    pub verdict: Option<String>,
+    /// The seed's skip reason, or the fetch's error note.
+    pub error: Option<String>,
+    /// Set when robots.txt refused the seed, which was then not fetched.
+    pub robots: Option<RobotsRefusal>,
+    /// Set when a local rule refused the seed fetch (a redirect into a
+    /// denied host).
+    pub denial: Option<crate::rules::Denial>,
+    /// False in content mode, which reads no sitemap.
+    pub has_sitemap_phase: bool,
+}
+
+/// How robots.txt refused a seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobotsRefusal {
+    /// The origin's published rules disallow it.
+    Disallow,
+    /// robots.txt could not be read (RFC 9309 "unreachable"), which
+    /// reads as disallow-all.
+    Unreachable,
+}
+
+impl RobotsRefusal {
+    fn of(robots: &sitemap::Robots) -> Self {
+        if robots.unreachable {
+            Self::Unreachable
+        } else {
+            Self::Disallow
+        }
+    }
+}
+
+impl SeedFailure {
+    /// A seed fetch that came back without content. `requested`,
+    /// `landing` and `has_sitemap_phase` are settled by the caller.
+    fn from_page(page: &FetchedPage, error: Option<String>) -> Self {
+        Self {
+            requested: String::new(),
+            landing: Some(page.url.clone()),
+            status: page.status,
+            verdict: Some(format!("{:?}", page.verdict)),
+            error: error.or_else(|| page.error_hint.clone()),
+            robots: None,
+            denial: page.denied.clone(),
+            has_sitemap_phase: false,
+        }
+    }
+
+    /// A seed robots.txt refused; it was not fetched.
+    fn from_robots(landing: &str, refusal: RobotsRefusal) -> Self {
+        Self {
+            requested: String::new(),
+            landing: Some(landing.to_string()),
+            status: 0,
+            verdict: None,
+            error: None,
+            robots: Some(refusal),
+            denial: None,
+            has_sitemap_phase: false,
+        }
+    }
+
+    /// Fill the fields only the crawl knows; `landing` survives only
+    /// when it names another URL than `requested`.
+    fn settle(mut self, requested: &str, has_sitemap_phase: bool) -> Self {
+        let same = |a: &str, b: &str| match (Url::parse(a), Url::parse(b)) {
+            (Ok(a), Ok(b)) => frontier::normalize(&a) == frontier::normalize(&b),
+            _ => a == b,
+        };
+        self.landing = self.landing.filter(|l| !same(l, requested));
+        self.requested = requested.to_string();
+        self.has_sitemap_phase = has_sitemap_phase;
+        self
+    }
+}
+
+/// The preflight's view of the seed, kept for map mode's exit, where
+/// the buffered seed page is gone by the time the empty-map branch runs.
+struct SeedPreflight {
+    /// The seed fetch, when robots let the preflight make it.
+    page: Option<SeedFailure>,
+    /// Content came back (2xx `ContentOk`).
+    page_ok: bool,
+    robots: Option<RobotsRefusal>,
+}
+
+impl SeedPreflight {
+    /// The failure the preflight saw, if the seed failed.
+    fn failure(&self, seed: &str) -> Option<SeedFailure> {
+        if let Some(refusal) = self.robots {
+            let mut failure = SeedFailure::from_robots(seed, refusal);
+            failure.error = self.page.as_ref().and_then(|p| p.error.clone());
+            return Some(failure);
+        }
+        match &self.page {
+            Some(page) if !self.page_ok => Some(page.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The local-rules check every frontier push goes through. It runs
+/// before robots wherever both apply, and it never touches the queue's
+/// order or scores: an allowed URL is pushed exactly as without rules.
+#[derive(Clone)]
+struct PushGate {
+    // Local rules: a change to where or how the crawl applies them needs
+    // the same change in docs/rules-architecture.md (and docs/rules.md
+    // when operators can see it).
+    rules: &'static crate::rules::RuleSet,
+    denied: Arc<Mutex<DeniedLog>>,
+    cap: usize,
+}
+
+impl PushGate {
+    /// True when a rule denies `url` or its adapter rewrite. The URL's
+    /// key then enters the queue's seen set (never the queue) and is
+    /// recorded in the denied log the first time it is seen.
+    fn refuse(&self, q: &mut FrontierQueue, url: &Url) -> bool {
+        let Some(denial) = rule_denial(self.rules, url) else {
+            return false;
+        };
+        let key = frontier::normalize(url);
+        // insert_seen, not mark_seen: an entry already queued (restored
+        // from a resume token) must stay queued, so the guard backstop
+        // can still report it as a policy skip row.
+        if q.insert_seen(key.clone()) {
+            self.denied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(&key, &denial, self.cap);
+        }
+        true
+    }
+
+    /// `push_with_parent` for an allowed URL; a denied one is refused.
+    fn push(
+        &self,
+        q: &mut FrontierQueue,
+        url: Url,
+        score: f64,
+        depth: u32,
+        parent: Option<String>,
+    ) -> bool {
+        // Allowed URLs go to push_with_parent whether or not they were
+        // seen: its re-push raises an already-queued entry (the seed
+        // neighbor boost), which a dedup step here would swallow.
+        if self.refuse(q, &url) {
+            return false;
+        }
+        q.push_with_parent(url, score, depth, parent)
+    }
+}
+
+/// The denial for `url`, testing its adapter rewrite too: the crawl
+/// fetcher asks the wire for the rewritten endpoint, whose host can
+/// differ (`npmjs.com` -> `registry.npmjs.org`).
+fn rule_denial(rules: &crate::rules::RuleSet, url: &Url) -> Option<crate::rules::Denial> {
+    if rules.is_empty() {
+        return None;
+    }
+    rules.denial(url).or_else(|| {
+        crate::adapters::rewrite(url).and_then(|(rewritten, _via)| rules.denial_for_str(&rewritten))
+    })
 }
 
 /// Ghost-rendered page from tier-2 browser escalation.
@@ -142,6 +395,7 @@ impl Drop for WorkInFlight<'_> {
 
 /// One harvested crawl page.
 pub struct CrawlPage {
+    pub focus: Option<FocusStats>,
     pub url: String,
     pub title: String,
     pub kind: ContentKind,
@@ -181,9 +435,26 @@ pub enum StopReason {
     Cancelled,
     /// Host boxed us out (all lanes walled) : resume later.
     ThrottledOut,
+    /// Published inventory exceeded the output or discovery bound.
+    InventoryLimit,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InventoryStatus {
+    pub complete: bool,
+    pub source: &'static str,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FocusStats {
+    pub omitted: bool,
+    pub blocks_total: usize,
+    pub blocks_shown: usize,
 }
 
 pub struct CrawlResult {
+    pub inventory: InventoryStatus,
     pub seed: String,
     pub pages: Vec<CrawlPage>,
     /// URLs discovered but not fetched (budget/depth/scope).
@@ -201,6 +472,13 @@ pub struct CrawlResult {
     pub crawl_delay: Option<f64>,
     /// Resume token when stopped early, for `resume=`.
     pub resume: Option<String>,
+    /// URLs refused at queue time by a local rule, never fetched;
+    /// includes the denials a resumed crawl's earlier runs recorded.
+    /// A page refused mid-fetch (a redirect into a denied host) is a
+    /// `skipped` row instead, never listed here.
+    pub denied: DeniedLog,
+    /// Set when the seed failed and the crawl had nothing else to fetch.
+    pub seed_failure: Option<SeedFailure>,
 }
 
 /// v3: (done, queued) : fired per completed page, throttled by the caller.
@@ -324,6 +602,9 @@ struct ResumeState {
     /// Seen-set from run 1 : without it, run-2 pages re-link
     /// to already-fetched pages and they crawl AGAIN.
     seen: Vec<String>,
+    /// Denials the earlier runs recorded; absent in older tokens.
+    #[serde(default)]
+    denied: DeniedLog,
 }
 
 /// Disk-backed resume store: tokens survive process restarts, so
@@ -470,30 +751,46 @@ fn resume_store_sweep(dir: &std::path::Path) {
     }
 }
 
-/// Read and consume one token (the v3 semantics: a token dies when
-/// its crawl actually resumes). Unknown, corrupt, or unreadable =
-/// the same honest error.
-fn resume_store_take(tok: &str) -> Result<ResumeState, String> {
+/// Read one token without consuming it. Unknown, corrupt, or
+/// unreadable = the same honest error.
+fn resume_store_read(tok: &str) -> Result<ResumeState, String> {
     // The token is agent-supplied and about to index the filesystem:
     // refuse anything that is not a well-formed token before it can
     // traverse out of the store directory (no FS touch on a bad one).
     if !is_valid_resume_token(tok) {
         return Err(format!("resume token expired or unknown: {tok}"));
     }
+    migrate_legacy_store();
+    read_token_file(&resumes_dir(), tok)
+}
+
+/// Parse one token file. The token must already be validated.
+fn read_token_file(dir: &std::path::Path, tok: &str) -> Result<ResumeState, String> {
+    std::fs::read_to_string(token_path(dir, tok))
+        .ok()
+        .and_then(|text| serde_json::from_str::<ResumeState>(&text).ok())
+        .ok_or_else(|| format!("resume token expired or unknown: {tok}"))
+}
+
+/// The seed a resume token would continue, read without consuming the
+/// token: a call refused on this seed leaves the token usable.
+pub(crate) fn resume_store_peek(tok: &str) -> Result<String, String> {
+    resume_store_read(tok).map(|state| state.seed)
+}
+
+/// Read and consume one token (the v3 semantics: a token dies when
+/// its crawl actually resumes). Unknown, corrupt, or unreadable =
+/// the same honest error.
+fn resume_store_take(tok: &str) -> Result<ResumeState, String> {
+    if !is_valid_resume_token(tok) {
+        return Err(format!("resume token expired or unknown: {tok}"));
+    }
     let dir = resumes_dir();
     migrate_legacy_store();
     resume_store_sweep(&dir);
-    let path = token_path(&dir, tok);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<ResumeState>(&text) {
-            Ok(state) => {
-                let _ = std::fs::remove_file(&path);
-                Ok(state)
-            }
-            Err(_) => Err(format!("resume token expired or unknown: {tok}")),
-        },
-        Err(_) => Err(format!("resume token expired or unknown: {tok}")),
-    }
+    let state = read_token_file(&dir, tok)?;
+    let _ = std::fs::remove_file(token_path(&dir, tok));
+    Ok(state)
 }
 
 /// Persist a freshly issued token. Failure is non-fatal: the crawl
@@ -504,7 +801,7 @@ fn resume_store_issue(tok: &str, state: &ResumeState) {
     migrate_legacy_store();
     resume_store_sweep(&dir);
     if !write_token_file(&dir, tok, state) {
-        eprintln!("[crawl] resume token write failed; the token will not survive a restart");
+        crate::diag!("[crawl] resume token write failed; the token will not survive a restart");
     }
 }
 
@@ -531,6 +828,9 @@ pub struct Crawler {
     governor: Arc<Governor>,
     ghost: Option<GhostHook>,
     token_seq: AtomicUsize,
+    /// The ruleset the frontier and robots cache enforce; None = the
+    /// process ruleset, resolved when a crawl starts.
+    rules: Option<&'static crate::rules::RuleSet>,
 }
 
 impl Crawler {
@@ -540,7 +840,17 @@ impl Crawler {
             governor,
             ghost: None,
             token_seq: AtomicUsize::new(0),
+            rules: None,
         }
+    }
+
+    /// Enforce `rules` at queue time instead of the process ruleset, so
+    /// tests need not install a config. The fetcher's own guard still
+    /// reads the process ruleset.
+    #[cfg(test)]
+    pub(crate) fn with_rules(mut self, rules: &'static crate::rules::RuleSet) -> Self {
+        self.rules = Some(rules);
+        self
     }
 
     /// Attach a ghost escalation hook for JS-only pages.
@@ -599,6 +909,7 @@ impl Crawler {
                             latency: Duration::ZERO,
                             cached: false,
                             error_hint: Some("crawl deadline exceeded".into()),
+                            denied: None,
                         },
                     }
                 })
@@ -639,7 +950,23 @@ impl Crawler {
             let h = u.host_str().ok_or("seed must have a host")?.to_string();
             (state.seed.clone(), u, h)
         };
+        // The seed as asked for, before the preflight may adopt a landing URL.
+        let requested_seed = seed.clone();
+        let requested_norm = frontier::normalize(&seed_url);
 
+        let rules = self.rules.unwrap_or_else(crate::rules::rules);
+        let gate = PushGate {
+            rules,
+            denied: Arc::new(Mutex::new(
+                resumed_state
+                    .as_ref()
+                    .map(|state| state.denied.clone())
+                    .unwrap_or_default(),
+            )),
+            cap: crate::config::cfg().rules.crawl_denied_urls_per_rule as usize,
+        };
+
+        let mut preflight: Option<SeedPreflight> = None;
         if resumed_state.is_none() {
             let origin = sitemap::origin_of(&seed_url);
             let seed_lane = self
@@ -661,8 +988,16 @@ impl Crawler {
                 buffered
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(robots_url, page);
-                robots.allows_url(&seed_url)
+                    .insert(robots_url, page.clone());
+                let allowed = robots.allows_url(&seed_url);
+                if !allowed {
+                    preflight = Some(SeedPreflight {
+                        page: Some(SeedFailure::from_page(&page, None)),
+                        page_ok: false,
+                        robots: Some(RobotsRefusal::of(&robots)),
+                    });
+                }
+                allowed
             } else {
                 true
             };
@@ -680,6 +1015,12 @@ impl Crawler {
                 // design (short URLs, www moves), so it stays
                 // ungated; worker hops carry the policy.
                 let page = fetch(seed.clone(), lane, None, None).await;
+                preflight = Some(SeedPreflight {
+                    page: Some(SeedFailure::from_page(&page, None)),
+                    page_ok: matches!(page.verdict, Verdict::ContentOk)
+                        && (200..300).contains(&page.status),
+                    robots: None,
+                });
                 if matches!(page.verdict, Verdict::ContentOk)
                     && (200..300).contains(&page.status)
                     && let Ok(resolved) = Url::parse(&page.url)
@@ -728,10 +1069,20 @@ impl Crawler {
         let seed_origin = sitemap::origin_of(&seed_url);
         let mut map: Vec<String> = Vec::new();
         let mut sitemap_entries: Vec<SitemapEntry> = Vec::new();
+        let mut inventory = InventoryStatus {
+            limit: opts.map_cap,
+            ..Default::default()
+        };
         let mut robots = sitemap::Robots::default();
         if opts.mode != CrawlMode::Content {
-            let (mut r, mut entries) =
-                sitemap::discover(&fetch, &seed_origin, opts.map_cap.saturating_mul(4)).await;
+            let discovery = sitemap::discover_inventory(&fetch, &seed_origin, 100_000).await;
+            inventory.source = if discovery.entries.is_empty() {
+                "seed-links"
+            } else {
+                "sitemap"
+            };
+            inventory.complete = discovery.complete;
+            let (mut r, mut entries) = (discovery.robots, discovery.entries);
             robots = sitemap::Robots::default();
             std::mem::swap(&mut robots, &mut r);
             // Newest first: lastmod-sorted sitemaps put fresh
@@ -770,6 +1121,15 @@ impl Crawler {
                     if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
                         continue;
                     }
+                    // Full mode only: a denied entry is reported in the
+                    // denied section (the queue loop below records it),
+                    // not as merely "not fetched". Map mode fetches none
+                    // of its URLs, so it lists them all unmarked. Before
+                    // the locale dedup, which keys on the path alone: a
+                    // denied entry must not take an allowed twin's slot.
+                    if opts.mode == CrawlMode::Full && rule_denial(rules, &u).is_some() {
+                        continue;
+                    }
                     if opts.respect_robots && !robots.allows_url(&u) {
                         continue;
                     }
@@ -802,6 +1162,7 @@ impl Crawler {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.1.cmp(&b.1))
             });
+            inventory.complete &= ranked.len() <= opts.map_cap;
             map = ranked
                 .into_iter()
                 .take(opts.map_cap)
@@ -818,7 +1179,7 @@ impl Crawler {
         // Per-origin robots for the page loop: the seed's rules come
         // from the phase-1 discovery; every other origin the frontier
         // reaches gets its own fetch at first contact (#344).
-        let robots_cache = Arc::new(sitemap::RobotsCache::new());
+        let robots_cache = Arc::new(sitemap::RobotsCache::with_rules(rules));
         if opts.respect_robots {
             self.governor
                 .set_host_crawl_delay(&seed_host, robots.crawl_delay);
@@ -865,11 +1226,19 @@ impl Crawler {
                 }
             }
             const MAP_RENDER_FLOOR: usize = 32;
+            // Phase 1 reads robots.txt even with respect_robots off, so
+            // the seed's verdict counts only when robots are respected.
+            let seed_robots_ok = !opts.respect_robots || robots.allows_url(&seed_url);
             if map.len() + candidates.len() < MAP_RENDER_FLOOR
+                && seed_robots_ok
                 && let Some(render) = opts.render_html.as_ref()
                 && deadline_at.saturating_duration_since(Instant::now()) > Duration::from_secs(15)
             {
-                match render(seed.clone()).await {
+                match tokio::time::timeout_at(deadline_at.into(), render(seed.clone()))
+                    .await
+                    .ok()
+                    .flatten()
+                {
                     Some((html, final_url)) => {
                         let parsed = Url::parse(&final_url).unwrap_or_else(|_| seed_url.clone());
                         let base = extract_base_href(&html)
@@ -882,13 +1251,13 @@ impl Crawler {
                                 candidates.push(u);
                             }
                         }
-                        eprintln!(
+                        crate::diag!(
                             "[crawl] thin static map; rendered harvest added {} candidate link(s)",
                             candidates.len() - before
                         );
                     }
                     None => {
-                        eprintln!("[crawl] thin static map; rendered harvest unavailable");
+                        crate::diag!("[crawl] thin static map; rendered harvest unavailable");
                     }
                 }
             }
@@ -899,9 +1268,6 @@ impl Crawler {
                 .map(|u| frontier::locale_canonical(u.path()))
                 .collect();
             for u in &candidates {
-                if map.len() >= opts.map_cap {
-                    break;
-                }
                 if !host_ok(u) {
                     continue;
                 }
@@ -930,9 +1296,34 @@ impl Crawler {
                 if !seen_urls.insert(normalized.clone()) {
                     continue;
                 }
+                if map.len() >= opts.map_cap {
+                    inventory.complete = false;
+                    break;
+                }
                 map.push(normalized);
             }
-            let skipped = if map.is_empty() {
+            // Judged after the seed-link harvest and the render: a seed
+            // the browser rescued leaves a map, so it is not a failure.
+            // When the preflight fetched nothing (boxed host, deadline)
+            // there is no outcome to report and today's row stays.
+            let stop = if Instant::now() >= deadline_at {
+                StopReason::Deadline
+            } else if !inventory.complete && map.len() >= opts.map_cap {
+                StopReason::InventoryLimit
+            } else {
+                StopReason::FrontierEmpty
+            };
+            // Like the page loop's rule, a crawl the deadline cut short
+            // keeps its zero-page result.
+            let seed_failure = if map.is_empty() && stop == StopReason::FrontierEmpty {
+                preflight
+                    .as_ref()
+                    .and_then(|p| p.failure(&seed))
+                    .map(|f| f.settle(&requested_seed, true))
+            } else {
+                None
+            };
+            let skipped = if map.is_empty() && seed_failure.is_none() {
                 vec![(
                     seed.to_string(),
                     "no sitemap found at common locations and the seed page exposed no usable links : try mode=full or mode=content"
@@ -942,20 +1333,21 @@ impl Crawler {
                 Vec::new()
             };
             return Ok(CrawlResult {
+                inventory,
                 crawl_delay: robots.crawl_delay,
                 seed: seed.to_string(),
                 pages: Vec::new(),
                 queued: Vec::new(),
                 filtered_out: 0,
                 skipped,
-                stop: if Instant::now() >= deadline_at {
-                    StopReason::Deadline
-                } else {
-                    StopReason::FrontierEmpty
-                },
+                stop,
                 elapsed: started.elapsed(),
                 map,
                 resume: None,
+                // Map mode tests no URL against the rules (it fetches
+                // none of them), so it reports no denials.
+                denied: DeniedLog::default(),
+                seed_failure,
             });
         }
 
@@ -991,7 +1383,7 @@ impl Crawler {
         // the sitemap inventory when one exists; None otherwise.
         let mut focus_idf: Option<std::sync::Arc<score::FocusIdf>> = None;
         if resume_token.is_none() {
-            let _ = queue.push(seed_url.clone(), 10.0, 0);
+            let _ = gate.push(&mut queue, seed_url.clone(), 10.0, 0, None);
             // Sitemap entries seed frontier at depth 1.
             // Dedup by locale-canonical path: don't queue
             // multiple language variants of the same page
@@ -1018,6 +1410,11 @@ impl Crawler {
                 if !host_ok(&u)
                     || !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
                 {
+                    continue;
+                }
+                // Rules before robots, and before the locale dedup (the
+                // map loop's reasons); the push below is then plain.
+                if gate.refuse(&mut queue, &u) {
                     continue;
                 }
                 if opts.respect_robots
@@ -1048,6 +1445,7 @@ impl Crawler {
 
         if queue.is_empty() {
             return Ok(CrawlResult {
+                inventory,
                 crawl_delay: robots.crawl_delay,
                 seed: seed.to_string(),
                 pages: Vec::new(),
@@ -1058,6 +1456,13 @@ impl Crawler {
                 elapsed: started.elapsed(),
                 map,
                 resume: None,
+                denied: std::mem::take(
+                    &mut *gate
+                        .denied
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
+                seed_failure: None,
             });
         }
 
@@ -1080,6 +1485,13 @@ impl Crawler {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let stop_flag: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
         let focus = Arc::new(opts.focus.clone());
+        // Failed-seed evidence, judged once the queue is empty: whether
+        // any URL other than the seed was dequeued, and how the seed's
+        // last attempt failed.
+        let other_dequeued = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seed_failed: Arc<Mutex<Option<SeedFailure>>> = Arc::new(Mutex::new(
+            preflight.as_ref().and_then(|p| p.failure(&seed)),
+        ));
 
         let workers = opts.concurrency.max(1);
         let ghost_budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
@@ -1106,6 +1518,10 @@ impl Crawler {
             let opts_worker = opts.clone();
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
+            let requested_norm_w = requested_norm.clone();
+            let other_dequeued = Arc::clone(&other_dequeued);
+            let seed_failed = Arc::clone(&seed_failed);
+            let gate = gate.clone();
             let robots_cache = Arc::clone(&robots_cache);
             // Pre-navigation redirect policy (v4.6): every redirect hop
             // is checked BEFORE it is dialed — same-host, scope and
@@ -1212,10 +1628,27 @@ impl Crawler {
                             }
                             break 'work;
                         }
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        tokio::time::sleep(
+                            Duration::from_millis(150)
+                                .min(deadline_at.saturating_duration_since(Instant::now())),
+                        )
+                        .await;
                         continue 'work;
                     };
                     let _active = WorkInFlight(&in_flight);
+                    // The seed under its requested or adopted URL; a
+                    // retry of it dequeues the same key again.
+                    let is_seed_entry = item.url == seed_norm_w || item.url == requested_norm_w;
+                    if !is_seed_entry {
+                        other_dequeued.store(true, Ordering::SeqCst);
+                    }
+                    let note_seed_failure = |failure: SeedFailure| {
+                        if is_seed_entry {
+                            *seed_failed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
+                        }
+                    };
 
                     let parsed = match Url::parse(&item.url) {
                         Ok(u) => u,
@@ -1265,6 +1698,18 @@ impl Crawler {
                     if opts_worker.respect_robots
                         && !robots_allows(&fetch, &governor, &robots_cache, &parsed).await
                     {
+                        if let Some(robots) = robots_cache.get(&sitemap::origin_of(&parsed)) {
+                            let mut failure =
+                                SeedFailure::from_robots(&item.url, RobotsRefusal::of(&robots));
+                            if is_seed_entry {
+                                failure.error = seed_failed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .as_ref()
+                                    .and_then(|f| f.error.clone());
+                            }
+                            note_seed_failure(failure);
+                        }
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
@@ -1317,7 +1762,11 @@ impl Crawler {
                                     retries: item.retries,
                                     parent: item.parent.clone(),
                                 });
-                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            tokio::time::sleep(
+                                Duration::from_millis(400)
+                                    .min(deadline_at.saturating_duration_since(Instant::now())),
+                            )
+                            .await;
                             continue 'work;
                         }
                         continue 'work;
@@ -1346,6 +1795,23 @@ impl Crawler {
                         redirect_gate.clone(),
                     )
                     .await;
+                    // A local rule refused this fetch: a redirect into a
+                    // denied host, or an entry that never met the queue's
+                    // rules check (restored from a resume token, a retry,
+                    // a rewrite that changed since it was queued). Final,
+                    // like the redirect-gate skip below: no retry, no
+                    // governor signal, and a skip row rather than a
+                    // denied-section entry, which lists only URLs the
+                    // crawl refused to contact.
+                    if let Some(denial) = &page.denied {
+                        let reason = policy_skip_reason(denial);
+                        note_seed_failure(SeedFailure::from_page(&page, Some(reason.clone())));
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), reason));
+                        continue 'work;
+                    }
                     // A redirect hop the pre-navigation policy refused
                     // (the target was never dialed: this is the bare
                     // redirect response) is recorded as a skip and
@@ -1364,11 +1830,19 @@ impl Crawler {
                                     Ok(final_url) => {
                                         format!("redirected out of scope -> {final_url}")
                                     }
-                                    Err(error) => format!("invalid redirect target: {error}"),
+                                    // The fetch loop refuses a denied hop
+                                    // before the gate, so this arm should
+                                    // not see one; matched anyway so a
+                                    // denial never reads as a bad target.
+                                    Err(error) => match crate::rules::Denial::from_error(&error) {
+                                        Some(denial) => policy_skip_reason(&denial),
+                                        None => format!("invalid redirect target: {error}"),
+                                    },
                                 }
                             }
                             Err(_) => format!("redirected out of scope -> {target}"),
                         };
+                        note_seed_failure(SeedFailure::from_page(&page, Some(reason.clone())));
                         skipped
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1399,7 +1873,11 @@ impl Crawler {
                     // Transient retry: network errors (status 0) and
                     // 5xx non-challenge get requeued up to 2 times.
                     // Walls, 404s, 429s, and challenges are permanent.
-                    let is_transient = page.status == 0
+                    let is_transient = (page.status == 0
+                        && !page
+                            .error_hint
+                            .as_deref()
+                            .is_some_and(|e| e.starts_with("network.dns:")))
                         || (page.status >= 500 && !matches!(page.verdict, Verdict::Challenge(_)));
                     if is_transient && item.retries < 2 {
                         queue
@@ -1415,7 +1893,7 @@ impl Crawler {
                         continue 'work;
                     }
 
-                    if let Err(reason) = redirect_target_allowed(
+                    if let Err(refusal) = redirect_target_allowed(
                         &fetch,
                         &governor,
                         &robots_cache,
@@ -1426,10 +1904,16 @@ impl Crawler {
                     )
                     .await
                     {
+                        let mut failure =
+                            SeedFailure::from_page(&page, Some(refusal.reason.clone()));
+                        if failure.denial.is_none() {
+                            failure.denial = refusal.denial;
+                        }
+                        note_seed_failure(failure);
                         skipped
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((item.url.clone(), reason));
+                            .push((item.url.clone(), refusal.reason));
                         continue 'work;
                     }
 
@@ -1456,7 +1940,7 @@ impl Crawler {
                             };
                             match rendered {
                                 Ok(gp) => {
-                                    if let Err(reason) = redirect_target_allowed(
+                                    if let Err(refusal) = redirect_target_allowed(
                                         &fetch,
                                         &governor,
                                         &robots_cache,
@@ -1467,10 +1951,17 @@ impl Crawler {
                                     )
                                     .await
                                     {
+                                        let mut failure = SeedFailure::from_page(
+                                            &page,
+                                            Some(refusal.reason.clone()),
+                                        );
+                                        failure.landing = Some(gp.document.url.clone());
+                                        failure.denial = refusal.denial;
+                                        note_seed_failure(failure);
                                         skipped
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .push((item.url.clone(), reason));
+                                            .push((item.url.clone(), refusal.reason));
                                         continue 'work;
                                     }
                                     page.apply_render(gp);
@@ -1506,6 +1997,7 @@ impl Crawler {
                                 .clone()
                                 .unwrap_or_else(|| format!("{:?}", page.verdict))
                         };
+                        note_seed_failure(SeedFailure::from_page(&page, Some(why.clone())));
                         skipped
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1555,8 +2047,25 @@ impl Crawler {
                     // pool with a generous timeout (5 min) that covers large
                     // PDFs (a 28 MB archive.org PDF takes ~70s) while still
                     // preventing infinite hangs. HTML stays on the fast path.
-                    let extract_res =
-                        extract::extract_off_worker(body_bytes, body_ctype, &page_url, &eo).await;
+                    let extract_res = match tokio::time::timeout_at(
+                        deadline_at.into(),
+                        extract::extract_off_worker(body_bytes, body_ctype, &page_url, &eo),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .requeue(item.clone());
+                            *stop_flag
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(StopReason::Deadline);
+                            break 'work;
+                        }
+                    };
                     let mut r = match extract_res {
                         Ok(r) => r,
                         Err(e) => {
@@ -1592,7 +2101,7 @@ impl Crawler {
                             };
                             match rendered {
                                 Ok(gp) => {
-                                    if let Err(reason) = redirect_target_allowed(
+                                    if let Err(refusal) = redirect_target_allowed(
                                         &fetch,
                                         &governor,
                                         &robots_cache,
@@ -1606,7 +2115,7 @@ impl Crawler {
                                         skipped
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .push((item.url.clone(), reason));
+                                            .push((item.url.clone(), refusal.reason));
                                         continue 'work;
                                     }
                                     match extract::extract(
@@ -1745,6 +2254,16 @@ impl Crawler {
                             &opts_worker.exclude_paths,
                         );
 
+                    let mut per_page_next = r.next_offset;
+                    if md.chars().count() > opts_worker.per_page_max {
+                        let cut = md
+                            .char_indices()
+                            .nth(opts_worker.per_page_max)
+                            .map(|(i, _)| i)
+                            .unwrap_or(md.len());
+                        md.truncate(cut);
+                        per_page_next = Some(cut.min(r.next_offset.unwrap_or(usize::MAX)));
+                    }
                     let mut chars = md.chars().count();
 
                     // v4 phase 3 delta recrawl: compare the freshly
@@ -1770,18 +2289,27 @@ impl Crawler {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
                     } else if unchanged {
-                        if r.next_offset.is_none()
-                            && r.partial.is_none()
+                        if r.partial.is_none()
+                            && !r.thin
                             && let Some(rec) = &opts_worker.on_page
                         {
-                            rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
+                            rec(
+                                &page.url,
+                                r.fingerprint.as_deref(),
+                                if per_page_next.is_none() && !r.focus_omitted {
+                                    &md
+                                } else {
+                                    ""
+                                },
+                                r.title.as_deref(),
+                            );
                         }
                         skipped
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "unchanged since last crawl".into()));
                     } else {
-                        let mut next_offset = r.next_offset;
+                        let mut next_offset = per_page_next;
                         let done;
                         {
                             // Reserve both limits under the result lock. Workers may
@@ -1832,6 +2360,11 @@ impl Crawler {
                             }
                             done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
                             kept.push(CrawlPage {
+                                focus: focus.as_ref().as_ref().map(|_| FocusStats {
+                                    omitted: r.focus_omitted,
+                                    blocks_total: r.blocks_total,
+                                    blocks_shown: r.blocks_shown,
+                                }),
                                 url: page.url.clone(),
                                 title: r.title.clone().unwrap_or_default(),
                                 kind: r.content_kind,
@@ -1860,11 +2393,20 @@ impl Crawler {
                             );
                         }
                         // A returned slice cannot populate the full-content history.
-                        if next_offset.is_none()
-                            && r.partial.is_none()
+                        if r.partial.is_none()
+                            && !r.thin
                             && let Some(rec) = &opts_worker.on_page
                         {
-                            rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
+                            rec(
+                                &page.url,
+                                r.fingerprint.as_deref(),
+                                if next_offset.is_none() && !r.focus_omitted {
+                                    &md
+                                } else {
+                                    ""
+                                },
+                                r.title.as_deref(),
+                            );
                         }
                         if duplicate {
                             skipped
@@ -1951,7 +2493,8 @@ impl Crawler {
                                             focus.as_deref(),
                                             focus_idf.as_deref(),
                                         ) - 100.0;
-                                        q.push_with_parent(
+                                        gate.push(
+                                            &mut q,
                                             nu,
                                             s,
                                             item.depth,
@@ -1969,7 +2512,7 @@ impl Crawler {
                                         focus.as_deref(),
                                         focus_idf.as_deref(),
                                     );
-                                    q.push_with_parent(nu, s, item.depth, Some(page.url.clone()));
+                                    gate.push(&mut q, nu, s, item.depth, Some(page.url.clone()));
                                 }
                             }
                         } // ls + q dropped before feed discovery's await
@@ -2064,7 +2607,8 @@ impl Crawler {
                                                 focus.as_deref(),
                                                 focus_idf.as_deref(),
                                             ) - 100.0;
-                                            q.push_with_parent(
+                                            gate.push(
+                                                &mut q,
                                                 u,
                                                 s,
                                                 item.depth + 1,
@@ -2078,7 +2622,8 @@ impl Crawler {
                                             focus.as_deref(),
                                             focus_idf.as_deref(),
                                         );
-                                        q.push_with_parent(
+                                        gate.push(
+                                            &mut q,
                                             u,
                                             s,
                                             item.depth + 1,
@@ -2168,7 +2713,7 @@ impl Crawler {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             for (cu, _anchor, s) in filtered {
-                                q.push_with_parent(cu, s, item.depth + 1, Some(page.url.clone()));
+                                gate.push(&mut q, cu, s, item.depth + 1, Some(page.url.clone()));
                             }
                         } // q dropped here
                     }
@@ -2262,6 +2807,11 @@ impl Crawler {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .seen_snapshot(),
+                        denied: gate
+                            .denied
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone(),
                     };
                     resume_store_issue(&id, &state);
                     Some(id)
@@ -2272,7 +2822,27 @@ impl Crawler {
             _ => None,
         };
 
+        // A failed seed is the crawl's failure only when nothing else
+        // could have produced a page: judged here, from what the workers
+        // did, because a transient seed is retried and a walled one may
+        // be rescued by the browser. A resumed crawl has no preflight
+        // and no seed row, so the rule does not apply to it.
+        let seed_failure = if resume_token.is_none()
+            && final_pages.is_empty()
+            && stop == StopReason::FrontierEmpty
+            && !other_dequeued.load(Ordering::SeqCst)
+        {
+            seed_failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .map(|f| f.settle(&requested_seed, opts.mode != CrawlMode::Content))
+        } else {
+            None
+        };
+
         Ok(CrawlResult {
+            inventory,
             crawl_delay: robots.crawl_delay,
             seed: seed.to_string(),
             pages: final_pages,
@@ -2286,6 +2856,13 @@ impl Crawler {
             elapsed,
             map,
             resume,
+            denied: std::mem::take(
+                &mut *gate
+                    .denied
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            seed_failure,
         })
     }
 }
@@ -2546,6 +3123,13 @@ fn build_redirect_gate(
     }))
 }
 
+/// Why `redirect_target_allowed` refused a landing URL: the skip
+/// reason, plus the rule payload when a local rule was the cause.
+struct RedirectRefusal {
+    reason: String,
+    denial: Option<crate::rules::Denial>,
+}
+
 async fn redirect_target_allowed(
     fetch: &PageFetcher,
     governor: &Governor,
@@ -2554,9 +3138,21 @@ async fn redirect_target_allowed(
     seed_host: &str,
     queued: &Url,
     target: &str,
-) -> Result<(), String> {
-    let final_url = crate::fetch::guards::validate_url_basic(target)
-        .map_err(|error| format!("invalid redirect target: {error}"))?;
+) -> Result<(), RedirectRefusal> {
+    // Matched on the typed error before anything formats it: a denial
+    // here yields the same policy skip row as a denied fetch.
+    let final_url = crate::fetch::guards::validate_url_basic(target).map_err(|error| {
+        match crate::rules::Denial::from_error(&error) {
+            Some(denial) => RedirectRefusal {
+                reason: policy_skip_reason(&denial),
+                denial: Some(denial),
+            },
+            None => RedirectRefusal {
+                reason: format!("invalid redirect target: {error}"),
+                denial: None,
+            },
+        }
+    })?;
     if final_url != *queued
         && ((opts.same_host
             && !final_url
@@ -2565,7 +3161,10 @@ async fn redirect_target_allowed(
             || !scope_allowed(final_url.path(), &opts.include_paths, &opts.exclude_paths)
             || (opts.respect_robots && !robots_allows(fetch, governor, robots, &final_url).await))
     {
-        return Err(format!("redirected out of scope -> {target}"));
+        return Err(RedirectRefusal {
+            reason: format!("redirected out of scope -> {target}"),
+            denial: None,
+        });
     }
     Ok(())
 }
@@ -2628,6 +3227,7 @@ mod resume_store_mode_tests {
                 None,
             )],
             seen: vec!["https://intranet.example/secret-plan".into()],
+            denied: Default::default(),
         };
         assert!(write_token_file(&dir, "c0001", &state));
         let p = dir.join("c0001.json");

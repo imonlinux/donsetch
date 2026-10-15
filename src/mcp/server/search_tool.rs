@@ -117,6 +117,7 @@ pub(super) fn make_ghost_hook(
             }
             tokio::time::timeout_at(deadline.into(), async move {
                 let url = request.url;
+                let render_state = GhostState::load();
                 let g_host = crate::search::rank::host_of(&url);
                 let (mut wire, persona) = {
                     let s = state.lock().await;
@@ -180,10 +181,12 @@ pub(super) fn make_ghost_hook(
                     fetcher.import_vault_cookies(&cookies).await;
                     crate::ghost::cache::store_session_cookies(&cookies);
                 }
-                state
-                    .lock()
-                    .await
-                    .record_render_document(&page.document, &page.html, &context);
+                state.lock().await.record_render_document_session(
+                    &page.document,
+                    &page.html,
+                    &context,
+                    &render_state.render_stamp(&page.document.url),
+                );
                 Ok(crate::crawl::GhostRender {
                     html: page.html,
                     document: page.document,
@@ -256,6 +259,15 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         .iter()
         .enumerate()
         .map(|(index, result)| {
+            // Every hit is listed exactly as the search returned it, even
+            // when a local `deny` rule covers its host. A hit that matches
+            // a deny rule could carry a marker so the agent does not try
+            // to fetch it and spend a round trip on the refusal; v1 leaves
+            // that out on purpose, because the display contract (where the
+            // marker goes, its token cost, whether an annotated hit still
+            // takes a result slot) has to be settled first. Dropping such
+            // hits is ruled out: the title and any DOI are how the agent
+            // finds a mirror.
             let mut item = json!({
                 "rank": index + 1,
                 "url": result.url,
@@ -469,7 +481,7 @@ pub(super) async fn search_outcome(
             Ok(out) => return Ok(out),
             Err(e) => {
                 if crate::config::cfg().debug.search {
-                    eprintln!("[byok] all providers exhausted, falling back to local: {e}");
+                    crate::diag!("[byok] all providers exhausted, falling back to local: {e}");
                 }
                 // #285: keep the failure so the fallback result can
                 // say a provider was tried and why it failed; the
@@ -506,7 +518,7 @@ pub(super) async fn search_outcome(
             // local-first mode, try BYOK as a last resort.
             if byok_configured && local_first {
                 if crate::config::cfg().debug.search {
-                    eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
+                    crate::diag!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
                 match byok_search_cached(daemon, query, max, intent).await {
                     Ok(out) => Ok(out),
@@ -577,6 +589,15 @@ async fn byok_search_cached(
         .await
 }
 
+/// True when the winning rule for `url` pins tier "1", advisory or
+/// enforced: an `auto` fetch of it then stays off the browser, so a
+/// background browser solve has nothing to warm and must not run.
+fn rules_keep_browser_off(rules: &crate::rules::RuleSet, url: &url::Url) -> bool {
+    rules
+        .eval(url)
+        .is_some_and(|winner| winner.rule.tier == Some(crate::rules::RuleTier::One))
+}
+
 /// Predict-prefetch the walledest top result while the agent reads
 /// results: when the top URL's domain is known-walled (skip-to-solve
 /// route), start ONE background solve NOW. The agent's fetch a few
@@ -588,6 +609,9 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
     let Ok(parsed) = crate::fetch::guards::validate_url_basic(url) else {
         return;
     };
+    if rules_keep_browser_off(crate::rules::rules(), &parsed) {
+        return;
+    }
     let Some(host) = parsed.host_str() else {
         return;
     };
@@ -616,9 +640,10 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             }
         }
         if crate::config::cfg().debug.ghost {
-            eprintln!(
+            crate::diag!(
                 "[pre-solve] kicking background solve for {} ({})",
-                host_str, url_str
+                host_str,
+                url_str
             );
         }
         let t0 = std::time::Instant::now();
@@ -695,7 +720,7 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             );
         }
         if crate::config::cfg().debug.ghost {
-            eprintln!(
+            crate::diag!(
                 "[pre-solve] done for {} in {}ms",
                 host_str,
                 t0.elapsed().as_millis()
@@ -722,6 +747,45 @@ mod pre_solve_tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn a_tier_one_pin_keeps_the_pre_solve_off_the_browser() {
+        use crate::rules::{RuleSet, RuleTier, RulesSection, UrlRule};
+        let pin = |tier, tier_enforce| UrlRule {
+            tier: Some(tier),
+            tier_enforce,
+            ..UrlRule::default()
+        };
+        let mut section = RulesSection::default();
+        section
+            .url
+            .insert("enforced.example".into(), pin(RuleTier::One, true));
+        section
+            .url
+            .insert("advisory.example".into(), pin(RuleTier::One, false));
+        section
+            .url
+            .insert("browser.example".into(), pin(RuleTier::Two, false));
+        let rules = RuleSet::compile(&section).unwrap();
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        assert!(rules_keep_browser_off(
+            &rules,
+            &url("https://www.enforced.example/a")
+        ));
+        assert!(rules_keep_browser_off(
+            &rules,
+            &url("https://advisory.example/a")
+        ));
+        // Negative: a tier "2" pin and an unmatched host leave it alone.
+        assert!(!rules_keep_browser_off(
+            &rules,
+            &url("https://browser.example/a")
+        ));
+        assert!(!rules_keep_browser_off(
+            &rules,
+            &url("https://other.example/a")
+        ));
+    }
 
     // Native Chromium, owned proxies and nextest's per-process state only.
     #[test]
