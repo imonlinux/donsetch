@@ -93,19 +93,22 @@ mod tests {
 
 #[cfg(test)]
 mod v471_tests {
+    // Upstream 83abe14 removed Wayback recovery and pinned the removal
+    // here. The fork reinstates the feature (imonlinux#1), so this test
+    // pins the fork's contract instead: the archive enum is present and
+    // the tool description advertises it.
     #[test]
-    fn v471_archive_is_absent_from_schema() {
+    fn v471_archive_is_present_in_fork_schema() {
         let schema = super::list();
-        assert!(
-            schema["tools"][0]["inputSchema"]["properties"]
-                .get("archive")
-                .is_none()
+        assert_eq!(
+            schema["tools"][0]["inputSchema"]["properties"]["archive"]["enum"],
+            serde_json::json!(["auto", "only", "off"])
         );
         assert!(
-            !schema["tools"][0]["description"]
+            schema["tools"][0]["description"]
                 .as_str()
                 .unwrap()
-                .contains("archive")
+                .contains("archive=auto")
         );
     }
 }
