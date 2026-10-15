@@ -195,6 +195,17 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         ),
     },
     ParamSpec {
+        name: "archive",
+        flag: "archive",
+        kind: ParamKind::Enum(&["auto", "only", "off"]),
+        cli: CliKind::Flag,
+        required: false,
+        help: "Dead-page recovery via the keyless Wayback Machine. auto (default): on hard failure (404/paywall/unsolvable wall) serve the nearest archived snapshot, clearly labeled with its date. only: skip the live fetch, go straight to the archive. off: never.",
+        mcp_help: Some(
+            "Archived-page policy: auto (default) falls back when the live page is unavailable; only skips the live page; off disables archive recovery.",
+        ),
+    },
+    ParamSpec {
         name: "since_last",
         flag: "since-last",
         kind: ParamKind::SetTrue,
@@ -573,7 +584,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_fetch",
         cli_cmd: "fetch",
         summary: "Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)",
-        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). At tier=auto, JS-only pages can escalate to the browser; use actions only when page interaction is needed. Any action forces the browser tier. Deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
+        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). At tier=auto, JS-only pages can escalate to the browser; use actions only when page interaction is needed. Any action forces the browser tier. Deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
         mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
         params: FETCH_PARAMS,
         examples: &[
@@ -635,6 +646,32 @@ pub fn by_cli_cmd(cmd: &str) -> Option<&'static ToolSpec> {
 
 // ── Argument validation ──────────────────────────────────────
 
+/// Rewrite numeric strings on integer parameters to the integers they
+/// name, in place. Some clients stringify every scalar argument (a
+/// bridge that renders arguments through text templates sends
+/// `max_results: "5"`), and a strict type check then rejects calls
+/// those clients cannot ever make pass. After coercion the strict
+/// check and the handlers both see the type the schema declares.
+/// Values that do not parse as u64 stay untouched and are rejected by
+/// `check_args` exactly as before.
+pub fn coerce_args(tool: &ToolSpec, args: &mut Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    for p in tool.params {
+        if p.kind != ParamKind::Usize {
+            continue;
+        }
+        let parsed = object
+            .get(p.name)
+            .and_then(Value::as_str)
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if let Some(n) = parsed {
+            object.insert(p.name.to_string(), Value::from(n));
+        }
+    }
+}
+
 /// Validate the argument object against parameter names, types, list limits
 /// and enum variants. Absent or null fields retain handler defaults;
 /// handlers enforce required fields, ranges and cross-field constraints.
@@ -642,12 +679,6 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
     let object = args.as_object().ok_or("arguments must be an object")?;
     for name in object.keys() {
         if !tool.params.iter().any(|p| p.name == name) {
-            // A removed surface gets a removal note, not a bare unknown:
-            // an agent that learned `archive` from an older schema must
-            // learn it is gone (live web only), not keep retrying it.
-            if name == "archive" && tool.name == "web_fetch" {
-                return Err("archive was removed: web_fetch returns live page content only".into());
-            }
             return Err(format!(
                 "unknown parameter {name:?}; use the current tools/list schema"
             ));
@@ -1102,6 +1133,61 @@ mod tests {
     }
 
     #[test]
+    fn numeric_strings_on_integer_parameters_are_coerced() {
+        // A text-template bridge sends every scalar as a string; the
+        // integer the string names must reach check_args and handlers
+        // as the type the schema declares.
+        let mut args = json!({ "query": "x", "max_results": "5" });
+        coerce_args(search_tool(), &mut args);
+        assert_eq!(args["max_results"], json!(5), "string must become integer");
+        assert_eq!(check_args(search_tool(), &args), Ok(()));
+
+        // Whitespace-tolerant, like any scalar parse.
+        let mut args = json!({ "url": "https://example.com", "max_chars": " 2000 " });
+        coerce_args(fetch_tool(), &mut args);
+        assert_eq!(args["max_chars"], json!(2000));
+        assert_eq!(check_args(fetch_tool(), &args), Ok(()));
+    }
+
+    #[test]
+    fn coercion_does_not_fire_where_it_must_not() {
+        // Garbage is not a number: it stays a string and is refused.
+        let mut args = json!({ "query": "x", "max_results": ",5" });
+        coerce_args(search_tool(), &mut args);
+        assert_eq!(
+            args["max_results"],
+            json!(",5"),
+            "garbage must stay untouched"
+        );
+        assert!(check_args(search_tool(), &args).is_err());
+
+        // Overflowing u64 is not coerced and is refused.
+        let mut args = json!({ "query": "x", "max_results": "99999999999999999999999" });
+        coerce_args(search_tool(), &mut args);
+        assert!(check_args(search_tool(), &args).is_err());
+
+        // Wrong types are never touched: booleans and arrays stay.
+        let mut args = json!({ "query": "x", "max_results": true });
+        coerce_args(search_tool(), &mut args);
+        assert_eq!(args["max_results"], json!(true));
+        assert!(check_args(search_tool(), &args).is_err());
+
+        // Real integers pass through byte-identical.
+        let mut args = json!({ "query": "x", "max_results": 3 });
+        coerce_args(search_tool(), &mut args);
+        assert_eq!(args["max_results"], json!(3));
+
+        // Untouched parameters keep their values exactly.
+        let mut args = json!({ "query": "5" });
+        coerce_args(search_tool(), &mut args);
+        assert_eq!(
+            args["query"],
+            json!("5"),
+            "string parameters are never coerced"
+        );
+    }
+
+    #[test]
     fn enum_args_outside_the_spec_are_refused() {
         let fetch = fetch_tool();
         let bad_values = [
@@ -1138,21 +1224,28 @@ mod tests {
         }
     }
 
-    // The archive fallback was removed (the audit's research foot-gun:
-    // an "auto" archive served a 395-day-old snapshot). An agent that
-    // learned the parameter from an older schema gets the removal
-    // spelled out, not a generic unknown-key shrug.
+    // The archive parameter takes the auto/only/off enum; off-list
+    // values get the standard enum answer, and the generic
+    // unknown-parameter path covers tools that never had it.
     #[test]
-    fn removed_archive_argument_gets_a_removal_note() {
-        let err = check_args(
-            fetch_tool(),
-            &json!({ "url": "https://example.com", "archive": "auto" }),
-        )
-        .expect_err("archive must not be accepted");
-        assert!(err.contains("archive was removed"), "{err}");
-        assert!(err.contains("live"), "{err}");
-        // The note is web_fetch-specific; other tools keep the generic
-        // unknown-parameter answer.
+    fn archive_argument_is_an_enum_like_any_other() {
+        for good in ["auto", "only", "off"] {
+            let args = json!({ "url": "https://example.com", "archive": good });
+            assert_eq!(
+                check_args(fetch_tool(), &args),
+                Ok(()),
+                "archive={good} must be accepted"
+            );
+        }
+        for bad in ["asdf", "bogus", "Off"] {
+            let args = json!({ "url": "https://example.com", "archive": bad });
+            let err = check_args(fetch_tool(), &args).expect_err("off-list archive accepted");
+            assert!(
+                err.contains(r#"archive must be one of "auto", "only", "off""#),
+                "{err}"
+            );
+        }
+        // Tools without the parameter keep the generic unknown-key answer.
         let err = check_args(search_tool(), &json!({ "query": "x", "archive": "auto" }))
             .expect_err("archive is not a search parameter");
         assert!(err.contains("unknown parameter"), "{err}");
