@@ -25,7 +25,7 @@ pub const EXIT_WALLED: u8 = 3;
 /// Run a tool command (fetch/search/crawl). Returns exit code.
 pub async fn run(cmd: &str, args: &[String]) -> u8 {
     let Some(tool) = spec::by_cli_cmd(cmd) else {
-        eprintln!("donsetch: unknown command '{cmd}'");
+        crate::diag!("donsetch: unknown command '{cmd}'");
         return EXIT_PERMANENT;
     };
 
@@ -69,7 +69,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
                 return EXIT_OK;
             }
             _ => {
-                eprintln!("{e}");
+                crate::diag!("{e}");
                 return EXIT_PERMANENT;
             }
         },
@@ -81,7 +81,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     let daemon = match Daemon::new().await {
         Ok(d) => Arc::new(d),
         Err(e) => {
-            eprintln!("[{cmd}] error: failed to initialize: {e}");
+            crate::diag!("[{cmd}] error: failed to initialize: {e}");
             return EXIT_PERMANENT;
         }
     };
@@ -107,7 +107,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     let result = match server::call_tool(&daemon, &params).await {
         Ok(v) => v,
         Err((code, msg)) => {
-            eprintln!("[{cmd}] error (code {code}): {msg}");
+            crate::diag!("[{cmd}] error (code {code}): {msg}");
             daemon.shutdown().await;
             return EXIT_PERMANENT;
         }
@@ -118,7 +118,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     // a silent no-save.
     if cmd == "screenshot" && out_seen {
         let Some(path) = out_path else {
-            eprintln!("[screenshot] error: --out given without a path; nothing saved");
+            crate::diag!("[screenshot] error: --out given without a path; nothing saved");
             return EXIT_PERMANENT;
         };
         let img = result
@@ -137,19 +137,19 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
                     .and_then(|b| b.get("data").and_then(|d| d.as_str()))
             });
         let Some(data) = img else {
-            eprintln!("[screenshot] error: capture returned no image to save");
+            crate::diag!("[screenshot] error: capture returned no image to save");
             return EXIT_PERMANENT;
         };
         let Ok(bytes) = BASE64_STANDARD
             .decode(data)
-            .map_err(|er| eprintln!("[screenshot] error: bad image payload: {er}"))
+            .map_err(|er| crate::diag!("[screenshot] error: bad image payload: {er}"))
         else {
             return EXIT_PERMANENT;
         };
         match std::fs::write(&path, &bytes) {
-            Ok(()) => eprintln!("[screenshot] saved {} bytes to {}", bytes.len(), path),
+            Ok(()) => crate::diag!("[screenshot] saved {} bytes to {}", bytes.len(), path),
             Err(er) => {
-                eprintln!("[screenshot] error: could not write {path}: {er}");
+                crate::diag!("[screenshot] error: could not write {path}: {er}");
                 return EXIT_PERMANENT;
             }
         }
@@ -247,7 +247,7 @@ async fn run_bulk_fetch(
                     }
                 }
                 Err((code, msg)) => {
-                    eprintln!("[fetch] error (code {code}): {msg}");
+                    crate::diag!("[fetch] error (code {code}): {msg}");
                     worst_exit = EXIT_PERMANENT;
                 }
             }
@@ -261,6 +261,17 @@ async fn run_bulk_fetch(
 /// Render a single call_tool result. Returns exit code.
 fn render_result(result: &Value, json_mode: bool, quiet: bool, cmd: &str) -> u8 {
     let exit = exit_code_of(result);
+
+    // Printed in every mode and even under -q: `--dataset` JSON Lines
+    // carry no denial, and -q silences only the stats line, so this is
+    // the one trace on the CLI that a rule refused part of the crawl.
+    if cmd == "crawl"
+        && let Some(notice) = result
+            .get("structuredContent")
+            .and_then(crawl_denied_notice)
+    {
+        crate::diag!("{notice}");
+    }
 
     if json_mode {
         let envelope = render_json_envelope(result, "");
@@ -297,14 +308,14 @@ fn render_result(result: &Value, json_mode: bool, quiet: bool, cmd: &str) -> u8 
         } else {
             content.as_str()
         };
-        eprintln!("[{cmd}] error: {msg}");
+        crate::diag!("[{cmd}] error: {msg}");
     } else {
         // Success: content goes to stdout.
         print!("{content}");
     }
 
     if !quiet && !is_error {
-        eprintln!("{}", stats_line(cmd, result, content.len()));
+        crate::diag!("{}", stats_line(cmd, result, content.len()));
     }
 
     exit
@@ -447,6 +458,27 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
     }
 }
 
+/// The stderr line for a crawl that local rules refused URLs in, e.g.
+/// `[crawl] 16 URLs excluded by the operator's local DonSeTch rules (1 rule)`, read from
+/// `denied_by_local_rules` in the crawl's structured content. `None`
+/// when nothing was denied.
+fn crawl_denied_notice(structured: &Value) -> Option<String> {
+    let denied = structured.get("denied_by_local_rules")?;
+    let count = denied.get("count").and_then(Value::as_u64)?;
+    if count == 0 {
+        return None;
+    }
+    let rules = denied
+        .get("groups")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Some(format!(
+        "[crawl] {count} URL{} excluded by the operator's local DonSeTch rules ({rules} rule{})",
+        if count == 1 { "" } else { "s" },
+        if rules == 1 { "" } else { "s" },
+    ))
+}
+
 /// Extract exit code from a call_tool result Value.
 fn exit_code_of(result: &Value) -> u8 {
     let is_error = server::is_failure(result);
@@ -551,45 +583,50 @@ fn machine_meta(result: &Value, sc: &Value) -> Value {
 
 /// Print top-level help (when no subcommand given or --help).
 pub fn print_top_help() {
-    println!("{DISPLAY_NAME} : web research for AI agents: fetch, search, crawl");
+    println!("{DISPLAY_NAME} · web research for AI agents: fetch, search, crawl");
     println!();
     println!("USAGE: donsetch <command> [args]");
     println!();
     println!("AGENT TOOLS:");
     for tool in spec::TOOLS {
-        println!("  {:8} {}", tool.cli_cmd, tool.summary);
+        println!("  {:10} {}", tool.cli_cmd, tool.summary);
     }
     println!();
     println!("DISCOVERY:");
     println!(
-        "  {:8} Print tool schemas as JSON (same as MCP tools/list)",
+        "  {:10} Print tool schemas as JSON (same as MCP tools/list)",
         "tools"
     );
     println!();
     println!("MANAGEMENT:");
-    println!("  {:8} Start MCP server (JSON-RPC on stdio)", "mcp");
-    println!("  {:8} Manage BYOK search provider keys", "keys");
+    println!("  {:10} Start MCP server (JSON-RPC on stdio)", "mcp");
+    println!("  {:10} Manage BYOK search provider keys", "keys");
     println!(
-        "  {:8} Sign into a site: later fetches replay your session",
+        "  {:10} Sign into a site: later fetches replay your session",
         "login"
     );
-    println!("  {:8} Manage proxy configuration", "proxy");
-    println!("  {:8} Quick status overview", "status");
+    println!("  {:10} Manage proxy configuration", "proxy");
     println!(
-        "  {:8} Show the adapter registry + user plugins",
+        "  {:10} Explain what the local rules do with a URL (rules test <url>)",
+        "rules"
+    );
+    println!("  {:10} Quick status overview", "status");
+    println!(
+        "  {:10} Show the adapter registry + user plugins",
         "adapters"
     );
     println!(
-        "  {:8} Kill orphaned Chrome instances + clean stale locks",
+        "  {:10} Kill orphaned Chrome instances + clean stale locks",
         "stop"
     );
-    println!("  {:8} Health check with auto-fix", "doctor");
-    println!("  {:8} Self-update from GitHub Releases", "update");
-    println!("  {:8} Revert to previous version", "rollback");
-    println!("  {:8} Show version and build info", "version");
+    println!("  {:10} Health check with auto-fix", "doctor");
+    println!("  {:10} Self-update from GitHub Releases", "update");
+    println!("  {:10} Revert to previous version", "rollback");
+    println!("  {:10} Show version and build info", "version");
     println!();
     println!("Run `donsetch <command> --help` for parameters.");
     println!("Run `donsetch help <command>` for detailed help on a command.");
+    println!("Run `donsetch -V` for the version block.");
     println!();
     println!(
         "Exit codes: 0 success · 1 permanent error · 2 transient (retry) · 3 walled (try different source)"
@@ -655,6 +692,67 @@ mod tests {
             "structuredContent": {"ok": false}
         });
         assert_eq!(exit_code_of(&v), EXIT_PERMANENT);
+    }
+
+    // A local-rule denial reaches the exit code through the same
+    // top-level errorKind as any other failure: the rule's kind picks
+    // walled (3) or permanent (1).
+    #[test]
+    fn exit_code_follows_a_policy_denial_kind() {
+        let denial = |kind: &str| {
+            json!({
+                "content": [{"type": "text", "text": "excluded by the operator's local DonSeTch rules `banned.example` (another source may have this content)"}],
+                "isError": true,
+                "errorKind": kind,
+                "structuredContent": {
+                    "ok": false,
+                    "errorKind": kind,
+                    "code": "policy.denied.ip_ban",
+                    "rule": "banned.example",
+                    "next_action": "use BladeBrowser"
+                }
+            })
+        };
+        assert_eq!(exit_code_of(&denial("walled")), EXIT_WALLED);
+        assert_eq!(exit_code_of(&denial("permanent")), EXIT_PERMANENT);
+    }
+
+    #[test]
+    fn crawl_denied_notice_counts_urls_and_rules() {
+        let sc = json!({
+            "pages": [],
+            "denied_by_local_rules": {
+                "count": 16,
+                "groups": [{"rule": "banned.example", "errorKind": "walled",
+                            "next_action": "x", "count": 16, "urls": []}]
+            }
+        });
+        assert_eq!(
+            crawl_denied_notice(&sc).as_deref(),
+            Some("[crawl] 16 URLs excluded by the operator's local DonSeTch rules (1 rule)")
+        );
+        let sc = json!({
+            "denied_by_local_rules": {
+                "count": 1,
+                "groups": [{"count": 1}, {"count": 0}]
+            }
+        });
+        assert_eq!(
+            crawl_denied_notice(&sc).as_deref(),
+            Some("[crawl] 1 URL excluded by the operator's local DonSeTch rules (2 rules)")
+        );
+    }
+
+    #[test]
+    fn crawl_denied_notice_is_none_when_nothing_was_denied() {
+        assert_eq!(
+            crawl_denied_notice(&json!({"pages": [], "stop": "FrontierEmpty"})),
+            None
+        );
+        assert_eq!(
+            crawl_denied_notice(&json!({"denied_by_local_rules": {"count": 0, "groups": []}})),
+            None
+        );
     }
 
     #[test]

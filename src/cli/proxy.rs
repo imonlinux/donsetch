@@ -40,6 +40,65 @@ pub(crate) struct ProbeResult {
 pub async fn run(args: &[String]) {
     cli::init();
     let sub = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+
+    // Each subcommand declares its own flags; an unknown one is refused
+    // (with the nearest-match tip) instead of being silently ignored.
+    const SUBS: &[&str] = &[
+        "add", "remove", "rm", "list", "ls", "check", "clear", "test", "import", "export", "fetch",
+        "crawl",
+    ];
+    let spec = match sub {
+        "add" => Some(crate::cli::args::Spec::new(
+            "proxy add",
+            "donsetch proxy add <url> [url...] [--no-check]",
+            &["--no-check", "--fast"],
+        )),
+        "remove" | "rm" => Some(crate::cli::args::Spec::new(
+            "proxy remove",
+            "donsetch proxy remove <id> [id...]",
+            &[],
+        )),
+        "list" | "ls" => Some(crate::cli::args::Spec::new(
+            "proxy list",
+            "donsetch proxy list",
+            &[],
+        )),
+        "check" => Some(crate::cli::args::Spec::new(
+            "proxy check",
+            "donsetch proxy check",
+            &[],
+        )),
+        "clear" => Some(crate::cli::args::Spec::new(
+            "proxy clear",
+            "donsetch proxy clear",
+            &[],
+        )),
+        "test" => Some(crate::cli::args::Spec::new(
+            "proxy test",
+            "donsetch proxy test <url>",
+            &[],
+        )),
+        "import" => Some(crate::cli::args::Spec::new(
+            "proxy import",
+            "donsetch proxy import <file>",
+            &[],
+        )),
+        "export" => Some(crate::cli::args::Spec::new(
+            "proxy export",
+            "donsetch proxy export [file]",
+            &[],
+        )),
+        "fetch" | "crawl" => Some(crate::cli::args::Spec::new(
+            sub,
+            "donsetch proxy <fetch|crawl> on|off",
+            &[],
+        )),
+        _ => None,
+    };
+    if let Some(spec) = spec {
+        spec.reject(&args[3..]);
+    }
+
     match sub {
         "add" => cmd_add(&args[3..]).await,
         "remove" | "rm" => cmd_remove(&args[3..]).await,
@@ -51,7 +110,18 @@ pub async fn run(args: &[String]) {
         "export" => cmd_export(&args[3..]).await,
         "fetch" => cmd_pool_toggle(args, "fetch").await,
         "crawl" => cmd_pool_toggle(args, "crawl").await,
-        _ => print_help(),
+        "help" | "-h" | "--help" => help(),
+        _ => {
+            // A usage error, not a run: this used to print the help and
+            // exit 0, which reads as success to anything that checks $?.
+            crate::diag!("donsetch proxy: unknown subcommand '{sub}'");
+            if let Some(tip) = crate::cli::args::suggest(sub, SUBS) {
+                crate::diag!("  tip: a similar subcommand exists: '{tip}'");
+            }
+            crate::diag!("");
+            help();
+            std::process::exit(1);
+        }
     }
 }
 
@@ -102,7 +172,7 @@ async fn cmd_pool_toggle(args: &[String], which: &str) {
             return;
         }
         _ => {
-            eprintln!("Usage: donsetch proxy {which} on|off");
+            crate::diag!("Usage: donsetch proxy {which} on|off");
             std::process::exit(1);
         }
     };
@@ -115,7 +185,7 @@ async fn cmd_pool_toggle(args: &[String], which: &str) {
             cli::print_kv("applies", "next donsetch run / MCP server restart");
         }
         Err(e) => {
-            eprintln!("{} {e}", cli::icon_fail());
+            crate::diag!("{} {e}", cli::icon_fail());
             std::process::exit(1);
         }
     }
@@ -134,9 +204,9 @@ async fn cmd_add(args: &[String]) {
     }
 
     if urls.is_empty() {
-        eprintln!("Usage: donsetch proxy add <url> [url...] [--no-check]");
-        eprintln!("  Adds one or more proxies. Validated and probed by default.");
-        eprintln!("  --no-check: skip connectivity probing for speed.");
+        crate::diag!("Usage: donsetch proxy add <url> [url...] [--no-check]");
+        crate::diag!("  Adds one or more proxies. Validated and probed by default.");
+        crate::diag!("  --no-check: skip connectivity probing for speed.");
         std::process::exit(1);
     }
 
@@ -250,7 +320,7 @@ async fn cmd_add(args: &[String]) {
         let mut merged = existing;
         merged.extend(to_save);
         if let Err(e) = proxy::save_config(&merged) {
-            eprintln!("  {} Failed to save config: {e}", cli::red("error:"));
+            crate::diag!("  {} Failed to save config: {e}", cli::red("error:"));
             std::process::exit(1);
         }
     }
@@ -262,8 +332,8 @@ async fn cmd_add(args: &[String]) {
 
 async fn cmd_remove(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: donsetch proxy remove <id> [id...]");
-        eprintln!("  Remove by index (1, 2, ...) from `proxy list` or by host:port / URL.");
+        crate::diag!("Usage: donsetch proxy remove <id> [id...]");
+        crate::diag!("  Remove by index (1, 2, ...) from `proxy list` or by host:port / URL.");
         std::process::exit(1);
     }
 
@@ -322,7 +392,7 @@ async fn cmd_remove(args: &[String]) {
     if removed > 0
         && let Err(e) = proxy::save_config(&proxies)
     {
-        eprintln!("  {} Failed to save config: {e}", cli::red("error:"));
+        crate::diag!("  {} Failed to save config: {e}", cli::red("error:"));
         std::process::exit(1);
     }
 
@@ -339,6 +409,7 @@ async fn cmd_list() {
     if proxies.is_empty() {
         println!("  No proxies configured.");
         println!("  Use `donsetch proxy add <url>` to add one.");
+        crate::cli::sponsor::print();
         println!();
         cli::print_footer();
         return;
@@ -378,6 +449,7 @@ async fn cmd_check() {
     if proxies.is_empty() {
         println!("  No proxies configured.");
         println!("  Use `donsetch proxy add <url>` to add one.");
+        crate::cli::sponsor::print();
         println!();
         cli::print_footer();
         return;
@@ -464,7 +536,7 @@ async fn cmd_clear() {
     }
 
     if let Err(e) = proxy::save_config(&[]) {
-        eprintln!("  {} Failed to clear config: {e}", cli::red("error:"));
+        crate::diag!("  {} Failed to clear config: {e}", cli::red("error:"));
         std::process::exit(1);
     }
 
@@ -478,8 +550,8 @@ async fn cmd_test(args: &[String]) {
     let url = match args.first() {
         Some(u) => u.as_str(),
         None => {
-            eprintln!("Usage: donsetch proxy test <url>");
-            eprintln!("  Tests a single proxy without adding it to the config.");
+            crate::diag!("Usage: donsetch proxy test <url>");
+            crate::diag!("  Tests a single proxy without adding it to the config.");
             std::process::exit(1);
         }
     };
@@ -536,8 +608,8 @@ async fn cmd_import(args: &[String]) {
     let path = match args.first() {
         Some(p) => p.as_str(),
         None => {
-            eprintln!("Usage: donsetch proxy import <file>");
-            eprintln!("  Imports proxies from a text file (one URL per line, # comments).");
+            crate::diag!("Usage: donsetch proxy import <file>");
+            crate::diag!("  Imports proxies from a text file (one URL per line, # comments).");
             std::process::exit(1);
         }
     };
@@ -548,7 +620,7 @@ async fn cmd_import(args: &[String]) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("  {} Cannot read file: {e}", cli::icon_fail());
+            crate::diag!("  {} Cannot read file: {e}", cli::icon_fail());
             std::process::exit(1);
         }
     };
@@ -579,7 +651,7 @@ async fn cmd_import(args: &[String]) {
     if added > 0
         && let Err(e) = proxy::save_config(&existing)
     {
-        eprintln!("  {} Failed to save config: {e}", cli::red("error:"));
+        crate::diag!("  {} Failed to save config: {e}", cli::red("error:"));
         std::process::exit(1);
     }
 
@@ -634,7 +706,7 @@ async fn cmd_export(args: &[String]) {
                     println!("  {} {} {} exported to {}", cli::icon_pass(), n, word, path);
                 }
                 Err(e) => {
-                    eprintln!("  {} Cannot write file: {e}", cli::icon_fail());
+                    crate::diag!("  {} Cannot write file: {e}", cli::icon_fail());
                     std::process::exit(1);
                 }
             }
@@ -642,7 +714,13 @@ async fn cmd_export(args: &[String]) {
             cli::print_footer();
         }
         None => {
-            // Print to stdout (machine-readable, no TUI).
+            // Print to stdout (machine-readable, no TUI). An empty pool
+            // prints nothing on stdout on purpose, so the note goes to
+            // stderr: silence read as success, and `donsetch proxy
+            // export` had no way to say "there was nothing to export".
+            if proxies.is_empty() {
+                crate::diag!("donsetch proxy export: no proxies configured (nothing written)");
+            }
             for p in &proxies {
                 println!("{}", p.to_url());
             }
@@ -798,7 +876,11 @@ fn format_probe_detail(r: &ProbeResult) -> String {
     }
 }
 
-fn print_help() {
+/// Usage text, shared by `donsetch proxy --help`, `donsetch help proxy`
+/// and the bare `donsetch proxy` : one text, so the two routes cannot
+/// drift apart (the copy that used to sit in main.rs knew nothing of
+/// `proxy fetch|crawl on|off`).
+pub fn help() {
     println!("Usage: donsetch proxy <subcommand> [args]");
     println!();
     println!("Subcommands:");
@@ -837,4 +919,5 @@ fn print_help() {
     println!();
     println!("Pool use: search and crawl ride the lanes; fetch opts in (`fetch on`);");
     println!("          `crawl off` leaves crawl on your IP. Written to donsetch.toml.");
+    crate::cli::sponsor::print();
 }

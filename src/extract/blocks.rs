@@ -71,9 +71,9 @@ impl Block {
         }
     }
 
-    /// Plain text for BM25 (path included as context).
-    pub fn text(&self) -> String {
-        let body = match self {
+    /// The block's own text, without inherited heading breadcrumbs.
+    pub fn body_text(&self) -> String {
+        match self {
             Block::Heading { text, .. } => text.clone(),
             Block::Para { md, .. } | Block::Quote { md, .. } => md.clone(),
             Block::List { items, .. } => items.join(" "),
@@ -87,7 +87,12 @@ impl Block {
             }
             Block::Code { code, .. } => code.clone(),
             Block::Media { alt, .. } => alt.clone(),
-        };
+        }
+    }
+
+    /// Plain text with heading context for accounting and diagnostics.
+    pub fn text(&self) -> String {
+        let body = self.body_text();
         if self.path().is_empty() {
             body
         } else {
@@ -135,7 +140,7 @@ fn walk<'a>(
     match name {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = name.as_bytes()[1] - b'0';
-            let text = inline::plain(el);
+            let text = inline::markdown(el, base, opts).0;
             if !text.is_empty() {
                 while headings.last().is_some_and(|(l, _)| *l >= level) {
                     headings.pop();
@@ -206,7 +211,7 @@ fn walk<'a>(
                     }
                     walk(child_el, base, opts, headings, out, depth + 1);
                 }
-            } else if let Some(t) = table_block(el, headings, opts.selector.is_some()) {
+            } else if let Some(t) = table_block(el, headings, opts.selector.is_some(), base, opts) {
                 push_block(t, out);
             }
         }
@@ -390,7 +395,7 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
                 }
                 if INLINE_TAGS.contains(&n) && !crate::extract::junk::skip(c) && !contains_block(c)
                 {
-                    let (md, _) = inline::markdown(c, base, opts);
+                    let (md, _) = inline::element_markdown(c, base, opts);
                     // Newlines inside inline content are real line breaks
                     // (the br sentinel survives the inline render). Trim
                     // horizontal whitespace but keep the newlines: a
@@ -551,11 +556,11 @@ fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) 
 
 /// Layout/prose table detection. Forums (HN, phpBB), old CMSes,
 /// and email-style pages lay CONTENT out in tables; rendering those
-/// as pipe tables truncates every cell to 120 chars and flattens
-/// paragraphs. A table is prose/layout when:
+/// as pipe tables flattens their paragraph structure. A table is
+/// prose/layout when:
 /// - it declares `role="presentation"`, or
-/// - any cell holds real paragraph-length text (300+ chars), or
-/// - it is effectively single-column.
+/// - without explicit headers, any cell holds paragraph-length text
+///   (300+ chars), or it is effectively single-column.
 ///
 /// Data tables (specs, pricing, comparisons) stay pipe tables.
 /// A table's own rows: `tr` children, directly or through its
@@ -603,10 +608,12 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
     let mut max_cell = 0usize;
     let mut rows = 0usize;
     let mut max_cols = 0usize;
+    let mut has_headers = false;
     for tr in own_rows(el).into_iter().take(40) {
         rows += 1;
         let mut cols = 0usize;
         for cell in own_cells(tr) {
+            has_headers |= cell.value().name() == "th";
             cols += 1;
             let t = crate::extract::junk::text_size(cell, 400);
             max_cell = max_cell.max(t);
@@ -614,6 +621,10 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
         max_cols = max_cols.max(cols);
     }
     if rows == 0 {
+        return false;
+    }
+    // Explicit headers identify a data table even when a cell is long.
+    if has_headers {
         return false;
     }
     // Paragraph-length text in a cell = the table holds prose.
@@ -630,15 +641,14 @@ fn table_block(
     el: ElementRef<'_>,
     headings: &[(u8, String)],
     explicit_scope: bool,
+    base: &str,
+    opts: &super::ExtractOptions,
 ) -> Option<Block> {
     let mut headers = Vec::new();
     let mut rows = Vec::new();
-    let mut truncated = false;
-    for (i, tr) in own_rows(el).into_iter().enumerate() {
-        if i >= 40 {
-            truncated = true;
-            break;
-        }
+    // Output pagination is the budget. Cutting source rows or cells here
+    // makes later focus/probe/offset reads unable to recover the evidence.
+    for tr in own_rows(el) {
         // One select over both cell kinds, in document order: a
         // row's <th scope="row"> label has to stay in its column.
         // Selecting <th> and <td> separately (the old shape) only
@@ -647,7 +657,7 @@ fn table_block(
         let cells: Vec<(bool, String)> = own_cells(tr)
             .map(|c| {
                 let is_th = c.value().name() == "th";
-                let t = inline::plain(c).replace('|', "\\|"); // unescaped pipes break md tables
+                let t = inline::markdown(c, base, opts).0.replace('|', "\\|"); // unescaped pipes break md tables
                 (is_th, t)
             })
             .collect();
@@ -660,19 +670,7 @@ fn table_block(
             headers = cells.into_iter().map(|(_, t)| t).collect();
             continue;
         }
-        let row: Vec<String> = cells
-            .into_iter()
-            .map(|(_, t)| {
-                // Char-based truncation: byte-based cuts CJK at ~40
-                // chars (3 bytes/char). 120 chars is the real limit.
-                if t.chars().count() > 120 {
-                    let truncated: String = t.chars().take(120).collect();
-                    format!("{truncated}…")
-                } else {
-                    t
-                }
-            })
-            .collect();
+        let row: Vec<String> = cells.into_iter().map(|(_, text)| text).collect();
         if row.iter().any(|c| !c.is_empty()) {
             rows.push(row);
         }
@@ -696,7 +694,7 @@ fn table_block(
     Some(Block::Table {
         headers,
         rows,
-        truncated,
+        truncated: false,
         path: current_path(headings),
     })
 }
