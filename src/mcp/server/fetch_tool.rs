@@ -1177,7 +1177,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
 /// gave up at. "Never archived" is claimed ONLY when both indexes
 /// (availability + CDX) were consulted and answered empty :
 /// unreachable archives and found-but-unusable snapshots get their
-
+/// own honest messages.
 fn resurrect_error(url: &str, f: &ResurrectError) -> Value {
     let tag = f.stage.tag();
     match &f.stage {
