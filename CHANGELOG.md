@@ -5,6 +5,92 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.10.2] - 2026-10-22
+
+### Added
+
+- `doctor` and human/JSON `status` report the configured MCP response mode
+  and its source (default, config file or environment). They explicitly note
+  that recognized clients may still require compatibility folding (#375).
+
+- The README's browser-backend section says DonSeTch can install CloakBrowser
+  itself: with `browser.backend = "cloak"` and
+  `browser.cloak_auto_download = true` it downloads the pinned release the
+  first time the backend is needed and reuses it from the cache. It shows the
+  two settings as TOML and as `DONSETCH_BROWSER__*` environment variables.
+
+### Fixed
+
+- CLI search prints reusable URLs instead of process-local S-handles that
+  expired as soon as the command exited. MCP search keeps its session-local
+  references. Fetch also accepts an optional `@` before a valid handle (#374).
+- HTTP/3 removes HTTP/1 connection-specific request fields, including fields
+  named by `Connection`, and normalizes field names to lowercase. Conforming
+  HTTP/3 servers no longer reject requests carrying `connection: keep-alive`.
+- The sponsor-output CLI test uses a refused loopback proxy and an explicitly
+  missing browser, avoiding real browser launches and network delays that
+  timed out the Windows nightly.
+- Nightly heavy CI uses the version-insensitive dependency key, a separate
+  `heavy` target-cache shape, SHA-pinned Cargo caching, and the bounded sweep
+  and partial-save recovery used by ordinary CI (#379).
+- Config help reports the actual `mcp.text_only = true` default and no longer
+  claims the still-supported legacy environment variables were removed in v4.
+
+- CloakBrowser could never be installed on Windows. The installer saves the
+  downloaded release asset to a temporary file with no extension, then chose
+  the unpacker from that file's extension, so the `windows-x64` zip always
+  went to the tar reader and failed with `read tar entry: invalid gzip
+  header` after the download and signature checks had passed. The format now
+  comes from the asset name. Linux and macOS ship `.tar.gz` and were not
+  affected.
+
+### Security
+
+- `zip` 2.4.2 to 9.0.5, clearing three advisories that are fixed only in 9.x
+  (RUSTSEC-2026-0367 through 0369: SUID/SGID bits kept on extraction, and
+  symlinks that escape the destination or carry permissions through, all in
+  `ZipArchive::extract`). DonSeTch never called `extract`: the CloakBrowser
+  installer and `build.rs` read entries themselves. The bump clears the
+  `cargo-deny` gate, and the CloakBrowser extractor gains tests for
+  traversal and symlink entries. The crate now asks for `deflate-flate2`,
+  not `deflate`, so flate2 keeps its miniz_oxide backend build-wide (#373).
+- The HTTP tier refuses TLS chains through the eight eMudhra intermediate CA
+  keys published as compromised in October 2026
+  (<https://emudhra.we-have-a-problem.com/>), whatever the trust store says.
+  On Windows, the HTTP tier accepted them until now: Windows still trusts AAA
+  Certificate Services, the root above the Sectigo cross-signs, and blocks
+  the intermediates through revocation, which DonSeTch does not check. The
+  match is on the public key, so both certificates of each key are covered.
+  A refusal is reported as `tls.verify` with its own message and next action,
+  never the advice to trust another CA bundle.
+- `rustls-webpki` 0.103.16, `webpki-roots` and `webpki-root-certs` 1.0.10 for
+  the same incident (RUSTSEC-2026-0381 through 0383): the rustls clients
+  (login, `doctor`, BYOK search, downloads) reject paths through those keys,
+  and the bundled roots drop emSign ECC Root CA - G3.
+- The opt-in h3 lane (`[fetch] h3 = true`) verifies the server certificate:
+  the same trust store and compromised-CA list as h1/h2, and a host name
+  check. Until now a QUIC handshake accepted any certificate, so anyone able
+  to intercept the UDP traffic to a host that advertised HTTP/3 could serve
+  content in its name (GHSA-h25m-wq9j-hq58). A refused certificate drops the
+  h3 route, and the fetch falls back to h1/h2, which verifies on its own.
+  The h3 lane checks an IP-literal host as a DNS name, so a certificate that
+  names the address only as an IP takes that fallback too. `routes.json`
+  moves to version 2, which drops the learned h3 routes once, together with
+  their saved sessions: those came from unverified handshakes, and resuming
+  one skips verification. The default (`h3 = false`) was never affected.
+
+### Changed
+
+- Update sha2 to 0.11.1, zstd to 0.14.2, winresource to 0.1.34, psl to
+  2.1.241 and serde_json to 1.0.154 (#368 through #372).
+
+- The READMEs name the setting that restores the split MCP result for
+  integrations reading both surfaces: the npm README now gives
+  `[mcp] text_only = false` and `DONSETCH_MCP__TEXT_ONLY=false` instead of only
+  pointing at the full README, and the full README no longer lists the legacy
+  `DONSETCH_MCP_TEXT_ONLY=1`, which only sets the default and ignores `=0`
+  (#375).
+
 ## [4.10.1] - 2026-10-14
 
 ### Added

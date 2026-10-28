@@ -23,7 +23,7 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 | **Solve-and-bounce** | The browser solves the challenge and hands cookies to tier 1, which then fetches at full speed. The browser almost never fetches content. |
 | **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus plus local semantic reranking. No keys, $0 forever. BYOK is optional. |
 | **Pixel-fusion PDF** | Glyphs and rendered pixels come from the same stream and are fused deterministically, with a per-region trust audit. Scanned PDFs auto-OCR. |
-| **Token control** | Links render as `[text](L12)` and results as `S1…Sn`, so `fetch S3` costs 3 tokens instead of 80. `focus`, `toc`, `section`, `must_contain` and `since_last` cut a page to what the agent actually needs. |
+| **Token control** | MCP results use compact, unguessable link and search handles; one-shot CLI search prints reusable URLs. `focus`, `toc`, `section`, `must_contain` and `since_last` cut a page to what the agent actually needs. |
 | **Self-improving fetch** | Cookie lifetimes adapt, walls that beat a real browser twice go into cooldown, searches pre-solve known walls. All local state, receipts in `status` and `doctor --improve`. |
 | **One command to verify** | `donsetch doctor` sweeps config, search health, egress, TLS, browser, DNS, secret permissions, and fixes what is mechanically fixable. |
 
@@ -82,7 +82,7 @@ Downloads the prebuilt binary for your platform from [GitHub Releases](https://g
 
 Prefer HTTP over stdio? `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth (`DONSETCH_HTTP_TOKEN`) and per-request timeouts are documented in `donsetch mcp --help`.
 
-Every client gets the `[meta]` fold by default: compact state and source evidence arrive together in `content`, including for unknown bridges and OpenCode's generic `cli` handshake. Raw MCP returns content blocks; some bridges join them into a string. Parse the leading `[meta]` JSON line, then read the source text. See the full README for the explicit split-output option.
+Every client gets the `[meta]` fold by default: compact state and source evidence arrive together in `content`, including for unknown bridges and OpenCode's generic `cli` handshake. Raw MCP returns content blocks; some bridges join them into a string. Parse the leading `[meta]` JSON line, then read the source text. To get the split result instead (`structuredContent` kept) for clients DonSeTch does not recognize, set `[mcp] text_only = false`, or `DONSETCH_MCP__TEXT_ONLY=false` in the environment; details in the [full README](https://github.com/dondai44423/donsetch#readme).
 
 ### 2. As a CLI (for humans and scripts)
 

@@ -136,9 +136,21 @@ fn select_dial_addr(
 /// All the quiche quoting for one connection: our Chrome-true builder
 /// and Chrome's public default transport params. quiche Config is
 /// single-use at connect time, so it is rebuilt per request.
-#[cfg_attr(test, allow(clippy::map_unwrap_or))]
 fn quic_config(profile: &crate::profile::BrowserProfile) -> Result<quiche::Config, FetchError> {
-    let builder = crate::transport::tls::build_quic_ctx_builder(profile)?;
+    quic_config_with(profile, crate::transport::ca_blocklist::COMPROMISED_CA_KEYS)
+}
+
+/// `quic_config` with its own list of blocked SubjectPublicKeyInfo
+/// SHA-256 hashes in place of the compromised-CA list.
+#[cfg_attr(test, allow(clippy::map_unwrap_or))]
+fn quic_config_with(
+    profile: &crate::profile::BrowserProfile,
+    blocked: &'static [[u8; 32]],
+) -> Result<quiche::Config, FetchError> {
+    let builder = crate::transport::tls::build_quic_ctx_builder(profile, blocked)?;
+    // Never call cfg.verify_peer here: it replaces the builder's verify
+    // callback with none, which drops the blocklist check, and
+    // verify_peer(false) also turns verification off.
     // NOTE(quiche): quiche's Config map_err has clippy's map_err for
     // the small closure body; keep it because it shows the eventual
     // failure surface in one place.
@@ -161,6 +173,39 @@ fn quic_config(profile: &crate::profile::BrowserProfile) -> Result<quiche::Confi
     cfg.set_max_send_udp_payload_size(1_352);
     cfg.discover_pmtu(true);
     Ok(cfg)
+}
+
+/// HTTP/3 forbids connection-specific fields and requires lowercase names
+/// (RFC 9114 sections 4.2 and 4.2.2). Keep end-to-end fields unchanged.
+fn request_fields(headers: &[(String, String)]) -> Vec<h3::Header> {
+    let nominated: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            if name.starts_with(':')
+                || matches!(
+                    name.as_str(),
+                    "connection"
+                        | "proxy-connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "host"
+                )
+                || nominated.contains(&name)
+                || (name == "te" && !value.trim().eq_ignore_ascii_case("trailers"))
+            {
+                return None;
+            }
+            Some(h3::Header::new(name.as_bytes(), value.as_bytes()))
+        })
+        .collect()
 }
 
 pub async fn h3_fetch_heat(
@@ -221,6 +266,10 @@ async fn h3_fetch_inner(
     boring::rand::rand_bytes(&mut scid)
         .map_err(|_| FetchError::Http("quic cid rand failed".into()))?;
 
+    // quiche checks `host` as a DNS name only (X509_VERIFY_PARAM_set1_host).
+    // An IP-literal origin therefore fails the check against a certificate
+    // that names the address only as an IP SAN, and the fetch falls back to
+    // h1/h2, whose boring connector checks an IP host as an IP.
     let mut conn = quiche::connect(
         Some(host),
         &quiche::ConnectionId::from_ref(&scid[..]),
@@ -245,9 +294,7 @@ async fn h3_fetch_inner(
         h3::Header::new(b"user-agent", user_agent.as_bytes()),
         h3::Header::new(b"accept", accept.as_bytes()),
     ];
-    for (n, v) in &headers {
-        req_headers.push(h3::Header::new(n.as_bytes(), v.as_bytes()));
-    }
+    req_headers.extend(request_fields(&headers));
 
     let mut send_buf = vec![0u8; UDP_BUF];
     let mut recv_buf = vec![0u8; UDP_BUF];
@@ -577,6 +624,43 @@ pub async fn h3_fetch_direct(
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_fields_drop_http1_connection_metadata() {
+        let fields = [
+            ("Connection", "keep-alive, X-Hop"),
+            ("X-Hop", "private"),
+            ("Keep-Alive", "timeout=5"),
+            ("Proxy-Connection", "keep-alive"),
+            ("Transfer-Encoding", "chunked"),
+            ("Upgrade", "h2c"),
+            ("Host", "example.test"),
+            ("TE", "gzip"),
+            ("Cookie", "session=value"),
+            ("Authorization", "Bearer value"),
+            ("X-End-To-End", "preserved"),
+            ("te", "trailers"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        let sent = request_fields(&fields)
+            .into_iter()
+            .map(|field| {
+                (
+                    String::from_utf8(field.name().to_vec()).unwrap(),
+                    String::from_utf8(field.value().to_vec()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent,
+            vec![
+                ("cookie".into(), "session=value".into()),
+                ("authorization".into(), "Bearer value".into()),
+                ("x-end-to-end".into(), "preserved".into()),
+                ("te".into(), "trailers".into()),
+            ]
+        );
+    }
+
     // The h3 dial path must apply the same connect-time SSRF filter
     // as h1/h2: a host that resolves to a private/loopback address
     // (a DNS rebind after the request-time check) must not be dialed
@@ -624,5 +708,199 @@ mod tests {
             "the crossing chunk must fail"
         );
         assert_eq!(near.len(), before, "a refused chunk must not allocate");
+    }
+
+    /// A self-signed certificate for `host` with its own subject name, so
+    /// chain building never mistakes one test certificate for another's
+    /// issuer.
+    fn own_cert(subject: &str, host: &str) -> rcgen::CertifiedKey<rcgen::KeyPair> {
+        let signing_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![host.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, subject);
+        let cert = params.self_signed(&signing_key).unwrap();
+        rcgen::CertifiedKey { cert, signing_key }
+    }
+
+    /// Runs one QUIC handshake against an in-memory server presenting
+    /// `server_cert`, with packets passed by hand: no socket, so no
+    /// egress guard. `Ok(())` when the client completes it without an
+    /// error; otherwise the transport error code the client closed with,
+    /// whether or not the handshake had completed. Panics when the client
+    /// has no transport error of its own: a stall, a close by the server,
+    /// or an application error.
+    fn handshake(
+        client_cfg: &mut quiche::Config,
+        server_cert: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    ) -> Result<(), u64> {
+        use boring::ssl::{SslContext, SslMethod, SslVersion};
+
+        let mut tls = SslContext::builder(SslMethod::tls()).unwrap();
+        tls.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+        tls.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+        tls.set_certificate(&boring::x509::X509::from_der(server_cert.cert.der()).unwrap())
+            .unwrap();
+        tls.set_private_key(
+            &boring::pkey::PKey::private_key_from_der(&server_cert.signing_key.serialize_der())
+                .unwrap(),
+        )
+        .unwrap();
+        let mut server_cfg =
+            quiche::Config::with_boring_ssl_ctx_builder(PROTOCOL_VERSION, tls).unwrap();
+        server_cfg.set_application_protos(&[b"h3"]).unwrap();
+
+        let client_addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &quiche::ConnectionId::from_ref(&[1; 16]),
+            client_addr,
+            server_addr,
+            client_cfg,
+        )
+        .unwrap();
+        let mut server = None;
+        let mut buf = vec![0u8; UDP_BUF];
+        for _ in 0..16 {
+            loop {
+                let len = match client.send(&mut buf) {
+                    Ok((len, _)) => len,
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => panic!("client send: {e:?}"),
+                };
+                let conn: &mut quiche::Connection = server.get_or_insert_with(|| {
+                    quiche::accept(
+                        &quiche::ConnectionId::from_ref(&[2; 16]),
+                        None,
+                        server_addr,
+                        client_addr,
+                        &mut server_cfg,
+                    )
+                    .unwrap()
+                });
+                // The server's own errors show up as the client's peer error.
+                let _ = conn.recv(
+                    &mut buf[..len],
+                    quiche::RecvInfo {
+                        from: client_addr,
+                        to: server_addr,
+                    },
+                );
+            }
+            if let Some(conn) = server.as_mut() {
+                loop {
+                    let len = match conn.send(&mut buf) {
+                        Ok((len, _)) => len,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => panic!("server send: {e:?}"),
+                    };
+                    // A refused certificate fails here and closes the client.
+                    let _ = client.recv(
+                        &mut buf[..len],
+                        quiche::RecvInfo {
+                            from: server_addr,
+                            to: client_addr,
+                        },
+                    );
+                }
+            }
+            if client.is_established() || client.local_error().is_some() {
+                break;
+            }
+        }
+        match (client.is_established(), client.local_error()) {
+            (true, None) => Ok(()),
+            (_, Some(e)) if !e.is_app => Err(e.error_code),
+            (established, local) => panic!(
+                "no client-side verdict: established={established}, local={local:?}, peer={:?}",
+                client.peer_error()
+            ),
+        }
+    }
+
+    /// Clears the test's trust bundle from the environment and the disk,
+    /// also when an assertion fails.
+    struct TrustBundle(std::path::PathBuf);
+
+    impl Drop for TrustBundle {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("SSL_CERT_FILE") };
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // The QUIC client accepted any server certificate: it checked
+    // neither the trust store nor the host name, and the compromised-CA
+    // list never reached it (GHSA-h25m-wq9j-hq58). The trusted localhost
+    // server is the control: the same config completes the handshake
+    // with it. Each refusal is pinned to the alert its own check sends,
+    // so a refusal for another reason fails the test.
+    #[test]
+    fn quic_handshakes_verify_the_server_certificate() {
+        // RFC 9001 section 4.8: a TLS alert closes a QUIC connection with
+        // 0x100 plus the alert number (RFC 8446 section 6).
+        const CRYPTO_ERROR: u64 = 0x100;
+        const HANDSHAKE_FAILURE: u64 = 40;
+        const BAD_CERTIFICATE: u64 = 42;
+        const UNKNOWN_CA: u64 = 48;
+
+        let trusted = own_cert("donsetch trusted", "localhost");
+        let untrusted = own_cert("donsetch untrusted", "localhost");
+        let other_host = own_cert("donsetch other host", "wrong.example");
+        // Not under cache_dir(): an exported DONSETCH_CACHE_DIR would put
+        // the bundle in a shared cache that outlives the run.
+        let directory = std::env::temp_dir()
+            .join("donsetch-test")
+            .join(crate::handles::random_base62(16));
+        std::fs::create_dir_all(&directory).unwrap();
+        let _cleanup = TrustBundle(directory.clone());
+        let bundle = directory.join("trusted.pem");
+        std::fs::write(
+            &bundle,
+            format!("{}{}", trusted.cert.pem(), other_host.cert.pem()),
+        )
+        .unwrap();
+        // Nextest isolates this owned trust bundle from every other test.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", &bundle);
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+
+        let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::Linux);
+        let result = handshake(&mut quic_config(&profile).unwrap(), &trusted);
+        assert_eq!(
+            result,
+            Ok(()),
+            "the trusted localhost certificate must pass"
+        );
+        let result = handshake(&mut quic_config(&profile).unwrap(), &untrusted);
+        assert_eq!(
+            result,
+            Err(CRYPTO_ERROR + UNKNOWN_CA),
+            "an untrusted certificate must fail the trust check"
+        );
+        let result = handshake(&mut quic_config(&profile).unwrap(), &other_host);
+        assert_eq!(
+            result,
+            Err(CRYPTO_ERROR + BAD_CERTIFICATE),
+            "a certificate for another host must fail the host name check"
+        );
+
+        let trusted_key = boring::x509::X509::from_der(trusted.cert.der())
+            .unwrap()
+            .public_key()
+            .unwrap()
+            .public_key_to_der()
+            .unwrap();
+        let blocked: &'static [[u8; 32]] = Box::leak(Box::new([boring::sha::sha256(&trusted_key)]));
+        let result = handshake(&mut quic_config_with(&profile, blocked).unwrap(), &trusted);
+        // The blocklist callback's APPLICATION_VERIFICATION maps to this
+        // alert; the trust store alone accepts this chain (control above).
+        assert_eq!(
+            result,
+            Err(CRYPTO_ERROR + HANDSHAKE_FAILURE),
+            "a blocked key must fail a trusted chain"
+        );
     }
 }
