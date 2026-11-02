@@ -3,7 +3,7 @@
 # DonSeTch
 
 **The web, for AI agents.**
-**V5 on works (Update stalled for 3-5 days): major change incoming**
+**V5 is being redesigned privately and will take longer. V4 updates will continue in the meantime; the features below describe the released product.**
 <div align="center">
 <a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
 </div>
@@ -75,10 +75,6 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 ## 💛 Our Sponsors
 
 <div align="center">
-
-<a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH"><img src="assets/sponsors/sidrune-ai-partner-banner.png" alt="Sidrune AI: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through the DonSeTch partner link." width="100%"></a>
-
-**Sidrune AI**: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through [this link](https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH).
 
 <a href="https://proxy-seller.com/"><img src="assets/sponsors/proxy-seller-banner.png" alt="Proxy-Seller: private residential, mobile, ISP and datacenter proxies with HTTP(S) and SOCKS5 support. Promo code DON15 for 15% off." width="100%"></a>
 
@@ -304,6 +300,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 **DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
 
 - **`focus`**: BM25-relevant passages with heading context. Scores use each passage's own text; a repeated page title or common subject cannot make every paragraph relevant. Tables keep selected rows with their headers and complete cells; unordered lists keep selected items with their nested conditions. Omitted blocks, rows and items are counted. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`faithful=true`** (CLI `--faithful`): read the selected HTML body in source order, keeping intentional repetitions, short answers, numbers and separators. No paragraph deduplication, repeated-section collapse, generated summary or domain adapter. Use `selector="article"` to choose the body, or `section` to choose a heading section. Hidden elements, scripts and navigation remain excluded; this is body text, not raw HTML. Pagination and `next_offset` still apply; repeat `faithful` and the same scope when continuing. Do not combine it with `focus`, `toc`, `must_contain` or `since_last`.
 - **`selector`**: extract only matching HTML subtrees. A miss returns `selector.nomatch` with the inspected element count; invalid syntax returns `selector.invalid`. Non-HTML responses cannot satisfy a CSS scope.
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
@@ -812,9 +809,32 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | It cannot | Why |
 |---|---|
 | Solve interactive captchas locally | hCaptcha, reCAPTCHA, Turnstile: an honest dead end, no solving service by design. |
-| Send ML-DSA post-quantum signatures | BoringSSL 5.1 lacks them. Lands when BoringSSL has it. |
 | Search with every engine down | An error with per-engine status. Honest, never fake. |
 | Replace a human working a defended site | See "Pick the right tool" above. |
+| Filter plain text, markdown or JSON | `focus`, `section` and `toc` need HTML or PDF structure. The response's Content-Type decides, not the URL: a plain-text, markdown or JSON response (typical for `.txt` and `.md` URLs) comes back unfiltered with a notice giving its size, and `filters_skipped` in the result state. Sitemaps and site API cards get a shorter notice, without the size or the curl advice. Prefer curl or wget for such files, or use `must_contain`, then `offset`. |
+
+### Big reads and your agent's context
+
+DonSeTch returns up to `max_chars` bytes of the document, plus a short header. What happens to a large result is up to your MCP client, not DonSeTch or the protocol, and two sizes decide what it costs your agent's context:
+
+- **The switch point.** Below it, the whole result goes into the model's context. Above it, the client saves the result to a file.
+- **The preview.** After the switch, some clients keep only a short preview in context, others still put tens of kilobytes of the result there on every call.
+
+Both differ per client. Measure yours once: fetch a long document (a `.txt` RFC works) with increasing `max_chars`, and note the largest result that still arrives whole and how much of it reaches the model after the switch. Then tell your agent in its rules file (`CLAUDE.md`, `AGENTS.md`, …), for example:
+
+> donsetch `web_fetch` results up to ~N KB arrive whole in context; larger ones are saved to a file and leave a K KB preview in context. To read a whole document, use a `max_chars` above its size only when K KB of context per call is acceptable; otherwise use `must_contain` and `offset`.
+
+<details>
+  <summary>Measured on two clients (2026-10-30)</summary>
+
+Text-only `web_fetch` of a 231 KiB `.txt` (draft-ietf-oauth-v2-1-16) with DonSeTch 4.10.2, varying only `max_chars`. Sizes are result bytes, ±1 KB. Client policies change between releases: re-measure after upgrading.
+
+| Client | Arrives whole | Above that |
+|---|---|---|
+| Claude Code 2.1.309 (Claude Desktop 4.4212) | up to ~49 KB | ~50-74 KB: saved to a file, 2 KB preview in context. From ~75 KB: saved to a file, only the path and an error notice in context. |
+| OpenCode 1.19.1 | up to ~51 KB | Saved to a file; the first ~51 KB still goes into context on every call. |
+
+</details>
 
 ## 🆚 How it compares
 

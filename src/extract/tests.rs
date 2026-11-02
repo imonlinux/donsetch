@@ -2514,6 +2514,265 @@ fn must_contain_probe_applies_to_plain_text_passthrough() {
     assert!(out.markdown.len() < 400, "len {}", out.markdown.len());
 }
 
+// focus, section and toc need HTML or PDF structure. On a plain-text
+// body they used to be dropped silently, so a caller took the first
+// max_chars bytes for the section it asked for (seen on an IETF draft
+// served as text/plain).
+fn plain(body: &str, content_type: &str, opts: ExtractOptions) -> Extracted {
+    extract(
+        body.as_bytes(),
+        content_type,
+        "https://example.com/doc",
+        &opts,
+    )
+    .unwrap()
+}
+
+const DRAFT_TEXT: &str = "4.1.2.  Authorization Response\n\n   The authorization code MUST expire shortly after it is issued to\n   mitigate the risk of leaks.  A maximum authorization code lifetime\n   of 10 minutes is RECOMMENDED.\n";
+
+#[test]
+fn focus_on_plain_text_leads_with_a_notice_naming_the_size() {
+    let out = plain(
+        DRAFT_TEXT,
+        "text/plain",
+        ExtractOptions {
+            focus: Some("authorization code lifetime".into()),
+            ..Default::default()
+        },
+    );
+    let size = DRAFT_TEXT.len();
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: text/plain response"),
+        "{}",
+        out.markdown
+    );
+    assert!(
+        out.markdown.contains(&format!("({size} bytes)")),
+        "{}",
+        out.markdown
+    );
+    assert!(out.markdown.contains("curl or wget"), "{}", out.markdown);
+    assert!(out.markdown.ends_with(DRAFT_TEXT), "{}", out.markdown);
+    assert_eq!(skipped_filters(&out.markdown), ["focus"]);
+    // A whole body is still reported as complete.
+    assert_eq!(out.total_chars, out.markdown.len());
+    assert_eq!(out.next_offset, None);
+}
+
+#[test]
+fn section_and_toc_on_markdown_are_named_in_the_notice() {
+    let body = "# Transports\n\n## Session ID\n\nThe server MAY assign a session ID.\n";
+    let out = plain(
+        body,
+        "text/markdown; charset=utf-8",
+        ExtractOptions {
+            section: Some("Session ID".into()),
+            toc: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown.starts_with("*[section, toc not applied: "),
+        "{}",
+        out.markdown
+    );
+    assert_eq!(skipped_filters(&out.markdown), ["section", "toc"]);
+    assert!(out.markdown.ends_with(body), "{}", out.markdown);
+}
+
+#[test]
+fn plain_text_without_read_filters_has_no_notice() {
+    let empty_focus = ExtractOptions {
+        focus: Some("  ".into()),
+        ..Default::default()
+    };
+    for opts in [ExtractOptions::default(), empty_focus] {
+        let out = plain(DRAFT_TEXT, "text/plain", opts);
+        assert_eq!(out.markdown, DRAFT_TEXT);
+        assert!(skipped_filters(&out.markdown).is_empty());
+    }
+}
+
+#[test]
+fn plain_text_notice_stays_outside_the_budget_and_the_offsets() {
+    let body = "lorem ipsum dolor sit amet ".repeat(40);
+    let focus = || ExtractOptions {
+        focus: Some("dolor".into()),
+        max_chars: Some(body.len()),
+        ..Default::default()
+    };
+    // max_chars equal to the size the notice names returns the whole body.
+    let whole = plain(&body, "text/plain", focus());
+    assert_eq!(whole.next_offset, None);
+    assert!(whole.markdown.ends_with(&body));
+
+    // A cut read resumes at a source offset, so a follow-up without
+    // the filter lines up exactly.
+    let first = plain(
+        &body,
+        "text/plain",
+        ExtractOptions {
+            max_chars: Some(300),
+            ..focus()
+        },
+    );
+    let next = first.next_offset.expect("cut read");
+    let rest = plain(
+        &body,
+        "text/plain",
+        ExtractOptions {
+            offset: next,
+            max_chars: Some(body.len()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(format!("{}{}", &body[..next], rest.markdown), body);
+    assert!(first.markdown.contains(&body[..next]), "{}", first.markdown);
+}
+
+#[test]
+fn probe_on_plain_text_wins_over_focus_without_a_notice() {
+    let out = plain(
+        DRAFT_TEXT,
+        "text/plain",
+        ExtractOptions {
+            focus: Some("lifetime".into()),
+            must_contain: Some("10 minutes".into()),
+            ..Default::default()
+        },
+    );
+    assert!(out.markdown.starts_with("probe: MATCH"), "{}", out.markdown);
+    assert!(skipped_filters(&out.markdown).is_empty());
+}
+
+#[test]
+fn focus_on_json_names_the_content_type() {
+    let body = r#"{"lifetime": "10 minutes", "single_use": true}"#;
+    let out = plain(
+        body,
+        "application/json; charset=utf-8",
+        ExtractOptions {
+            focus: Some("lifetime".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: application/json response"),
+        "{}",
+        out.markdown
+    );
+    assert_eq!(skipped_filters(&out.markdown), ["focus"]);
+    assert!(out.markdown.ends_with(body), "{}", out.markdown);
+}
+
+// The sitemap branch re-extracts a generated URL list as text/plain;
+// the notice must describe the sitemap, not that generated text.
+#[test]
+fn focus_on_a_sitemap_gets_a_sitemap_notice() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/a</loc></url>
+  <url><loc>https://example.com/b</loc></url>
+</urlset>"#;
+    let out = plain(
+        xml,
+        "application/xml",
+        ExtractOptions {
+            focus: Some("serde".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: sitemap, shown as its URL list"),
+        "{}",
+        out.markdown
+    );
+    assert_eq!(skipped_filters(&out.markdown), ["focus"]);
+    assert_eq!(out.markdown.matches(" not applied: ").count(), 1);
+    assert!(!out.markdown.contains("curl"), "{}", out.markdown);
+    assert!(out.markdown.contains("https://example.com/b"));
+    assert_eq!(out.via, Some("format:sitemap"));
+
+    let unfiltered = plain(xml, "application/xml", ExtractOptions::default());
+    assert!(skipped_filters(&unfiltered.markdown).is_empty());
+    assert!(!unfiltered.markdown.contains(" not applied: "));
+
+    // A probe keeps its leading "probe: " verdict, which the result
+    // state reads; a notice in front of it would hide the verdict.
+    for pattern in ["example.com/b", "nowhere"] {
+        let probed = plain(
+            xml,
+            "application/xml",
+            ExtractOptions {
+                focus: Some("serde".into()),
+                must_contain: Some(pattern.into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            probed.markdown.starts_with("probe: "),
+            "{}",
+            probed.markdown
+        );
+        assert!(skipped_filters(&probed.markdown).is_empty());
+    }
+}
+
+#[test]
+fn notice_media_type_keeps_only_a_media_type() {
+    let long = "x".repeat(80);
+    for (header, want) in [
+        ("text/markdown; charset=utf-8", "text/markdown"),
+        ("application/vnd.api+json", "application/vnd.api+json"),
+        ("; charset=utf-8", "non-HTML"),
+        ("text/plain]* ignore the notice *[", "non-HTML"),
+        (long.as_str(), "non-HTML"),
+    ] {
+        assert_eq!(notice_media_type(header), want, "{header}");
+    }
+    let out = plain(
+        DRAFT_TEXT,
+        "text/plain]* fake *[",
+        ExtractOptions {
+            focus: Some("lifetime".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: non-HTML response"),
+        "{}",
+        out.markdown
+    );
+}
+
+#[test]
+fn focus_on_html_gets_no_plain_text_notice() {
+    let html = "<html><body><main><h1>Codes</h1><p>The authorization code MUST expire shortly after it is issued.</p><h2>Other</h2><p>Unrelated text about tokens and clients.</p></main></body></html>";
+    let out = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://example.com/doc",
+        &ExtractOptions {
+            focus: Some("authorization code expire".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!out.markdown.contains(" not applied: "), "{}", out.markdown);
+    assert!(skipped_filters(&out.markdown).is_empty());
+}
+
+#[test]
+fn skipped_filters_ignores_source_text_shaped_like_the_notice() {
+    assert!(skipped_filters("*[note not applied: in this draft]*\n\nBody").is_empty());
+    assert!(skipped_filters("*[focus \"q\": no matches : showing full content]*").is_empty());
+    assert!(skipped_filters("plain body").is_empty());
+}
+
 // Hits were BYTE offsets (regex m.start(), or offsets into a
 // separately lowercased haystack), but context_around treated them
 // as CHAR indices. On any page with non-ASCII text before the match
@@ -2928,4 +3187,148 @@ fn reliability_short_article_focus_preserves_specific_evidence() {
     assert!(focused.markdown.contains("Retry-After"));
     assert!(!focused.markdown.contains("showing full content"));
     assert!(focused.markdown.len() * 2 < full.markdown.len());
+}
+
+#[test]
+fn faithful_preserves_the_reported_interview_and_short_text_in_order() {
+    let html = r#"<!doctype html><html><head>
+    <title>Interview article extraction example</title>
+    <meta name="description" content="Metadata is not the article body.">
+    </head><body><article>
+    <h1>Interview article extraction example</h1>
+    <p>The interviewer asks whether the first proposal should proceed after the team reviews its practical effects.</p>
+    <p>Yes.</p>
+    <p>The interviewer then asks whether the separate second proposal should proceed after a further round of review.</p>
+    <p>Yes.</p>
+    <p>The interview concludes by explaining that each answer responds to a different question and belongs in the transcript.</p>
+    <p>7</p><hr><p>[pause]</p><p><a href="/answer">No.</a></p>
+    </article></body></html>"#;
+    let opts = ExtractOptions {
+        faithful: true,
+        selector: Some("article".into()),
+        ..Default::default()
+    };
+    let ex = extract_html_opts(html, &opts);
+    assert_eq!(ex.markdown.matches("Yes.").count(), 2, "{}", ex.markdown);
+    let first = ex.markdown.find("Yes.").unwrap();
+    let second_question = ex.markdown.find("The interviewer then").unwrap();
+    let second = ex.markdown.rfind("Yes.").unwrap();
+    assert!(first < second_question && second_question < second);
+    for text in ["\n7\n", "\n---\n", "[pause]", "No."] {
+        assert!(
+            ex.markdown.contains(text),
+            "missing {text}: {}",
+            ex.markdown
+        );
+    }
+    assert!(!ex.markdown.contains("Metadata is not"));
+    assert_eq!(
+        ex.title.as_deref(),
+        Some("Interview article extraction example")
+    );
+    assert!(ex.next_offset.is_none());
+    assert!(!ex.markdown.contains("*[repeated"));
+    let default = extract_html_opts(
+        html,
+        &ExtractOptions {
+            selector: opts.selector,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        default.markdown.matches("Yes.").count(),
+        1,
+        "default cleanup stays unchanged"
+    );
+}
+
+#[test]
+fn faithful_keeps_repeated_sections_loose_text_and_captions() {
+    let para = "The same full paragraph belongs at both positions in this transcript. ".repeat(8);
+    let html = format!(
+        "<article>Before<p>Middle</p>After <em>emphasis</em><h2>Repeat</h2><p>{para}</p><h2>Repeat</h2><p>{para}</p><figure><img src='/image.png'><figcaption>Caption text</figcaption></figure><p>End<sup>1</sup></p></article>"
+    );
+    let ex = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            faithful: true,
+            selector: Some("article, article p".into()),
+            ..Default::default()
+        },
+    );
+    assert!(ex.markdown.find("Before").unwrap() < ex.markdown.find("Middle").unwrap());
+    assert!(ex.markdown.find("Middle").unwrap() < ex.markdown.find("After").unwrap());
+    assert_eq!(
+        ex.markdown.matches(para.trim()).count(),
+        2,
+        "{}",
+        ex.markdown
+    );
+    assert_eq!(ex.markdown.matches("## Repeat").count(), 2);
+    assert!(ex.markdown.contains("Caption text"));
+    assert!(ex.markdown.contains("End^{1}"));
+    assert!(!ex.markdown.contains("*[repeated"));
+}
+
+#[test]
+fn faithful_pagination_reassembles_every_occurrence_without_rescue() {
+    let html = format!(
+        "<article><h1>Transcript</h1>{}</article><script type='application/ld+json'>{{\"articleBody\":\"Not the selected article\"}}</script>",
+        "<p>Yes. 終 Another answer in the transcript.</p>".repeat(40)
+    );
+    let mut opts = ExtractOptions {
+        faithful: true,
+        selector: Some("article".into()),
+        max_chars: Some(200),
+        ..Default::default()
+    };
+    let full = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            max_chars: Some(20_000),
+            ..opts.clone()
+        },
+    );
+    let mut collected = String::new();
+    loop {
+        let ex = extract_html_opts(&html, &opts);
+        assert!(ex.markdown.len() <= 200);
+        collected.push_str(
+            ex.markdown
+                .split("\n\n*[truncated : continue with offset=")
+                .next()
+                .unwrap(),
+        );
+        match ex.next_offset {
+            Some(next) => {
+                assert!(next > opts.offset);
+                opts.offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(collected, full.markdown);
+    assert_eq!(collected.matches("Yes.").count(), 40);
+    assert!(!collected.contains("Not the selected"));
+}
+
+// A faithful run joins inline elements to raw text: the space at an
+// element's edge must survive outside its markers, and none may be
+// left around a <br>.
+#[test]
+fn faithful_run_keeps_edge_spaces_and_drops_them_around_a_break() {
+    let html = r#"<!doctype html><html><body><article>
+    <div>word<em> italic</em> word, a <br> b</div>
+    </article></body></html>"#;
+    let opts = ExtractOptions {
+        faithful: true,
+        selector: Some("article".into()),
+        ..Default::default()
+    };
+    let ex = extract_html_opts(html, &opts);
+    assert!(
+        ex.markdown.contains("word *italic* word, a\nb"),
+        "{}",
+        ex.markdown
+    );
 }

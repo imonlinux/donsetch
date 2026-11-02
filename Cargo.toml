@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "4.10.2"
+version = "4.10.4"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
@@ -12,7 +12,7 @@ foreign-types = "0.5"
 tokio-boring = "5"
 # QUIC + HTTP/3 (phase 5.1). Donsetch fork of quiche 0.29.3 with the boring
 # dep raised to ^5 so the QUIC handshake forges share one boringssl build
-# (boring/boring-sys 5.2) with tier-1 h1/h2. Upstream tag: 0.29.3; fork tag
+# (boring/boring-sys 5.x) with tier-1 h1/h2. Upstream tag: 0.29.3; fork tag
 # donsetch-v0.29.3-1 = "quiche + boring 5" only.
 quiche = { git = "https://github.com/dondai44423/quiche", tag = "donsetch-v0.29.3-1", default-features = false, features = ["boringssl-boring-crate"] }
 tokio = { version = "1", features = ["full"] }
@@ -20,7 +20,7 @@ url = "2"
 brotli = "9"
 memchr = "2"
 flate2 = "1"
-zstd = "0.14"
+zstd = "0.14.3"
 rustls-native-certs = "0.8"
 scraper = "0.27.0"
 encoding_rs = "0.8.35"
@@ -62,7 +62,7 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.241" }
+psl = { version = "=2.1.243" }
 # OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
 # below, never here: Cargo unions features across every matching target
 # section, so declaring it in more than one place is how `load-dynamic` once
