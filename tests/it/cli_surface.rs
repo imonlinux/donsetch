@@ -12,8 +12,6 @@
 //! - `donsetch fetc` printed "unknown command" and the top help with no
 //!   suggestion; `donsetch help nonsense` exited 0.
 //! - `donsetch -V` was an unknown command while `-h` worked.
-//! - `donsetch login` with no terminal launched a real browser before
-//!   discovering the closed stdin.
 //!
 //! Plus the sponsor placement's hard lines: labelled, human-surface only,
 //! and switchable off without the config layer complaining about the
@@ -162,15 +160,56 @@ fn status_json_is_one_document() {
     assert!(!text.contains("DonSeTch "), "human title in machine output");
 }
 
+/// The browser health line names only what still needs the browser:
+/// screenshots.
+#[test]
+fn status_browser_warning_names_only_what_uses_the_browser() {
+    let sb = Sandbox::new("status-browser");
+    let missing = sb.root.join("no-such-chrome");
+    let out = sb.run_with(
+        &["status"],
+        &[(
+            "DONSETCH_BROWSER__CHROMIUM_PATH",
+            missing.to_str().expect("utf-8 sandbox path"),
+        )],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    let health = text
+        .lines()
+        .find(|l| l.contains("browser unavailable"))
+        .unwrap_or_else(|| panic!("no browser warning in: {text}"));
+    assert!(health.contains("screenshot will not work"), "{health}");
+    assert!(!health.contains("actions"), "{health}");
+
+    // Negative case: with a browser present there is no warning at all.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = sb.root.join("chrome-stub");
+        std::fs::write(&stub, "#!/bin/sh\necho 'Chromium 140.0.0.0'\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = sb.run_with(
+            &["status"],
+            &[(
+                "DONSETCH_BROWSER__CHROMIUM_PATH",
+                stub.to_str().expect("utf-8 sandbox path"),
+            )],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let text = stdout(&out);
+        assert!(text.contains("browser ready"), "{text}");
+        assert!(!text.contains("will not work"), "{text}");
+    }
+}
+
 /// `donsetch help <cmd>` and `donsetch <cmd> --help` are one text. The
 /// copy in main.rs had gone stale (`proxy fetch|crawl on|off` was missing
 /// from it), which is the whole reason the routes are pinned together.
 #[test]
 fn the_two_help_routes_cannot_drift() {
     let sb = Sandbox::new("help-routes");
-    for cmd in [
-        "proxy", "keys", "login", "status", "doctor", "adapters", "rules",
-    ] {
+    for cmd in ["proxy", "keys", "status", "doctor", "adapters", "rules"] {
         let routed = sb.run(&["help", cmd]);
         let direct = sb.run(&[cmd, "--help"]);
         assert_eq!(routed.status.code(), Some(0), "help {cmd}");
@@ -217,25 +256,6 @@ fn short_version_flag_works() {
     assert!(stdout(&out).contains(env!("CARGO_PKG_VERSION")));
 }
 
-/// The other branches of `login` are non-interactive; the interactive one
-/// needs a human, and must say so before spawning anything.
-#[test]
-fn login_without_a_terminal_launches_no_browser() {
-    let sb = Sandbox::new("login-notty");
-    let out = sb.run(&["login"]);
-    assert_ne!(out.status.code(), Some(0));
-    assert!(
-        stderr(&out).contains("needs a terminal"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(
-        !stdout(&out).contains("Starting browser"),
-        "a browser was launched for a login nobody could confirm: {}",
-        stdout(&out)
-    );
-}
-
 /// An empty export prints nothing on stdout (it is piped into other
 /// tools) and says so on stderr, so silence stops reading as success.
 #[test]
@@ -262,7 +282,7 @@ fn the_sponsor_line_is_labelled_human_only_and_switchable() {
     std::fs::write(
         sb.root.join("donsetch.toml"),
         format!(
-            "[browser]\nbackend = \"chromium\"\nchromium_path = {:?}\n[proxy]\nfrom_environment = false\nhttps = \"http://127.0.0.1:0\"\nhttp = \"http://127.0.0.1:0\"\n",
+            "[browser]\nchromium_path = {:?}\n[proxy]\nfrom_environment = false\nhttps = \"http://127.0.0.1:0\"\nhttp = \"http://127.0.0.1:0\"\n",
             sb.root.join("missing-browser").to_string_lossy()
         ),
     )

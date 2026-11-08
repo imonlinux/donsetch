@@ -85,7 +85,7 @@ impl Searcher {
     /// from the actual page HTML : richer than any SERP
     /// snippet. Dead links (404/timeout) get demoted 50%.
     /// Pages behind bot walls are left untouched (still
-    /// valid results, agent fetches via tier 2).
+    /// valid results, no demotion).
     ///
     /// This is what makes our search better than any
     /// individual engine: results carry the page's own
@@ -96,7 +96,7 @@ impl Searcher {
         const ENRICH_TOP: usize = 5;
         const ENRICH_TIMEOUT: Duration = Duration::from_secs(4);
 
-        // Kill switch (v4 phase 2.1): with prewarm disabled ([fetch]
+        // Kill switch: with prewarm disabled ([fetch]
         // prewarm = false; historically DONSETCH_NO_PREWARM) no prewarm
         // fetch ever goes on the wire, so servers see no burst at all.
         // The honest-off state of the layer.
@@ -129,7 +129,7 @@ impl Searcher {
                 // route out, a direct dial here failed and the result was
                 // scored QualityObs::Dead: live search results got demoted
                 // as dead links because of the egress, not the page.
-                let route = crate::transport::request_route::RequestRoute::configured();
+                let route = crate::egress::request_route::RequestRoute::configured();
                 let env_proxy = match route.proxy_for(&url) {
                     Ok(proxy) => proxy,
                     // An unusable client route is not evidence that the page died.
@@ -137,7 +137,7 @@ impl Searcher {
                 };
                 let out = tokio::time::timeout(
                     ENRICH_TIMEOUT,
-                    // v4 phase 2.1: enrichment rides the shared cookie
+                    // enrichment rides the shared cookie
                     // jar (browser-real). Fresh-jar enrichment + warm
                     // fetch = two devices from one IP within seconds;
                     // one store, like a browser.
@@ -163,6 +163,14 @@ impl Searcher {
                     // demote search hits; v1 never lets a rule affect
                     // search ranking.
                     Ok(Err(crate::error::FetchError::Denied { .. })) => {
+                        (i, None, Some(String::new()), QualityObs::Neutral)
+                    }
+                    // A proxy the route needs could not be used (an
+                    // unreadable proxy URL, or a hop the route proxies
+                    // from a read that left direct): a routing fact, not
+                    // a page fact, so the hit keeps its score and no
+                    // quality is recorded, as for a deny.
+                    Ok(Err(crate::error::FetchError::ProxyConfig(_))) => {
                         (i, None, Some(String::new()), QualityObs::Neutral)
                     }
                     // Refused / DNS-dead / nothing recovered = dead.
@@ -290,7 +298,7 @@ impl Searcher {
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
 
-    /// v4 phase 2.1: detached warm-handoff for the BYOK takeover
+    /// detached warm-handoff for the BYOK takeover
     /// path. Provider results already carry real titles/snippets, so
     /// the search reply does not wait for the prefetch pass: it fires
     /// in the background and parks bodies while the model reads the
@@ -339,7 +347,10 @@ fn extract_description(html: &str) -> Option<String> {
 /// still matched `Timeout` alone, so a 5s resolver blip during enrich
 /// demoted a live result 50% and marked its host's quality down.
 fn slow_not_dead(e: &FetchError) -> bool {
-    matches!(e, FetchError::Timeout | FetchError::DnsTimeout(_))
+    matches!(
+        e,
+        FetchError::Timeout | FetchError::SlowTransfer(_) | FetchError::DnsTimeout(_)
+    )
 }
 
 #[cfg(test)]
@@ -361,7 +372,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
-    // == v4 phase 2.1 battery: wire truth of the prewarm layer ==
+    // == battery: wire truth of the prewarm layer ==
     // Every fact is observed on the real socket; nothing mocked.
 
     enum RigMode {
@@ -463,11 +474,10 @@ mod tests {
                 .any(|w| w == b"hop-ok")
         );
         // The shared jar now holds the device cookie.
-        let jar = searcher.fetcher.jar_snapshot("127.0.0.1");
+        let jar = searcher.fetcher.cookie_names("127.0.0.1");
         assert!(
-            jar.iter().any(|c| c.name == "uid" && c.value == "fleet9"),
-            "the enrich fetch must ride the shared jar: {:?}",
-            jar
+            jar.iter().any(|name| name == "uid"),
+            "the enrich fetch must ride the shared jar: {jar:?}"
         );
         // Second leg: a NEW listener on an ephemeral port; the cookie
         // keys on the host (127.0.0.1), not the port: it must ride.
@@ -547,6 +557,134 @@ mod tests {
         );
     }
 
+    /// A hit whose page redirects to a host the configured route sends
+    /// through a proxy, from a read that left direct, is refused with
+    /// ProxyConfig. That is a routing fact: the hit keeps its score and no
+    /// host quality is recorded. Sets process-wide proxy variables, so it
+    /// relies on nextest's process per test.
+    #[tokio::test]
+    async fn a_redirect_the_route_refuses_is_neither_dead_nor_recorded() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        // Nothing listens here: a direct dial of the hop is refused.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let read_head = |sock: &std::net::TcpStream| -> String {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(4)));
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            first.trim_end().to_string()
+        };
+        // The proxy answers every request with a page and logs its request line.
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let through = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let through = std::sync::Arc::clone(&through);
+            std::thread::spawn(move || {
+                for sock in proxy.incoming() {
+                    let Ok(mut sock) = sock else { break };
+                    let head = read_head(&sock);
+                    through.lock().unwrap().push(head);
+                    let body = "<html><head><title>Through the proxy: the real page title of this search result</title><meta name=\"description\" content=\"A description long enough to be taken as the snippet of this search result, from the proxy.\"></head><body><p>Readable text of the page.</p></body></html>";
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+        // The hit's page: a redirect to localhost, which NO_PROXY does not name.
+        let page = TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_port = page.local_addr().unwrap().port();
+        let page_heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let page_heads = std::sync::Arc::clone(&page_heads);
+            std::thread::spawn(move || {
+                for sock in page.incoming() {
+                    let Ok(mut sock) = sock else { break };
+                    let head = read_head(&sock);
+                    page_heads.lock().unwrap().push(head);
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{dead}/page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+        unsafe {
+            for name in [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "http_proxy",
+                "no_proxy",
+                "REQUEST_METHOD",
+            ] {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
+            std::env::set_var("NO_PROXY", "127.0.0.1");
+        }
+        let searcher = searcher();
+        let url = format!("http://127.0.0.1:{page_port}/start");
+        let mut hits = vec![merged(&url, "search title long enough to be replaced")];
+        let before = hits[0].score;
+        searcher.enrich_results(&mut hits).await;
+        std::thread::sleep(Duration::from_millis(200));
+        let quality = searcher
+            .quality
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&crate::search::persist::quality_host_key("127.0.0.1"))
+            .copied();
+        let parked = searcher
+            .prewarms()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(&url)
+            .is_some();
+        assert!(
+            (hits[0].score - before).abs() < f64::EPSILON,
+            "a routing refusal must not demote the hit: {} -> {}",
+            before,
+            hits[0].score
+        );
+        assert!(
+            quality.is_none(),
+            "a routing refusal must not record host quality"
+        );
+        assert!(!parked, "nothing was read, so nothing is parked");
+        assert!(
+            through.lock().unwrap().is_empty(),
+            "the refused hop must not reach the proxy: {:?}",
+            through.lock().unwrap()
+        );
+        assert_eq!(
+            page_heads.lock().unwrap().len(),
+            1,
+            "the hit's own page was read once"
+        );
+    }
+
     /// The prewarm burst must ride the ambient proxy like every other
     /// request path. Behind a forward proxy that is the only route out, a
     /// direct dial here failed and the result was scored
@@ -598,7 +736,7 @@ mod tests {
     }
 
     /// Bot walls (200 but not ContentOk) leave the result neutral:
-    /// no demotion (still valid for tier 2), no parked body.
+    /// no demotion (still a valid result), no parked body.
     #[tokio::test]
     async fn wall_leg_neutral_no_park() {
         unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };

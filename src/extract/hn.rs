@@ -18,10 +18,6 @@ use super::{ContentKind, ExtractOptions, Extracted, inline};
 const MAX_COMMENTS: usize = 150;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() || opts.toc || opts.section.is_some() || opts.must_contain.is_some()
-    {
-        return None;
-    }
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     if host != "news.ycombinator.com" {
@@ -120,6 +116,7 @@ fn extract_permalink(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Ext
     let tokens_est = slice.len() / 4;
     let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
+        page: None,
         markdown: slice,
         title: Some(title),
         byline: (!author.is_empty()).then(|| author.clone()),
@@ -361,6 +358,7 @@ fn extract_thread(
     let tokens_est = slice.len() / 4;
     let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
+        page: None,
         markdown: slice,
         title: Some(title),
         byline: (!author.is_empty()).then(|| author.clone()),

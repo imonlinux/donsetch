@@ -7,11 +7,9 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 ```bash
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
-cargo build --release                     # core build (fetch, search, crawl, PDF)
-# For the dev loop use `just bin` (target/fast/donsetch, seconds) and
-# `just bin-ci` when release-profile parity matters: these two lines below
-# compile the release-shaped graph, which is the slowest thing here.
-cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
+just bin                      # edit-loop binary: target/fast/donsetch (seconds)
+just bin-dist                 # the SHIPPED shape: target/dist-thin/donsetch (what CI releases)
+cargo build --release         # local release: thin LTO, parallel codegen
 ```
 
 **Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
@@ -21,35 +19,79 @@ cargo build --release --features ocr,rerank  # full build (adds OCR + semantic r
 The ladder: climb only as far as the question needs.
 
 ```bash
-just check              # types + cfg on the full feature set   (seconds, warm)
-just t crawl::frontier  # the touched scope, fast profile        (seconds)
-just all                # pre-push net: guard + fmt + check + lockgate + lint
+just check              # types + cfg on the full feature set   ~1 s warm
+just t crawl::frontier  # the touched scope, fast profile       ~6 s warm
+just test               # the default suite                     ~35 s warm
+just all                # pre-push: guard + fmt + check + lockgate + lint + budget-static
 ```
 
-`just check` and `just t` run the **`fast` cargo profile** (debug codegen for
-this crate, deps at opt-level 1, no debuginfo): an edit rebuilds in seconds
-instead of the 8-12 minutes a release-shaped whole-crate recompile costs on a
-machine that is also doing other things. Use `just tci <expr>` or `just bin-ci`
-when the question is release-profile behavior specifically (`panic = "abort"`
-included), and `just heavy` for the tests that measure time and memory (soak,
-corpus, landmarks, live probes).
+`just check` and `just t` run the **`fast` profile** (this crate at opt-level 0,
+deps at opt-level 1, no debuginfo, codegen-units 16), and so does every CI test
+lane: what you run is what CI runs. `dist-thin` is the shipped shape (opt-level
+3, no LTO, `panic = "abort"`); the release pipeline builds it and the nightly
+heavy suite runs on it, because those tests measure time and memory. There are
+no other profiles. A plain `cargo build --release` is thin LTO on purpose: a
+local release binary should not cost ten minutes.
 
-Do **not** make a bare `cargo test` or `cargo build --release` your edit loop:
-those compile another artifact graph, and recompiling it is the slowest thing in
-this repository. CI is the full gate (5 platforms, in parallel); `just all` is
-the only local gate you need before pushing.
+**Tests are budgeted.** The default filter in `.config/nextest.toml` excludes
+the four tests that parse a 501-page PDF, a large scanned PDF, or prove a
+20-second timing ceiling. They still run in `just heavy` and in nightly CI.
+`tests/budget.json` caps the default suite (count, per-suite count, single-test
+time, total CPU, fixture size); CI fails when a change grows past it without a
+deliberate raise. A new test should be cheap and specific: prefer a unit test or
+one integration test for the contract, keep it under ~2 s, and put anything that
+needs a real corpus or a real clock in the heavy set.
 
-A Windows-shaped failure fails the gate: the Windows lane runs the core suite on
-master pushes, tags and the nightly, while PR cycles keep a compile-only check
-there because the MSVC link is the expensive part. `macos-x86_64` is still
-compile-only for the same reason.
+Use `just th <name>` to run a heavy test on purpose, `just tdist <expr>` for
+release-profile behavior, `just budget` to see the suite exactly as the guard
+does, and `just ratchet` after a clean run to pull the ceilings in to what the
+suite really uses (raising one stays a reviewed edit to `tests/budget.json`). Do **not** make a bare `cargo test` or `cargo build --release` your
+edit loop: those compile another artifact graph, and recompiling it is the
+slowest thing in this repository. `just all` is the only local gate you need
+before pushing.
+
+### What CI runs, and when
+
+One workflow, `.github/workflows/ci.yml`, with one required check, `gate`:
+
+| Event | What runs |
+|---|---|
+| Docs-only push or PR | nothing (the gate passes) |
+| Any other push or PR | `lint` (fmt, deny, budget, clippy on both feature sets) and the full suite on Linux, about 5 minutes warm |
+| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `core/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
+| A release commit, and the nightly | everything: all three test lanes, and the five shipped binaries built and gated |
+
+A newer push to master cancels the unfinished run of an older one; a release
+run is never cancelled. To run the Windows and macOS lanes on a branch, or to
+build and gate the five binaries without publishing, dispatch the workflow
+(`gh workflow run ci.yml --ref <branch> -f platforms=true -f build=true`).
+
+Caches hold dependencies only, one entry per lane, replaced when the
+dependency hash changes (`.github/actions/`). The repository's cache pool is
+10 GB; do not add a lane without checking `gh cache list` and the budget table
+at the top of `ci.yml`.
 
 [`sccache`](https://github.com/mozilla/sccache) is picked up automatically when
 installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
 profiles, feature sets and branches become cache hits, and it wraps the C/C++
 compilers too, which is where BoringSSL's build cost actually lives.
 
-The recipes go through `scripts/budget.sh`, which pins the whole build tree to a quarter of the cores and passes the job cap into nested build systems (cmake, make, nasm). Prefer them on a workstation you are also using: a `-j` flag alone does not bound a Rust build, because rustc spawns its own codegen threads and some `-sys` crates spawn their own `make -j$(nproc)`. `BG_JOBS=<n>` lifts the job cap when the box is otherwise idle.
+The recipes go through `scripts/budget.sh`, which pins the whole build tree to
+half the cores and passes the job cap into nested build systems (cmake, make,
+nasm). It also sizes the job count from `MemAvailable` right now (~700 MB per
+rustc at codegen-units 16, 1 GB reserved): three to four jobs with a browser
+open, eight on an idle box. `BG_JOBS=<n>` overrides it.
+
+Releasing is one command: `just ship <version>`. It bumps the manifests and
+pushes the release commit. A push to master whose version has no tag yet *is* a
+release to the pipeline: it runs the suite on Linux, Windows and macOS, builds
+the five binaries and runs `scripts/gates.sh` on each (size, ONNX payload,
+version, glibc 2.35 baseline, non-AVX CPU) while that happens, and only when
+everything is green creates the tag and the GitHub release from those exact
+binaries and publishes npm. A red run publishes nothing and leaves nothing to
+undo: fix forward and push, and the same version is tried again. One failed job
+(the npm step, say) re-runs alone with `gh run rerun <id> --failed`. Progress:
+`just runs`.
 
 ### Verifying Windows compilation from Linux
 
@@ -133,7 +175,10 @@ Scope optional: `feat(search): add scholar vertical`.
 - **Bug fixes** with a test that would have caught the bug.
 - **New search engines** that are keyless and don't require API keys.
 - **Fixes to existing BYOK search providers.** These remain optional and must never weaken the keyless experience.
-- **Anti-bot improvements**: new wall vendors, better detection heuristics.
+- **Fetch improvements inside the four classes** — identity, state, request contract,
+  egress: a new coherent client profile, a wall classified with a witness, a site's own
+  interface as a contract. A new heuristic that guesses at a wall instead of classifying
+  it is not a contribution.
 - **PDF extraction** edge cases: corrupt files, weird encodings, exotic tables.
 - **Performance**: measured improvements, not micro-optimizations.
 
@@ -147,17 +192,24 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-DonSeTch is built from scratch — no dependency on existing OSS web tooling:
+The fetch layer is `core/` (repo root, its own crate and CI job): carried client
+identity, carried state, a page cache, wall classification, the site's own interfaces,
+and an in-process V8 engine that runs a challenge page's own program. No browser is in
+the fetch path — Chromium serves `web_screenshot` and doctor's parity capture only. The
+[README architecture map](README.md#-built-from-scratch) is the public description of
+the whole product.
 
-| Component | What it does | Key files |
-|---|---|---|
-| DonShadow | Tier 1 stealth HTTP fetch (BoringSSL TLS, own HTTP/1.1 + HTTP/2) | `src/fetch/`, `src/transport/` |
-| DonGhost | Tier 2 headless browser (CDP, no Runtime/Console/Debugger) | `src/ghost/` |
-| DonSift | HTML-to-markdown extraction engine (block model, BM25 focus) | `src/extract/` |
-| DonSeek | Keyless multi-engine search (RRF + BM25 + semantic reranking) | `src/search/` |
-| DonTread | Crawl engine (sitemap, frontier, Governor pacing) | `src/crawl/` |
-| DonSheet | PDF extraction (PDFium FFI, OCR arbitration, fusion) | `src/pdf/` |
-| MCP daemon | stdio server (JSON-RPC 2.0, MCP 2024-11-05+) | `src/mcp/` |
+Fetch work is measured, not argued. The crate has `fetch`, `probe` (identity × target
+matrix), `bench` (cold, paired with curl in the same window) and `state`, and the rules
+for improving it — classify the wall first, then identity, state, request contract or
+egress, with a witness — are in
+[AGENTS.md](AGENTS.md#the-fetch-path-has-a-shape). Its suite runs as its
+own CI job on linux-x86_64 and linux-aarch64: `cd core && cargo test --release
+--locked`.
+
+Experimental branches may have a different source layout; do not treat their
+implementation as a released feature or an approved plan. For local planning context,
+follow [AGENTS.md](AGENTS.md#local-project-context).
 
 ## Pull requests
 

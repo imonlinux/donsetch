@@ -1,4 +1,4 @@
-//! Stealth scorecard (v4 phase 0.4): the drift alarm.
+//! Stealth scorecard: the drift alarm.
 //!
 //! The market-wide stealth failure mode is DRIFT: Chrome bumps
 //! every ~4 weeks, static mimicry rots, JA3/JA4 databases catch up,
@@ -11,10 +11,10 @@
 //!   user agent) via a public echo endpoint and diffs every layer
 //!   against the committed baseline fixture. Any layer that moved
 //!   without a deliberate profile change = alarm.
-//! - When a local Chrome is available, the same endpoint is ALSO
-//!   captured through the ghost (a real browser): tier-1 vs real
-//!   Chrome parity is the strongest stealth statement available,
-//!   computed live with no fixture maintenance.
+//! - `--stealth --parity` captures the same endpoint through the
+//!   local browser (a real Chrome) instead of reading the fixture:
+//!   local fetch vs real Chrome parity is the strongest stealth
+//!   statement available, computed live with no fixture maintenance.
 //! - CI runs the fixture diff weekly; a drift reds the pipeline
 //!   before the ecosystem's JA4 databases even notice.
 //!
@@ -36,10 +36,10 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FingerprintSnapshot {
     /// Free-text provenance: what produced this snapshot
-    /// ("tier1 fetcher, profile chrome-151, linux", or the ghost
-    /// chrome version). For human review of the fixture.
+    /// ("local fetcher, profile chrome-151, linux", or "local browser
+    /// (real Chrome)"). For human review of the fixture.
     /// Defaulted: raw echo endpoints do not carry it; capture()
-    /// stamps it. Ghost-parsed snapshots carry it too.
+    /// stamps it. Browser captures carry it too.
     #[serde(default)]
     pub source: String,
     /// Defaulted like source
@@ -71,10 +71,11 @@ pub async fn capture(fetcher: &Fetcher) -> Result<FingerprintSnapshot, String> {
         .await
         .map_err(|e| format!("echo endpoint fetch failed: {e}"))?;
     // Operator debug: when DONSETCH_DEBUG_ECHO=1 the RAW echo lands
-    // in /tmp/ for offline diffing against the evergreen ghost
-    // capture (/tmp/ghost-echo-blob.json). Off by default.
+    // in /tmp/ for offline diffing against the evergreen browser
+    // capture (`--parity` leaves /tmp/browser-echo-blob.json when its
+    // echo does not parse). Off by default.
     if crate::config::cfg().debug.echo_scorecard {
-        let _ = std::fs::write("/tmp/tier1-echo-raw.json", &out.body);
+        let _ = std::fs::write("/tmp/fetch-echo-raw.json", &out.body);
     }
     parse_echo(&out.body, &fetcher.profile().name)
 }
@@ -92,7 +93,7 @@ pub fn parse_echo(body: &[u8], profile_name: &str) -> Result<FingerprintSnapshot
             .ok_or_else(|| format!("echo payload missing {key}"))
     };
     Ok(FingerprintSnapshot {
-        source: "tier1 fetcher".to_string(),
+        source: "local fetcher".to_string(),
         captured_at: String::new(),
         user_agent: get(&v["http"], "user_agent")
             .or_else(|_| get(&v, "user_agent"))
@@ -190,47 +191,55 @@ pub fn parse_fixture_str(s: &str) -> Result<FingerprintSnapshot, String> {
     serde_json::from_str(s).map_err(|e| format!("stealth baseline fixture unreadable: {e}"))
 }
 
-/// Echo capture through the REAL local browser (ghost): the
-/// always-current reference for `doctor --stealth --parity`. No
-/// fixture involved: the comparison is tier-1 vs the browser on
-/// the floor, and it cannot go stale. The echo JSON arrives
-/// rendered in a <pre> block; carve the first JSON object out and
-/// parse. `None` when no usable local Chrome exists (doctor says
-/// so instead of pretending).
-pub async fn capture_via_ghost(
-    mgr: &std::sync::Arc<crate::ghost::manager::GhostManager>,
-) -> Result<FingerprintSnapshot, String> {
-    let profile = crate::profile::BrowserProfile::host_default();
-    let mut g = mgr
-        .acquire(&profile)
-        .await
-        .map_err(|e| format!("ghost acquire: {e}"))?;
-    let page = crate::ghost::ops::ghost_fetch(&mut g, ECHO_ENDPOINT, Duration::from_secs(35))
-        .await
-        .map_err(|e| format!("ghost render of the echo: {e}"))?;
-    let html = page.html;
-    let start = html
-        .find('{')
-        .ok_or("no echo JSON found in the browser page")?;
-    let end = html
-        .rfind('}')
-        .take_if(|e| *e > start)
-        .ok_or("no echo JSON end in the browser page")?
-        + 1;
-    let blob = &html[start..end];
-    let parse = parse_echo(blob.as_bytes(), "ghost real Chrome");
-    if parse.is_err()
-        && let Err(write_err) = std::fs::write("/tmp/ghost-echo-blob.json", blob.as_bytes())
-    {
-        crate::diag!("ghost echo debug dump failed: {write_err}");
+/// Echo capture through the REAL local browser: the always-current
+/// reference for `doctor --stealth --parity`. No fixture involved:
+/// the comparison is the local fetch vs the browser on the floor, and
+/// it cannot go stale. The echo JSON arrives as the page's own text
+/// (Chrome renders the JSON response inline); carve the first JSON
+/// object out and parse. An error when no usable local Chrome exists
+/// (doctor says so instead of pretending).
+pub async fn capture_via_browser() -> Result<FingerprintSnapshot, String> {
+    let resolved = crate::browser::resolve_browser_without_download()?;
+    let session = crate::browser::launch_headless(&resolved.path).await?;
+    let result = async {
+        session.navigate(ECHO_ENDPOINT).await?;
+        // The echo body can fill in after the load event; poll the
+        // carved JSON until it parses, bounded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(35);
+        loop {
+            let text = session.page_text().await.unwrap_or_default();
+            if let Some(blob) = carve_echo_json(&text)
+                && let Ok(mut snap) = parse_echo(blob.as_bytes(), "local browser")
+            {
+                snap.source = "local browser (real Chrome)".to_string();
+                snap.captured_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default();
+                return Ok(snap);
+            }
+            if std::time::Instant::now() >= deadline {
+                if let Some(blob) = carve_echo_json(&text)
+                    && let Err(write_err) =
+                        std::fs::write("/tmp/browser-echo-blob.json", blob.as_bytes())
+                {
+                    crate::diag!("browser echo debug dump failed: {write_err}");
+                }
+                return Err("echo JSON did not appear in the browser page".into());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
-    let mut snap = parse?;
-    snap.source = "ghost (real local Chrome)".to_string();
-    snap.captured_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
-    Ok(snap)
+    .await;
+    session.close().await;
+    result
+}
+
+/// The first `{...}` span of the page text.
+fn carve_echo_json(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}').filter(|e| *e > start)? + 1;
+    Some(&text[start..end])
 }
 
 #[cfg(test)]

@@ -1,62 +1,17 @@
 //! The fetch tool handler: dispatch, URL/handle resolution,
-//! multi-fetch batching, single fetch + the full escalation ladder
-//! (bypass, ghost, actions, OCR, anticloak), page
-//! history + link handles, and the result envelope assembly.
+//! multi-fetch batching, single fetch + wall handling (the optional
+//! unlocker), OCR, page history + link handles, and the result
+//! envelope assembly.
 
 use serde_json::{Value, json};
 
 use super::*;
-use crate::transport::request_route::RequestRoute;
+use crate::egress::request_route::RequestRoute;
 
-/// The caller's whole-call budget, carried into the browser helpers so a
-/// single pass can be sized against what is left of it.
-///
-/// The passes used to be fixed at 20s (25s on the actions path) and ignored
-/// `deadline_ms` entirely, while the deadline wrapped the whole call from
-/// outside. With a short deadline the call was therefore cut off MID-pass:
-/// measured, `--tier 2 --deadline-ms 12000` against a known interstitial
-/// answered `deadline.hit` with no wall verdict at all, even though the first
-/// pass had already seen the wall, and the browser kept working on a pass
-/// nobody was waiting for. A pass is bounded by the remaining budget now,
-/// without a floor that can exceed the clock; the fixed default stands when
-/// the caller asked for no deadline.
-#[derive(Clone, Copy)]
-pub(super) struct Budget {
-    deadline: Option<std::time::Duration>,
-    start: std::time::Instant,
-}
-
-impl Budget {
-    fn of(args: &Value) -> Self {
-        Self {
-            deadline: args
-                .get("deadline_ms")
-                .and_then(Value::as_u64)
-                .map(|ms| std::time::Duration::from_millis(ms.clamp(1, 600_000))),
-            start: std::time::Instant::now(),
-        }
-    }
-
-    /// How long one browser pass may run.
-    fn pass(self, default_secs: u64) -> std::time::Duration {
-        let default = std::time::Duration::from_secs(default_secs);
-        let Some(d) = self.deadline else {
-            return default;
-        };
-        // Reserve at most a tenth of the remaining time for the envelope.
-        // A fixed two seconds would consume short calls before navigation.
-        let remaining = d.saturating_sub(self.start.elapsed());
-        let reserve = (remaining / 10).min(std::time::Duration::from_secs(2));
-        let usable = remaining.saturating_sub(reserve);
-        usable.min(default)
-    }
-}
-
-/// State selected once before adapter or browser work.
+/// State selected once for the whole call.
 struct FetchCall {
     session_stamp: String,
     route: RequestRoute,
-    budget: Budget,
 }
 
 async fn fetch_with_budget(
@@ -68,11 +23,17 @@ async fn fetch_with_budget(
 ) -> Value {
     let started = std::time::Instant::now();
     let witness = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The encounter plans inside the caller's deadline (`fetch::v5`); without
+    // one it keeps its own budget.
+    let until = started + deadline.unwrap_or(std::time::Duration::from_secs(86_400));
     let mut result = FETCH_TRACE
         .scope(
             witness.clone(),
             run_with_budget(
-                Box::pin(fetch_single(daemon, args, url)),
+                Box::pin(
+                    crate::fetch::core::CALLER_DEADLINE
+                        .scope(until, fetch_single(daemon, args, url)),
+                ),
                 deadline,
                 ctx,
                 || {
@@ -90,29 +51,10 @@ async fn fetch_with_budget(
     let trace = witness
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A deadline or cancellation can interrupt an action before its result
-    // arrives. The side effect may still have happened; never advise replay.
-    if is_failure(&result)
-        && trace
-            .iter()
-            .any(|step| step["action"] == "action-execution" && step["outcome"] == "started")
-    {
-        let action = "inspect the result with a plain fetch without actions; earlier actions may have completed, so do not replay them automatically";
-        result["errorKind"] = json!("permanent");
-        result["structuredContent"]["retry_safe"] = json!(false);
-        result["structuredContent"]["next_action"] = json!(action);
-        if let Some(text) = result["content"][0]["text"].as_str() {
-            let message = text.split("\n\nNext action:").next().unwrap_or(text);
-            result["content"][0]["text"] = json!(format!("{message}\n\nNext action: {action}"));
-        }
-    }
-    add_shot_receipt(args, &mut result, &trace);
     drop(trace);
-    if args.get("links").and_then(Value::as_bool) == Some(true)
-        || args.get("media").and_then(Value::as_bool) == Some(true)
-    {
+    if link_mode(args) != LinkMode::Off {
         result["structuredContent"]["budget_scope"] =
-            json!("rendered markdown, including link and media markup");
+            json!("rendered markdown, including link markup");
     }
     if let Some(debug) = result.pointer_mut("/_meta/com.donsetch~1fetch-debug") {
         debug["elapsed_ms"] = json!(started.elapsed().as_millis());
@@ -120,102 +62,17 @@ async fn fetch_with_budget(
     result
 }
 
-fn add_shot_receipt(args: &Value, result: &mut Value, trace: &[Value]) {
-    let Some(path) = args.get("shot").and_then(Value::as_str) else {
-        return;
-    };
-    let outcome = trace
-        .iter()
-        .rev()
-        .find(|step| step["action"] == "screenshot")
-        .and_then(|step| step["outcome"].as_str());
-    let reason: String = match outcome {
-        Some(o) => o.to_string(),
-        None if !is_failure(&*result) => {
-            "skipped: no interactive captcha capture was needed".to_string()
-        }
-        None if result.pointer("/structuredContent/retry_in_secs").is_some() => {
-            "skipped: host is in a learned solve-cooldown; the fetch was refused before any captcha capture"
-                .to_string()
-        }
-        None => match result
-            .pointer("/structuredContent/code")
-            .and_then(Value::as_str)
-        {
-            Some("deadline.hit") => {
-                "skipped: the fetch hit its deadline before an interactive captcha capture"
-                    .to_string()
-            }
-            Some("browser.transport") | Some("browser.timeout") => {
-                "skipped: the browser pass failed before an interactive captcha capture"
-                    .to_string()
-            }
-            _ => "skipped: fetch failed before an interactive captcha capture".to_string(),
-        },
-    };
-    result["structuredContent"]["shot"] = json!({
-        "requested": path,
-        "saved_to": outcome.and_then(|s| s.strip_prefix("saved: ")),
-        "reason": reason,
-    });
-}
-
-async fn record_shot(ghost: &crate::ghost::Ghost, path: &str, trace: &mut Trace) {
-    let outcome = match ghost.screenshot(path).await {
-        Ok(()) => match crate::paths::resolve_screenshot_path(path) {
-            Ok(dest) => format!("saved: {}", dest.display()),
-            Err(e) => format!("failed: {e}"),
-        },
-        Err(e) => format!("failed: {e}"),
-    };
-    trace.step("2", "screenshot", &outcome, 0);
-}
-
-/// V11: the shot destination is validated when the call is parsed.
-/// `record_shot` only runs when a capture is attempted, after the
-/// fetch has already spent its work: an outside path used to be
-/// refused only then (the audit's case: after a full Cloudflare
-/// solve pass, 42s of browser work). A bad destination is a bad
-/// argument; refuse it before any network or browser work.
-fn shot_path_error(args: &Value) -> Option<Value> {
-    let shot = args.get("shot").and_then(Value::as_str)?;
-    let reason = match crate::paths::resolve_screenshot_path(shot) {
-        Ok(_) => return None,
-        Err(e) => e,
-    };
-    let root = crate::paths::screenshots_dir();
-    Some(tool_error_structured(
-        format!("fetch: shot path rejected: {reason}"),
-        "permanent",
-        Some(json!({
-            "code": "shot.invalid",
-            "shot": {
-                "requested": shot,
-                "saved_to": null,
-                "reason": format!("rejected: {reason}")
-            },
-            "allowed_root": root.display().to_string(),
-            "next_action": format!(
-                "pass a relative filename (it resolves under {}) or an absolute path already below it; drop `shot` if no capture is wanted",
-                root.display()
-            ),
-        })),
-    ))
-}
-
 pub(super) async fn fetch_tool(
     daemon: &Arc<Daemon>,
     args: &Value,
     mut ctx: Option<ToolCtx>,
 ) -> Value {
-    daemon.refresh_vault().await;
     let deadline = args
         .get("deadline_ms")
         .and_then(Value::as_u64)
         .map(|ms| std::time::Duration::from_millis(ms.clamp(1, 600_000)));
-    // v3: url accepts one URL/handle OR an array of them : batch
-    // fetch in a single call, optionally under a shared token
-    // budget (budget_tokens) allocated across results.
+    // url is one URL/handle or an array of up to 12: one parallel batch
+    // whose max_chars is the total across its pages.
     let urls: Vec<String> = match args.get("url") {
         Some(Value::String(s)) => vec![s.to_string()],
         Some(Value::Array(a)) => {
@@ -238,269 +95,40 @@ pub(super) async fn fetch_tool(
         }
         _ => return tool_error("fetch: url must be http(s)"),
     };
-    let budget_tokens = args
-        .get("budget_tokens")
-        .and_then(Value::as_u64)
-        .map(|t| (t as usize).clamp(200, 500_000));
-
-    // V11: a bad shot destination is refused here, before any
-    // network or browser work (see shot_path_error).
-    if let Some(error) = shot_path_error(args) {
+    // Argument mistakes answer before any URL is resolved or fetched.
+    if let Err(error) = fetch_view(args) {
         return error;
     }
-
-    if urls.len() == 1 && budget_tokens.is_none() {
+    if urls.len() == 1 {
         let url = match resolve_fetch_url(daemon, &urls[0]).await {
             Ok(u) => u,
-            Err(mut e) => {
-                add_shot_receipt(args, &mut e, &[]);
+            Err(e) => {
                 return e;
             }
         };
-        let result = fetch_with_budget(daemon, args, &url, deadline, ctx.as_mut()).await;
-        return result;
+        return fetch_with_budget(daemon, args, &url, deadline, ctx.as_mut()).await;
     }
-    // Single resolved URL: keep the single-page response shape, but
-    // always run under the deadline + MCP-cancellation wrapper (#164).
-    // Previously this branch (reached whenever budget_tokens was set,
-    // since the fast path above demands budget_tokens.is_none())
-    // called fetch_single bare: an uncancellable, deadline-free fetch
-    // on a path that can still spawn a ghost render. budget_tokens
-    // also bounds the page now, exactly like the batch path.
-    if urls.len() == 1 {
-        let resolved = match resolve_fetch_url(daemon, &urls[0]).await {
-            Ok(url) => url,
-            Err(mut error) => {
-                add_shot_receipt(args, &mut error, &[]);
-                return error;
-            }
-        };
-        let owned_args;
-        let effective_args = if let Some(b) = budget_tokens {
-            let budget_chars = b.saturating_mul(4).max(800);
-            let mut a = args.clone();
-            a["max_chars"] = json!(budget_chars);
-            owned_args = a;
-            &owned_args
-        } else {
-            args
-        };
-        let result =
-            fetch_with_budget(daemon, effective_args, &resolved, deadline, ctx.as_mut()).await;
-        return result;
-    }
-    fetch_multi(daemon, args, urls, budget_tokens, deadline, ctx).await
+    let budget = args
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .map_or(BATCH_MAX_CHARS_DEFAULT, |n| {
+            (n as usize).clamp(MAX_CHARS_MIN, MAX_CHARS_MAX)
+        });
+    fetch_multi(daemon, args, urls, budget, deadline, ctx).await
 }
 
-/// The verdict a FAILURE envelope reports.
-///
-/// The success path starts the verdict at ContentOk and a prewarm hit
-/// sets it too, so a failure envelope inherited "ContentOk" and
-/// contradicted the error beside it: a walled fetch reported
-/// `"verdict": "ContentOk"` with `"code": "wall.captcha"` (#258).
-///
-/// A failure never calls the fetch content. Any other verdict the run
-/// earned is kept, a challenge or a 404 included, and otherwise the
-/// failure names itself: `Blocked` for a wall, which is the word the
-/// error-code table already uses for `wall.*`, and `Unknown` for
-/// anything else.
-fn failure_verdict(current: &str, kind: &str) -> String {
-    if current != "ContentOk" {
-        return current.to_string();
-    }
-    match kind {
-        "walled" => "Blocked".to_string(),
-        _ => "Unknown".to_string(),
-    }
-}
-
-/// Advice for a browser-pass failure envelope: an unsettled document
-/// waits, a deadline stall gets real deadline advice (retrying the
-/// same way will not pass a wall), everything else derives from the
-/// verdict/kind.
-fn browser_failure_next_action(
-    failed_verdict: &str,
-    deadline_stall: bool,
-    gate: Option<Verdict>,
-    status: u16,
-    kind: &str,
-) -> String {
-    if failed_verdict == "Incomplete" {
-        "retry with a wait for expected content; the browser document did not settle".to_string()
-    } else if deadline_stall {
-        "the browser pass hit its deadline before usable content : retry with a higher deadline_ms, or tier=1 for the plain-HTTP view; if it repeats, choose another source".to_string()
-    } else {
-        next_action_for(gate, status, kind)
-    }
-}
+/// `max_chars` when the caller sets none: one page.
+pub(super) const MAX_CHARS_DEFAULT: usize = 16_000;
+/// `max_chars` when the caller sets none: the total of a URL batch.
+pub(super) const BATCH_MAX_CHARS_DEFAULT: usize = 48_000;
+const MAX_CHARS_MIN: usize = 200;
+const MAX_CHARS_MAX: usize = 1_048_576;
+/// The most document one read extracts before any view applies. A larger
+/// document is cut here, and its views say part of it was not read.
+const DOCUMENT_MAX_CHARS: usize = 8 * 1_048_576;
 
 #[cfg(test)]
-mod browser_failure_advice_tests {
-    use super::browser_failure_next_action;
-
-    // The TikTok report: a browser pass that hit its deadline answered
-    // "check this host from another network" : an invented network
-    // fault. A deadline stall must give deadline advice instead.
-    #[test]
-    fn a_deadline_stall_gets_deadline_advice_not_network_advice() {
-        let action = browser_failure_next_action("Unknown", true, None, 0, "transient");
-        assert!(action.contains("deadline_ms"), "{action}");
-        assert!(!action.contains("another network"), "{action}");
-    }
-
-    #[test]
-    fn an_unsettled_document_keeps_its_wait_advice() {
-        let action = browser_failure_next_action("Incomplete", false, None, 200, "transient");
-        assert!(action.contains("did not settle"), "{action}");
-    }
-
-    #[test]
-    fn a_genuine_transient_keeps_the_network_advice() {
-        let action = browser_failure_next_action("Unknown", false, None, 0, "transient");
-        assert!(action.contains("network"), "{action}");
-    }
-}
-
-#[cfg(test)]
-mod shot_path_tests {
-    use super::shot_path_error;
-    use serde_json::json;
-
-    // V11: parse-time refusal of invalid `shot` destinations.
-    #[test]
-    fn invalid_shot_paths_are_refused_at_parse() {
-        for (shot, want) in [
-            ("/tmp/v11-outside.png", "outside"),
-            ("../evil.png", "traversal"),
-            ("", "empty"),
-            ("a\0b.png", "NUL"),
-        ] {
-            let error = shot_path_error(&json!({"shot": shot}))
-                .unwrap_or_else(|| panic!("{shot:?} must be refused"));
-            let sc = &error["structuredContent"];
-            assert_eq!(sc["code"], "shot.invalid", "{shot:?}");
-            assert_eq!(sc["ok"], false, "{shot:?}");
-            assert_eq!(error["isError"], false, "{shot:?}");
-            assert!(
-                sc["next_action"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("screenshots"),
-                "{shot:?}"
-            );
-            let text = error["content"][0]["text"].as_str().unwrap_or("");
-            assert!(text.contains(want), "{shot:?}: {text}");
-            let shot_field = &sc["shot"];
-            assert_eq!(shot_field["requested"].as_str(), Some(shot), "{shot:?}");
-            assert!(shot_field["saved_to"].is_null(), "{shot:?}");
-            assert!(
-                shot_field["reason"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("rejected"),
-                "{shot:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn valid_shot_paths_pass_the_parse_gate() {
-        assert!(shot_path_error(&json!({})).is_none());
-        assert!(shot_path_error(&json!({"shot": 5})).is_none());
-        assert!(shot_path_error(&json!({"shot": "v11-out.png"})).is_none());
-        let inside = crate::paths::screenshots_dir().join("sub").join("ok.png");
-        assert!(shot_path_error(&json!({"shot": inside.to_str().unwrap()})).is_none());
-    }
-}
-
-#[cfg(test)]
-mod shot_receipt_tests {
-    use super::add_shot_receipt;
-    use serde_json::json;
-
-    fn reason_of(result: &serde_json::Value) -> String {
-        result["structuredContent"]["shot"]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    // The 4chan report: a learned solve-cooldown refusal and a real
-    // browser failure shared one ambiguous string. Each cause now
-    // names itself.
-    #[test]
-    fn a_learned_solve_cooldown_names_itself() {
-        let mut result = json!({"structuredContent": {"ok": false, "retry_in_secs": 900}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("solve-cooldown"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_deadline_names_itself() {
-        let mut result = json!({"structuredContent": {"ok": false, "code": "deadline.hit"}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("deadline"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_browser_failure_names_itself() {
-        let mut result = json!({"structuredContent": {"ok": false, "code": "browser.transport"}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("browser pass failed"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_success_without_a_capture_says_no_capture_was_needed() {
-        let mut result = json!({"structuredContent": {"ok": true}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("no interactive captcha"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn an_unclassified_failure_keeps_the_generic_reason() {
-        let mut result = json!({"structuredContent": {"ok": false, "code": "content.notfound"}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("fetch failed"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_recorded_outcome_beats_the_reason_guessing() {
-        let mut result = json!({"structuredContent": {"ok": false}});
-        add_shot_receipt(
-            &json!({"shot": "/tmp/cap.png"}),
-            &mut result,
-            &[json!({"action": "screenshot", "outcome": "saved: /tmp/cap.png"})],
-        );
-        assert!(
-            reason_of(&result).contains("saved"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-}
-
-#[cfg(test)]
-mod failure_verdict_tests {
+mod fetch_batch_tests {
     // Nextest isolates daemon state. Match the production runtime's 8 MiB
     // stack: the unoptimized fetch future exceeds libtest's 2 MiB default.
     #[test]
@@ -534,48 +162,10 @@ mod failure_verdict_tests {
             .join()
             .unwrap();
     }
-
-    use super::failure_verdict;
-
-    #[test]
-    fn a_failure_never_reports_content_ok() {
-        // #258: a walled fetch reported `"verdict": "ContentOk"` beside
-        // `"code": "wall.captcha"`. ContentOk is the success path's
-        // default, and no failure may inherit it.
-        assert_eq!(failure_verdict("ContentOk", "walled"), "Blocked");
-        assert_eq!(failure_verdict("ContentOk", "permanent"), "Unknown");
-        assert_eq!(failure_verdict("ContentOk", "transient"), "Unknown");
-    }
-
-    #[test]
-    fn a_failure_keeps_a_verdict_the_run_actually_earned() {
-        // Tier 1 hit the wall and the ghost could not clear it: the
-        // challenge is what happened, and it stays reported rather than
-        // being flattened to Blocked.
-        assert_eq!(
-            failure_verdict("Challenge(Cloudflare)", "walled"),
-            "Challenge(Cloudflare)"
-        );
-        assert_eq!(failure_verdict("SoftNotFound", "permanent"), "SoftNotFound");
-    }
-}
-
-fn fetch_url_shape_error(raw: &str) -> Option<Value> {
-    raw.trim_start().starts_with('[').then(|| tool_error_structured(
-        "fetch: url looks like a stringified array (one string, not a list)",
-        "permanent",
-        Some(json!({
-            "code": "fetch.invalid",
-            "next_action": "pass a real JSON array of up to 12 URL/handle strings, or one http(s) URL/handle per call; do not encode the array inside a string",
-        })),
-    ))
 }
 
 pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result<String, Value> {
     let raw = raw.trim();
-    if let Some(error) = fetch_url_shape_error(raw) {
-        return Err(error);
-    }
     let raw = raw
         .strip_prefix('@')
         .filter(|id| crate::handles::is_handle(id))
@@ -614,25 +204,21 @@ pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result
     ))
 }
 
-/// Batch fetch (v3): parallel single-fetches composed into one
-/// result under an optional shared token budget. Small pages stay
-/// whole; the budget slices proportional to size, never below a
-/// floor. All-failed = honest error; partial = composed result
-/// with per-URL status.
+/// Batch fetch: parallel single fetches composed into one result under
+/// the shared `budget` of characters. Small pages stay whole; the budget
+/// slices proportional to size, never below a floor. All-failed = honest
+/// error; partial = composed result with per-URL status.
 pub(super) async fn fetch_multi(
     daemon: &Arc<Daemon>,
     args: &Value,
     urls: Vec<String>,
-    budget_tokens: Option<usize>,
+    budget: usize,
     deadline: Option<std::time::Duration>,
     ctx: Option<ToolCtx>,
 ) -> Value {
-    // Under a budget, let each fetch run up to the whole budget
-    // (slicing happens in composition); without one, defaults rule.
+    // Each fetch may use the whole budget; composition slices.
     let mut call_args = args.clone();
-    if let Some(b) = budget_tokens {
-        call_args["max_chars"] = json!(b * 4);
-    }
+    call_args["max_chars"] = json!(budget);
     let progress_parts = ctx.as_ref().map(|c| c.progress_parts());
     // Cancellation must reach every sub-fetch: the batch used to
     // drop the ctx entirely, so a cancelled 12-URL batch kept
@@ -654,8 +240,7 @@ pub(super) async fn fetch_multi(
             async move {
                 let url = match resolve_fetch_url(&d, &requested).await {
                     Ok(url) => url,
-                    Err(mut error) => {
-                        add_shot_receipt(&a, &mut error, &[]);
+                    Err(error) => {
                         return (requested, error);
                     }
                 };
@@ -697,17 +282,9 @@ pub(super) async fn fetch_multi(
         .map(|r| if is_err(r) { None } else { Some(md_of(r)) })
         .collect();
     let mut sliced_flags = vec![false; results.len()];
-    if let Some(budget_tok) = budget_tokens {
-        slice_batch_markdowns(
-            &urls,
-            &results,
-            &mut markdowns,
-            budget_tok,
-            &mut sliced_flags,
-        );
-    }
+    slice_batch_markdowns(&urls, &results, &mut markdowns, budget, &mut sliced_flags);
 
-    render_fetch_batch(&urls, &results, &markdowns, budget_tokens, &sliced_flags)
+    render_fetch_batch(&urls, &results, &markdowns, budget, &sliced_flags)
 }
 
 /// Compose a batch without repeating page evidence or transport telemetry on
@@ -717,7 +294,7 @@ pub(super) fn render_fetch_batch(
     urls: &[String],
     results: &[Value],
     markdowns: &[Option<String>],
-    budget_tokens: Option<usize>,
+    budget: usize,
     sliced_flags: &[bool],
 ) -> Value {
     debug_assert_eq!(urls.len(), results.len());
@@ -766,7 +343,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["shot", "budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part", "filters_skipped"] {
+                for field in ["budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "must_contain", "focus", "section", "next_page"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -794,7 +371,7 @@ pub(super) fn render_fetch_batch(
             if is_err(r) {
                 o["content_ok"] = json!(false);
                 o["content_complete"] = json!(false);
-                for field in ["shot", "read_status", "next_action"] {
+                for field in ["read_status", "next_action"] {
                     if let Some(value) = r["structuredContent"].get(field) {
                         o[field] = value.clone();
                     }
@@ -835,7 +412,7 @@ pub(super) fn render_fetch_batch(
         .map(|(index, result)| {
             let fetch_debug = &result["_meta"]["com.donsetch/fetch-debug"];
             let mut item = json!({"url": urls[index]});
-            for field in ["tier", "tokens_est"] {
+            for field in ["fetch", "tokens_est"] {
                 if let Some(value) = fetch_debug.get(field)
                     && !value.is_null()
                 {
@@ -847,7 +424,7 @@ pub(super) fn render_fetch_batch(
         .collect::<Vec<_>>();
     let debug = json!({
         "count": results.len(),
-        "budget_tokens": budget_tokens,
+        "max_chars": budget,
         "results": debug_results,
     });
 
@@ -940,10 +517,9 @@ pub(super) fn slice_batch_markdowns(
     urls: &[String],
     results: &[Value],
     markdowns: &mut [Option<String>],
-    budget_tokens: usize,
+    budget_chars: usize,
     sliced_flags: &mut [bool],
 ) {
-    let budget_chars = budget_tokens.saturating_mul(4);
     let lens: Vec<usize> = markdowns
         .iter()
         .map(|m| m.as_ref().map(|s| s.len()).unwrap_or(0))
@@ -1026,7 +602,7 @@ pub(super) fn slice_batch_markdowns(
     }
 }
 
-fn fetch_input(args: &Value, url: &str) -> Result<url::Url, Value> {
+fn fetch_input(url: &str) -> Result<url::Url, Value> {
     // Full parse up front: an unparseable URL would otherwise flow
     // through the whole pipeline with host="" : poisoning domain
     // profiles and producing confusing late errors.
@@ -1051,94 +627,147 @@ fn fetch_input(args: &Value, url: &str) -> Result<url::Url, Value> {
             })),
         ));
     }
-    if let Some(selector) = args.get("selector").and_then(Value::as_str)
-        && scraper::Selector::parse(selector).is_err()
-    {
-        return Err(tool_error_structured(
-            format!("invalid CSS selector: {selector}"),
-            "permanent",
-            Some(json!({
-                "url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax",
-            })),
-        ));
-    }
     Ok(parsed_url)
 }
 
-fn fetch_read_options(args: &Value) -> Result<ExtractOptions, Value> {
-    let mut opts = ExtractOptions::default();
-    let preset = match args.get("mode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(m)) if m == "scan" => Some(800),
-        Some(Value::String(m)) if m == "read" => Some(4_000),
-        Some(Value::String(m)) if m == "deep" => Some(16_000),
-        _ => return Err(tool_error("fetch: mode must be scan, read or deep")),
+/// An argument mistake: permanent, named, before anything is fetched.
+fn args_error(message: impl Into<String>, next_action: &str) -> Value {
+    tool_error_structured(
+        message.into(),
+        "permanent",
+        Some(json!({"code": "fetch.args", "next_action": next_action})),
+    )
+}
+
+/// How a call wants the page's links: as text only, as short handles that
+/// `url` accepts, or as the real addresses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LinkMode {
+    Off,
+    Handles,
+    Urls,
+}
+
+pub(super) fn link_mode(args: &Value) -> LinkMode {
+    match args.get("links") {
+        Some(Value::Bool(true)) => LinkMode::Urls,
+        Some(Value::String(mode)) if mode == "urls" => LinkMode::Urls,
+        Some(Value::String(mode)) if mode == "handles" => LinkMode::Handles,
+        _ => LinkMode::Off,
+    }
+}
+
+/// The extraction options and the agent's view, from the call's arguments.
+/// Extraction always reads the whole document; the view projects it.
+pub(super) fn fetch_view(args: &Value) -> Result<(ExtractOptions, extract::view::View), Value> {
+    use extract::view::{MUST_CONTAIN_MAX_TERMS, Term, View};
+    let opts = ExtractOptions {
+        include_links: link_mode(args) != LinkMode::Off,
+        link_urls: link_mode(args) == LinkMode::Urls,
+        max_chars: Some(DOCUMENT_MAX_CHARS),
+        ..ExtractOptions::default()
     };
-    opts.faithful = match args.get("faithful") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(value)) => *value,
-        _ => return Err(tool_error("fetch: faithful must be a boolean")),
+    let text = |name: &str| {
+        args.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
     };
-    if opts.faithful
-        && (args.get("focus").and_then(Value::as_str).is_some()
-            || args.get("must_contain").and_then(Value::as_str).is_some()
-            || args.get("toc").and_then(Value::as_bool) == Some(true)
-            || args.get("since_last").and_then(Value::as_bool) == Some(true))
-    {
-        return Err(tool_error(
-            "fetch: faithful cannot be combined with focus, toc, must_contain or since_last; use selector or section to choose the body",
+    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+    let raw_terms: Vec<String> = match args.get("must_contain") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(one)) => vec![one.clone()],
+        Some(Value::Array(many)) => many
+            .iter()
+            .map(|v| v.as_str().map(String::from))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                args_error(
+                    "must_contain: every term must be a string",
+                    "pass a string or an array of strings",
+                )
+            })?,
+        Some(_) => {
+            return Err(args_error(
+                "must_contain must be a string or an array of strings",
+                "pass a string or an array of strings",
+            ));
+        }
+    };
+    if raw_terms.len() > MUST_CONTAIN_MAX_TERMS {
+        return Err(args_error(
+            format!("must_contain takes at most {MUST_CONTAIN_MAX_TERMS} terms"),
+            "split the terms over several calls",
         ));
     }
-    opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
-    opts.max_chars = args
-        .get("max_chars")
-        .and_then(Value::as_u64)
-        .map(|n| (n as usize).clamp(200, 1_048_576))
-        .or(preset);
-    opts.offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(1_000_000_000) as usize;
-    opts.section = args
-        .get("section")
-        .and_then(Value::as_str)
-        .map(String::from);
-    opts.selector = args
-        .get("selector")
-        .and_then(Value::as_str)
-        .map(String::from);
-    opts.toc = args.get("toc").and_then(Value::as_bool).unwrap_or(false);
-    opts.include_links = args.get("links").and_then(Value::as_bool).unwrap_or(false);
-    opts.include_media = args.get("media").and_then(Value::as_bool).unwrap_or(false);
-    opts.must_contain = args
-        .get("must_contain")
-        .and_then(Value::as_str)
-        .map(String::from);
-    Ok(opts)
+    let must_contain = raw_terms
+        .iter()
+        .map(|t| Term::parse(t))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| args_error(e, "fix the term: a phrase, or a /regex/ with valid syntax"))?;
+    let view = View {
+        focus: text("focus"),
+        section: text("section"),
+        toc: flag("toc"),
+        must_contain,
+        offset: args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(1_000_000_000) as usize,
+        max_chars: args
+            .get("max_chars")
+            .and_then(Value::as_u64)
+            .map_or(MAX_CHARS_DEFAULT, |n| {
+                (n as usize).clamp(MAX_CHARS_MIN, MAX_CHARS_MAX)
+            }),
+    };
+    // Each view answers one question; a combination that would silently
+    // drop one of them is refused instead.
+    let probe = !view.must_contain.is_empty();
+    let conflict = |a: &str, b: &str| {
+        args_error(
+            format!("{a} and {b} cannot be combined"),
+            &format!("drop {b}, or make a second call for it"),
+        )
+    };
+    if probe {
+        for (set, name) in [
+            (view.focus.is_some(), "focus"),
+            (view.toc, "toc"),
+            (view.offset > 0, "offset"),
+            (flag("since_last"), "since_last"),
+        ] {
+            if set {
+                return Err(conflict("must_contain", name));
+            }
+        }
+    }
+    if view.toc && view.focus.is_some() {
+        return Err(conflict("toc", "focus"));
+    }
+    if flag("since_last") {
+        for (set, name) in [
+            (view.focus.is_some(), "focus"),
+            (view.section.is_some(), "section"),
+            (view.toc, "toc"),
+            (view.offset > 0, "offset"),
+        ] {
+            if set {
+                return Err(conflict("since_last", name));
+            }
+        }
+    }
+    Ok((opts, view))
 }
 
 /// Fetch one live URL on a route selected once for the whole call.
 pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
-    let parsed_url = match fetch_input(args, url) {
+    let parsed_url = match fetch_input(url) {
         Ok(parsed) => parsed,
         Err(error) => return error,
     };
-    // A rule's tier acts exactly as if the caller had passed it, so it
-    // replaces the argument before anything reads it. Evaluated once, on
-    // the caller's URL: the fallbacks re-enter `fetch_single_inner` with
-    // clones of these arguments and inherit the pin.
-    let pinned_args = rule_pinned_args(args, crate::rules::rules(), &parsed_url);
-    let args = pinned_args.as_ref().unwrap_or(args);
-    if let Err(error) = fetch_read_options(args) {
-        return error;
-    }
-    let archive = match args.get("archive").and_then(Value::as_str) {
-        Some("off") => "off",
-        Some("only") => "only",
-        _ => "auto",
-    };
-    let budget = Budget::of(args);
     // Preserve persona binding before the pool pick, then freeze that route
     // for the entire call. A related adapter host cannot bind another lane.
     let route = {
@@ -1151,123 +780,9 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     };
     let call = FetchCall {
         route,
-        budget,
-        session_stamp: crate::ghost::cache::disk_session_stamp()
-            .unwrap_or_else(|| "legacy:0".into()),
+        session_stamp: crate::state::disk_session_stamp().unwrap_or_else(|| "legacy:0".into()),
     };
-    if archive == "only" {
-        let no_live = tool_error(format!("archive=only : skipping live fetch for {url}"));
-        return match try_resurrect(daemon, args, url, &no_live, &call.route).await {
-            Ok(v) => v,
-            Err(f) => resurrect_error(url, &f),
-        };
-    }
-    let result = Box::pin(fetch_single_inner(daemon, args, url, &call)).await;
-    if archive == "off" || !is_failure(&result) {
-        return result;
-    }
-    // Resurrectable failures only: dead pages, hard walls, and
-    // transport-level death (TLS handshake against a parked domain,
-    // DNS gone, port closed) : the archetypal dead links. Ambiguous
-    // transients : timeouts, resets, protocol errors : stay
-    // excluded : a snapshot would launder an unknown into fake
-    // certainty, and a reset can be an IP-level block that a
-    // snapshot must never paper over.
-    let transport_dead = result
-        .pointer("/structuredContent/fetch_error")
-        .and_then(Value::as_str)
-        .is_some_and(|k| matches!(k, "tls" | "dns" | "refused"));
-    let resurrectable = result
-        .pointer("/structuredContent/verdict")
-        .and_then(Value::as_str)
-        .is_some_and(|v| matches!(v, "SoftNotFound" | "Paywall" | "Challenge" | "AuthWall"))
-        || result
-            .pointer("/structuredContent/status")
-            .and_then(Value::as_u64)
-            .is_some_and(|s| s == 404 || s == 410)
-        || transport_dead;
-    if !resurrectable {
-        return result;
-    }
-    match try_resurrect(daemon, args, url, &result, &call.route).await {
-        Ok(v) => v,
-        Err(f) => {
-            // The original live error stands as the primary answer;
-            // the archive attempt is recorded as context so a silent
-            // snapshot-side failure is visible in the payload.
-            let mut result = result;
-            if let Some(obj) = result
-                .pointer_mut("/structuredContent")
-                .and_then(Value::as_object_mut)
-            {
-                obj.insert("archive_stage".into(), json!(f.stage.tag()));
-            }
-            result
-        }
-    }
-}
-
-/// Build the archive=only error from the exact stage resurrection
-/// gave up at. "Never archived" is claimed ONLY when both indexes
-/// (availability + CDX) were consulted and answered empty :
-/// unreachable archives and found-but-unusable snapshots get their
-/// own honest messages.
-fn resurrect_error(url: &str, f: &ResurrectError) -> Value {
-    let tag = f.stage.tag();
-    match &f.stage {
-        ResurrectStage::LookupUnreachable => tool_error_structured(
-            format!("archive: Wayback Machine unreachable for {url}"),
-            "transient",
-            Some(json!({
-                "url": url,
-                "archive_stage": tag,
-                "next_action": "the archive lookup failed : retry, or try web_search for a live alternative",
-            })),
-        ),
-        ResurrectStage::NoSnapshot => tool_error_structured(
-            format!("archive: no Wayback snapshot found for {url}"),
-            "permanent",
-            Some(json!({
-                "url": url,
-                "archive_stage": tag,
-                "next_action": "the URL was never archived : try web_search for a live alternative",
-            })),
-        ),
-        _ => {
-            let snap = f.snapshot_url.clone().unwrap_or_default();
-            tool_error_structured(
-                format!("archive: Wayback snapshot found but unusable ({tag}) for {url}"),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "archive_stage": tag,
-                    "snapshot_url": snap,
-                    "next_action": format!("a snapshot exists but could not be served : inspect it at {snap} or try web_search for a live alternative"),
-                })),
-            )
-        }
-    }
-}
-
-/// `args` with `tier` replaced by the tier the winning rule for `url`
-/// imposes (see [`rule_tier`]), or `None` when no rule changes it.
-fn rule_pinned_args(args: &Value, rules: &crate::rules::RuleSet, url: &url::Url) -> Option<Value> {
-    let winner = rules.eval(url)?;
-    let tier = rule_tier(args.get("tier").and_then(Value::as_str), &winner.rule)?;
-    let mut pinned = args.clone();
-    pinned["tier"] = json!(tier);
-    Some(pinned)
-}
-
-/// The tier a rule imposes on a call, or `None` when the call keeps the
-/// tier it asked for. `requested` is the call's validated `tier`
-/// argument (`None` when absent, read as `auto`). A rule without a
-/// `tier` imposes nothing; an advisory rule applies only to `auto`; a
-/// rule with `tier_enforce` overrides an explicit tier as well.
-fn rule_tier(requested: Option<&str>, rule: &crate::rules::UrlRule) -> Option<&'static str> {
-    let tier = rule.tier?;
-    let explicit = requested.is_some_and(|t| t != "auto");
-    (!explicit || rule.tier_enforce).then_some(tier.as_str())
+    Box::pin(fetch_single_inner(daemon, args, url, &call)).await
 }
 
 /// v3 F3: find the rel=next pagination link (rel may carry other
@@ -1293,162 +808,26 @@ pub(super) fn find_rel_next(html: &str, base: &str) -> Option<String> {
     None
 }
 
-/// Strip a part's frontmatter (title line, URL line, description
-/// line) : stitched parts share the article's chrome, and the
-/// `*(part N)*` marker already carries the context.
-pub(super) fn strip_part_frontmatter(md: &str) -> String {
-    let lines: Vec<&str> = md.lines().collect();
-    let mut start = 0;
-    if lines.first().is_some_and(|l| l.starts_with("# ")) {
-        start = 1;
-    }
-    if lines.get(start).is_some_and(|l| l.starts_with("http")) {
-        start += 1;
-    }
-    if lines.get(start).is_some_and(|l| l.starts_with("> ")) {
-        start += 1;
-    }
-    lines[start..].join("\n").trim().to_string()
+fn fetch_url_rewrite(url: &url::Url, no_adapter: bool) -> Option<(String, &'static str)> {
+    crate::adapters::rewrite(url).filter(|_| !no_adapter)
 }
 
-fn fetch_url_rewrite(
-    url: &url::Url,
-    args: &Value,
-    no_adapter: bool,
-) -> Option<(String, &'static str)> {
-    crate::adapters::rewrite(url).filter(|(_, name)| {
-        !no_adapter
-            && args.get("faithful").and_then(Value::as_bool) != Some(true)
-            && args.get("tier").and_then(Value::as_str) != Some("2")
-            && args
-                .get("actions")
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty)
-            && (args.get("section").and_then(Value::as_str).is_none()
-                || *name == "adapter:stackexchange-api")
-            && args.get("selector").and_then(Value::as_str).is_none()
-    })
-}
-
-/// Whether a tier-1 verdict means the ADAPTER rewrite bought
+/// Whether a failed verdict means the ADAPTER rewrite bought
 /// nothing: every non-content verdict, a challenge included. The
 /// adapter is an optimization the caller never asked for, and
-/// adapter endpoints never route to the browser (a `.json` page in
-/// a browser is useless), so a refusal there must retry the page
-/// the caller asked for (#287: every reddit fetch died on a single
-/// `.json` 403 with no browser pass and a one-step trail).
+/// adapter endpoints never render (a `.json` page in a browser is
+/// useless), so a refusal there must retry the page the caller
+/// asked for (#287: every reddit fetch died on a single `.json`
+/// 403 with no second hop and a one-step trail).
 fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) -> bool {
     adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
 }
 
-// Reddit adapter/session recovery earns an HTTP recheck after initialization.
-// Its saved wall memory must not skip that recovery. Other hosts retain their
-// learned cooldown; explicit browser requests keep precedence.
-// v4.7 V03: JSON data endpoints (reddit `.json`, API dumps) are always Cold:
-// like PDFs, a browser pass cannot improve a raw payload.
-fn fetch_route(
-    state: &crate::ghost::cache::GhostState,
-    host: &str,
-    tier: &str,
-    is_pdf_url: bool,
-    is_json_url: bool,
-    adapter_host: bool,
-    retry_http: bool,
-) -> RouteDecision {
-    if tier == "2" && !is_pdf_url && !is_json_url && !adapter_host {
-        RouteDecision::SkipToSolve
-    } else if tier == "1"
-        || is_pdf_url
-        || is_json_url
-        || adapter_host
-        || (retry_http && matches!(host, "www.reddit.com" | "reddit.com"))
-    {
-        RouteDecision::Cold
-    } else {
-        state.route_for(host)
-    }
-}
-
-/// One legacy-host navigation to seed the reddit session (#291
-/// follow-through): any old.reddit.com response runs its login
-/// flow and seeds the cookies `www.reddit.com` needs before it
-/// serves the real SSR page instead of the humanity interstitial
-/// or the JS shell. The body is discarded; the side effect is the
-/// cookie jar. Returns whether a navigation actually ran.
-async fn reddit_session_hop(
-    daemon: &Arc<Daemon>,
-    u: &url::Url,
-    trace: &mut Trace,
-    route: &RequestRoute,
-) -> bool {
-    let Some(oldu) = crate::adapters::reddit_session_url(u) else {
-        return false;
-    };
-    let t0 = std::time::Instant::now();
-    let hop = daemon
-        .fetcher
-        .fetch_persona_on_route(&oldu, None, Some(route))
-        .await;
-    trace.step(
-        "1",
-        "reddit-session",
-        &format!("status={}", hop.as_ref().map_or(0, |o| o.status)),
-        t0.elapsed().as_millis(),
-    );
-    true
-}
-
-/// Reddit's anonymous identity cookie, `loid`, is the gate for the
-/// direct `.json` endpoint (verified live: loid alone serves the
-/// listing, absent it is refused). When the jar already carries it
-/// the pre-emptive legacy-host hop is a redundant request; without
-/// it the hop is what seeds a session. A refusal on a direct
-/// attempt still runs the one-shot session fallback, so a stale
-/// loid self-heals.
-fn reddit_session_live(cookies: &[CookieRecord]) -> bool {
-    cookies.iter().any(|c| c.name == "loid")
-}
-
-async fn reddit_session_fallback(
-    daemon: &Arc<Daemon>,
-    args: &Value,
-    url: &str,
-    trace: &mut Trace,
-    call: &FetchCall,
-) -> Value {
-    let hop_done = match url::Url::parse(url) {
-        Ok(pu) => reddit_session_hop(daemon, &pu, trace, &call.route).await,
-        Err(_) => false,
-    };
-    let prior = trace.value().as_array().cloned().unwrap_or_default();
-    let mut args2 = args.clone();
-    args2["_reddit_session"] = json!(true);
-    let mut res = Box::pin(fetch_single_inner(daemon, &args2, url, call)).await;
-    if let Some(sc) = res.pointer_mut("/structuredContent") {
-        sc["reddit_session"] = json!(hop_done);
-    }
-    fold_trace_into_result(&mut res, prior);
-    res
-}
-
-/// A reddit page refusal at tier 1 that one session-init retry can
-/// fix (the content host serves the humanity page or the JS shell
-/// to a sessionless client). Never twice (`_reddit_session`
-/// guard), never off the content host.
-fn reddit_session_retry_eligible(verdict: &Verdict, host: &str, args: &Value) -> bool {
-    matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked)
-        && matches!(host, "www.reddit.com" | "reddit.com")
-        && !args
-            .get("_reddit_session")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-}
-
 /// Retry the caller's URL without the adapter rewrite, and fold the
-/// adapter hop's trail in front of the retry's so the escalation
-/// reads as ONE ladder rather than two unrelated hops. The retry
-/// runs the full generic pipeline, which escalates on its own
-/// rules (HTML fetch, ghost, cookie retry).
+/// adapter hop's trail in front of the retry's so the trail reads
+/// as ONE story rather than two unrelated hops. The retry runs the
+/// full generic pipeline, which handles walls on its own rules
+/// (HTML fetch, cookie retry, the optional unlocker).
 #[allow(clippy::too_many_arguments)]
 async fn adapter_fallback(
     daemon: &Arc<Daemon>,
@@ -1457,15 +836,11 @@ async fn adapter_fallback(
     trace: &mut Trace,
     action: &str,
     why: &str,
-    session_seeded: bool,
     call: &FetchCall,
 ) -> Value {
     trace.step("adapter", action, why, 0);
-    // Try the public page before spending a session-init request. A blocked
-    // or thin Reddit page still gets the existing one-hop session recovery.
-    // Legacy-host caller URLs retry on the content host: `old.`/
-    // `np.` serve a login wall to anonymous clients, so the retry
-    // there could never succeed.
+    // Legacy-host caller URLs retry on the content host: `old.`/`np.` serve a
+    // login wall to anonymous clients, so the retry there could never succeed.
     let retry_url = url::Url::parse(orig_url)
         .ok()
         .and_then(|u| crate::adapters::reddit_content_url(&u))
@@ -1476,7 +851,6 @@ async fn adapter_fallback(
     };
     let mut args2 = args.clone();
     args2["_no_adapter"] = json!(true);
-    args2["_reddit_session"] = json!(session_seeded);
     let mut res = Box::pin(fetch_single_inner(daemon, &args2, &retry_url, call)).await;
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["adapter_fallback"] = json!(true);
@@ -1519,8 +893,7 @@ async fn fetch_single_inner(
     call: &FetchCall,
 ) -> Value {
     let t0 = std::time::Instant::now();
-    let budget = call.budget;
-    let parsed_url = match fetch_input(args, url) {
+    let parsed_url = match fetch_input(url) {
         Ok(parsed) => parsed,
         Err(error) => return error,
     };
@@ -1528,7 +901,7 @@ async fn fetch_single_inner(
 
     // Domain intelligence (v3): the adapters registry may rewrite
     // the URL to the site's own structured endpoint (reddit .json,
-    // npm/PyPI/crates/Go/RubyGems APIs) : one cheap tier-1 request
+    // npm/PyPI/crates/Go/RubyGems APIs) : one cheap local request
     // for structured truth. `orig_url` stays the agent-facing
     // identity: history, handles, and display key on it.
     let no_adapter = args
@@ -1537,7 +910,7 @@ async fn fetch_single_inner(
         .unwrap_or(false);
     let orig_url = url.to_string();
     let adapter_used: Option<&'static str>;
-    let url = match fetch_url_rewrite(&parsed_url, args, no_adapter) {
+    let url = match fetch_url_rewrite(&parsed_url, no_adapter) {
         Some((new_url, name)) => {
             adapter_used = Some(name);
             new_url
@@ -1552,7 +925,7 @@ async fn fetch_single_inner(
     let adapter_host = adapter_used.is_some();
 
     // Centralized SSRF guard (sync part): scheme, credentials, localhost/private literals.
-    // DNS-resolved private addresses are checked at transport/browser layers.
+    // DNS-resolved private addresses are checked at the transport layer.
     if let Err(e) = crate::fetch::guards::validate_url_basic(&url) {
         // A rule on the rewrite target: the SSRF advice below would
         // replace the operator's message.
@@ -1568,8 +941,8 @@ async fn fetch_single_inner(
             })),
         );
     }
-    let mut opts = match fetch_read_options(args) {
-        Ok(opts) => opts,
+    let (opts, view) = match fetch_view(args) {
+        Ok(parsed) => parsed,
         Err(error) => return error,
     };
     let image_text = args
@@ -1580,74 +953,31 @@ async fn fetch_single_inner(
         .get("since_last")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let stitch = args.get("stitch").and_then(Value::as_bool).unwrap_or(false);
-    let output_opts = opts.clone();
-    if stitch && opts.must_contain.is_none() && !opts.toc {
-        opts.max_chars = Some(1_048_576);
-        opts.offset = 0;
-        if output_opts.offset >= 1_048_576 {
-            return tool_error(
-                "fetch: stitched offset exceeds the 1 MiB article collection limit; use the returned next_part URL and offset",
-            );
-        }
-    }
-    let tier = args.get("tier").and_then(Value::as_str).unwrap_or("auto");
-    let shot = args.get("shot").and_then(Value::as_str);
 
-    // === v2: fetch-actions : browser control INSIDE fetch ===
-    // A non-empty `actions` array routes the whole call to the
-    // ghost with an action executor: navigate → act → extract.
-    // Parsing/validation happens before any browser time is
-    // spent; a typo in step 5 must not burn a launch on step 1.
-    let actions = match args.get("actions") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(v) => match crate::ghost::actions::parse(v) {
-            Ok(a) => a,
-            Err(e) => return tool_error(format!("fetch: {e}")),
-        },
-    };
-    if !actions.is_empty() {
-        if is_pdf_url_like(&url) {
-            return tool_error(
-                "fetch: actions cannot run on PDFs : fetch the PDF directly instead",
-            );
-        }
-        if tier == "1" {
-            return tool_error(
-                "fetch: actions need the browser : use tier=auto (default) or tier=2",
-            );
-        }
-        return fetch_with_actions(
-            daemon, &url, &url_host, &opts, &actions, shot, image_text, call,
-        )
-        .await;
+    // v5: `actions` was removed with the browser tier. The spec layer
+    // answers it first (like `tier`); this guard is the layer under it.
+    if args.get("actions").is_some_and(|v| !v.is_null()) {
+        return tool_error(
+            "fetch: actions was removed: every web_fetch runs the local engine, with no browser drive",
+        );
     }
 
     let host = url_host;
 
     // === PDF early detection ===
-    // Ghost can't render PDFs (Chrome's PDF viewer is a JS shell).
-    // If the URL looks like a PDF, always fetch raw bytes (tier 1)
-    // and route to the DonSheet engine. Never skip tier 1 for PDFs.
-    // Uses the SAME helper as the actions guard : covers both the
-    // `.pdf` suffix and the `/pdf/` path convention (arXiv serves
-    // PDFs at /pdf/1706.03762 with no extension).
-    let is_pdf_url = is_pdf_url_like(&url);
+    // If the URL looks like a PDF, always fetch raw bytes and route
+    // to the DonSheet engine. The check covers both the `.pdf`
+    // suffix and the `/pdf/` path convention (arXiv serves PDFs at
+    // /pdf/1706.03762 with no extension).
+    let is_pdf_url = crate::fetch::guards::is_pdf_url_like(&url);
     // v4.7 V03: JSON data endpoints (`reddit .json`, API dumps) are
-    // terminal at the HTTP tier : a browser cannot improve a
+    // terminal at the local fetch : no further pass can improve a
     // structured payload. Same class PDFs and adapter endpoints
     // already follow.
     let is_json_url = is_json_url_like(&url);
 
-    // === Decision: how to route this fetch? ===
-    // The self-improving loop: the domain profile decides
-    // cold / warm / skip-to-solve / recheck-cold.
-    // Adapter endpoints (reddit .json, package registry APIs) are
-    // plain-GET structured targets : never
-    // need a browser. Force Cold even if a stale profile says
-    // SkipToSolve (from a previous Xvfb failure that poisoned
-    // the domain).
-    // Remember the real origin scheme (v4 phase 0.2: the prober
+    // === Domain state before the fetch ===
+    // Remember the real origin scheme (the prober
     // probes the origin, not a guessed https upgrade).
     {
         let scheme = if url.starts_with("http://") {
@@ -1661,127 +991,41 @@ async fn fetch_single_inner(
             .unwrap_or(if scheme == "http" { 80 } else { 443 });
         let mut state = daemon.state.lock().await;
         state.note_origin(&host, scheme, port);
-        // Longitudinal identity (v4 phase 0.3): mint or validate
+        // Longitudinal identity: mint or validate
         // the domain persona. Coherence drift or quarantine here
         // re-mints automatically.
         let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
         state.ensure_persona(&host, &caps);
     }
-    // v4 E2: persona locale drives Accept-Language so tier-1 and
-    // the ghost claim one language identity. Viewport/locale for the
-    // browser itself are looked up again at acquire time.
-    let persona_al = {
-        let state = daemon.state.lock().await;
-        match state.personas.get(&host) {
-            Some(p) if p.quarantine_reason.is_none() => {
-                Some(crate::profile::accept_language_with_persona(
-                    &host,
-                    url::Url::parse(&url)
-                        .map(|u| u.path().to_string())
-                        .unwrap_or_else(|_| "/".into())
-                        .as_str(),
-                    &p.locale,
-                ))
-            }
-            _ => None,
-        }
-    };
-    if tier == "auto" && shot.is_none() {
-        let age = daemon
-            .state
-            .lock()
-            .await
-            .human_wall_age(&host, &url, &call.route.id());
-        if let Some(age) = age {
-            let mut trace = Trace::default();
-            trace.step("route", "human-wall-cache", "recent observed refusal", 0);
-            return tool_error_structured(
-                "this exact URL recently required human verification; browser retry skipped",
-                "walled",
-                Some(
-                    json!({"url":url,"code":"wall.captcha","cached":true,"observed_ago_s":age,
-                    "next_action":"use an interactive browser, or tier=1 to recheck HTTP; a new login or route invalidates this short-lived refusal",
-                    "escalation":trace.value()}),
-                ),
-            );
-        }
-    }
-    let retry_http =
-        no_adapter || args.get("_reddit_session").and_then(Value::as_bool) == Some(true);
-    let (route, known_walled) = {
-        let state = daemon.state.lock().await;
-        (
-            fetch_route(
-                &state,
-                &host,
-                tier,
-                is_pdf_url,
-                is_json_url,
-                adapter_host,
-                retry_http,
-            ),
-            state.is_known_walled(&host),
-        )
-    };
-
-    let warm_cookies: Vec<CookieRecord> = match &route {
-        RouteDecision::Warm(c) => c.clone(),
-        _ => Vec::new(),
-    };
-    let is_warm = !warm_cookies.is_empty();
-    let is_recheck = matches!(route, RouteDecision::RecheckCold);
-    let skip_tier1 = matches!(route, RouteDecision::SkipToSolve);
-
-    let mut tier_used = "1";
-    if is_warm {
-        daemon.fetcher.import_cookies(&warm_cookies).await;
-        tier_used = "1(warm)";
-    } else if is_recheck {
-        tier_used = "1(recheck)";
-    } else if skip_tier1 {
-        tier_used = "2-direct";
-    }
-
-    let mut trace = Trace::default();
-    let route_name = match &route {
-        RouteDecision::Cold => "cold",
-        RouteDecision::Warm(_) => "warm",
-        RouteDecision::SkipToSolve => "skip-to-solve",
-        RouteDecision::RecheckCold => "recheck-cold",
-        RouteDecision::SolveCooldown(_) => "solve-cooldown",
-    };
-    trace.step("route", "domain-profile", route_name, 0);
-
-    // Fail-fast memory: the wall survived real-browser passes
-    // recently. Honest error, no browser cycle. The cooldown
-    // lapses on its own; success memories from other layers
-    // (record_cold_ok) clear it on their own cadence.
-    if let RouteDecision::SolveCooldown(retry_in) = route {
+    let age = daemon
+        .state
+        .lock()
+        .await
+        .human_wall_age(&host, &url, &call.route.id());
+    if let Some(age) = age {
+        let mut trace = Trace::default();
+        trace.step("route", "human-wall-cache", "recent observed refusal", 0);
         return tool_error_structured(
-            format!(
-                "known wall at {host} : recent browser passes did not clear it on this host; retrying before {retry_in}s from now would waste a solve cycle"
-            ),
+            "this exact URL recently required human verification",
             "walled",
-            Some(json!({
-                "url": url,
-                "status": 0,
-                "code": "wall.blocked",
-                "retry_in_secs": retry_in,
-                "next_action": "wait for the cooldown, or browse the site with an interactive agent browser (your human session clears walls this host cannot)",
-                "escalation": trace.value(),
-            })),
+            Some(
+                json!({"url":url,"code":"wall.captcha","cached":true,"observed_ago_s":age,
+                    "next_action":"complete this verification in an interactive browser session; a new login or route invalidates this short-lived refusal",
+                    "escalation":trace.value()}),
+            ),
         );
     }
+    let mut trace = Trace::default();
 
-    // === Fetch (tier 1, unless skipped) ===
+    // === The local fetch ===
     let mut out: Option<crate::fetch::client::FetchOutcome> = None;
 
     // === v3 F1: search→fetch warm handoff ===
     // Enrichment already fetched the top search results : if
     // this URL is one of them, serve that body, skip the
     // network. One-shot (a second fetch goes to the wire for
-    // freshness); the rest of the pipeline (extraction,
-    // thin→ghost, history) runs unchanged on the cached body.
+    // freshness); the rest of the pipeline (extraction, history)
+    // runs unchanged on the cached body.
     let mut prewarmed = false;
     // Bind the take() result first: a lock guard in the if-let
     // scrutinee would live across the .await below and make the
@@ -1798,7 +1042,6 @@ async fn fetch_single_inner(
         None
     };
     if let Some(entry) = prewarm_entry {
-        tier_used = "prewarmed";
         prewarmed = true;
         trace.step("prewarm", "search-handoff", "hit", 0);
         // law 6: make the warm handoff observable in `donsetch status`.
@@ -1806,41 +1049,12 @@ async fn fetch_single_inner(
         out = Some(entry.outcome);
     }
 
-    let mut adapter_session_seeded = false;
-    if !skip_tier1 && !prewarmed {
+    if !prewarmed {
         let t0 = std::time::Instant::now();
-        let response = {
-            let request = daemon.fetcher.fetch_persona_on_route(
-                &url,
-                persona_al.as_deref(),
-                Some(&call.route),
-            );
-            let needs_seed = adapter_used == Some("adapter:reddit-json")
-                && !reddit_session_live(&daemon.fetcher.jar_snapshot(&host));
-            if needs_seed {
-                // The structured endpoint and session initialization do not
-                // depend on each other's response. Overlap their network waits.
-                // A usable JSON reply wins immediately; failures still wait
-                // for the session before reading the public SSR page. A jar
-                // that already holds the session skips the hop entirely.
-                let seed = reddit_session_hop(daemon, &parsed_url, &mut trace, &call.route);
-                tokio::pin!(request, seed);
-                tokio::select! {
-                    reply = &mut request => {
-                        if !matches!(&reply, Ok(out) if out.verdict == Verdict::ContentOk) {
-                            adapter_session_seeded = seed.await;
-                        }
-                        reply
-                    },
-                    seeded = &mut seed => {
-                        adapter_session_seeded = seeded;
-                        request.await
-                    },
-                }
-            } else {
-                request.await
-            }
-        };
+        let response = daemon
+            .fetcher
+            .fetch_persona_on_route(&url, Some(&call.route))
+            .await;
         let fetched = match response {
             Ok(o) => o,
             Err(e) => {
@@ -1860,7 +1074,6 @@ async fn fetch_single_inner(
                         &mut trace,
                         "fallback",
                         "transport error : retrying original URL",
-                        adapter_session_seeded,
                         call,
                     )
                     .await;
@@ -1868,7 +1081,7 @@ async fn fetch_single_inner(
                 let kind = fetch_error_kind(&e);
                 let failures = if transport_failure_evidence(&e) {
                     let mut state = daemon.state.lock().await;
-                    state.record_failure(&host, crate::ghost::cache::FailClass::Network);
+                    state.record_failure(&host, crate::state::FailClass::Network);
                     state.recent_network_failures(&host)
                 } else {
                     0
@@ -1899,7 +1112,7 @@ async fn fetch_single_inner(
         let ms = t0.elapsed().as_millis();
         let verdict_str = format!("{:?}", fetched.verdict);
         trace.step(
-            "1",
+            "local",
             "http-fetch",
             &format!("{} status={}", verdict_str, fetched.status),
             ms,
@@ -1907,46 +1120,28 @@ async fn fetch_single_inner(
         out = Some(fetched);
 
         // === Observe the outcome ===
-        // Every fetch teaches the domain profile something : but
-        // only CHALLENGES say anything about walls. A 404, 429,
-        // paywall, or auth wall is an honest terminal answer from
-        // the origin; recording it as "walled" used to poison easy
-        // domains into permanent skip-to-solve (every later fetch
-        // burned a 20s ghost launch on a 404).
+        // Counters for `donsetch status`: only CHALLENGES say anything
+        // about walls. A 404, 429, paywall or auth wall is an honest
+        // terminal answer from the origin. The fetch layer keeps its own
+        // per-origin memory; these never route a fetch.
         let o = out.as_ref().unwrap();
         {
             let mut state = daemon.state.lock().await;
-            // Tier-1 jar flush (v4 phase 1.4): persist the whole
-            // cookie store on every completed navigation, inside
-            // the same record_* save (one state write per fetch,
-            // today's cost class). Browser-true: cookies survive
-            // process restarts, so remote sessions see a RETURNING
-            // visitor, not a fresh jar every run.
-            state.sync_tier1_cookies(&daemon.fetcher.jar_all_snapshot().await);
             match o.verdict {
                 // An adapter endpoint's refusal is not evidence about
                 // the PAGE (reddit's protected `.json` is the known
-                // case, #291): recording it as a domain wall routed
-                // the fallback retry, and every later fetch, around
-                // tier 1 entirely. The fallback below re-probes the
+                // case, #291): recording it as a domain wall
+                // mis-routed the fallback retry and every later fetch.
+                // The fallback below re-probes the
                 // caller's URL itself; its own verdict is what
                 // records a wall. v4.7 V03: the same holds for any
                 // JSON data endpoint : a `.json` challenge says
                 // nothing about the human-facing pages.
                 Verdict::Challenge(_) if adapter_host || is_json_url || is_json_endpoint(o) => {}
-                Verdict::Challenge(_) => {
-                    state.record_failure(&host, crate::ghost::cache::FailClass::Block);
-                    if is_warm {
-                        // Warm cookies went stale : learn the real lifetime.
-                        state.record_warm_stale(&host);
-                    } else {
-                        // Cold (or recheck) was challenged : domain needs tier 2.
-                        let vendor = match &o.verdict {
-                            Verdict::Challenge(v) => Some(format!("{v:?}").to_lowercase()),
-                            _ => None,
-                        };
-                        state.record_cold_walled(&host, vendor.as_deref());
-                    }
+                Verdict::Challenge(vendor) => {
+                    state.record_failure(&host, crate::state::FailClass::Block);
+                    let vendor = format!("{vendor:?}").to_lowercase();
+                    state.record_cold_walled(&host, Some(&vendor));
                 }
                 // API access does not prove the original website wall
                 // cleared (v4.7 V03: nor does a JSON endpoint's success :
@@ -1954,19 +1149,7 @@ async fn fetch_single_inner(
                 Verdict::ContentOk if adapter_host || is_json_url || is_json_endpoint(o) => {
                     state.record_fetch(&host)
                 }
-                Verdict::ContentOk => {
-                    if is_warm {
-                        // Warm succeeded : refresh the cookie vault (write-back).
-                        let snap = daemon.fetcher.jar_snapshot(&host);
-                        state.record_warm_ok(&host, &snap);
-                    } else if known_walled {
-                        // A previously walled site may serve bait to HTTP. Keep
-                        // its wall memory until a browser comparison is equivalent.
-                        state.record_fetch(&host);
-                    } else {
-                        state.record_cold_ok(&host);
-                    }
-                }
+                Verdict::ContentOk => state.record_cold_ok(&host),
                 // Everything else (404, rate-limit, paywall, auth,
                 // hard block): counters only, no wall inference.
                 _ => state.record_fetch(&host),
@@ -1974,69 +1157,40 @@ async fn fetch_single_inner(
         }
     }
 
-    // v4.7 V03: JSON data endpoints are terminal at the HTTP tier.
+    // v4.7 V03: JSON data endpoints are terminal at the local fetch.
     // The `.json` name or a JSON content type means a structured
-    // payload : a browser pass cannot improve it, it must not gate
-    // the verdict, and it must not trigger a decoy comparison.
+    // payload : nothing downstream can improve it, and it must not
+    // gate the verdict.
     let json_like = is_json_url || out.as_ref().is_some_and(is_json_endpoint);
 
-    // === Verdict gate: everything except ContentOk/Challenge ===
-    // is a terminal, legitimate response : clean error, no ghost.
-    // Challenge on an explicit tier=1 request is also terminal.
+    // === Verdict gate ===
+    // Everything except ContentOk is terminal at the local fetch :
+    // a clean error; there is no second engine. Wall-class verdicts
+    // (Challenge/Blocked) ask the optional unlocker first.
     // Adapter failures (rate-limited .json, registry hiccup)
     // first fall back to the ORIGINAL URL through the generic
     // path : the adapter is an optimization, never a dependency.
     if let Some(o) = &out {
         match o.verdict {
-            Verdict::ContentOk => {
-                // Page-load realism (v4 phase 1.3): background
-                // subresource burst for stealth-relevant hosts.
-                crate::fetch::shadow::maybe_shadow(&daemon.fetcher, &daemon.state, &o.url, o).await;
-            }
+            Verdict::ContentOk => {}
             // A refusal on an ADAPTER endpoint (a challenge
-            // included) is a failed adapter hop, never the end of
-            // the ladder: retry the caller's URL through the generic
-            // pipeline, which escalates to the browser on its own
-            // rules (#287: reddit's `.json` 403 used to end every
+            // included) is a failed adapter hop, never the end:
+            // retry the caller's URL through the generic pipeline
+            // (#287: reddit's `.json` 403 used to end every
             // fetch at exactly this point).
             _ if adapter_hop_failed(o.verdict, adapter_host, no_adapter) => {
                 let why = format!("{:?} : retrying original URL", o.verdict);
                 return adapter_fallback(
-                    daemon,
-                    args,
-                    &orig_url,
-                    &mut trace,
-                    "fallback",
-                    &why,
-                    adapter_session_seeded,
-                    call,
+                    daemon, args, &orig_url, &mut trace, "fallback", &why, call,
                 )
                 .await;
             }
-            // A reddit page (thread, listing, about, wiki) refused
-            // at tier 1 without a session: the humanity page or the
-            // shell. One legacy-host navigation seeds the session,
-            // the retry gets the real SSR page, and the SSR adapter
-            // turns that into the card. Cheap enough to try before
-            // any ghost pass, on tier 1 and on auto alike.
-            _ if reddit_session_retry_eligible(&o.verdict, &host, args) => {
-                return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
-            }
-            // v4.7 V03: a refused JSON data endpoint is terminal too :
-            // an honest wall error outranks a browser pass on a
-            // payload a browser cannot improve.
-            _ if tier != "1"
-                && !json_like
-                && crate::detect::walls::browser_recovery(
-                    o.status, &o.headers, &o.body, o.verdict,
-                ) => {}
             v => {
                 let kind = verdict_kind(v, o.status);
-                // v3.4: bypass fetch for hard walls (Challenge/Blocked).
-                // Fires on tier != "1" (respect explicit no-escalation).
-                // Skip AuthWall/Paywall/SoftNotFound (credentials/money/dead).
-                if tier != "1"
-                    && matches!(v, Verdict::Challenge(_) | Verdict::Blocked)
+                // The optional unlocker for hard walls (Challenge/
+                // Blocked); skipped for AuthWall/Paywall/SoftNotFound
+                // (credentials/money/dead).
+                if matches!(v, Verdict::Challenge(_) | Verdict::Blocked)
                     && let Some(v3) = try_bypass(daemon, &url, &opts, &mut trace).await
                 {
                     return v3;
@@ -2052,10 +1206,7 @@ async fn fetch_single_inner(
                 }
                 return tool_error_structured(
                     if human_wall {
-                        format!(
-                            "interactive verification required at {}; browser escalation skipped for a human CAPTCHA",
-                            o.url
-                        )
+                        format!("interactive verification required at {}", o.url)
                     } else {
                         verdict_error(v, o.status, &o.url)
                     },
@@ -2065,9 +1216,7 @@ async fn fetch_single_inner(
                         "status": o.status,
                         "verdict": format!("{:?}", v),
                         "next_action": if human_wall {
-                            "interactive verification required; no automated captcha solver (browser escalation skipped)".to_string()
-                        } else if tier == "1" && !json_like && crate::detect::walls::browser_recovery(o.status, &o.headers, &o.body, v) {
-                            "browser escalation disabled by tier=1; retry with tier=2 or tier=auto".to_string()
+                            "complete this verification in an interactive browser session; no automated solver can pass it".to_string()
                         } else { next_action_for(Some(v), o.status, kind) },
                         "escalation": trace.value(),
                     })),
@@ -2086,7 +1235,7 @@ async fn fetch_single_inner(
     // A 200 that isn't JSON on a rewritten endpoint (login walls,
     // HTML error interstitials) bought the adapter nothing : fall
     // back to the original URL through the full generic pipeline
-    // (which still escalates to ghost if the page is a shell).
+    // (which still treats a shell honestly).
     if adapter_host
         && !no_adapter
         && let Some(o) = &out
@@ -2104,17 +1253,15 @@ async fn fetch_single_inner(
             &mut trace,
             "shape-mismatch",
             "structured payload unavailable : retrying original URL",
-            adapter_session_seeded,
             call,
         )
         .await;
     }
 
-    // === Tier-1 extraction (when we have a body) ===
-    let mut ghost_html = None;
+    // === Local extraction (when we have a body) ===
     let mut final_ex: Option<extract::Extracted> = None;
-    let mut final_tier: &str = tier_used;
-    let mut final_status: u16 = out.as_ref().map(|o| o.status).unwrap_or(0);
+    let final_fetch: &str = "local";
+    let final_status: u16 = out.as_ref().map(|o| o.status).unwrap_or(0);
     let mut final_url: String = url.clone();
     let mut final_verdict: String = out
         .as_ref()
@@ -2147,7 +1294,11 @@ async fn fetch_single_inner(
                 })),
             );
         }
-        match extract::extract_off_worker(&o.body, &ct, &o.url, &opts).await {
+        let read_opts = extract::ExtractOptions {
+            verified: o.verified,
+            ..opts.clone()
+        };
+        match extract::extract_off_worker(&o.body, &ct, &o.url, &read_opts).await {
             Ok(e) => {
                 final_url = o.url.clone();
                 final_ex = Some(e);
@@ -2155,40 +1306,6 @@ async fn fetch_single_inner(
             Err(extract::ExtractError::Wall(v)) => {
                 extraction_wall = Some(v);
                 final_verdict = format!("{v:?}");
-                if tier == "1" {
-                    return tool_error_structured(
-                        format!("access wall at {url}: {v:?}"),
-                        "walled",
-                        Some(json!({
-                            "url": url, "status": final_status, "verdict": final_verdict,
-                            "next_action": if matches!(v, Verdict::Challenge(_)) {
-                                "browser escalation disabled by tier=1; retry with tier=2 or tier=auto".to_string()
-                            } else { next_action_for(Some(v), final_status, "walled") }, "escalation": trace.value(),
-                        })),
-                    );
-                }
-            }
-            Err(extract::ExtractError::SelectorNoMatch {
-                selector,
-                inspected,
-            }) => {
-                return tool_error_structured(
-                    format!("CSS selector {selector:?} matched no elements"),
-                    "permanent",
-                    Some(
-                        json!({"url": orig_url, "code": "selector.nomatch", "elements_inspected": inspected,
-                        "next_action": "correct the selector, or omit it to read the page"}),
-                    ),
-                );
-            }
-            Err(extract::ExtractError::BadSelector(selector)) => {
-                return tool_error_structured(
-                    format!("invalid CSS selector: {selector}"),
-                    "permanent",
-                    Some(
-                        json!({"url": orig_url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax"}),
-                    ),
-                );
             }
             Err(e) => {
                 return tool_error_structured(
@@ -2196,40 +1313,22 @@ async fn fetch_single_inner(
                     "transient",
                     Some(json!({
                         "url": url,
-                        "next_action": "retry with a narrow selector= or focus=; if the page is JS-heavy, tier=2 renders it in a browser",
+                        "next_action": "retry once; if it fails again, the page is too large or malformed to extract: choose another source",
                     })),
                 );
             }
         }
     }
 
-    let ex_thin = final_ex.as_ref().map(|e| e.thin).unwrap_or(false);
     let challenge = out
         .as_ref()
         .map(|o| crate::detect::walls::browser_recovery(o.status, &o.headers, &o.body, o.verdict))
         .unwrap_or(false)
         || extraction_wall.is_some();
 
-    // Warm cookies that only buy a SHELL are stale cookies : but
-    // the evidence must be a shell, not an extraction gap. A warm
-    // ContentOk whose body is big yet nearly invisible-text-free
-    // (JS shell) means the clearance bought nothing. A body with
-    // rich visible text that extracts thin is a DonSift gap :
-    // killing valid cookies for it is the gallery-page bug.
-    let shell_warm = is_warm && ex_thin && {
-        let o = out.as_ref().unwrap();
-        o.body.len() > 20_000
-            && (crate::detect::walls::visible_text_count(&o.body) as f64 / o.body.len() as f64)
-                < 0.02
-    };
-    if shell_warm {
-        daemon.state.lock().await.record_warm_stale(&host);
-    }
-
-    // Tier-1 links fallback: listing/feed pages over plain
-    // HTTP (Hacker News, indexes) die in the prose pipeline
-    // simply for being link-dense. Try links-keeping
-    // extraction before any ghost work.
+    // Links fallback: listing/feed pages (Hacker News, indexes)
+    // die in the prose pipeline simply for being link-dense. Try
+    // links-keeping extraction before failing.
     if final_ex.as_ref().map(|e| e.thin).unwrap_or(false)
         && !opts.include_links
         && let Some(o) = &out
@@ -2247,25 +1346,26 @@ async fn fetch_single_inner(
             && !e3.thin
         {
             final_ex = Some(e3);
-            final_tier = "1(links)";
-            trace.step("1", "links-extract", "ok", 0);
+            trace.step("local", "links-extract", "ok", 0);
         }
     }
 
-    // === Tier 2 via ghost (unified) ===
-    // Triggers: explicit tier 2, profile skip-to-solve, challenge
-    // wall, or tier 1 produced only a JS shell on auto tier.
-    // (thin recomputed AFTER the tier-1 links fallback.)
+    // === Walled and shell outcomes ===
+    // v5: one local system, no second engine to escalate to. A
+    // wall-class outcome reaches the optional unlocker once, then
+    // fails honestly; a shell that never hydrated locally fails
+    // honestly too, and a shell is never served as content.
+    // (thin recomputed AFTER the local links fallback.)
     //
     // Exception: very small pages (< 5KB) that came back thin are
     // 404/error pages, not JS shells. JS shells are > 50KB (React
-    // apps, SPAs). A 2KB page with no content is a 404 : don't
-    // waste 20s launching a browser for it.
+    // apps, SPAs). A 2KB page with no content is a 404, never a
+    // shell class.
     let still_thin = final_ex.as_ref().map(|e| e.thin).unwrap_or(false);
     let page_size = out.as_ref().map(|o| o.body.len()).unwrap_or(0);
     // PDF detection: if the response is a PDF (content-type or magic
-    // bytes), never escalate to ghost : Chrome's PDF viewer is a JS
-    // shell with no extractable text. PDFs are handled by DonSheet.
+    // bytes), never render it : a browser PDF viewer is a JS shell
+    // with no extractable text. PDFs are handled by DonSheet.
     let is_pdf_content = out
         .as_ref()
         .map(|o| {
@@ -2283,7 +1383,7 @@ async fn fetch_single_inner(
     // it is only a 404 when the STATUS says so: a 2xx that comes
     // back with no content is a wall or a spinner shell, not a
     // 404 (live case: tiktok's "Please wait..." 12-token fetch
-    // served as ok). Never escalate on a real error status.
+    // served as ok). A real error status is never a shell class.
     let status_2xx = out
         .as_ref()
         .map(|o| (200..300).contains(&o.status))
@@ -2298,335 +1398,169 @@ async fn fetch_single_inner(
     // as DOM text nodes): the extracted "content" is things like
     // `# is_latency_sensitive_broadcast`, `FDSTooltipDef`,
     // `[["low","normal"]]` with no prose (live case: facebook's
-    // tier-1 fetch served that as a successful result). Short,
+    // local fetch served that as a successful result). Short,
     // sentence-free, identifier-dominated text = a shell, not
-    // content: escalate instead of serving garbage.
-    let shell_text =
-        status_2xx && !is_pdf_content && final_ex.as_ref().map(is_framework_shell).unwrap_or(false);
+    // content: fail instead of serving garbage.
+    // The document's own substance verdict (`detect::substance`), read from
+    // its structure at extraction: authoritative for an HTML read. The text
+    // heuristics below stand in only where no verdict exists, and a
+    // verdict of content overrides them (a short real page is content).
+    let page_verdict = final_ex.as_ref().and_then(|e| e.page);
+    let page_content = page_verdict.is_some_and(|v| v.is_content());
+    let shell_text = status_2xx
+        && !is_pdf_content
+        && !page_content
+        && final_ex.as_ref().map(is_framework_shell).unwrap_or(false);
     // #282: "the extraction is non-empty" is not a success test. A
-    // challenge interstitial or a chrome-only shell extracted at
-    // tier 1 must escalate (auto) or fail honestly, not serve.
+    // challenge interstitial or a chrome-only shell must fail
+    // honestly, not serve.
+    let verified = out.as_ref().is_some_and(|o| o.verified);
     let challenge_text = status_2xx
+        && !verified
         && final_ex
             .as_ref()
             .map(|e| crate::detect::walls::challenge_text(&e.markdown))
             .unwrap_or(false);
     let chrome_text = status_2xx
         && !is_pdf_content
+        && page_verdict.is_none()
         && final_ex
             .as_ref()
             .map(|e| crate::extract::quality::chrome_only(&e.markdown))
             .unwrap_or(false);
-    // Reddit can answer 200 with a logged-out JS shell. The same cheap
-    // session initialization used for explicit walls belongs before render.
-    if status_2xx
-        && (still_thin || shell_text || challenge_text || chrome_text)
-        && reddit_session_retry_eligible(&Verdict::Blocked, &host, args)
-    {
-        return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
-    }
-    let need_ghost = !is_pdf_content
-        && !adapter_host // adapter endpoints (reddit .json, registry APIs) are plain GETs
-        && !json_like // v4.7 V03: JSON data endpoints never escalate
-        && ((challenge && tier != "1" && !is_small_404)
-            || skip_tier1
-            || (still_thin && tier == "auto" && !is_small_404)
-            || (shell_text && tier == "auto")
-            || (challenge_text && tier == "auto")
-            || (chrome_text && tier == "auto" && !is_small_404));
-
-    if need_ghost {
-        // Render-cache shortcut: a previously recovered DOM.
-        // Verified non-thin AND non-challenge before serving : the
-        // cache used to store shells and challenge interstitials,
-        // re-serving them forever as ContentOk.
-        if ex_thin
-            && !stitch
-            && tier == "auto"
-            && let Some(rc) = daemon.state.lock().await.render_for(&final_url).cloned()
-            && let Ok(e2) = extract::extract(
-                rc.html.as_bytes(),
-                extract::charset::GHOST_TEXT_CT,
-                &final_url,
-                &opts,
-            )
-            && !e2.thin
-        {
-            // Defense in depth: even if a challenge page slipped into
-            // the cache (pre-fix), don't serve it as ContentOk.
-            let cached_verdict = crate::detect::walls::detect_dom_smart(rc.html.as_bytes());
-            if cached_verdict == Verdict::ContentOk {
-                let vstr = format!("{:?}", cached_verdict);
-                trace.step("cache", "render-hit", "ok", 0);
-                let mut res = finish_result(
-                    &e2,
-                    "render-cache",
-                    final_status,
-                    &vstr,
-                    &final_url,
-                    &trace,
-                    t0.elapsed().as_millis(),
-                );
-                apply_faithful_body(&mut res, &e2, &opts);
-                res["_meta"]["ttlMs"] = json!(300_000);
-                res["_meta"]["cacheScope"] = json!("session");
-                if prewarmed {
-                    res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
-                }
-                apply_link_handles(daemon, &mut res).await;
-                return res;
-            }
-        }
-
-        let ghost_result = ghost_escalate(
-            daemon,
-            &url,
-            &host,
-            &opts,
-            challenge || shell_warm || (skip_tier1 && tier != "2"),
-            tier == "2" || opts.selector.is_some(),
-            shot,
-            &mut trace,
-            budget,
-            &call.route,
-            persona_al.as_deref(),
-            &call.session_stamp,
-        )
-        .await;
-        match ghost_result {
-            Ok((e, tier2, status, furl, html)) => {
-                if stitch {
-                    ghost_html = Some((html, furl.clone()));
-                }
-                final_ex = Some(e);
-                final_tier = tier2;
-                final_status = status;
-                final_url = furl;
-                // Ghost beat the challenge : the verdict should reflect
-                // the actual content, not the tier-1 wall that was
-                // bypassed. Without this, a successfully rendered page
-                // shows "Challenge(DataDome)" in the verdict field.
-                final_verdict = "ContentOk".to_string();
-            }
-            // Before the unlocker gate below: a rule's default kind is
-            // `walled`, which that gate would pay to bypass.
-            Err(GhostFailure::Denied(e)) => {
-                return policy_error_value(&e, &url, Some(trace.value()));
-            }
-            Err(GhostFailure::Failed(msg, kind)) => {
-                // A ghost failure on a warm-routed fetch means the
-                // cookies no longer clear the wall : count it as the
-                // second warm failure so the vault clears (first was
-                // the tier-1 challenge that triggered escalation).
-                if is_warm {
-                    daemon.state.lock().await.record_warm_stale(&host);
-                }
-                // v3.4: ghost hit a hard wall (kind == "walled"),
-                // try bypass unlocker before giving up.
-                if kind == "walled"
-                    && !msg.starts_with("authentication required")
-                    && let Some(v3) = try_bypass(daemon, &url, &opts, &mut trace).await
-                {
-                    return v3;
-                }
-                let observed_gate = if msg.starts_with("authentication required") {
-                    Some(Verdict::AuthWall)
-                } else if msg.starts_with("not found:") {
-                    Some(Verdict::SoftNotFound)
-                } else if msg.starts_with("paywall:") {
-                    Some(Verdict::Paywall)
-                } else {
-                    None
-                };
-                let failed_verdict = if msg.starts_with("browser navigation error:")
-                    || msg.starts_with("browser launch failed:")
-                    || msg.starts_with("browser recovery failed")
-                {
-                    "Unknown".to_string()
-                } else if msg.starts_with("browser document incomplete") {
-                    "Incomplete".to_string()
-                } else {
-                    observed_gate
-                        .map(|v| format!("{v:?}"))
-                        .unwrap_or_else(|| failure_verdict(&final_verdict, kind))
-                };
-                let observed_status = trace
-                    .browser_document
+    // Wall-class: a challenge body, an extraction wall, or an
+    // interstitial behind a 2xx. Shell-class: a client-rendered page
+    // that never hydrated locally. Adapters, JSON payloads and PDFs
+    // are excluded (they are terminal at the local fetch already).
+    let sink_eligible = !is_pdf_content && !adapter_host && !json_like;
+    // Wave W / D5: a scripted micro-document with near-empty extraction is a
+    // throttle/block shell (bloomberg's 502-byte ok:true body), never ok.
+    let micro_shell = sink_eligible
+        && status_2xx
+        && !page_content
+        && out
+            .as_ref()
+            .map(|o| {
+                crate::detect::walls::js_micro_shell(
+                    &o.body,
+                    final_ex.as_ref().map(|e| e.markdown.len()).unwrap_or(0),
+                )
+            })
+            .unwrap_or(false);
+    let wall_like = sink_eligible && (challenge || challenge_text);
+    // A document whose structure says it is not content (an app frame, a
+    // sign-in page, a loading placeholder, a notice) is not served, whatever
+    // the fetch layer's contract counted: that contract counts visible
+    // characters, and a navigation frame has plenty.
+    let page_shell = sink_eligible && status_2xx && page_verdict.is_some() && still_thin;
+    // Without a verdict, a body the fetch layer verified as content is served
+    // as extracted: its contract already ruled out an empty shell.
+    let shell_like = sink_eligible
+        && !wall_like
+        && (page_shell
+            || (!(verified
+                && final_ex
                     .as_ref()
-                    .map(|d| d.status)
-                    .unwrap_or((final_status != 0).then_some(final_status));
-                // Honest advice: a stall the browser could not clear
-                // is not a network fault (v4.7 D2 : never send an agent
-                // to "another network" for a wall the browser could
-                // not pass).
-                let deadline_stall = msg.contains("deadline");
-                return tool_error_structured(
-                    msg,
-                    kind,
-                    Some(json!({
-                        "url": trace.browser_document.as_ref().map(|d| d.url.as_str()).unwrap_or(&url),
-                        "status": observed_status,
-                        "verdict": failed_verdict,
-                        "next_action": browser_failure_next_action(
-                            &failed_verdict,
-                            deadline_stall,
-                            observed_gate.or_else(|| out.as_ref().map(|o| o.verdict)),
-                            observed_status.unwrap_or(0),
-                            kind,
-                        ),
-                        "escalation": trace.value(),
-                    })),
-                );
-            }
-        }
-    }
-
-    // === v3 F3: article pagination stitching ===
-    // rel=next chains walked to a bounded budget: one call returns
-    // the whole article with part markers instead of eight calls.
-    let mut stitched_parts: usize = 1;
-    let mut stitch_next = None;
-    if stitch && output_opts.must_contain.is_none() && !output_opts.toc {
-        const STITCH_MAX_PARTS: usize = 6;
-        const STITCH_BUDGET: usize = 1_048_576;
-        let base = ghost_html.or_else(|| {
-            out.as_ref()
-                .filter(|o| o.verdict == Verdict::ContentOk && o.url == final_url)
-                .map(|o| {
-                    let ct = o
-                        .headers
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default();
-                    (crate::extract::charset::decode(&o.body, &ct), o.url.clone())
-                })
-        });
-        if let Some((html, base_url)) = base
-            && let Some(ex) = final_ex.as_mut()
+                    .is_some_and(|e| !e.markdown.trim().is_empty()))
+                && (shell_text || chrome_text || micro_shell || (still_thin && !is_small_404))));
+    // An anonymous read the site redirected to its sign-in endpoint: the
+    // final page is a login form, never the requested content.
+    let login_redirected = sink_eligible
+        && status_2xx
+        && out
+            .as_ref()
+            .is_some_and(|o| crate::detect::substance::login_redirect(&url, &o.url));
+    if wall_like {
+        let v = extraction_wall.unwrap_or(Verdict::Challenge(Vendor::Generic));
+        // The optional unlocker: a paid opt-in reached after a local
+        // failure, never a tier. No key = inert.
+        if matches!(v, Verdict::Challenge(_) | Verdict::Blocked)
+            && let Some(v3) = try_bypass(daemon, &url, &opts, &mut trace).await
         {
-            let base_host = url::Url::parse(&base_url)
-                .ok()
-                .and_then(|u| u.host_str().map(String::from));
-            let mut visited = std::collections::HashSet::from([base_url.clone()]);
-            let mut next = find_rel_next(&html, &base_url);
-            if let Some(offset) = ex.next_offset.take() {
-                if let Some(marker) = ex.markdown.rfind("\n\n*[truncated : continue") {
-                    ex.markdown.truncate(marker);
-                }
-                stitch_next = Some(
-                    json!({"url": base_url, "offset": offset, "reason": "article collection limit"}),
-                );
-                next = None;
-            }
-            while let Some(next_url) = next.take() {
-                stitch_next = Some(
-                    json!({"url": next_url, "offset": 0, "reason": "part limit or unavailable part"}),
-                );
-                if stitched_parts >= STITCH_MAX_PARTS || ex.markdown.len() + 200 >= STITCH_BUDGET {
-                    break;
-                }
-                if !visited.insert(next_url.clone()) {
-                    stitch_next = Some(json!({"url": next_url, "reason": "pagination cycle"}));
-                    break;
-                }
-                // Hijack guard: never follow rel=next off-host.
-                let Ok(nu) = url::Url::parse(&next_url) else {
-                    break;
-                };
-                if nu.host_str().map(String::from) != base_host {
-                    break;
-                }
-                let fetched = match daemon.fetcher.fetch(&next_url).await {
-                    Ok(o2)
-                        if matches!(o2.verdict, Verdict::ContentOk)
-                            && url::Url::parse(&o2.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                                == base_host =>
-                    {
-                        o2
-                    }
-                    _ => break,
-                };
-                if fetched.url != next_url && !visited.insert(fetched.url.clone()) {
-                    stitch_next =
-                        Some(json!({"url": fetched.url, "reason": "redirected pagination cycle"}));
-                    break;
-                }
-                trace.step(
-                    "stitch",
-                    "fetch-part",
-                    &next_url,
-                    fetched.elapsed.as_millis(),
-                );
-                let ct2 = fetched
-                    .headers
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                let html2 = crate::extract::charset::decode(&fetched.body, &ct2);
-                let mut popts = opts.clone();
-                popts.max_chars = Some(
-                    STITCH_BUDGET
-                        .saturating_sub(ex.markdown.len() + 40)
-                        .max(200),
-                );
-                match extract::extract_off_worker(&fetched.body, &ct2, &fetched.url, &popts).await {
-                    Ok(mut pe) => {
-                        if pe.thin {
-                            break;
-                        }
-                        if let Some(offset) = pe.next_offset {
-                            if let Some(marker) = pe.markdown.rfind("\n\n*[truncated : continue") {
-                                pe.markdown.truncate(marker);
-                            }
-                            stitch_next = Some(
-                                json!({"url": fetched.url, "offset": offset, "reason": "article collection limit"}),
-                            );
-                        } else {
-                            stitch_next = None;
-                        }
-                        let md = if opts.faithful {
-                            pe.markdown.clone()
-                        } else {
-                            strip_part_frontmatter(&pe.markdown)
-                        };
-                        stitched_parts += 1;
-                        ex.markdown
-                            .push_str(&format!("\n\n---\n\n*(part {stitched_parts})*\n\n"));
-                        ex.markdown.push_str(&md);
-                        ex.total_chars = ex.markdown.len();
-                        if pe.next_offset.is_some() {
-                            break;
-                        }
-                        next = find_rel_next(&html2, &fetched.url);
-                    }
-                    Err(_) => break,
-                }
-            }
+            return v3;
         }
-    }
-
-    if stitch
-        && output_opts.must_contain.is_none()
-        && !output_opts.toc
-        && let Some(ex) = final_ex.as_mut()
-    {
-        let (slice, next) = extract::paginate_public(
-            &ex.markdown,
-            output_opts.offset,
-            output_opts.max_chars.unwrap_or(16_000),
+        let kind = verdict_kind(v, final_status);
+        let msg = match v {
+            Verdict::Challenge(Vendor::Generic) => format!(
+                "blocked at {url} : the page serves an anti-bot challenge that did not clear"
+            ),
+            _ => verdict_error(v, final_status, &url),
+        };
+        return tool_error_structured(
+            msg,
+            kind,
+            Some(json!({
+                "url": url,
+                "status": final_status,
+                "verdict": format!("{v:?}"),
+                "next_action": next_action_for(Some(v), final_status, kind),
+                "escalation": trace.value(),
+            })),
         );
-        ex.markdown = slice;
-        ex.next_offset = next;
-        ex.tokens_est = ex.markdown.len() / 4;
+    }
+    if shell_like || login_redirected {
+        // A document with no content that tells script-less clients where
+        // to go (`<noscript><meta http-equiv=refresh>`, duckduckgo's HTML
+        // site) is followed once, on the same site: it is the site's own
+        // answer for a client like this one.
+        if !login_redirected
+            && args.get("_noscript_hop").is_none()
+            && let Some(o) = out.as_ref()
+            && let Some(target) = noscript_hop(&o.body, &o.url)
+        {
+            trace.step("local", "noscript-redirect", &target, 0);
+            let prior = match trace.value() {
+                Value::Array(a) => a,
+                _ => Vec::new(),
+            };
+            let mut args2 = args.clone();
+            args2["_noscript_hop"] = json!(true);
+            let mut res = Box::pin(fetch_single_inner(daemon, &args2, &target, call)).await;
+            fold_trace_into_result(&mut res, prior);
+            return res;
+        }
+        // A thin shell whose visible content is sign-in prompts, or a read
+        // redirected to a sign-in endpoint, is an authentication gate, not a
+        // hydration failure: the honest answer a browser would give.
+        if login_redirected
+            || page_verdict == Some(crate::detect::substance::Verdict::AuthGate)
+            || (page_verdict.is_none()
+                && out
+                    .as_ref()
+                    .map(|o| crate::detect::walls::auth_shell(&o.body))
+                    .unwrap_or(false))
+        {
+            return tool_error_structured(
+                format!(
+                    "login required at {url} : the page is an authentication gate and served no public content"
+                ),
+                "permanent",
+                Some(json!({
+                    "url": url,
+                    "status": final_status,
+                    "verdict": "AuthWall",
+                    "next_action": "the page needs a signed-in session, which fetch does not carry; choose a public source for this content",
+                    "escalation": trace.value(),
+                })),
+            );
+        }
+        let (msg, kind, action) = shell_failure(&url, page_verdict, out.as_ref());
+        return tool_error_structured(
+            msg,
+            kind,
+            Some(json!({
+                "url": url,
+                "status": final_status,
+                "verdict": "Incomplete",
+                "next_action": action,
+                "escalation": trace.value(),
+            })),
+        );
     }
 
     let Some(ex) = final_ex else {
         return tool_error_structured(
-            "all fetch tiers exhausted : no response received",
+            "fetch produced no usable response",
             "permanent",
             Some(json!({
                 "url": url,
@@ -2638,10 +1572,16 @@ async fn fetch_single_inner(
     };
 
     // #282: a challenge interstitial or a chrome-only shell is not
-    // content, whatever tier produced it. The failure is "walled"
-    // so the escalation ladder (ghost, a configured unlocker) can
-    // engage instead of the agent trusting navigation boilerplate.
-    if let Some((msg, kind, action)) = content_fail(&ex.markdown, &url, final_status) {
+    // content, whatever produced it. The failure is "walled" so the
+    // optional unlocker can engage instead of the agent trusting
+    // navigation boilerplate.
+    if let Some((msg, kind, action)) = content_fail(
+        &ex.markdown,
+        &url,
+        final_status,
+        verified,
+        ex.page.is_some(),
+    ) {
         return tool_error_structured(
             msg,
             kind,
@@ -2656,10 +1596,10 @@ async fn fetch_single_inner(
     }
 
     // Final shell gate: a framework dump (React server renders)
-    // must never ship as successful content regardless of the tier
-    // that produced it (live case: facebook's solve returned React
-    // internals as markdown with a clean verdict). Honest fail
-    // with the repair hint instead of garbage "success".
+    // must never ship as successful content regardless of what
+    // produced it (live case: facebook returned React internals
+    // as markdown with a clean verdict). Honest fail with the
+    // repair hint instead of garbage "success".
     if is_framework_shell(&ex) {
         return tool_error_structured(
             format!(
@@ -2669,16 +1609,15 @@ async fn fetch_single_inner(
             Some(json!({
                 "url": url,
                 "verdict": "Challenge(Generic)",
-                "next_action": "use an agent browser to browse sites like these; retry later",
+                "next_action": "open the page in an interactive browser session; retry later",
                 "escalation": trace.value(),
             })),
         );
     }
 
-    // Small 404 page: if we didn't escalate to ghost (is_small_404)
-    // and the extraction is still thin/empty, return "not found".
-    // This is honest : the page exists (HTTP 200) but has no content.
-    // Could be a non-existent product, a deleted page, or a soft 404.
+    // Small 404 page: a small error-status page with no content and
+    // no wall class is "not found", not a shell. The page may not
+    // exist, be deleted, or require JavaScript.
     if is_small_404 {
         return tool_error_structured(
             format!(
@@ -2703,81 +1642,89 @@ async fn fetch_single_inner(
     } else {
         final_url.clone()
     };
+    // The document is whole here; the view projects it. OCR text joins the
+    // document first, so every view (a probe, focus) searches it too.
+    let mut ex = ex;
+    let document = ex.markdown.clone();
+    let ocr_state = if image_text {
+        let (section, state) = image_ocr(daemon, &ex.images).await;
+        ex.markdown.push_str(&section);
+        Some(state)
+    } else {
+        None
+    };
+    let incomplete = ex
+        .partial
+        .as_ref()
+        .map(|p| match p.items_total {
+            Some(total) => format!("{}: {} of {total} items loaded", p.reason, p.items_found),
+            None => format!("{}: {} items loaded", p.reason, p.items_found),
+        })
+        .or_else(|| {
+            ex.next_offset.map(|_| {
+                format!("the document is longer than the {DOCUMENT_MAX_CHARS}-char read limit")
+            })
+        });
+    let rendered = extract::view::render(&ex.markdown, &view, incomplete.as_deref());
+    ex.markdown = rendered.text;
+    ex.next_offset = rendered.next_offset;
+    ex.tokens_est = ex.markdown.len() / 4;
+
     let mut res = finish_result(
         &ex,
-        final_tier,
+        final_fetch,
         final_status,
         &final_verdict,
         &display_url,
         &trace,
         t0.elapsed().as_millis(),
     );
-    apply_faithful_body(&mut res, &ex, &opts);
-    maybe_record_agent_outcome(daemon, &host, &opts, &ex, &final_verdict);
+    // A resumed read continues text the caller already holds: the title and
+    // source line belong to the first chunk, and repeating them would put a
+    // second H1 into the stitched document.
+    if view.offset > 0
+        && let Some(cell) = res.pointer_mut("/content/0/text")
+    {
+        *cell = json!(ex.markdown.trim_start_matches('\n'));
+    }
+    if let Some(sc) = res.pointer_mut("/structuredContent") {
+        if !ex.thin {
+            sc["read_status"] = json!(match (rendered.status, ex.partial.is_some()) {
+                ("content", true) => "partial",
+                (status, _) => status,
+            });
+            sc["content_complete"] = json!(rendered.complete && ex.partial.is_none());
+        }
+        if let Some(state) = rendered.state.as_object() {
+            for (key, value) in state {
+                sc[key] = value.clone();
+            }
+        }
+        if rendered.verdict.is_some()
+            && let Some(object) = sc.as_object_mut()
+        {
+            object.remove("content_kind");
+        }
+        if let Some(state) = ocr_state {
+            sc["image_text"] = state;
+        }
+        if let Some(next) = out
+            .as_ref()
+            .filter(|o| o.verdict == Verdict::ContentOk && adapter_used.is_none())
+            .and_then(|o| next_page(&o.body, &o.url))
+        {
+            sc["next_page"] = json!(next);
+        }
+    }
+    maybe_record_agent_outcome(daemon, &host, &view, &ex, &final_verdict, rendered.verdict);
     if daemon.state.lock().await.is_flaky(&host) {
         res["structuredContent"]["stability"] = json!("flaky");
     }
     if prewarmed {
         res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
     }
-    if stitch
-        && output_opts.must_contain.is_none()
-        && !output_opts.toc
-        && let Some(sc) = res.pointer_mut("/structuredContent")
-    {
-        sc["stitched"] = json!(stitched_parts);
-        sc["stitch_complete"] = json!(stitch_next.is_none());
-        if let Some(next_part) = stitch_next {
-            sc["content_complete"] = json!(false);
-            sc["read_status"] = json!("partial");
-            sc["next_part"] = next_part;
-        }
-    }
-    apply_link_handles(daemon, &mut res).await;
-    // v3 anti-cloak: a known-walled domain passing tier-1 cold
-    // cleanly is suspicious. One equivalence check; a warning is
-    // stamped, never a silent pass.
-    let mut cloak_warning: Option<String> = None;
-    // Compare suspicious HTTP-only content once. A recovery already observed
-    // this browser document, and explicit tier 1 must not launch a browser.
-    // v4.7 V03: JSON data endpoints and PDFs are terminal at the HTTP
-    // tier : the equivalence comparison needs a browser-readable
-    // document, and a data payload is not one.
-    if known_walled
-        && !adapter_host
-        && !skip_tier1
-        && !is_warm
-        && !need_ghost
-        && !json_like
-        && !is_pdf_content
-        && tier != "1"
-    {
-        let started = std::time::Instant::now();
-        trace.step("2", "anti-cloak", "started", 0);
-        let outcome = match anticloak_check(daemon, &url, &ex.markdown, budget, &call.route).await {
-            CloakComparison::Equivalent => {
-                daemon.state.lock().await.record_cold_ok(&host);
-                "equivalent"
-            }
-            CloakComparison::Divergent(note) => {
-                cloak_warning = Some(note);
-                "divergent"
-            }
-            CloakComparison::Unavailable(reason) => reason,
-        };
-        trace.step("2", "anti-cloak", outcome, started.elapsed().as_millis());
-        res["_meta"]["com.donsetch/fetch-debug"]["escalation"] = trace.value();
-    }
-    if let Some(note) = &cloak_warning {
-        if let Some(cell) = res.pointer_mut("/content/0/text")
-            && let Some(md) = cell.as_str().map(String::from)
-        {
-            *cell = json!(format!("*[cloak_suspected: {note}]*\n\n{md}"));
-        }
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["cloak_suspected"] = json!(true);
-            sc["cloak_note"] = json!(note);
-        }
+    if !opts.link_urls {
+        apply_link_handles(daemon, &mut res).await;
     }
 
     // v3 freshness: the server's own Last-Modified, when it
@@ -2793,47 +1740,56 @@ async fn fetch_single_inner(
     {
         sc["server_modified"] = json!(lm);
     }
-    if !opts.faithful
-        && opts.focus.is_none()
-        && opts.section.is_none()
-        && opts.selector.is_none()
-        && !opts.toc
-        && opts.must_contain.is_none()
-        && !stitch
-    {
-        apply_page_history(
-            daemon,
-            &mut res,
-            &display_url,
-            PageFacts {
-                fingerprint: ex.fingerprint.as_deref(),
-                markdown: &ex.markdown,
-                title: ex.title.as_deref(),
-                complete: opts.offset == 0
-                    && ex.next_offset.is_none()
-                    && !ex.thin
-                    && ex.partial.is_none(),
-            },
-            since_last,
-        );
-    }
-    if image_text {
-        apply_image_ocr(daemon, &mut res, &ex.images).await;
-    }
+    // Every read records the page for since_last; only a since_last call
+    // replaces its output with the change report. A path that builds its
+    // markdown without the block extractor (text fallback, feeds, data
+    // rescue) has no fingerprint of its own, so the page's text is
+    // fingerprinted here: an unfingerprinted read could never be checked
+    // for change, and a news front page paid full price on every call.
+    let own_fingerprint = ex.fingerprint.clone().or_else(|| {
+        (!ex.thin && !document.trim().is_empty())
+            .then(|| crate::pages::history::PageHistory::fingerprint(&document))
+    });
+    apply_page_history(
+        daemon,
+        &mut res,
+        &display_url,
+        PageFacts {
+            fingerprint: own_fingerprint.as_deref(),
+            markdown: &document,
+            title: ex.title.as_deref(),
+            complete: incomplete.is_none() && !ex.thin,
+        },
+        since_last,
+    );
     res
 }
 
-/// Unified tier-2: ghost render + cookie harvest + tier-1 retry,
-/// then pick the candidate with the best content yield. Ok ONLY
-/// when a candidate extracts as real content : a shell is a
-/// failure, never a success. This is the loop the design always
-/// promised: escalate, render, hand cookies back to tier 1.
-///
-/// Anti-bot bypass fetch (v3.4): when ghost fails on a hard wall,
-/// hand the URL to Bright Data Web Unlocker API. Opt-in via
-/// `donsetch keys add unlocker <key>`. No key = inert, returns None.
-/// Only fires on wall verdicts (Challenge/Blocked) and ghost "walled"
-/// failures. Respects tier=1 (explicit no-escalation).
+/// The same-host page an HTML document names as its next one
+/// (`rel="next"`), for reading a paginated article part by part.
+fn next_page(body: &[u8], base: &str) -> Option<String> {
+    static REL_NEXT: std::sync::LazyLock<regex::bytes::Regex> = std::sync::LazyLock::new(|| {
+        regex::bytes::Regex::new(r#"(?i)<(?:link|a)\b[^>]*\brel\s*=\s*["']?[^"'>]*\bnext\b"#)
+            .expect("static regex")
+    });
+    if !REL_NEXT.is_match(body) {
+        return None;
+    }
+    let html = String::from_utf8_lossy(body);
+    let next = find_rel_next(&html, base)?;
+    let host = |u: &str| {
+        url::Url::parse(u)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+    };
+    (next != base && host(&next).is_some() && host(&next) == host(base)).then_some(next)
+}
+
+/// The optional unlocker (Bright Data Web Unlocker): when a local
+/// fetch hits a hard wall (Challenge/Blocked), hand the URL to the
+/// paid API once. Opt-in via `donsetch keys add unlocker <key>`;
+/// no key = inert, returns None. A challenge or empty shell that
+/// comes back stays a failed fetch.
 pub(super) async fn try_bypass(
     daemon: &Arc<Daemon>,
     url: &str,
@@ -2868,23 +1824,38 @@ pub(super) async fn try_bypass(
         );
         return None;
     }
-    let ex =
-        match extract::extract_off_worker(&outcome.body, &outcome.content_type, url, opts).await {
-            Ok(e) => e,
-            Err(e) => {
-                trace.step(
-                    "bypass",
-                    "extract",
-                    &format!("{e}"),
-                    t0.elapsed().as_millis(),
-                );
-                return None;
-            }
-        };
+    // The unlocker hands the page over inside a JSON string, so the body
+    // is UTF-8 whatever charset the target's Content-Type names: extract
+    // gets the target's MIME type with charset=utf-8. An empty MIME type
+    // becomes text/html, the type parse_response gives a target that sent
+    // no Content-Type; extract routes it as it routes an empty type.
+    let mime = match outcome
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+    {
+        "" => "text/html",
+        mime => mime,
+    };
+    let unlocked_ct = format!("{mime}; charset=utf-8");
+    let ex = match extract::extract_off_worker(&outcome.body, &unlocked_ct, url, opts).await {
+        Ok(e) => e,
+        Err(e) => {
+            trace.step(
+                "bypass",
+                "extract",
+                &format!("{e}"),
+                t0.elapsed().as_millis(),
+            );
+            return None;
+        }
+    };
     let failure = if ex.blocks_total == 0 || ex.markdown.trim().is_empty() {
         Some("unlocker returned no extracted content".to_string())
     } else {
-        content_fail(&ex.markdown, url, outcome.status).map(|(msg, _, _)| msg)
+        content_fail(&ex.markdown, url, outcome.status, false, false).map(|(msg, _, _)| msg)
     };
     if let Some(msg) = failure {
         crate::fetch::bypass::invalidate_cached(&cache_dir, url, cfg.render);
@@ -2902,625 +1873,115 @@ pub(super) async fn try_bypass(
         ),
         t0.elapsed().as_millis(),
     );
-    let tier = if outcome.cached {
-        "3-cached"
-    } else {
-        "3-bypass"
-    };
     let mut res = finish_result(
         &ex,
-        tier,
+        "unlocker",
         outcome.status,
         "ContentOk",
         url,
         trace,
         t0.elapsed().as_millis(),
     );
-    apply_faithful_body(&mut res, &ex, opts);
     res["_meta"]["com.donsetch/fetch-debug"]["bypass"] = json!({
         "provider": "brightdata",
-        "tier": if outcome.cached { "cache" } else { "unlocker" },
         "cache": outcome.cached,
     });
-    apply_link_handles(daemon, &mut res).await;
+    if !opts.link_urls {
+        apply_link_handles(daemon, &mut res).await;
+    }
     Some(res)
 }
 
-/// Why `ghost_escalate` returned no page.
-pub(super) enum GhostFailure {
-    /// The browser lane failed: the agent-facing message and its
-    /// `errorKind`.
-    Failed(String, &'static str),
-    /// A local rule refused a URL on the browser lane. Always
-    /// `FetchError::Denied`; the caller reports it as the rule's policy
-    /// error and never escalates it.
-    Denied(FetchError),
+/// The same-site page a contentless document sends script-less clients
+/// to: its `<noscript>` refresh, or, for a document with no text at all,
+/// its declared English alternate (where its script would send a
+/// browser). None when it leads nowhere new.
+fn noscript_hop(body: &[u8], page_url: &str) -> Option<String> {
+    let page = crate::detect::substance::assess_html(body, page_url);
+    if page.verdict.is_content() {
+        return None;
+    }
+    let target = page.noscript_redirect.or(page.language_hop)?;
+    let (from, to) = (
+        url::Url::parse(page_url).ok()?,
+        url::Url::parse(&target).ok()?,
+    );
+    let site = |u: &url::Url| {
+        u.host_str()
+            .map(|h| psl::domain_str(h).unwrap_or(h).to_ascii_lowercase())
+    };
+    (matches!(to.scheme(), "http" | "https")
+        && site(&from).is_some()
+        && site(&from) == site(&to)
+        && !same_fetch_url(&target, page_url))
+    .then_some(target)
 }
 
-/// `learn` = this escalation was WALL-DRIVEN (challenge seen, warm
-/// cookies bought a shell, or the profile routed skip-to-solve).
-/// A wall-driven success records the solve so the next fetch can
-/// ride warm tier 1 : with `replay_ok` set from the tier-1 retry's
-/// actual outcome. A pure SPA render (thin content, no wall) never
-/// touches the domain profile: the site isn't walled, it's JS-only.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn ghost_escalate(
-    daemon: &Arc<Daemon>,
+/// The honest failure for a document that carries no content: what it is,
+/// quoted where it says so itself, and what to do instead. Not "retry": the
+/// same document comes back.
+fn shell_failure(
     url: &str,
-    host: &str,
-    opts: &ExtractOptions,
-    learn: bool,
-    browser_only: bool,
-    shot: Option<&str>,
-    trace: &mut Trace,
-    budget: Budget,
-    route: &crate::transport::request_route::RequestRoute,
-    accept_language: Option<&str>,
-    session_stamp: &str,
-) -> Result<(extract::Extracted, &'static str, u16, String, String), GhostFailure> {
-    let render_state = GhostState::load();
-    let t0 = std::time::Instant::now();
-    // v4 E2: ghost agrees with the persona pin (viewport + locale).
-    let mut wire = {
-        let state = daemon.state.lock().await;
-        state
-            .personas
-            .get(host)
-            .filter(|p| p.quarantine_reason.is_none())
-            .map(|p| p.ghost_wire())
-            .unwrap_or_default()
-    };
-    wire.route = Some(route.clone());
-    trace.step("2", "browser-launch", "started", 0);
-    let g = daemon
-        .ghost_mgr
-        .acquire_for_wire(&daemon.profile, Some(host), wire)
-        .await
-        .map_err(|e| GhostFailure::Failed(format!("browser launch failed: {e}"), "permanent"))?;
-    trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
-    trace.step(
-        "2",
-        "browser-queue",
-        if g.reused { "reused" } else { "launched" },
-        g.queue_wait.as_millis(),
-    );
-    let t1 = std::time::Instant::now();
-    let read = daemon
-        .ghost_mgr
-        .read_document(g, &daemon.profile, url, budget.pass(20))
-        .await
-        .map_err(|error| {
-            let message = error.to_string();
-            trace.step("2", "ghost-render", &message, t1.elapsed().as_millis());
-            // A denial must not become a transient browser failure: that
-            // reads as worth a retry against a host the operator denied.
-            if matches!(error, FetchError::Denied { .. }) {
-                return GhostFailure::Denied(error);
-            }
-            GhostFailure::Failed(format!("browser navigation error: {message}"), "transient")
-        })?;
-    if let Some(recovery) = read.recovery {
-        trace.step(
-            "2",
-            "browser-read-retry",
-            recovery.reason,
-            recovery.elapsed.as_millis(),
-        );
-    }
-    let mut g = read.guard;
-    let mut page = read.page;
-    trace.step(
-        "2",
-        "ghost-render",
-        &format!(
-            "outcome={:?} dom={}KB",
-            page.outcome,
-            page.html.len() / 1024
-        ),
-        t1.elapsed().as_millis(),
-    );
-    trace.observe_browser(&page.document);
-    if crate::config::cfg().debug.ghost {
-        let p = dump_ghost_dom(
-            &crate::paths::cache_dir().join("ghost-debug"),
-            host,
-            &page.html,
-        );
-        crate::diag!(
-            "[ghost_escalate] dom={}B dumped to {}",
-            page.html.len(),
-            p.display()
-        );
-    }
-    if crate::ghost::is_chrome_error_html(&page.html) {
-        return Err(GhostFailure::Failed(
-            format!("browser network error at {url}: Chrome could not load the document"),
-            "transient",
-        ));
-    }
-    let gate = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-    if matches!(
-        gate,
-        Verdict::AuthWall | Verdict::Paywall | Verdict::SoftNotFound
-    ) {
-        let status = page.document.status.unwrap_or(0);
-        return Err(GhostFailure::Failed(
-            verdict_error(gate, status, &page.document.url),
-            verdict_kind(gate, status),
-        ));
-    }
-    if page.outcome.is_wall() {
-        // Interactive widgets are outside this solver's capabilities. The
-        // first real DOM is decisive; another navigation cannot answer a
-        // human challenge. Turnstile keeps its bounded warm second pass.
-        if page.outcome == ops::BrowserOutcome::HumanRequired {
-            trace.step(
-                "2",
-                "solve",
-                "human challenge required",
-                t1.elapsed().as_millis(),
-            );
-            if let Some(path) = shot {
-                record_shot(&g, path, trace).await;
-            }
-            {
-                let mut state = daemon.state.lock().await;
-                state.record_wall_failed(host);
-                state.record_human_wall(host, url, &route.id(), session_stamp);
-            }
-            return Err(GhostFailure::Failed(
-                format!("blocked at {url} : interactive captcha requires a human browser session"),
-                "walled",
-            ));
+    verdict: Option<crate::detect::substance::Verdict>,
+    out: Option<&crate::fetch::client::FetchOutcome>,
+) -> (String, &'static str, &'static str) {
+    use crate::detect::substance::Verdict as V;
+    const ELSEWHERE: &str = "the content renders in a browser after scripts run: look for the same content in a server-rendered page, a feed or an API of this site, or another source (web_search)";
+    let notice = match verdict {
+        Some(V::Notice | V::Loading | V::Shell) => {
+            out.and_then(|o| crate::detect::substance::assess_html(&o.body, &o.url).notice)
         }
-        // Solve-grade second pass: some vendors (Akamai) run the
-        // sensor on the first load and only clear on a follow-up
-        // navigation once their first-party state is planted. The
-        // browser is warm now: one bounded re-render, then a
-        // settle re-check. Never more: two passes is the ceiling,
-        // an honest captcha stays an honest captcha.
-        let t1b = std::time::Instant::now();
-        let page2 = ops::ghost_fetch(&mut g, url, budget.pass(20)).await;
-        match page2 {
-            Ok(p2) if !p2.outcome.is_wall() => {
-                trace.observe_browser(&p2.document);
-                trace.step(
-                    "2",
-                    "solve-pass2",
-                    &format!(
-                        "cleared: captcha={} dom={}KB",
-                        p2.outcome.is_wall(),
-                        p2.html.len() / 1024
-                    ),
-                    t1b.elapsed().as_millis(),
-                );
-                // Fall through into the normal harvest/retry flow.
-                page = p2;
-            }
-            Ok(p2) if p2.outcome.is_wall() => {
-                trace.observe_browser(&p2.document);
-                // A failed second pass must leave the same trail a
-                // successful one does. The debug log showed two
-                // attempts while the escalation listed one, so the
-                // trail implied the wall had been met once (#258).
-                trace.step(
-                    "2",
-                    "solve-pass2",
-                    &format!(
-                        "still walled: captcha={} dom={}KB",
-                        p2.outcome.is_wall(),
-                        p2.html.len() / 1024
-                    ),
-                    t1b.elapsed().as_millis(),
-                );
-                if let Some(p) = shot {
-                    record_shot(&g, p, trace).await;
-                }
-                // The wall survived BOTH passes in a real browser:
-                // this is wall-persisting evidence, recorded.
-                daemon.state.lock().await.record_wall_failed(host);
-                // #282: different recoveries get different codes. A
-                // page holding an interactive captcha widget needs a
-                // human or a vendor solver; a vendor-less challenge
-                // that never finished is the retry-or-unlocker class.
-                let msg = if crate::detect::walls::interactive_captcha(p2.html.as_bytes()) {
-                    "interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these".to_string()
+        _ => None,
+    };
+    match (verdict, notice) {
+        (Some(V::Notice), Some(text)) => {
+            let transient = {
+                let l = text.to_lowercase();
+                l.contains("try again") || l.contains("temporar")
+            };
+            (
+                format!(
+                    "no readable content at {url} : the page shows a notice instead of its content: \"{text}\""
+                ),
+                if transient { "transient" } else { "permanent" },
+                if transient {
+                    "the site reports a temporary failure: retry later, or choose another source"
                 } else {
-                    "the page is an anti-bot challenge that did not clear (the challenge never finished on its own; retry later or let a configured unlocker solve this class)".to_string()
-                };
-                return Err(GhostFailure::Failed(
-                    format!("blocked at {url} : {msg}"),
-                    "walled",
-                ));
-            }
-            // A rule refused the second navigation: the rule's error,
-            // never a retryable recovery failure.
-            Err(error @ FetchError::Denied { .. }) => {
-                return Err(GhostFailure::Denied(error));
-            }
-            // ghost_fetch errored on the retry (automation failure,
-            // not a wall): no wall memory recorded.
-            Err(error) => {
-                if let Some(p) = shot {
-                    record_shot(&g, p, trace).await;
-                }
-                return Err(GhostFailure::Failed(
-                    format!("browser recovery failed at {url}: {error}"),
-                    "transient",
-                ));
-            }
-            _ => unreachable!(),
+                    "the notice is the site's answer for this client: choose another source for this content (web_search)"
+                },
+            )
         }
-    }
-    let status = page.document.status.unwrap_or(0);
-    let observed_gate = match status {
-        401 => Some(Verdict::AuthWall),
-        402 => Some(Verdict::Paywall),
-        404 | 410 => Some(Verdict::SoftNotFound),
-        _ => crate::detect::walls::content_gate(page.html.as_bytes()),
-    };
-    if let Some(verdict) = observed_gate {
-        return Err(GhostFailure::Failed(
-            verdict_error(verdict, status, &page.document.url),
-            verdict_kind(verdict, status),
-        ));
-    }
-    if page.outcome == ops::BrowserOutcome::Incomplete {
-        return Err(GhostFailure::Failed(
-            format!("browser document incomplete at {url}: content did not settle"),
-            "transient",
-        ));
-    }
-    if !page.outcome.is_wall() {
-        // Solve-grade pass for invisible walls: Akamai-class vendors
-        // render a "still checking" page that settles (no captcha
-        // form) but whose DOM classifies as a wall. The sensor fires
-        // during pass 1 and plants first-party state; a warm re-render
-        // right after is the pass that gets the real page. One
-        // attempt only, then fall into the normal flow regardless.
-        let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-        // Gate: a stuck wall burns the FULL 20s in pass 1; a second
-        // 20s pass2b on top = 40s of dead air. Only re-render when
-        // pass 1 returned fast (the wall cleared mid-flight and the
-        // re-render catches the real page).
-        if matches!(
-            dom_verdict,
-            crate::detect::walls::Verdict::Challenge(_) | crate::detect::walls::Verdict::Blocked
-        ) && page.took < std::time::Duration::from_secs(12)
-        {
-            let t1b = std::time::Instant::now();
-            if let Ok(p2) = ops::ghost_fetch(&mut g, url, budget.pass(20)).await {
-                let v2 = crate::detect::walls::detect_dom_smart(p2.html.as_bytes());
-                if !p2.outcome.is_wall()
-                    && !matches!(
-                        v2,
-                        crate::detect::walls::Verdict::Challenge(_)
-                            | crate::detect::walls::Verdict::Blocked
-                    )
-                {
-                    trace.step(
-                        "2",
-                        "solve-pass2",
-                        &format!("cleared after re-render: {}KB", p2.html.len() / 1024),
-                        t1b.elapsed().as_millis(),
-                    );
-                    page = p2;
-                    trace.observe_browser(&page.document);
-                }
-            }
-        }
-    }
-    if !page.cookies.is_empty() {
-        // A pooled browser can predate a logout for one of its
-        // domains: a dead session must not ride back into the jar
-        // or the vault.
-        let cookies = crate::ghost::cache::session_cookies_since(&page.cookies, g.launched_epoch);
-        daemon.fetcher.import_vault_cookies(&cookies).await;
-        crate::ghost::cache::store_session_cookies(&cookies);
-    }
-    // Retry tier 1 with fresh cookies : the cheap path back to
-    // normal HTTP when the gate was cookie-driven.
-    let t2 = std::time::Instant::now();
-    let retry = if !browser_only && !page.cookies.is_empty() {
-        let r = daemon
-            .fetcher
-            .fetch_persona_on_route(url, accept_language, Some(route))
-            .await
-            .ok();
-        trace.step(
-            "1",
-            "http-retry-with-ghost-cookies",
-            &format!(
-                "cookies={} status={}",
-                page.cookies.len(),
-                r.as_ref().map(|o| o.status).unwrap_or(0)
+        (Some(V::Loading), _) => (
+            format!(
+                "no readable content at {url} : the page is a loading placeholder; its content is fetched by scripts in a browser"
             ),
-            t2.elapsed().as_millis(),
-        );
-        r
-    } else {
-        None
-    };
-
-    // Replay verification: cookies are only "warm-worthy" when the
-    // tier-1 retry returned real content with them. A walled or
-    // shell retry means the vendor binds clearance to the browser
-    // fingerprint : record replay_ok=false so route_for never
-    // serves a doomed Warm roundtrip again.
-    let mut replay_content_ok = false;
-
-    // HTTP replay is an independent candidate. A failed replay cannot
-    // override the browser's observed response or usable document.
-
-    // Candidates: retry bytes (cheap path) and the ghost's own
-    // rendered DOM. Non-thin always beats thin; within a class,
-    // bigger yield wins. The old code always preferred the retry
-    // and discarded the browser's work : the core tier-2 bug.
-    let mut best: Option<(bool, extract::Extracted, &'static str, u16, String)> = None;
-
-    if let Some(r) = &retry
-        && matches!(r.verdict, Verdict::ContentOk)
-    {
-        let ct = r
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        if !crate::fetch::guards::is_binary(&r.body, &ct)
-            && let Ok(e) = extract::extract_off_worker(&r.body, &ct, &r.url, opts).await
-        {
-            let thin = e.thin;
-            replay_content_ok = !thin;
-            let better = match &best {
-                None => true,
-                Some((bt, be, ..)) => {
-                    (!thin && *bt) || (thin == *bt && e.total_chars > be.total_chars)
-                }
-            };
-            if better {
-                best = Some((thin, e, "1+ghost-solve", r.status, r.url.clone()));
-            }
-        }
-    }
-    if let Ok(e2) = extract::extract(
-        page.html.as_bytes(),
-        extract::charset::GHOST_TEXT_CT,
-        &page.document.url,
-        opts,
-    ) {
-        let thin = e2.thin;
-        let better = match &best {
-            None => true,
-            Some((bt, be, ..)) => {
-                (!thin && *bt) || (thin == *bt && e2.total_chars > be.total_chars)
-            }
-        };
-        if better {
-            best = Some((
-                thin,
-                e2,
-                "ghost-dom",
-                page.document.status.unwrap_or(0),
-                page.document.url.clone(),
-            ));
-        }
-    }
-
-    // Links fallback: listing/feed pages (marketplaces, SERPs,
-    // thread indexes) are link-dense by nature : the prose-tuned
-    // pipeline kills them. Re-extract with links kept as a last
-    // candidate before conceding.
-    if best.as_ref().map(|(thin, ..)| *thin).unwrap_or(true) {
-        let mut lopts = opts.clone();
-        lopts.include_links = true;
-        if let Ok(e3) = extract::extract(
-            page.html.as_bytes(),
-            extract::charset::GHOST_TEXT_CT,
-            &page.document.url,
-            &lopts,
-        ) {
-            let thin = e3.thin;
-            let better = match &best {
-                None => true,
-                Some((bt, be, ..)) => {
-                    (!thin && *bt) || (thin == *bt && e3.total_chars > be.total_chars)
-                }
-            };
-            if better {
-                best = Some((
-                    thin,
-                    e3,
-                    "ghost-dom(links)",
-                    page.document.status.unwrap_or(0),
-                    page.document.url.clone(),
-                ));
-            }
-        }
-    }
-
-    if let Some((thin, e, t, s, u)) = best
-        && !thin
-    {
-        // #282: a challenge interstitial or chrome-only shell that
-        // passed the thin gate must not be served (or learned from)
-        // as content.
-        if let Some((msg, kind, _)) = content_fail(&e.markdown, url, s) {
-            return Err(GhostFailure::Failed(msg, kind));
-        }
-        // Learning is gated on WALL-DRIVEN escalation AND gated on
-        // CONTENT : success is "we got content", not "we got HTTP
-        // 200". The replay probe (or its absence) sets replay_ok.
-        if learn || page.vendor.is_some() {
-            // A pooled browser can predate a logout for one of its
-            // domains: a dead session must not ride back into the
-            // learned route or the vault.
-            let cookies =
-                crate::ghost::cache::session_cookies_since(&page.cookies, g.launched_epoch);
-            daemon.state.lock().await.record_solved(
-                host,
-                &cookies,
-                page.vendor.as_deref(),
-                replay_content_ok,
-            );
-            crate::ghost::cache::store_session_cookies(&cookies);
-        }
-        // Don't cache challenge/wall DOMs : defense in depth alongside
-        // the ghost_fetch timeout check. A challenge page that has
-        // enough block structure to pass !thin would otherwise be
-        // cached and re-served as ContentOk forever.
-        let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-        if dom_verdict == Verdict::ContentOk {
-            daemon.state.lock().await.record_render_session(
-                &page.document.url,
-                &page.html,
-                &render_state.render_stamp(&page.document.url),
-            );
-        }
-        return Ok((e, t, s, u, page.html));
-    }
-
-    // JSON endpoints recovered through the ghost (reddit .json,
-    // registry APIs): Chrome wraps raw JSON in a <pre>; unwrap it
-    // and run the adapter over the true bytes instead of
-    // misclassifying a JSON page as a wall or a thin shell. This
-    // closes the adapter-after-solve gap: a reddit listing walled
-    // on tier-1 re-parses cleanly here after ghost recovery.
-    let pre = scraper::Html::parse_document(&page.html)
-        .select(&scraper::Selector::parse("pre").unwrap_or(scraper::Selector::parse("*").unwrap()))
-        .next()
-        .map(|n| n.text().collect::<String>());
-    let candidate = pre.as_deref().unwrap_or(&page.html);
-    let trimmed = candidate.trim_start();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Some(ext) = crate::adapters::extract_json(
-            trimmed.as_bytes(),
-            "application/json",
-            &page.document.url,
-            opts,
-        ) {
-            return Ok((
-                ext,
-                "ghost-json",
-                page.document.status.unwrap_or(0),
-                page.document.url.clone(),
-                page.html,
-            ));
-        }
-        // No adapter: DonSift's generic pass for the raw body.
-        if let Ok(ext) = extract::extract(
-            trimmed.as_bytes(),
-            "application/json",
-            &page.document.url,
-            opts,
-        ) {
-            return Ok((
-                ext,
-                "ghost-json",
-                page.document.status.unwrap_or(0),
-                page.document.url.clone(),
-                page.html,
-            ));
-        }
-    }
-
-    // Last resort: raw text fallback. If the ghost DOM has real
-    // visible text but DonSift's block extraction couldn't parse
-    // it (complex DOM, non-standard structure), strip tags and
-    // return the visible text. This makes "found DOM but failed
-    // to extract content" IMPOSSIBLE when the DOM has real text.
-    //
-    // BUT: only return Ok when the fallback is non-thin (>= 800
-    // chars of visible text). A captcha/challenge page with 300
-    // chars of "Please verify you are a human" must NOT be
-    // returned as ContentOk : the agent would trust it.
-    if !page.outcome.is_wall() {
-        let doc = scraper::Html::parse_document(&page.html);
-        let meta = crate::extract::metadata::metadata(&doc);
-        let max_chars = opts.max_chars.unwrap_or(16_000).max(200);
-        if let Some(fb) = crate::extract::fallback::text_fallback(
-            &page.html,
-            &meta,
-            &page.document.url,
-            opts,
-            max_chars,
-        ) {
-            // The fallback is the LAST resort. A real page render
-            // whose useful text is short must still succeed (live
-            // case: instagram's profile card = 279 collectible
-            // chars, all of it the useful content; the old gate
-            // failed the whole fetch because the 800-char thin bar
-            // is tuned for articles). Only a login-only shell or a
-            // sub-sentence fragment stays a fail.
-            let login_only = fb.markdown.len() < 60
-                && (fb.markdown.to_ascii_lowercase().contains("log in")
-                    || fb.markdown.to_ascii_lowercase().contains("sign up"));
-            // The last resort must not resurrect junk (#282): a
-            // challenge interstitial or chrome-only shell stays a
-            // failure even though its text is technically non-empty.
-            let status = page.document.status.unwrap_or(0);
-            if content_fail(&fb.markdown, url, status).is_none()
-                && (!fb.thin || (fb.markdown.len() >= 40 && !login_only))
-            {
-                return Ok((
-                    fb,
-                    "ghost-text",
-                    page.document.status.unwrap_or(0),
-                    page.document.url.clone(),
-                    page.html,
-                ));
-            }
-        }
-    }
-
-    // Differentiate: small DOM with no content = not found / blocked.
-    // Large DOM with no extractable content = genuine extraction failure.
-    // A challenge page (captcha, bot wall) must ALWAYS return "blocked"
-    // with kind="walled" (exit 3), regardless of DOM size : never "not
-    // found" (exit 1). This fixes the Medium URL that gave different
-    // verdicts across runs: sometimes the challenge page was < 5KB
-    // (→ "not found"), sometimes larger (→ "blocked").
-    let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-    if matches!(dom_verdict, Verdict::Challenge(_) | Verdict::Blocked) {
-        daemon.state.lock().await.record_wall_failed(host);
-        // #282: the code must say which recovery applies. An
-        // interactive widget needs a human or a vendor solver; a
-        // bare challenge that never finished is retry-or-unlocker.
-        let msg = if crate::detect::walls::interactive_captcha(page.html.as_bytes()) {
-            "interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these".to_string()
-        } else {
-            "the page is an anti-bot challenge that did not clear (the challenge never finished on its own; retry later or let a configured unlocker solve this class)".to_string()
-        };
-        return Err(GhostFailure::Failed(
-            format!("blocked at {url} : {msg}"),
-            "walled",
-        ));
-    }
-    if matches!(dom_verdict, Verdict::AuthWall | Verdict::Paywall) {
-        return Err(GhostFailure::Failed(
-            format!("login or payment required at {url}"),
-            "walled",
-        ));
-    }
-    if page.html.len() < 5_000 {
-        return Err(GhostFailure::Failed(
-            format!("browser document incomplete at {url}: no extractable content"),
-            "transient",
-        ));
-    }
-    Err(GhostFailure::Failed(
-        format!(
-            "content could not be extracted at {url}: browser returned a {}KB document without readable content",
-            page.html.len() / 1024
+            "permanent",
+            ELSEWHERE,
         ),
-        "permanent",
-    ))
+        (Some(V::Empty), _) => (
+            format!(
+                "no readable content at {url} : the document has no visible text; the page is built by scripts in a browser"
+            ),
+            "permanent",
+            ELSEWHERE,
+        ),
+        (Some(_), _) => (
+            format!(
+                "no readable content at {url} : the page is a client-side app frame (navigation, labels, legal lines) without its content"
+            ),
+            "permanent",
+            ELSEWHERE,
+        ),
+        (None, _) => (
+            format!(
+                "no readable content at {url} : the page renders client-side and did not hydrate"
+            ),
+            "transient",
+            "retry later, or choose another source for this page",
+        ),
+    }
 }
 
-/// PDF-shaped URL check for the actions guard (before the main
-/// flow computes its own is_pdf_url). Covers both the .pdf
-/// suffix convention and the /pdf/ path convention (arXiv:
-/// arxiv.org/pdf/1706.03762 serves a PDF with no extension).
 /// Short, sentence-free, identifier-dominated extraction = a
 /// framework shell (React server dumps leak identifiers as DOM
 /// text nodes). Real prose has sentences.
@@ -3572,18 +2033,23 @@ fn looks_like_shell_text(markdown: &str) -> bool {
 /// Positive content tests (#282): a challenge interstitial or a
 /// chrome-only shell that made it through as "some text" is not
 /// content. Returns the honest failure for the extracted shape, or
-/// None when the text is real content.
+/// None when the text is real content. A `verified` body (the fetch layer's
+/// contract found content) is not failed on bot-wall words alone.
 fn content_fail(
     markdown: &str,
     url: &str,
     status: u16,
+    verified: bool,
+    has_verdict: bool,
 ) -> Option<(String, &'static str, &'static str)> {
-    if let Some(wall) = crate::detect::walls::text_wall(markdown) {
+    if let Some(wall) = crate::detect::walls::text_wall(markdown)
+        && !(verified && matches!(wall, Verdict::Challenge(_) | Verdict::Blocked))
+    {
         if wall == Verdict::AuthWall {
             return Some((
                 format!("login required at {url}"),
                 "walled",
-                "authenticate with donsetch login <domain>, or use an accessible source",
+                "the page needs a signed-in session, which fetch does not carry; use an accessible source",
             ));
         }
         return Some((
@@ -3591,44 +2057,30 @@ fn content_fail(
                 "blocked at {url} : the page is an anti-bot challenge that did not clear (the extracted text is the interstitial, not content)"
             ),
             "walled",
-            "retry later : the challenge may clear; tier=auto renders with a browser, and a configured unlocker solves this class",
+            "retry later : the challenge may clear; a configured unlocker can try this class",
         ));
     }
-    if (200..300).contains(&status) && crate::extract::quality::chrome_only(markdown) {
+    // A document verdict already judged the frame; the markdown test is
+    // for reads without one.
+    if !has_verdict
+        && (200..300).contains(&status)
+        && crate::extract::quality::chrome_only(markdown)
+    {
         return Some((
             format!(
                 "blocked at {url} : the page rendered only navigation and login chrome (an empty shell or a login wall), no content"
             ),
             "walled",
-            "use an agent browser to browse sites like these : the page may be a client-rendered shell or a login wall",
+            "use an interactive browser session for sites like these : the page may be a client-rendered shell or a login wall",
         ));
     }
     None
 }
 
-/// Whether the URL is PDF-shaped: its path (query stripped,
-/// case-insensitive) ends in `.pdf`, has a `pdf` segment, or ends in
-/// `/pdf`. `fetch_route` routes such URLs Cold.
-pub(crate) fn is_pdf_url_like(url: &str) -> bool {
-    let path = url.split('?').next().unwrap_or(url).to_lowercase();
-    if path.ends_with(".pdf") {
-        return true;
-    }
-    // Path-segment "/pdf/" or trailing "/pdf" (arXiv, IACR,
-    // many journal endpoints).
-    let no_scheme = path
-        .strip_prefix("https://")
-        .or_else(|| path.strip_prefix("http://"))
-        .unwrap_or(&path);
-    let path_part = no_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
-    let segs: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
-    segs.contains(&"pdf") || path_part.ends_with("/pdf")
-}
-
 /// v4.7 V03: JSON data-endpoint URL check : the path names a `.json`
 /// document (reddit `.json`, API dumps; query and fragment stripped,
-/// case-insensitive). A structured payload is terminal at the HTTP
-/// tier : a browser cannot improve it.
+/// case-insensitive). A structured payload is terminal at the local
+/// fetch : a rendered document cannot improve it.
 pub(super) fn is_json_url_like(url: &str) -> bool {
     let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
     path.ends_with(".json")
@@ -3648,347 +2100,27 @@ fn is_json_endpoint(o: &crate::fetch::client::FetchOutcome) -> bool {
     is_json_url_like(&o.url) || ct_is_json(&o.headers)
 }
 
-/// v2: fetch with an action script : navigate, act (click /
-/// type / press / scroll / wait), then run the NORMAL DonSift
-/// extraction over the final DOM. focus/section/toc all work
-/// on the interacted-with page. One call replaces hound's
-/// navigate→act→act→read round-trips.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_with_actions(
+/// OCR the page's first content images (up to 4, 5 MB each,
+/// SSRF-guarded): the `image text` section to append to the document,
+/// and the state for the structured result. Runs only when asked.
+pub(super) async fn image_ocr(
     daemon: &Arc<Daemon>,
-    url: &str,
-    host: &str,
-    opts: &ExtractOptions,
-    actions: &[crate::ghost::actions::Action],
-    shot: Option<&str>,
-    image_text: bool,
-    call: &FetchCall,
-) -> Value {
-    let budget = call.budget;
-    let mut trace = Trace::default();
-    trace.step("route", "actions", "browser-script", 0);
-
-    let t0 = std::time::Instant::now();
-    let mut wire = {
-        let state = daemon.state.lock().await;
-        state
-            .personas
-            .get(host)
-            .filter(|p| p.quarantine_reason.is_none())
-            .map(|p| p.ghost_wire())
-            .unwrap_or_default()
-    };
-    wire.route = Some(call.route.clone());
-    let g = match daemon
-        .ghost_mgr
-        .acquire_for_wire(&daemon.profile, Some(host), wire)
-        .await
-    {
-        Ok(g) => g,
-        Err(e) => {
-            return tool_error_structured(
-                format!("browser launch failed: {e}"),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "status": 0,
-                    "next_action": "run `donsetch doctor` : the browser path is broken on this machine",
-                    "escalation": trace.value(),
-                })),
-            );
-        }
-    };
-    trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
-
-    // Initial render through the standard ghost oracle: navigate,
-    // settle, challenge handling, content checks.
-    let t1 = std::time::Instant::now();
-    let read = match daemon
-        .ghost_mgr
-        .read_document(g, &daemon.profile, url, budget.pass(25))
-        .await
-    {
-        Ok(read) => read,
-        Err(error @ FetchError::Denied { .. }) => {
-            return policy_error_value(&error, url, Some(trace.value()));
-        }
-        Err(error) => {
-            return tool_error_structured(
-                format!("browser navigation error: {error}"),
-                "transient",
-                Some(json!({ "url": url, "status": null, "escalation": trace.value() })),
-            );
-        }
-    };
-    if let Some(recovery) = read.recovery {
-        trace.step(
-            "2",
-            "browser-read-retry",
-            recovery.reason,
-            recovery.elapsed.as_millis(),
-        );
-    }
-    let mut g = read.guard;
-    let page = read.page;
-    trace.step(
-        "2",
-        "ghost-render",
-        &format!(
-            "captcha={} dom={}KB",
-            page.outcome.is_wall(),
-            page.html.len() / 1024
-        ),
-        t1.elapsed().as_millis(),
-    );
-    trace.observe_browser(&page.document);
-    if page.outcome.is_wall() {
-        if let Some(p) = shot {
-            record_shot(&g, p, &mut trace).await;
-        }
-        return tool_error_structured(
-            format!(
-                "blocked at {url} : interactive captcha before actions could run. Use an Agent browser to browse sites like these"
-            ),
-            "walled",
-            Some(json!({
-                "url": url,
-                "status": page.document.status,
-                "verdict": "Challenge",
-                "next_action": next_action_for(Some(Verdict::Challenge(Vendor::Generic)), 200, "walled"),
-                "escalation": trace.value(),
-            })),
-        );
-    }
-
-    let initial_gate = match page.document.status {
-        Some(401) => Some(Verdict::AuthWall),
-        Some(402) => Some(Verdict::Paywall),
-        Some(404 | 410) => Some(Verdict::SoftNotFound),
-        _ => crate::detect::walls::content_gate(page.html.as_bytes()),
-    };
-    if let Some(gate) = initial_gate {
-        return tool_error_structured(
-            verdict_error(gate, page.document.status.unwrap_or(0), &page.document.url),
-            verdict_kind(gate, page.document.status.unwrap_or(0)),
-            Some(
-                json!({"url":page.document.url, "status":page.document.status,
-                "verdict":format!("{gate:?}"), "escalation":trace.value()}),
-            ),
-        );
-    }
-
-    // Run the script.
-    let t2 = std::time::Instant::now();
-    trace.step("2", "action-execution", "started", 0);
-    let outcomes = match crate::ghost::actions::run(&mut g, actions).await {
-        Ok(o) => {
-            trace.step(
-                "2",
-                "actions",
-                &format!("{} steps ok", o.len()),
-                t2.elapsed().as_millis(),
-            );
-            o
-        }
-        Err((step, reason, partial)) => {
-            for o in &partial {
-                trace.step("2", &format!("action[{}]", o.step), &o.outcome, o.ms);
-            }
-            if let Some(p) = shot {
-                record_shot(&g, p, &mut trace).await;
-            }
-            let steps_json: Vec<Value> = partial
-                .iter()
-                .map(|o| json!({"step": o.step, "action": o.action, "outcome": o.outcome, "ms": o.ms}))
-                .collect();
-            return tool_error_structured(
-                format!(
-                    "actions[{step}] failed: {reason} : an action may already have completed (see structuredContent.actions)"
-                ),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "status": page.document.status,
-                    "actions": steps_json,
-                    "escalation": trace.value(),
-                    "next_action": "inspect the page with a plain fetch (no actions), correct the failing step's selector/text, re-run",
-                })),
-            );
-        }
-    };
-
-    // Post-action DOM + optional screenshot for visual debugging.
-    let before = g.document();
-    let html = match g.outer_html().await {
-        Ok(h) => h,
-        Err(e) => {
-            return tool_error_structured(
-                format!("post-action DOM read failed: {e}"),
-                "transient",
-                Some(json!({
-                    "url": url,
-                    "status": page.document.status,
-                    "escalation": trace.value(),
-                })),
-            );
-        }
-    };
-    let document = g.document();
-    if before.generation != document.generation {
-        return tool_error_structured(
-            "post-action document changed during extraction; add a wait for the destination",
-            "transient",
-            Some(json!({"url": url, "status": null, "escalation": trace.value()})),
-        );
-    }
-    trace.observe_browser(&document);
-    // Actions can navigate; the final URL is part of the DOM's provenance.
-    if let Err(e) = crate::fetch::guards::ensure_url_safe(&document.url).await {
-        if matches!(e, FetchError::Denied { .. }) {
-            return policy_error_value(&e, &document.url, Some(trace.value()));
-        }
-        return tool_error_structured(
-            format!("post-action navigation failed: {e}"),
-            fetch_error_kind(&e),
-            Some(
-                json!({"url": document.url, "code": fetch_error_code(&e), "escalation": trace.value()}),
-            ),
-        );
-    }
-    let gate = match document.status {
-        Some(401) => Verdict::AuthWall,
-        Some(402) => Verdict::Paywall,
-        Some(404 | 410) => Verdict::SoftNotFound,
-        _ => crate::detect::walls::detect_dom_smart(html.as_bytes()),
-    };
-    if gate != Verdict::ContentOk {
-        return tool_error_structured(
-            verdict_error(gate, document.status.unwrap_or(0), &document.url),
-            verdict_kind(gate, document.status.unwrap_or(0)),
-            Some(
-                json!({"url": document.url, "status": document.status, "escalation": trace.value()}),
-            ),
-        );
-    }
-    if let Some(p) = shot {
-        record_shot(&g, p, &mut trace).await;
-    }
-
-    // Cookie write-back : same discipline as ghost_escalate:
-    // the browser's clearance cookies flow to tier 1 for future
-    // plain-HTTP fetches of this domain. record_solved ONLY when
-    // a challenge was actually cleared (page.vendor set) :
-    // marking a never-walled domain needs_tier2 would poison its
-    // route to skip-to-solve forever (the v1.1 reddit-poisoning
-    // bug class). Replay is unverified in the actions flow (no
-    // tier-1 retry happens) : false until the fetch path proves it.
-    if let Ok(Ok(cookies)) =
-        tokio::time::timeout(std::time::Duration::from_secs(3), g.cookies()).await
-        && !cookies.is_empty()
-    {
-        // A pooled browser can predate a logout for one of its
-        // domains: a dead session must not ride back into the jar
-        // or the vault.
-        let cookies = crate::ghost::cache::session_cookies_since(&cookies, g.launched_epoch);
-        daemon.fetcher.import_vault_cookies(&cookies).await;
-        crate::ghost::cache::store_session_cookies(&cookies);
-        if page.vendor.is_some() {
-            daemon
-                .state
-                .lock()
-                .await
-                .record_solved(host, &cookies, page.vendor.as_deref(), false);
-        }
-    }
-
-    // Standard extraction over the final DOM, with the same
-    // candidate ladder as ghost_escalate: prose → links-keeping
-    // → raw text. A shell after actions is still a shell.
-    let mut best: Option<extract::Extracted> = None;
-    if let Ok(e) = extract::extract(
-        html.as_bytes(),
-        extract::charset::GHOST_TEXT_CT,
-        &document.url,
-        opts,
-    ) && !e.thin
-    {
-        best = Some(e);
-    }
-    if best.is_none() {
-        let mut lopts = opts.clone();
-        lopts.include_links = true;
-        if let Ok(e2) = extract::extract(
-            html.as_bytes(),
-            extract::charset::GHOST_TEXT_CT,
-            &document.url,
-            &lopts,
-        ) && !e2.thin
-        {
-            best = Some(e2);
-        }
-    }
-    let Some(ex) = best else {
-        return tool_error_structured(
-            format!(
-                "actions succeeded but the resulting page yielded no extractable content ({}KB DOM) : inspect the resulting page without repeating actions",
-                html.len() / 1024
-            ),
-            "transient",
-            Some(json!({
-                "url": document.url,
-                "status": document.status,
-                "verdict": "Incomplete",
-                "escalation": trace.value(),
-                "next_action": "add {\"do\":\"wait_text\",\"text\":\"<expected>\"} or {\"do\":\"wait\",\"ms\":2000} before extraction",
-            })),
-        );
-    };
-
-    let steps_json: Vec<Value> = outcomes
-        .iter()
-        .map(|o| json!({"step": o.step, "action": o.action, "outcome": o.outcome, "ms": o.ms}))
-        .collect();
-    let mut res = finish_result(
-        &ex,
-        "2-actions",
-        document.status.unwrap_or(0),
-        "ContentOk",
-        &document.url,
-        &trace,
-        t0.elapsed().as_millis(),
-    );
-    apply_faithful_body(&mut res, &ex, opts);
-    maybe_record_agent_outcome(daemon, host, opts, &ex, "ContentOk");
-    res["structuredContent"]["actions"] = Value::Array(steps_json);
-    apply_link_handles(daemon, &mut res).await;
-    if image_text {
-        apply_image_ocr(daemon, &mut res, &ex.images).await;
-    }
-    res
-}
-
-/// v3 image OCR: fetch + OCR the page's content images (up to 4,
-/// 5MB each, SSRF-guarded) and append an `## image text` section
-/// to the result. On-demand only : OCR models are heavy and most
-/// pages never need it.
-pub(super) async fn apply_image_ocr(
-    daemon: &Arc<Daemon>,
-    res: &mut Value,
     images: &[(String, String)],
-) {
+) -> (String, Value) {
     #[cfg(not(feature = "ocr"))]
     {
         let _ = (daemon, images);
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["image_text"] = json!("unavailable : this build lacks the ocr feature");
-        }
+        (
+            String::new(),
+            json!("unavailable : this build lacks the ocr feature"),
+        )
     }
     #[cfg(feature = "ocr")]
     {
         const MAX_IMAGES: usize = 4;
         const MAX_BYTES: usize = 5 * 1024 * 1024;
         if images.is_empty() {
-            return;
+            return (String::new(), json!({"images": 0, "ocred": 0}));
         }
         let mut section = String::from("\n## image text (OCR)\n");
         let mut ocred = 0usize;
@@ -4085,961 +2217,10 @@ pub(super) async fn apply_image_ocr(
                 Err(error) => section.push_str(&format!("- {src}: [OCR task failed: {error}]\n")),
             }
         }
-        if let Some(cell) = res.pointer_mut("/content/0/text")
-            && let Some(md) = cell.as_str().map(String::from)
-        {
-            *cell = json!(md + &section);
-        }
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["image_text"] = json!({ "images": images.len().min(MAX_IMAGES), "ocred": ocred });
-        }
-    }
-}
-
-enum CloakComparison {
-    Equivalent,
-    Divergent(String),
-    Unavailable(&'static str),
-}
-
-/// v3 anti-cloak: a domain KNOWN to be walled (needs_tier2 in the
-/// profile) suddenly serving clean tier-1 content is suspicious :
-/// bot walls sometimes serve benign-looking bait to suspected
-/// bots. Render the same URL in the real browser and compare word
-/// sets. Material divergence → `cloak_suspected` with a trust
-/// recommendation. Cost: one browser render, only on suspicion.
-async fn anticloak_check(
-    daemon: &Arc<Daemon>,
-    url: &str,
-    tier1_markdown: &str,
-    budget: Budget,
-    route: &RequestRoute,
-) -> CloakComparison {
-    let host = crate::search::rank::host_of(url);
-    let mut wire = {
-        let state = daemon.state.lock().await;
-        state
-            .personas
-            .get(host.as_str())
-            .filter(|p| p.quarantine_reason.is_none())
-            .map(|p| p.ghost_wire())
-            .unwrap_or_default()
-    };
-    wire.route = Some(route.clone());
-    let Ok(g) = daemon
-        .ghost_mgr
-        .acquire_for_wire(&daemon.profile, Some(host.as_str()), wire)
-        .await
-    else {
-        return CloakComparison::Unavailable("unavailable:launch");
-    };
-    let Ok(read) = daemon
-        .ghost_mgr
-        .read_document(g, &daemon.profile, url, budget.pass(20))
-        .await
-    else {
-        return CloakComparison::Unavailable("unavailable:transport");
-    };
-    let _guard = read.guard;
-    let page = read.page;
-    if page.outcome.is_wall() {
-        return CloakComparison::Divergent(
-            "browser sees a challenge where HTTP saw content".to_string(),
-        );
-    }
-    if page.outcome != ops::BrowserOutcome::Content {
-        return CloakComparison::Unavailable("unavailable:access");
-    }
-    let Ok(ex) = extract::extract(
-        page.html.as_bytes(),
-        extract::charset::GHOST_TEXT_CT,
-        url,
-        &ExtractOptions::default(),
-    ) else {
-        return CloakComparison::Unavailable("unavailable:extraction");
-    };
-    pub(super) fn words(s: &str) -> std::collections::HashSet<&str> {
-        s.split_whitespace().collect()
-    }
-    let a = words(tier1_markdown);
-    let b = words(&ex.markdown);
-    if b.is_empty() {
-        return CloakComparison::Unavailable("unavailable:empty");
-    }
-    let inter = a.intersection(&b).count();
-    let union = a.union(&b).count();
-    let sim = if union == 0 {
-        1.0
-    } else {
-        inter as f64 / union as f64
-    };
-    if sim < 0.55 {
-        CloakComparison::Divergent(format!(
-            "HTTP and browser content diverge (similarity {sim:.2}) : the HTTP copy may be bot-bait; browser tier text is the one to trust"
-        ))
-    } else {
-        CloakComparison::Equivalent
-    }
-}
-
-/// v3 resurrection fetch: when a URL is truly dead (404, paywall,
-/// unsolvable wall) consult the keyless Wayback Machine and serve
-/// the nearest snapshot : labeled ruthlessly so archived content
-/// can never masquerade as live. `archive: auto` (default) only on
-/// dead-end failures; `only` skips the live attempt; `off` never.
-/// Err carries the exact stage that gave up, so the caller can
-/// never confuse "the URL was never archived" with "a snapshot
-/// exists but was unusable" or "the archive was unreachable".
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ResurrectStage {
-    /// The availability/CDX endpoints could not be reached.
-    LookupUnreachable,
-    /// Both indexes were consulted and have no 200 capture.
-    /// (Non-200 captures never get this far: availability and CDX
-    /// are both probed until a 200 capture turns up or both answer
-    /// empty.)
-    NoSnapshot,
-    /// The snapshot page failed at the transport layer.
-    SnapshotFetch,
-    /// The snapshot page tripped the wall detector.
-    SnapshotVerdict,
-    /// The snapshot body is binary (PDF/image), not extractable HTML.
-    SnapshotBinary,
-    /// The snapshot extracted to too little text to serve.
-    SnapshotThin(usize),
-}
-
-impl ResurrectStage {
-    /// Machine-readable tag for structuredContent.archive_stage.
-    fn tag(&self) -> String {
-        match self {
-            Self::LookupUnreachable => "lookup_unreachable".into(),
-            Self::NoSnapshot => "no_snapshot".into(),
-            Self::SnapshotFetch => "snapshot_fetch_failed".into(),
-            Self::SnapshotVerdict => "snapshot_verdict_rejected".into(),
-            Self::SnapshotBinary => "snapshot_binary".into(),
-            Self::SnapshotThin(n) => format!("snapshot_extract_thin({n})"),
-        }
-    }
-}
-
-struct ResurrectError {
-    stage: ResurrectStage,
-    /// Nearest snapshot URL reached, when one was found : lets the
-    /// caller distinguish "never archived" from "archived but the
-    /// copy was unusable" (and hand over the URL for inspection).
-    snapshot_url: Option<String>,
-}
-
-/// What an archive index said about the URL.
-enum Avail {
-    /// A 200-status capture: (snapshot URL, capture timestamp).
-    Found((String, String)),
-    /// The index answered and has nothing usable.
-    Empty,
-    /// The index could not be reached (or answered with a server
-    /// error) : says nothing about the archive's contents.
-    Unreachable,
-}
-
-/// Availability API lookup (keyless, public).
-async fn availability_lookup(daemon: &Arc<Daemon>, url: &str, route: &RequestRoute) -> Avail {
-    let avail_url = format!(
-        "https://archive.org/wayback/available?url={}",
-        encode_query_value(url)
-    );
-    let fetched = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        daemon
-            .fetcher
-            .fetch_persona_on_route(&avail_url, None, Some(route)),
-    )
-    .await;
-    let Ok(Ok(out)) = fetched else {
-        return Avail::Unreachable;
-    };
-    if !(200..300).contains(&out.status) {
-        return Avail::Unreachable;
-    }
-    // A 200 whose body is not JSON (rate-limit HTML, an interstitial)
-    // says nothing definitive : the CDX fallback gets its shot.
-    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
-        return Avail::Unreachable;
-    };
-    let Some(closest) = v.pointer("/archived_snapshots/closest") else {
-        return Avail::Empty;
-    };
-    let Some(snap_url) = closest.get("url").and_then(Value::as_str) else {
-        return Avail::Empty;
-    };
-    let ts = closest
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    // The API returns status as a STRING ("200"); accept both.
-    let snap_status = closest
-        .get("status")
-        .map(|s| {
-            s.as_i64()
-                .or_else(|| s.as_str().and_then(|x| x.parse().ok()))
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
-    if snap_status != 200 {
-        // A non-200 "closest" may have a 200 sibling the lossy
-        // availability view missed : let the complete index decide.
-        return Avail::Empty;
-    }
-    Avail::Found((snap_url.to_string(), ts))
-}
-
-/// The complete CDX capture index. `url=` goes schemeless : CDX
-/// canonicalizes the scheme away, so a capture recorded under
-/// http:// answers an https:// query (the availability API is
-/// scheme-strict and misses those). limit=-5 keeps the LAST rows,
-/// i.e. the captures nearest the present.
-async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str, route: &RequestRoute) -> Avail {
-    let bare = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let cdx_url = format!(
-        "https://web.archive.org/cdx/search/cdx?url={}&output=json&filter=statuscode:200&limit=-5",
-        encode_query_value(bare)
-    );
-    let fetched = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
-        daemon
-            .fetcher
-            .fetch_persona_on_route(&cdx_url, None, Some(route)),
-    )
-    .await;
-    let Ok(Ok(out)) = fetched else {
-        return Avail::Unreachable;
-    };
-    // CDX answers rate limits and abuse holds with HTML, not JSON :
-    // a transient condition, never evidence of "never archived".
-    if !(200..300).contains(&out.status) {
-        return Avail::Unreachable;
-    }
-    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
-        return Avail::Unreachable;
-    };
-    match cdx_latest(&v) {
-        // Rebuild from the row's `original` : it is the exact form
-        // wayback replayed and canonicalized (urlkey is computed on
-        // it, trailing slashes, :80 port and all). Rebuilding from
-        // the REQUESTED url instead mismatched the urlkey when the
-        // capture was recorded under a different path form, and
-        // wayback answered with its calendar page instead of the
-        // capture.
-        Some((ts, original)) => {
-            let target: &str = if original.is_empty() {
-                bare
-            } else {
-                original.as_str()
-            };
-            Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
-        }
-        None => Avail::Empty,
-    }
-}
-
-/// Pick the nearest-to-present 200 capture from a CDX json response.
-/// Rows are [["urlkey","timestamp","original", ...], ...] : row 0 is
-/// the header, the nearest capture is the last data row.
-fn cdx_latest(v: &Value) -> Option<(String, String)> {
-    let rows = v.as_array()?;
-    if rows.len() < 2 {
-        return None;
-    }
-    let last = &rows[rows.len() - 1];
-    let ts = last.get(1)?.as_str()?.to_string();
-    let original = last
-        .get(2)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    Some((ts, original))
-}
-
-// Both indexes get their full opportunity concurrently. A found capture wins
-// immediately; "never archived" requires two empty, reachable answers.
-async fn archive_lookup_pair(
-    availability: impl std::future::Future<Output = Avail>,
-    cdx: impl std::future::Future<Output = Avail>,
-) -> Avail {
-    tokio::pin!(availability, cdx);
-    let (first, second) = tokio::select! {
-        answer = &mut availability => match answer {
-            Avail::Found(pair) => return Avail::Found(pair),
-            other => (other, cdx.await),
-        },
-        answer = &mut cdx => match answer {
-            Avail::Found(pair) => return Avail::Found(pair),
-            other => (other, availability.await),
-        },
-    };
-    match (first, second) {
-        (Avail::Found(pair), _) | (_, Avail::Found(pair)) => Avail::Found(pair),
-        (Avail::Empty, Avail::Empty) => Avail::Empty,
-        _ => Avail::Unreachable,
-    }
-}
-
-async fn try_resurrect(
-    daemon: &Arc<Daemon>,
-    args: &Value,
-    url: &str,
-    live_error: &Value,
-    route: &RequestRoute,
-) -> Result<Value, ResurrectError> {
-    let (mut snap_url, mut ts) = match archive_lookup_pair(
-        availability_lookup(daemon, url, route),
-        cdx_lookup(daemon, url, route),
-    )
-    .await
-    {
-        Avail::Found(pair) => pair,
-        Avail::Unreachable => {
-            return Err(ResurrectError {
-                stage: ResurrectStage::LookupUnreachable,
-                snapshot_url: None,
-            });
-        }
-        Avail::Empty => {
-            return Err(ResurrectError {
-                stage: ResurrectStage::NoSnapshot,
-                snapshot_url: None,
-            });
-        }
-    };
-
-    // 2. Fetch the snapshot : wayback is plain HTTP-friendly. A thin
-    // extraction gets a second look first: a dead domain's last
-    // capture is very often a meta-refresh stub ("parked → redirect")
-    // that extracts to zero text but chains to the capture holding
-    // the content. Browsers follow the refresh; so does resurrection,
-    // but ONLY when wayback rewrote the target : a live-web target
-    // would fetch a URL that may still be dead, moved, or hostile.
-    let opts = ExtractOptions::default();
-    let mut hops: u8 = 0;
-    let (snap, ct) = loop {
-        let snap = match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            daemon
-                .fetcher
-                .fetch_persona_on_route(&snap_url, None, Some(route)),
+        (
+            section,
+            json!({ "images": images.len().min(MAX_IMAGES), "ocred": ocred }),
         )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::SnapshotFetch,
-                    snapshot_url: Some(snap_url.clone()),
-                });
-            }
-        };
-        if !matches!(snap.verdict, Verdict::ContentOk) {
-            return Err(ResurrectError {
-                stage: ResurrectStage::SnapshotVerdict,
-                snapshot_url: Some(snap_url.clone()),
-            });
-        }
-        let ct = snap
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-        if crate::fetch::guards::is_binary(&snap.body, &ct) {
-            return Err(ResurrectError {
-                stage: ResurrectStage::SnapshotBinary,
-                snapshot_url: Some(snap_url.clone()),
-            });
-        }
-        let ex = match extract::extract_off_worker(&snap.body, &ct, &snap_url, &opts).await {
-            Ok(ex) => ex,
-            Err(_) => {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::SnapshotThin(0),
-                    snapshot_url: Some(snap_url.clone()),
-                });
-            }
-        };
-        // Wayback serves the ORIGINAL server-rendered HTML : thinness
-        // here usually means a genuinely small page, not a JS shell.
-        // But wayback's redirect interstitials carry enough IA nav
-        // chrome to pass any char threshold, so serving is gated on
-        // stub markers too : a stub hops (up to MAX), a real page
-        // serves, a true empty fails.
-        let stub = ex.thin || ex.total_chars < 50 || is_wayback_stub(&snap.body);
-        let chained = if hops < MAX_RESURRECT_HOPS && stub {
-            meta_refresh_target(&snap.body).filter(|t| wayback_ts_of(t).is_some())
-        } else {
-            None
-        };
-        match chained {
-            Some(target) => {
-                hops += 1;
-                if let Some(t) = wayback_ts_of(&target) {
-                    ts = t;
-                }
-                snap_url = target;
-            }
-            None if stub => {
-                return Err(ResurrectError {
-                    stage: ResurrectStage::SnapshotThin(ex.total_chars),
-                    snapshot_url: Some(snap_url.clone()),
-                });
-            }
-            // No chain, but real-enough content : serve it.
-            None => break (snap, ct),
-        }
-    };
-
-    let opts = match fetch_read_options(args) {
-        Ok(opts) => opts,
-        Err(error) => return Ok(error),
-    };
-    // First establish that the snapshot is usable, then apply the caller's
-    // scope. A short selected slice or a probe miss is not a dead snapshot.
-    let ex = extract::extract_off_worker(&snap.body, &ct, &snap_url, &opts).await;
-    Ok(archived_content(
-        ex,
-        &snap_url,
-        url,
-        &ts,
-        snap.status,
-        live_error,
-    ))
-}
-
-fn archived_content(
-    extracted: Result<extract::Extracted, extract::ExtractError>,
-    snapshot_url: &str,
-    url: &str,
-    ts: &str,
-    status: u16,
-    live_error: &Value,
-) -> Value {
-    let ex = match extracted {
-        Ok(ex) => ex,
-        Err(extract::ExtractError::SelectorNoMatch {
-            selector,
-            inspected,
-        }) => {
-            return tool_error_structured(
-                format!("CSS selector {selector:?} matched no elements in the archive snapshot"),
-                "permanent",
-                Some(
-                    json!({"url": url, "snapshot_url": snapshot_url, "code": "selector.nomatch", "elements_inspected": inspected,
-                "next_action": "correct the selector, or omit it to read the snapshot"}),
-                ),
-            );
-        }
-        Err(extract::ExtractError::BadSelector(selector)) => {
-            return tool_error_structured(
-                format!("invalid CSS selector: {selector}"),
-                "permanent",
-                Some(
-                    json!({"url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax"}),
-                ),
-            );
-        }
-        Err(error) => {
-            return tool_error_structured(
-                format!("archive content extraction failed: {error}"),
-                "permanent",
-                Some(
-                    json!({"url": url, "snapshot_url": snapshot_url, "next_action": "inspect the snapshot or choose another source"}),
-                ),
-            );
-        }
-    };
-    // 3. Label everything: banner in content, fields in structure.
-    let date = wayback_date(ts);
-    let age_days = wayback_age_days(ts);
-    let live_reason = live_error
-        .pointer("/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("live fetch failed")
-        .lines()
-        .next()
-        .unwrap_or("live fetch failed")
-        .to_string();
-    let staleness = if age_days > 730 {
-        format!(
-            " : WARNING: {} years old, treat as historical",
-            age_days / 365
-        )
-    } else {
-        String::new()
-    };
-    let banner = format!(
-        "*[ARCHIVED COPY : Wayback snapshot {date} ({age_days}d old){staleness}. Retrieval note: {live_reason}]*\n\n"
-    );
-    let mut trace = Trace::default();
-    trace.step("archive", "wayback", &format!("snapshot {ts}"), 0);
-    // The provenance banner is outside the source read budget and must not
-    // change pagination, probe state or completeness calculations.
-    let mut result = finish_result(&ex, "1(wayback)", status, "ContentOk", url, &trace, 0);
-    result["content"][0]["text"] = json!(format!(
-        "{banner}{}",
-        format_fetch_markdown(&ex, snapshot_url, url)
-    ));
-    result["structuredContent"]["snapshot_url"] = json!(snapshot_url);
-    result["structuredContent"]["archived"] =
-        json!({"snapshot": ts, "date": date, "age_days": age_days});
-    result["_meta"]["com.donsetch/fetch-debug"]["verdict"] = json!("Archived");
-    result["_meta"]["com.donsetch/fetch-debug"]["live_error"] = json!(live_reason);
-    result
-}
-
-/// Redirect chains through wayback interstitials can run several
-/// captures deep (a dead domain's stub -> a host's redirect stub ->
-/// the real landing page). Bounded so a hostile chain cannot spin.
-const MAX_RESURRECT_HOPS: u8 = 4;
-
-/// Wayback's "Got an HTTP NNN at crawl time / Redirecting to... /
-/// Impatient?" interstitial and its capture-calendar page : both are
-/// wayback UI, not archived content, and both extract enough text to
-/// defeat char-count thinness checks.
-fn is_wayback_stub(body: &[u8]) -> bool {
-    // No 64KB head window: replay pages wrap captures in the full
-    // IA nav (megabytes of markup), and the interstitial markers sit
-    // AFTER it, near the redirect notice at the document's end.
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    text.contains("response at crawl time")
-        || text.contains("impatient?")
-        || text.contains("redirecting to...")
-}
-
-/// Pull the refresh target out of `<meta http-equiv="refresh"
-/// content="[delay;] url=target">`. A dead domain's archived last
-/// capture is very often exactly this stub, and a browser would
-/// follow it : so does resurrection. Byte-scanned on an
-/// ASCII-lowercased copy (length-preserving, so spans index the
-/// original); the target keeps its original case because wayback
-/// capture paths are case-sensitive.
-fn meta_refresh_target(body: &[u8]) -> Option<String> {
-    let head = &body[..body.len().min(64 * 1024)];
-    let text = String::from_utf8_lossy(head).to_string();
-    let lower = text.to_ascii_lowercase();
-    let mut from = 0usize;
-    while let Some(rel) = lower[from..].find("<meta") {
-        let start = from + rel;
-        let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
-        from = end.max(start + 1);
-        let tag_lower = &lower[start..end];
-        let tag_orig = &text[start..end];
-        let is_refresh = attr_value_span(tag_lower, "http-equiv")
-            .and_then(|(s, e)| tag_lower.get(s..e))
-            .is_some_and(|v| v.trim() == "refresh");
-        if !is_refresh {
-            continue;
-        }
-        let Some((cs, ce)) = attr_value_span(tag_lower, "content") else {
-            continue;
-        };
-        let content_lower = tag_lower.get(cs..ce)?;
-        let content_orig = tag_orig.get(cs..ce)?;
-        // "[delay][;] *url=target" : find the url= part case-
-        // insensitively, keep the target's original bytes.
-        let Some(urel) = content_lower.find("url=") else {
-            continue;
-        };
-        let target = content_orig[urel + 4..].trim();
-        let target = target.trim_matches(|c| c == '\'' || c == '"').trim();
-        if !target.is_empty() {
-            return Some(target.to_string());
-        }
-    }
-    None
-}
-
-/// Byte span of `name="value"` (or single quotes) inside a tag.
-/// Offsets index the string given, so callers can slice the same
-/// spans out of the original-case text.
-fn attr_value_span(tag_lower: &str, name: &str) -> Option<(usize, usize)> {
-    let pat = format!("{name}=");
-    let bytes = tag_lower.as_bytes();
-    let mut from = 0usize;
-    while let Some(rel) = tag_lower[from..].find(&pat) {
-        let at = from + rel;
-        let boundary_ok = at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
-        let after = at + pat.len();
-        if boundary_ok && after < bytes.len() && matches!(bytes[after], b'"' | b'\'') {
-            let quote = bytes[after] as char;
-            let vstart = after + 1;
-            let vend = tag_lower[vstart..]
-                .find(quote)
-                .map_or(tag_lower.len(), |e| vstart + e);
-            return Some((vstart, vend));
-        }
-        from = at + pat.len();
-    }
-    None
-}
-
-/// `https://web.archive.org/web/<14-digit-ts>/<...>` → Some(ts).
-/// Only wayback-rewritten refresh targets are followed : a target
-/// pointing at the live web would silently fetch a URL that may
-/// still be dead (or hostile).
-fn wayback_ts_of(target: &str) -> Option<String> {
-    let after_scheme = target.split_once("://")?.1;
-    let (host, path) = after_scheme.split_once('/')?;
-    if !host.eq_ignore_ascii_case("web.archive.org") {
-        return None;
-    }
-    let seg = path.strip_prefix("web/")?;
-    let ts: String = seg.chars().take(14).collect();
-    (ts.len() == 14 && ts.bytes().all(|b| b.is_ascii_digit())).then_some(ts)
-}
-
-/// Percent-encode a value for a query string: everything outside
-/// the unreserved set (plus ':', '/' which wayback tolerates raw).
-pub(super) fn encode_query_value(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'/' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Wayback timestamp (YYYYMMDDhhmmss) → "YYYY-MM-DD".
-pub(super) fn wayback_date(ts: &str) -> String {
-    // Byte slicing via get(): a hostile archive response carrying a
-    // multibyte char across byte 8 used to panic the slice (and a
-    // panic in a tool task hangs the caller's request with no
-    // response and leaks the cancel-registry entry).
-    if ts.len() >= 8 && ts.as_bytes()[..8].iter().all(|b| b.is_ascii_digit()) {
-        format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8])
-    } else {
-        ts.to_string()
-    }
-}
-
-pub(super) fn wayback_age_days(ts: &str) -> u64 {
-    let y: u64 = ts.get(0..4).and_then(|s| s.parse().ok()).unwrap_or(2015);
-    let m: u64 = ts.get(4..6).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let d: u64 = ts.get(6..8).and_then(|s| s.parse().ok()).unwrap_or(1);
-    // Approximation good enough for staleness warnings (30-day
-    // months; the warning threshold is 2 years).
-    let snap_days = y.saturating_sub(1970) * 365 + (m.saturating_sub(1)) * 30 + d;
-    let now_days = now_unix() / 86_400;
-    now_days.saturating_sub(snap_days)
-}
-
-#[cfg(test)]
-mod resurrect_tests {
-    use super::{
-        ResurrectStage, attr_value_span, cdx_latest, is_wayback_stub, meta_refresh_target,
-        wayback_ts_of,
-    };
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn archived_reads_keep_selector_probe_and_pagination_contracts() {
-        let html = format!(
-            "<html><head><title>Archived delivery guide</title></head><body><article><h1>Delivery</h1><p>OUTSIDE scope.</p><div id='wanted'><p>{}</p></div></article></body></html>",
-            "INSIDE reliable delivery records every operation and frees cancelled resources. "
-                .repeat(40)
-        );
-        let snapshot = "https://web.archive.org/web/20250101000000/https://example.com/guide";
-        let original = "https://example.com/guide";
-        let mut results = Vec::new();
-        for args in [
-            json!({"selector":"#wanted","max_chars":300}),
-            json!({"selector":"#missing"}),
-            json!({"must_contain":"ABSENT_PHRASE"}),
-            json!({"max_chars":300,"offset":300}),
-        ] {
-            let opts = super::fetch_read_options(&args).unwrap_or_else(|e| panic!("{e}"));
-            let extracted =
-                crate::extract::extract_off_worker(html.as_bytes(), "text/html", snapshot, &opts)
-                    .await;
-            results.push(super::archived_content(
-                extracted,
-                snapshot,
-                original,
-                "20250101000000",
-                200,
-                &json!({}),
-            ));
-        }
-        let text = results[0]["content"][0]["text"].as_str().unwrap();
-        let checks = [
-            text.contains("INSIDE") && !text.contains("OUTSIDE") && text.len() < 800,
-            results[0]["structuredContent"]["next_offset"]
-                .as_u64()
-                .is_some()
-                && results[0]["structuredContent"]["content_complete"] == false,
-            results[1]["structuredContent"]["ok"] == false
-                && results[1]["structuredContent"]["code"] == "selector.nomatch",
-            results[2]["structuredContent"]["read_status"] == "probe"
-                && results[2]["structuredContent"]["matched"] == false,
-            results[3]["structuredContent"]["next_offset"]
-                .as_u64()
-                .is_some_and(|n| n > 300),
-        ];
-        assert_eq!(checks, [true; 5], "archive caller controls: {results:?}");
-    }
-
-    // Nextest gives the daemon and process-wide configuration fresh state.
-    #[tokio::test]
-    async fn archive_only_checks_inputs_before_lookup() {
-        let daemon = std::sync::Arc::new(super::Daemon::new().await.unwrap());
-        for (url, args, code) in [
-            ("http://127.0.0.1/", json!({"archive":"only"}), "guard.ssrf"),
-            (
-                "https://fake-user:fake-pass@example.com/",
-                json!({"archive":"only"}),
-                "guard.ssrf",
-            ),
-            (
-                "https://example.com/",
-                json!({"archive":"only","selector":"["}),
-                "selector.invalid",
-            ),
-        ] {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                super::fetch_single(&daemon, &args, url),
-            )
-            .await
-            .expect("input guard must precede archive network access");
-            assert_eq!(result["isError"], false, "{result}");
-            assert_eq!(result["structuredContent"]["ok"], false, "{result}");
-            assert_eq!(result["structuredContent"]["code"], code, "{result}");
-        }
-        let result = super::fetch_single(
-            &daemon,
-            &json!({"archive":"only","mode":"wrong"}),
-            "https://example.com/",
-        )
-        .await;
-        assert_eq!(result["isError"], false);
-        assert_eq!(result["structuredContent"]["ok"], false);
-        assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("mode must be")
-        );
-    }
-
-    #[test]
-    fn meta_refresh_follows_wayback_rewrite() {
-        let html = b"<html><head><script>x</script>\
-            <meta http-equiv=\"refresh\" content=\"0; url=http://web.archive.org/web/20190613084634/https://smallbusiness.yahoo.com/webhosting?source=geocities\"/>\
-            </head><body></body></html>";
-        let t = meta_refresh_target(html).expect("refresh target extracted");
-        assert!(t.starts_with("http://web.archive.org/web/20190613084634/"));
-        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20190613084634"));
-    }
-
-    #[test]
-    fn meta_refresh_is_case_insensitive_but_case_preserving() {
-        // Match must survive any case in the markup ; the target's
-        // case must survive the match (wayback paths are sensitive).
-        let html = b"<META HTTP-EQUIV='Refresh' CONTENT=\"5; URL=http://web.archive.org/web/20200101000000/HTTP://Example.COM/Page\">";
-        let t = meta_refresh_target(html).expect("refresh target extracted");
-        assert!(t.contains("Example.COM/Page"), "original case lost: {t}");
-        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20200101000000"));
-    }
-
-    #[test]
-    fn meta_refresh_unquoted_and_delayed_forms() {
-        let html = b"<meta http-equiv=refresh content=30;url=http://web.archive.org/web/19990101000000/http://a.example/>";
-        assert!(
-            meta_refresh_target(html).is_none(),
-            "unquoted attr values are not misparsed"
-        );
-    }
-
-    #[test]
-    fn meta_refresh_off_wayback_or_missing_is_none() {
-        let live =
-            b"<meta http-equiv=\"refresh\" content=\"0; url=https://parking.example/for-sale\">";
-        assert_eq!(
-            meta_refresh_target(live).as_deref(),
-            Some("https://parking.example/for-sale")
-        );
-        assert_eq!(wayback_ts_of("https://parking.example/for-sale"), None);
-        assert_eq!(meta_refresh_target(b"<html><body>hi</body></html>"), None);
-        assert_eq!(
-            meta_refresh_target(b"<meta http-equiv=\"refresh\" content=\"3\">"),
-            None
-        );
-    }
-
-    #[test]
-    fn wayback_ts_rejects_non_wayback_and_malformed() {
-        assert_eq!(
-            wayback_ts_of("https://web.archive.org/web/notatime/http://x.example"),
-            None
-        );
-        assert_eq!(
-            wayback_ts_of("http://web.archive.org/other/20200101000000/x"),
-            None
-        );
-        assert_eq!(
-            wayback_ts_of("https://spoof.example/web/20200101000000/x"),
-            None
-        );
-    }
-
-    #[test]
-    fn attr_value_span_respects_boundaries() {
-        let tag = "meta data-content=\"a\" content=\"real value\" x";
-        let (s, e) = attr_value_span(tag, "content").expect("span");
-        assert_eq!(&tag[s..e], "real value");
-        assert_eq!(attr_value_span(tag, "missing"), None);
-    }
-
-    #[test]
-    fn stage_tags_are_stable_machine_strings() {
-        assert_eq!(
-            ResurrectStage::LookupUnreachable.tag(),
-            "lookup_unreachable"
-        );
-        assert_eq!(ResurrectStage::NoSnapshot.tag(), "no_snapshot");
-        assert_eq!(ResurrectStage::SnapshotFetch.tag(), "snapshot_fetch_failed");
-        assert_eq!(
-            ResurrectStage::SnapshotVerdict.tag(),
-            "snapshot_verdict_rejected"
-        );
-        assert_eq!(ResurrectStage::SnapshotBinary.tag(), "snapshot_binary");
-        assert_eq!(
-            ResurrectStage::SnapshotThin(12).tag(),
-            "snapshot_extract_thin(12)"
-        );
-    }
-    #[test]
-    fn cdx_latest_picks_last_data_row() {
-        let v = json!([
-            [
-                "urlkey",
-                "timestamp",
-                "original",
-                "mimetype",
-                "statuscode",
-                "digest",
-                "length"
-            ],
-            [
-                "com,geocities)/",
-                "20010615131644",
-                "http://www.geocities.com/",
-                "text/html",
-                "200",
-                "AAA",
-                "1000"
-            ],
-            [
-                "com,geocities)/",
-                "20190613084634",
-                "http://www.geocities.com/",
-                "text/html",
-                "200",
-                "BBB",
-                "900"
-            ]
-        ]);
-        let (ts, original) = cdx_latest(&v).expect("capture picked");
-        assert_eq!(ts, "20190613084634", "nearest-to-present capture wins");
-        assert_eq!(original, "http://www.geocities.com/");
-    }
-
-    #[test]
-    fn cdx_latest_handles_header_only_empty_and_garbage() {
-        assert_eq!(
-            cdx_latest(&json!([["urlkey", "timestamp", "original"]])),
-            None
-        );
-        assert_eq!(cdx_latest(&json!([])), None);
-        assert_eq!(cdx_latest(&json!("not an array")), None);
-        assert_eq!(
-            cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])),
-            None
-        );
-    }
-
-    #[test]
-    fn transport_classes_separate_death_from_ambiguity() {
-        use super::super::transport_class;
-        use crate::error::FetchError;
-        // Resurrectable: the site is gone.
-        assert_eq!(
-            transport_class(&FetchError::Tls("certificate verify failed".into())),
-            "tls"
-        );
-        assert_eq!(
-            transport_class(&FetchError::Tls("handshake failure".into())),
-            "tls"
-        );
-        assert_eq!(
-            transport_class(&FetchError::Io(std::io::Error::other(
-                "Name or service not known"
-            ))),
-            "dns"
-        );
-        assert_eq!(
-            transport_class(&FetchError::Io(std::io::Error::other("connection refused"))),
-            "refused"
-        );
-        // Excluded: ambiguous or IP-level; a snapshot would lie.
-        assert_eq!(transport_class(&FetchError::Timeout), "timeout");
-        assert_eq!(
-            transport_class(&FetchError::Tls("connection reset by peer".into())),
-            "reset"
-        );
-        assert_eq!(
-            transport_class(&FetchError::Io(std::io::Error::other(
-                "connection timed out"
-            ))),
-            "timeout"
-        );
-        assert_eq!(
-            transport_class(&FetchError::Http("parser died".into())),
-            "protocol"
-        );
-        assert_eq!(
-            transport_class(&FetchError::Ghost("no browser".into())),
-            "ghost"
-        );
-    }
-
-    #[test]
-    fn resurrectable_transport_classes_are_exactly_tls_dns_refused() {
-        let resurrectable: fn(&str) -> bool = |k| matches!(k, "tls" | "dns" | "refused");
-        assert!(resurrectable("tls"));
-        assert!(resurrectable("dns"));
-        assert!(resurrectable("refused"));
-        assert!(!resurrectable("timeout"));
-        assert!(!resurrectable("reset"));
-        assert!(!resurrectable("network"));
-        assert!(!resurrectable("protocol"));
-    }
-    #[test]
-    fn wayback_stub_markers_do_not_catch_real_pages() {
-        let interstitial = b"<html><body>Got an HTTP 301 response at crawl time.             Redirecting to... <a href=\"/web/20100101/http://x.example\">x</a>             <b>Impatient?</b></body></html>";
-        assert!(is_wayback_stub(interstitial));
-        assert!(!is_wayback_stub(
-            b"<html><body>Welcome to my Geocities page. Under construction.</body></html>"
-        ));
-        // An archived page ABOUT the wayback machine must not be
-        // misread as chrome : the calendar phrase differs from prose.
-        let article = b"<html><body><h1>History of the Wayback Machine</h1>            It preserves redirects and their targets.</body></html>";
-        assert!(!is_wayback_stub(article));
     }
 }
 
@@ -5123,25 +2304,50 @@ pub(super) fn apply_page_history(
         None => ("new".to_string(), None, 0),
     };
 
-    // since_last: collapse the payload to the verdict.
+    // since_last: collapse the payload to the verdict. When there is
+    // nothing to compare against (a first read, or a copy too large to
+    // keep) the page itself is the answer, so the agent never pays a
+    // second call for what this one already fetched.
     if since_last {
         let title_line = ex_title.map(|t| format!("# {t}\n")).unwrap_or_default();
-        let body = match (changed.as_str(), &delta) {
-            ("unchanged", _) => {
-                format!("{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago)*\n")
-            }
-            ("new", _) => format!(
-                "{title_line}{url}\n\n*no prior snapshot for this URL : refetch without since_last for full content*\n"
-            ),
-            (_, Some(d)) => format!(
+        let collapsed = match (changed.as_str(), &delta) {
+            ("unchanged", _) => Some(format!(
+                "{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago)*\n"
+            )),
+            (_, Some(d)) => Some(format!(
                 "{title_line}{url}\n\n*changed since last fetch ({changed}, {ago}s ago):*\n\n- {d}\n\n*(full content: refetch without since_last)*\n"
-            ),
-            _ => format!(
-                "{title_line}{url}\n\n*{changed} since last fetch ({ago}s ago) : refetch without since_last for full content*\n"
-            ),
+            )),
+            _ => None,
         };
+        if let Some(body) = &collapsed {
+            // The answer is a change report, not the page: no cut-off to
+            // resume, and the size is the report's.
+            if let Some(sc) = res.pointer_mut("/structuredContent") {
+                if let Some(object) = sc.as_object_mut() {
+                    object.remove("next_offset");
+                }
+                sc["read_status"] = json!("change_report");
+                sc["content_complete"] = json!(false);
+            }
+            res["_meta"]["com.donsetch/fetch-debug"]["tokens_est"] = json!(body.len() / 4);
+        }
         if let Some(cell) = res.pointer_mut("/content/0/text") {
-            *cell = json!(body);
+            match collapsed {
+                Some(body) => *cell = json!(body),
+                None => {
+                    let note = if changed == "new" {
+                        "no earlier read of this URL to compare with".to_string()
+                    } else {
+                        format!(
+                            "changed since last fetch ({changed}, {ago}s ago), and no stored copy to compare with"
+                        )
+                    };
+                    let md = cell.as_str().unwrap_or_default().to_string();
+                    *cell = json!(format!(
+                        "*[since_last: {note} : full content follows]*\n\n{md}"
+                    ));
+                }
+            }
         }
     } else if changed != "new" && !ex_markdown.starts_with("probe: ") {
         // A change note in the content: ONE line, never the delta
@@ -5277,9 +2483,10 @@ pub(super) fn format_fetch_markdown(
 fn maybe_record_agent_outcome(
     daemon: &Daemon,
     host: &str,
-    opts: &ExtractOptions,
+    view: &extract::view::View,
     ex: &extract::Extracted,
     verdict: &str,
+    probe: Option<extract::view::Verdict>,
 ) {
     if !crate::config::cfg().search.outcome_feedback {
         return;
@@ -5290,31 +2497,19 @@ fn maybe_record_agent_outcome(
         return;
     }
     let class = crate::search::outcome_class(
-        opts.must_contain.is_some(),
-        opts.focus.is_some() || opts.toc || opts.section.is_some(),
+        !view.must_contain.is_empty(),
+        view.focus.is_some() || view.toc || view.section.is_some(),
     );
-    let probe_miss = opts.must_contain.is_some() && ex.markdown.starts_with("probe: NO MATCH");
+    let probe_miss = probe == Some(extract::view::Verdict::NoMatch);
     let unreadable = ex.thin || verdict == "SoftNotFound";
     if probe_miss || unreadable {
         daemon.searcher.observe_outcome_miss(class, host);
     }
 }
 
-/// Keep source text separate from generated metadata. A source heading or
-/// URL must not be mistaken for frontmatter and stripped from a faithful read.
-fn apply_faithful_body(result: &mut Value, ex: &extract::Extracted, opts: &ExtractOptions) {
-    if opts.faithful {
-        result["content"][0]["text"] = json!(ex.markdown);
-        result["structuredContent"]["faithful"] = json!(true);
-        if let Some(title) = &ex.title {
-            result["structuredContent"]["title"] = json!(title);
-        }
-    }
-}
-
 pub(super) fn finish_result(
     ex: &extract::Extracted,
-    tier: &str,
+    fetch: &str,
     status: u16,
     verdict: &str,
     url: &str,
@@ -5362,20 +2557,8 @@ pub(super) fn finish_result(
             structured["items_total"] = json!(total);
         }
     }
-    if ex.markdown.starts_with("probe: ") {
-        structured["read_status"] = json!("probe");
-        structured["content_complete"] = json!(false);
-        structured.as_object_mut().unwrap().remove("content_kind");
-        if ex.markdown.starts_with("probe: MATCH") || ex.markdown.starts_with("probe: NO MATCH") {
-            structured["matched"] = json!(ex.markdown.starts_with("probe: MATCH"));
-        }
-    }
     if ex.thin {
         structured["thin"] = json!(true);
-    }
-    let skipped = extract::skipped_filters(&ex.markdown);
-    if !skipped.is_empty() {
-        structured["filters_skipped"] = json!(skipped);
     }
     // #292: repeated blocks/sections were omitted and marked in
     // place; the count makes the omission auditable without reading
@@ -5387,16 +2570,8 @@ pub(super) fn finish_result(
     if omitted > 0 {
         structured["omitted_repeats"] = json!(omitted);
     }
-    if !ex.markdown.starts_with("probe: ") {
-        if let Some(source) = ex.lang_source
-            && !matches!(ex.lang.as_str(), "" | "und" | "unknown")
-        {
-            structured["lang"] = json!(ex.lang);
-            structured["lang_source"] = json!(source);
-        }
-        if let Some(script) = ex.script.filter(|s| *s != extract::language::Script::Other) {
-            structured["script"] = json!(script.as_str());
-        }
+    if !matches!(ex.lang.as_str(), "" | "und" | "unknown") {
+        structured["lang"] = json!(ex.lang);
     }
     if let Some(next_offset) = ex.next_offset {
         structured["next_offset"] = json!(next_offset);
@@ -5412,7 +2587,7 @@ pub(super) fn finish_result(
     // no longer competes with source evidence in model context.
     let debug = json!({
         "status": (status != 0).then_some(status),
-        "tier": tier,
+        "fetch": fetch,
         "verdict": verdict,
         "quality": ex.quality,
         "title": ex.title,
@@ -5436,8 +2611,8 @@ pub(super) fn finish_result(
 }
 
 /// v3 F2: per-result route hints from the self-improving store :
-/// domains that consistently need the browser carry the cost in
-/// the open so the agent can budget or pick a faster source.
+/// domains that consistently wall automated fetches carry the cost
+/// in the open so the agent can budget or pick a faster source.
 pub(super) async fn route_hints(
     daemon: &Arc<Daemon>,
     out: &crate::search::SearchOutcome,
@@ -5449,7 +2624,7 @@ pub(super) async fn route_hints(
             let host = crate::search::rank::host_of(&r.url);
             state
                 .is_known_walled(&host)
-                .then(|| "· ⚠ may need browser; challenge latency varies".to_string())
+                .then(|| "· ⚠ often walled; the fetch may fail".to_string())
         })
         .collect()
 }
@@ -5474,20 +2649,6 @@ pub(super) async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> V
     hs
 }
 
-/// Writes a rendered page's DOM to `dir/dom-<host>.html` for the
-/// `debug.ghost` dump, readable by its owner only, and returns that
-/// path. Best effort: a failed write is not an error for the fetch.
-fn dump_ghost_dom(dir: &std::path::Path, host: &str, html: &str) -> std::path::PathBuf {
-    let safe: String = host
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    let _ = std::fs::create_dir_all(dir);
-    let p = dir.join(format!("dom-{safe}.html"));
-    let _ = crate::config::write_private(&p, html.as_bytes());
-    p
-}
-
 #[cfg(test)]
 mod bypass_content_tests {
     use super::*;
@@ -5496,7 +2657,7 @@ mod bypass_content_tests {
 
     // Nextest isolates the process-wide key store and daemon state.
     #[tokio::test]
-    async fn tier_three_rejects_and_evicts_shells_but_returns_real_content() {
+    async fn unlocker_rejects_and_evicts_shells_but_returns_real_content() {
         let cache = crate::paths::cache_dir();
         ByokConfig {
             default: "local".into(),
@@ -5558,7 +2719,7 @@ mod bypass_content_tests {
             assert_eq!(
                 result.is_some(),
                 accepted,
-                "{name}: tier-three content contract: {result:?}"
+                "{name}: unlocker content contract: {result:?}"
             );
             if accepted {
                 assert!(
@@ -5578,23 +2739,94 @@ mod bypass_content_tests {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod ghost_dom_dump_tests {
-    // The dump is the DOM the ghost rendered with the session vault
-    // replanted: a logged-in page's markup.
-    #[cfg(unix)]
-    #[test]
-    fn the_ghost_debug_dom_dump_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("donsetch-dom-mode-{}", std::process::id()));
-        let p = super::dump_ghost_dom(&dir, "app.example.com", "<html>inbox</html>");
-        assert_eq!(p, dir.join("dom-app_example_com.html"));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "<html>inbox</html>");
-        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(mode, 0o600);
+    // The unlocker's answer carries the page inside a JSON string, so its
+    // bytes are UTF-8 whatever charset the target's Content-Type names.
+    // Nextest isolates the process-wide key store and daemon state.
+    #[tokio::test]
+    async fn an_unlocked_page_reads_as_utf8_whatever_charset_the_target_names() {
+        let cache = crate::paths::cache_dir();
+        ByokConfig {
+            default: "local".into(),
+            providers: vec![ProviderConfig {
+                name: "unlocker".into(),
+                keys: vec![KeyEntry {
+                    key: "fixture-token::fixture-zone".into(),
+                    state: KeyState::Active,
+                    ts: 0,
+                }],
+            }],
+        }
+        .save();
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        let ru = "Привет, мир! Это обычная страница из разблокировщика, в ней достаточно \
+                  текста, чтобы извлечение не сочло её пустой оболочкой. Съешь же ещё этих \
+                  мягких французских булок да выпей чаю. Вторая фраза тоже на русском языке.";
+        let text = format!("{ru}\n{ru}\n");
+        let article = format!("<article><h1>Заголовок страницы</h1><p>{ru}</p></article>");
+        let html =
+            format!("<html><head><title>Страница</title></head><body>{article}</body></html>");
+        let feed = format!(
+            "<?xml version=\"1.0\" encoding=\"windows-1251\"?><rss version=\"2.0\"><channel>\
+             <title>Новости</title><link>https://news.example/</link><item>\
+             <title>Первая новость дня</title><link>https://news.example/1</link>\
+             <description>{ru}</description></item></channel></rss>"
+        );
+        // The last two are negatives: a UTF-8 label, and an empty type, which
+        // must still take the HTML route (a body without <html> is not shown
+        // as raw markup).
+        let doc = format!("<body>{article}</body>");
+        let mut wrong = Vec::new();
+        for (name, ct, body) in [
+            ("text-1251", "text/plain; charset=windows-1251", &text),
+            (
+                "feed-1251",
+                "application/rss+xml; charset=windows-1251",
+                &feed,
+            ),
+            ("html-1251", "text/html; charset=windows-1251", &html),
+            ("text-utf8", "text/plain; charset=utf-8", &text),
+            ("doc-no-type", "", &doc),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
+            let answer =
+                json!({"status_code":200,"headers":{"content-type":ct},"body":body}).to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let cfg = crate::fetch::bypass::BypassConfig {
+                endpoint,
+                ..Default::default()
+            };
+            let url = format!("https://fixture.example/{name}");
+            // Primes the solve cache; try_bypass reads the page from it.
+            crate::fetch::bypass::unlock("fixture-token::fixture-zone", &url, &cfg, &cache)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            let mut trace = Trace::default();
+            match try_bypass(&daemon, &url, &ExtractOptions::default(), &mut trace).await {
+                None => wrong.push(format!("{name}: refused: {}", trace.value())),
+                Some(result) => {
+                    let shown = result["content"][0]["text"].as_str().unwrap_or_default();
+                    if !shown.contains("Привет, мир!") || shown.contains("<article>") {
+                        wrong.push(format!(
+                            "{name} ({ct}): {} {shown}",
+                            result["structuredContent"]
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
 
@@ -5655,8 +2887,83 @@ mod page_history_signal_tests {
             true,
         );
         assert_eq!(res["structuredContent"]["changed"], "new");
+        // The page is the answer on a first read: one call, not two.
         let text = res["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("no prior snapshot"), "got: {text}");
+        assert!(text.contains("no earlier read"), "got: {text}");
+        assert!(text.contains("full content follows"), "got: {text}");
+        assert!(text.contains("\nbody"), "got: {text}");
+    }
+
+    // An unchanged page collapses to one line on the second since_last
+    // read, whatever path produced it; a page with no fingerprint of its
+    // own (a text fallback, a feed) is fingerprinted from its text.
+    #[tokio::test]
+    async fn since_last_collapses_an_unchanged_page_on_the_second_read() {
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let url = format!("https://x.test/second-read-{unique}");
+        let fp = crate::pages::history::PageHistory::fingerprint("body of the page");
+        let mut texts = Vec::new();
+        let mut statuses = Vec::new();
+        let mut has_next = Vec::new();
+        for _ in 0..2 {
+            let mut res = json!({
+                "content": [{"type": "text", "text": "# T\nhttps://x.test/\n\nbody of the page"}],
+                "structuredContent": {"ok": true, "read_status": "partial", "next_offset": 15706},
+            });
+            apply_page_history(
+                &daemon,
+                &mut res,
+                &url,
+                PageFacts {
+                    fingerprint: Some(&fp),
+                    markdown: "body of the page",
+                    title: Some("T"),
+                    complete: true,
+                },
+                true,
+            );
+            texts.push(res["content"][0]["text"].as_str().unwrap().to_string());
+            statuses.push(
+                res["structuredContent"]["read_status"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            has_next.push(res["structuredContent"].get("next_offset").is_some());
+        }
+        assert_eq!(statuses[1], "change_report");
+        assert!(!has_next[1], "a change report has nothing to resume");
+        assert!(
+            texts[0].contains("full content follows"),
+            "got: {}",
+            texts[0]
+        );
+        assert!(
+            texts[1].contains("unchanged since last fetch"),
+            "got: {}",
+            texts[1]
+        );
+        assert!(!texts[1].contains("body of the page"), "got: {}", texts[1]);
+    }
+}
+
+#[cfg(test)]
+mod link_mode_tests {
+    use super::{LinkMode, link_mode};
+    use serde_json::json;
+
+    #[test]
+    fn links_are_off_handles_or_urls() {
+        assert_eq!(link_mode(&json!({})), LinkMode::Off);
+        assert_eq!(link_mode(&json!({"links": false})), LinkMode::Off);
+        assert_eq!(link_mode(&json!({"links": true})), LinkMode::Urls);
+        assert_eq!(link_mode(&json!({"links": "handles"})), LinkMode::Handles);
+        assert_eq!(link_mode(&json!({"links": "urls"})), LinkMode::Urls);
+        assert_eq!(link_mode(&json!({"links": "nonsense"})), LinkMode::Off);
     }
 }
 
@@ -5669,7 +2976,7 @@ mod batch_budget_tests {
     // old accounting left member headers and the slicing marker
     // uncounted (measured ~9% over on a real batch).
     #[test]
-    fn a_batch_stays_within_its_token_budget() {
+    fn a_batch_stays_within_its_max_chars() {
         let urls: Vec<String> = (0..6).map(|i| format!("https://ex.test/{i}")).collect();
         let big = "x".repeat(9_000);
         let results: Vec<Value> = urls
@@ -5685,18 +2992,17 @@ mod batch_budget_tests {
         let mut markdowns: Vec<Option<String>> =
             results.iter().map(|_| Some(big.clone())).collect();
         let mut flags = vec![false; urls.len()];
-        slice_batch_markdowns(&urls, &results, &mut markdowns, 2_000, &mut flags);
+        slice_batch_markdowns(&urls, &results, &mut markdowns, 8_000, &mut flags);
         assert!(
             flags.iter().all(|f| *f),
             "every over-share member gets sliced"
         );
-        let out = render_fetch_batch(&urls, &results, &markdowns, Some(2_000), &flags);
+        let out = render_fetch_batch(&urls, &results, &markdowns, 8_000, &flags);
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.len() <= 2_000 * 4,
-            "batch output {} bytes exceeds its {} byte budget",
-            text.len(),
-            2_000 * 4
+            text.len() <= 8_000,
+            "batch output {} bytes exceeds its 8000-char budget",
+            text.len()
         );
     }
 }
@@ -5704,8 +3010,7 @@ mod batch_budget_tests {
 #[cfg(test)]
 mod fetch_output_contract_tests {
     use super::{Trace, finish_result, format_fetch_markdown};
-    use crate::extract::{self, ContentKind, ExtractOptions, Extracted};
-    use serde_json::json;
+    use crate::extract::{ContentKind, Extracted};
 
     #[test]
     fn stealth_v3_unavailable_browser_status_is_null_not_success_200() {
@@ -5769,49 +3074,9 @@ mod fetch_output_contract_tests {
         assert_eq!(output["structuredContent"]["content_complete"], true);
     }
 
-    #[test]
-    fn skipped_read_filters_reach_model_state() {
-        let opts = ExtractOptions {
-            focus: Some("lifetime".into()),
-            toc: true,
-            ..Default::default()
-        };
-        let skipped = extract::extract(
-            b"A maximum authorization code lifetime of 10 minutes.\n",
-            "text/plain",
-            "https://owned.test/draft.txt",
-            &opts,
-        )
-        .unwrap();
-        let output = finish_result(
-            &skipped,
-            "1",
-            200,
-            "ContentOk",
-            "https://owned.test/draft.txt",
-            &Trace::default(),
-            0,
-        );
-        assert_eq!(
-            output["structuredContent"]["filters_skipped"],
-            json!(["focus", "toc"])
-        );
-        assert_eq!(output["structuredContent"]["content_complete"], true);
-
-        let output = finish_result(
-            &extracted("# Owned document\n\nActual evidence."),
-            "1",
-            200,
-            "ContentOk",
-            "https://owned.test/page",
-            &Trace::default(),
-            0,
-        );
-        assert!(output["structuredContent"].get("filters_skipped").is_none());
-    }
-
     pub(super) fn extracted(markdown: &str) -> Extracted {
         Extracted {
+            page: None,
             markdown: markdown.into(),
             title: Some("Example".into()),
             byline: Some("A. Author".into()),
@@ -5826,6 +3091,7 @@ mod fetch_output_contract_tests {
             thin: false,
             content_kind: ContentKind::Article,
             lang: "en".into(),
+
             lang_source: None,
             script: None,
             quality: 0.91,
@@ -5838,47 +3104,12 @@ mod fetch_output_contract_tests {
     }
 
     #[test]
-    fn language_metadata_distinguishes_declarations_from_scripts() {
-        for (declaration, expected_lang, expected_source) in [
-            ("", None, None),
-            (" lang=\"fr\"", Some("fr"), Some("html_lang")),
-        ] {
-            let html = format!(
-                "<html{declaration}><body><article><h1>Financement public</h1><p>Le parlement examine les propositions de financement et les dépenses publiques pour les collectivités et les services publics.</p></article></body></html>"
-            );
-            let ex = extract::extract(
-                html.as_bytes(),
-                "text/html",
-                "https://example.com/fr",
-                &ExtractOptions::default(),
-            )
-            .unwrap();
-            let result = finish_result(
-                &ex,
-                "1",
-                200,
-                "ContentOk",
-                "https://example.com/fr",
-                &Trace::default(),
-                1,
-            );
-            let state = &result["structuredContent"];
-            assert_eq!(state.get("lang").and_then(|v| v.as_str()), expected_lang);
-            assert_eq!(
-                state.get("lang_source").and_then(|v| v.as_str()),
-                expected_source
-            );
-            assert_eq!(state["script"], "latin");
-        }
-    }
-
-    #[test]
     pub(super) fn fetch_renders_identity_once_and_hides_diagnostics_from_model_state() {
         let mut trace = Trace::default();
-        trace.step("1", "http-fetch", "ok", 12);
+        trace.step("local", "http-fetch", "ok", 12);
         let output = finish_result(
             &extracted("https://example.com/page\n\n# Example\n\nEvidence."),
-            "1",
+            "local",
             200,
             "ContentOk",
             "https://example.com/page",
@@ -5894,7 +3125,7 @@ mod fetch_output_contract_tests {
         let state = output["structuredContent"].as_object().unwrap();
         for absent in [
             "title",
-            "tier",
+            "fetch",
             "quality",
             "tokens_est",
             "escalation",
@@ -5906,7 +3137,10 @@ mod fetch_output_contract_tests {
             );
         }
         assert_eq!(state["url"], "https://example.com/page");
-        assert_eq!(output["_meta"]["com.donsetch/fetch-debug"]["tier"], "1");
+        assert_eq!(
+            output["_meta"]["com.donsetch/fetch-debug"]["fetch"],
+            "local"
+        );
 
         let unrelated = extracted("# Actual first section\n\nEvidence.");
         assert!(
@@ -5920,8 +3154,8 @@ mod fetch_output_contract_tests {
     }
 
     // Framework-junk shells must never ship as successful content:
-    // the classifier that gates the tier-2 escalation (live case:
-    // facebook's tier-1 markdown was React internals).
+    // the classifier that gates the shell class (live case:
+    // facebook's markdown was React internals).
     #[test]
     fn shell_text_classifier_rejects_react_dumps_and_flags_spinners() {
         let fb = "# is_latency_sensitive_broadcast\n# Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -5964,7 +3198,7 @@ mod batch_output_contract_tests {
         ];
         let success = finish_result(
             &extracted("# Example\nhttps://example.com/a\n\nAlpha."),
-            "1",
+            "local",
             200,
             "ContentOk",
             &urls[0],
@@ -5986,7 +3220,7 @@ mod batch_output_contract_tests {
             ),
             None,
         ];
-        let output = render_fetch_batch(&urls, &results, &markdowns, Some(2_000), &[false, false]);
+        let output = render_fetch_batch(&urls, &results, &markdowns, 8_000, &[false, false]);
         assert_eq!(output["content"].as_array().unwrap().len(), 1);
         let text = output["content"][0]["text"].as_str().unwrap();
         assert!(text.find("Alpha.").unwrap() < text.find("request timed out").unwrap());
@@ -6000,9 +3234,9 @@ mod batch_output_contract_tests {
         assert!(first.get("content_kind").is_none());
         assert!(first.get("thin").is_none());
         assert!(first.get("changed").is_none());
-        assert!(first.get("tier").is_none());
+        assert!(first.get("fetch").is_none());
         let first_debug = &output["_meta"]["com.donsetch/fetch-batch-debug"]["results"][0];
-        assert_eq!(first_debug["tier"], "1");
+        assert_eq!(first_debug["fetch"], "local");
         assert!(first_debug.get("tokens_est").is_some());
         assert!(first_debug.get("quality").is_none());
         assert!(first_debug.get("escalation").is_none());
@@ -6015,15 +3249,14 @@ mod batch_output_contract_tests {
                 "thin": true,
                 "changed": "major",
                 "next_offset": 16000,
-                "cloak_suspected": true,
-                "filters_skipped": ["focus"]
+                "cloak_suspected": true
             }
         });
         let flagged_output = render_fetch_batch(
             &urls[..1],
             &[flagged],
             &[Some("# Thin\nhttps://example.com/a".into())],
-            None,
+            48_000,
             &[false],
         );
         let flagged_state = &flagged_output["structuredContent"]["results"][0];
@@ -6033,8 +3266,6 @@ mod batch_output_contract_tests {
         assert_eq!(flagged_state["changed"], "major");
         assert_eq!(flagged_state["next_offset"], 16000);
         assert_eq!(flagged_state["cloak_suspected"], true);
-        assert_eq!(flagged_state["filters_skipped"], json!(["focus"]));
-        assert!(first.get("filters_skipped").is_none());
     }
 }
 
@@ -6056,35 +3287,13 @@ mod budget_tests {
         assert_eq!(ex.via, Some("adapter:pypi-json"));
         assert!(ex.markdown.contains("requests 2.34.2"));
         assert!(!is_framework_shell(&ex), "{}", ex.markdown);
-        assert!(extract::skipped_filters(&ex.markdown).is_empty());
-
-        // The package card reads no filter, so a focus is reported.
-        let focused = extract::extract(
-            payload.to_string().as_bytes(),
-            "application/json",
-            "https://pypi.org/pypi/requests/json",
-            &ExtractOptions {
-                focus: Some("license".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(focused.via, Some("adapter:pypi-json"));
-        assert_eq!(extract::skipped_filters(&focused.markdown), ["focus"]);
-        assert!(focused.markdown.contains("requests 2.34.2"));
     }
 
     #[test]
     fn wave450_batch_preserves_partial_state_and_never_skips_sliced_content() {
         let url = "https://example.org/".to_string();
         let result = json!({"content":[{"type":"text","text":"evidence"}], "structuredContent":{"content_ok":true,"partial":true,"content_complete":false,"read_status":"partial","items_found":3,"next_offset":16000}});
-        let batch = render_fetch_batch(
-            &[url],
-            &[result],
-            &[Some("evidence".into())],
-            Some(200),
-            &[true],
-        );
+        let batch = render_fetch_batch(&[url], &[result], &[Some("evidence".into())], 800, &[true]);
         let sc = &batch["structuredContent"]["results"][0];
         assert_eq!(sc["partial"], true);
         assert_eq!(sc["items_found"], 3);
@@ -6130,73 +3339,6 @@ mod budget_tests {
     }
     use super::*;
 
-    fn args_with(ms: Option<u64>) -> Value {
-        match ms {
-            Some(v) => json!({ "deadline_ms": v }),
-            None => json!({}),
-        }
-    }
-
-    #[test]
-    fn no_deadline_keeps_the_fixed_pass() {
-        let b = Budget::of(&args_with(None));
-        assert_eq!(b.pass(20), std::time::Duration::from_secs(20));
-        assert_eq!(b.pass(25), std::time::Duration::from_secs(25));
-    }
-
-    #[test]
-    fn a_short_deadline_shrinks_the_pass_instead_of_being_cut_off() {
-        // 12s of budget: a 20s pass runs past it, so the caller gets a clock
-        // hit instead of the wall verdict that pass had already seen.
-        let b = Budget::of(&args_with(Some(12_000)));
-        let p = b.pass(20);
-        assert!(
-            p < std::time::Duration::from_secs(12),
-            "the pass must fit the budget, got {p:?}"
-        );
-        assert!(
-            p >= std::time::Duration::from_secs(3),
-            "the floor must keep it usable, got {p:?}"
-        );
-    }
-
-    #[test]
-    fn a_deadline_larger_than_the_default_still_caps_at_the_default() {
-        let b = Budget::of(&args_with(Some(600_000)));
-        assert_eq!(b.pass(20), std::time::Duration::from_secs(20));
-        assert_eq!(b.pass(25), std::time::Duration::from_secs(25));
-    }
-
-    #[test]
-    fn stealth_v3_short_budget_still_allocates_a_browser_pass() {
-        for ms in [500, 1000, 2000] {
-            let b = Budget::of(&args_with(Some(ms)));
-            let pass = b.pass(20);
-            assert!(
-                pass >= std::time::Duration::from_millis(ms / 2),
-                "the envelope reserve cannot consume the whole {ms}ms budget: {pass:?}"
-            );
-            assert!(pass < std::time::Duration::from_millis(ms));
-        }
-        let expired = Budget {
-            deadline: Some(std::time::Duration::from_millis(500)),
-            start: std::time::Instant::now() - std::time::Duration::from_millis(501),
-        };
-        assert_eq!(
-            expired.pass(20),
-            std::time::Duration::ZERO,
-            "expired budget cannot gain time"
-        );
-    }
-
-    #[test]
-    fn a_tiny_deadline_never_allocates_time_beyond_the_call() {
-        let b = Budget::of(&args_with(Some(500)));
-        let pass = b.pass(20);
-        assert!(pass > std::time::Duration::ZERO);
-        assert!(pass < std::time::Duration::from_millis(500));
-    }
-
     #[tokio::test]
     async fn wave450_deadline_retains_observed_escalation() {
         let witness = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6238,181 +3380,13 @@ mod adapter_hop_tests {
     use super::*;
     use crate::detect::walls::Vendor;
 
-    // Nextest owns config/state; match the production runtime's 8 MiB stack.
     #[test]
-    fn stealth_v3_adapter_fallback_keeps_the_callers_selected_lane() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all().build().unwrap();
-                runtime.block_on(async {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    unsafe {
-                        std::env::set_var("DONSETCH_FETCH_ROTATE", "1");
-                        std::env::remove_var("DONSETCH_NO_FETCH_ROTATE");
-                        std::env::set_var("DONSETCH_NO_ENV_PROXY", "1");
-                        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
-                        std::env::set_var("DONSETCH_NO_ROUTE_PROBES", "1");
-                    }
-                    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let proxies = [&a, &b].map(|listener| {
-                        crate::transport::proxy::Proxy::parse(&format!(
-                            "http://{}", listener.local_addr().unwrap()
-                        )).unwrap()
-                    });
-                    let pool = Arc::new(crate::search::egress::EgressPool::new(proxies.to_vec()));
-                    crate::search::egress::install_global(Arc::clone(&pool));
-                    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-                    let (stop, stopped) = tokio::sync::watch::channel(false);
-                    let mut servers = Vec::new();
-                    for (lane, listener) in [("A", a), ("B", b)] {
-                        let events = Arc::clone(&events);
-                        let mut stopped = stopped.clone();
-                        servers.push(tokio::spawn(async move {
-                            loop {
-                                let mut socket = tokio::select! {
-                                    _ = stopped.changed() => break,
-                                    accepted = listener.accept() => accepted.unwrap().0,
-                                };
-                                let mut head = Vec::new();
-                                while !head.ends_with(b"\r\n\r\n") {
-                                    assert!(head.len() < 16384);
-                                    head.push(socket.read_u8().await.unwrap());
-                                }
-                                let request = String::from_utf8(head).unwrap();
-                                let target = request.split_whitespace().nth(1).unwrap().to_owned();
-                                events.lock().unwrap().push((lane, target.clone()));
-                                let (status, body) = if target.contains(".json") {
-                                    (429, "<html><body>Too many requests</body></html>".to_string())
-                                } else {
-                                    (200, format!("<article><h1>Owned fallback lane {lane}</h1><p>{}</p></article>",
-                                        "This complete research document must retain the proxy selected for the original call. ".repeat(40)))
-                                };
-                                socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                            }
-                        }));
-                    }
-                    let mut daemon = Daemon::new().await.unwrap();
-                    daemon.fetcher = Arc::new(Fetcher::new(daemon.profile.clone()).unwrap().with_egress(Arc::clone(&pool)));
-                    let daemon = Arc::new(daemon);
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(8),
-                        fetch_single(&daemon, &json!({"tier":"1"}), "http://old.reddit.com/r/owned/")
-                    ).await.unwrap();
-                    stop.send(true).unwrap();
-                    for server in servers { tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap(); }
-                    assert_eq!(result["structuredContent"]["ok"], true, "{result}");
-                    let events = events.lock().unwrap();
-                    assert_eq!(events.len(), 2, "one adapter read and one fallback: {events:?}");
-                    assert!(events[0].1.contains(".json"), "{events:?}");
-                    assert!(!events[1].1.contains(".json"), "{events:?}");
-                    assert!(events.iter().all(|(lane, _)| *lane == "A"),
-                        "a related fallback must not repick after the adapter burns its lane: {events:?}");
-                    assert!(result["content"][0]["text"].as_str().unwrap().contains("Owned fallback lane A"), "{result}");
-                    assert!(!pool.is_dead(&proxies[0].id()),
-                        "an origin 429 must not globally bench a reachable proxy");
-                });
-            }).unwrap().join().unwrap();
-    }
-
-    #[test]
-    fn browser_controls_keep_the_requested_website_url() {
+    fn the_adapter_rewrite_runs_unless_the_read_is_its_own_fallback() {
+        // Views apply to the adapter's markdown like any other, so no view
+        // argument turns the rewrite off; only the adapter fallback does.
         let url = url::Url::parse("https://stackoverflow.com/questions/42917566/example").unwrap();
-        let cases = [
-            json!({"tier":"2"}),
-            json!({"actions":[{"do":"wait","ms":10}]}),
-            json!({"actions":[]}),
-            json!({"tier":"1"}),
-            json!({"section":"Answer 1"}),
-            json!({"selector":"article"}),
-        ];
-        let rewrites: Vec<bool> = cases
-            .iter()
-            .map(|args| fetch_url_rewrite(&url, args, false).is_some())
-            .collect();
-        assert_eq!(rewrites, vec![false, false, true, true, true, false]);
-        assert!(fetch_url_rewrite(&url, &json!({}), true).is_none());
-    }
-
-    #[test]
-    fn recovery_retries_recheck_http_despite_saved_wall_routes() {
-        use crate::ghost::cache::{DomainProfile, GhostState};
-        let host = "www.reddit.com";
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut state = GhostState::default();
-        state.profiles.insert(
-            host.into(),
-            DomainProfile {
-                needs_tier2: true,
-                last_cold_check: now,
-                ..Default::default()
-            },
-        );
-        assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, false, false),
-            RouteDecision::SkipToSolve
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, false, true),
-            RouteDecision::Cold
-        ));
-        let profile = state.profiles.get_mut(host).unwrap();
-        profile.wall_fail_streak = 2;
-        profile.last_wall_fail = now;
-        assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, false, false),
-            RouteDecision::SolveCooldown(_)
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, false, true),
-            RouteDecision::Cold
-        ));
-        state
-            .profiles
-            .insert("stackoverflow.com".into(), state.profiles[host].clone());
-        assert!(matches!(
-            fetch_route(
-                &state,
-                "stackoverflow.com",
-                "auto",
-                false,
-                false,
-                false,
-                true
-            ),
-            RouteDecision::SolveCooldown(_)
-        ));
-        // Explicit browser requests and other remembered walls keep their route.
-        assert!(matches!(
-            fetch_route(&state, host, "2", false, false, false, true),
-            RouteDecision::SkipToSolve
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, "1", false, false, false, false),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, "2", true, false, false, false),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, true, false),
-            RouteDecision::Cold
-        ));
-        // v4.7 V03: JSON data endpoints are terminal at the HTTP tier
-        // : tier 2 stays Cold and a learned wall never skips tier 1.
-        assert!(matches!(
-            fetch_route(&state, host, "2", false, true, false, false),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, "auto", false, true, false, false),
-            RouteDecision::Cold
-        ));
+        assert!(fetch_url_rewrite(&url, false).is_some());
+        assert!(fetch_url_rewrite(&url, true).is_none());
     }
 
     #[test]
@@ -6441,8 +3415,8 @@ mod adapter_hop_tests {
 
     // #287: a challenge (or any non-content verdict) on an adapter
     // endpoint must retry the caller's URL. Before this, the
-    // `Challenge(_) if tier != "1"` arm swallowed it and the ladder
-    // ended after one HTTP request.
+    // adapter's refusal ended the whole fetch after one HTTP
+    // request.
     #[test]
     fn a_refusal_on_an_adapter_endpoint_falls_back() {
         assert!(adapter_hop_failed(
@@ -6462,66 +3436,6 @@ mod adapter_hop_tests {
         ));
         // The retry itself must not bounce (`_no_adapter`).
         assert!(!adapter_hop_failed(Verdict::Blocked, true, true));
-    }
-
-    // V02: `loid` is the gateway cookie for the direct `.json`
-    // endpoint. When the jar holds it, the pre-emptive hop is
-    // skipped; the refusal ladder still covers a revoked session.
-    #[test]
-    fn a_live_loid_gates_the_preemptive_reddit_hop() {
-        let cookie = |name: &str| CookieRecord {
-            name: name.into(),
-            value: "v".into(),
-            domain: ".reddit.com".into(),
-            path: "/".into(),
-            expires_at: None,
-            secure: true,
-            http_only: true,
-            same_site: "Lax".into(),
-        };
-        assert!(reddit_session_live(&[cookie("loid")]));
-        assert!(reddit_session_live(&[
-            cookie("session_tracker"),
-            cookie("loid")
-        ]));
-        assert!(!reddit_session_live(&[cookie("session_tracker")]));
-        assert!(!reddit_session_live(&[]));
-    }
-
-    // The session retry: reddit page refusals at tier 1 get one
-    // session-init attempt; never twice, never off the content host.
-    #[test]
-    fn reddit_session_retry_eligibility() {
-        let args = serde_json::json!({});
-        assert!(reddit_session_retry_eligible(
-            &Verdict::Challenge(Vendor::Generic),
-            "www.reddit.com",
-            &args
-        ));
-        assert!(reddit_session_retry_eligible(
-            &Verdict::Blocked,
-            "reddit.com",
-            &args
-        ));
-        // Other hosts keep their own escalation rules.
-        assert!(!reddit_session_retry_eligible(
-            &Verdict::Blocked,
-            "registry.npmjs.org",
-            &args
-        ));
-        // Served content is content.
-        assert!(!reddit_session_retry_eligible(
-            &Verdict::ContentOk,
-            "www.reddit.com",
-            &args
-        ));
-        // The retry is one-shot.
-        let done = serde_json::json!({"_reddit_session": true});
-        assert!(!reddit_session_retry_eligible(
-            &Verdict::Blocked,
-            "www.reddit.com",
-            &done
-        ));
     }
 
     // The adapter hop's steps fold in FRONT of the retry's own trail
@@ -6556,8 +3470,7 @@ mod adapter_hop_tests {
 #[cfg(test)]
 mod rules_tests {
     use super::*;
-    use crate::ghost::cache::GhostState;
-    use crate::rules::{RuleAction, RuleSet, RuleTier, RulesSection, UrlRule};
+    use crate::rules::{RuleAction, RulesSection, UrlRule};
 
     const MESSAGE: &str = "ask the human operator to download the file";
 
@@ -6578,14 +3491,6 @@ mod rules_tests {
         }
     }
 
-    fn pin(tier: RuleTier, tier_enforce: bool) -> UrlRule {
-        UrlRule {
-            tier: Some(tier),
-            tier_enforce,
-            ..UrlRule::default()
-        }
-    }
-
     fn denial(kind: &'static str) -> FetchError {
         FetchError::Denied {
             rule: "banned.example".into(),
@@ -6594,103 +3499,6 @@ mod rules_tests {
             reason: Some("ip_ban".into()),
             url: "https://www.banned.example/".into(),
         }
-    }
-
-    fn url(s: &str) -> url::Url {
-        url::Url::parse(s).unwrap()
-    }
-
-    #[test]
-    fn rule_tier_follows_the_precedence_table() {
-        let none = UrlRule::default();
-        let advisory_two = pin(RuleTier::Two, false);
-        let enforced_two = pin(RuleTier::Two, true);
-        let enforced_one = pin(RuleTier::One, true);
-        // No tier in the rule: the call keeps whatever it asked for.
-        for requested in [None, Some("auto"), Some("1"), Some("2")] {
-            assert_eq!(rule_tier(requested, &none), None, "{requested:?}");
-            assert_eq!(rule_tier(requested, &deny(None)), None, "{requested:?}");
-        }
-        // An advisory rule fills auto, absent or spelled out.
-        assert_eq!(rule_tier(None, &advisory_two), Some("2"));
-        assert_eq!(rule_tier(Some("auto"), &advisory_two), Some("2"));
-        // The explicit argument beats an advisory rule...
-        assert_eq!(rule_tier(Some("1"), &advisory_two), None);
-        // ...and loses to an enforced one, in both directions.
-        assert_eq!(rule_tier(Some("1"), &enforced_two), Some("2"));
-        assert_eq!(rule_tier(Some("2"), &enforced_one), Some("1"));
-    }
-
-    #[test]
-    fn an_enforced_auto_tier_overrides_an_explicit_tier() {
-        let enforced_auto = pin(RuleTier::Auto, true);
-        assert_eq!(rule_tier(Some("2"), &enforced_auto), Some("auto"));
-        assert_eq!(rule_tier(Some("1"), &enforced_auto), Some("auto"));
-        assert_eq!(rule_tier(None, &enforced_auto), Some("auto"));
-    }
-
-    #[test]
-    fn an_advisory_auto_tier_leaves_an_explicit_tier_as_asked() {
-        let advisory_auto = pin(RuleTier::Auto, false);
-        assert_eq!(rule_tier(Some("2"), &advisory_auto), None);
-        assert_eq!(rule_tier(Some("1"), &advisory_auto), None);
-        // An absent tier already means auto, so filling it changes nothing.
-        assert!(matches!(
-            rule_tier(None, &advisory_auto),
-            None | Some("auto")
-        ));
-    }
-
-    #[test]
-    fn a_rule_tier_pins_only_the_url_it_matches() {
-        let rules =
-            RuleSet::compile(&section(&[("pinned.example", pin(RuleTier::Two, false))])).unwrap();
-        // A batch hands every URL the same arguments; the pin is per URL.
-        let args = json!({"max_chars": 2000});
-        let pinned = rule_pinned_args(&args, &rules, &url("https://www.pinned.example/a"))
-            .expect("the rule pins its host and subdomains");
-        assert_eq!(pinned["tier"], "2");
-        assert_eq!(pinned["max_chars"], 2000, "every other argument is kept");
-        assert!(
-            rule_pinned_args(&args, &rules, &url("https://other.example/a")).is_none(),
-            "an unpinned URL in the same batch keeps the caller's arguments"
-        );
-        assert!(
-            rule_pinned_args(
-                &json!({"tier": "1"}),
-                &rules,
-                &url("https://pinned.example/a")
-            )
-            .is_none(),
-            "an explicit tier beats an advisory rule"
-        );
-    }
-
-    #[test]
-    fn a_rule_tier_routes_like_an_explicit_tier() {
-        let rules =
-            RuleSet::compile(&section(&[("www.reddit.com", pin(RuleTier::Two, false))])).unwrap();
-        let page = url("https://www.reddit.com/r/rust/");
-        let pinned = rule_pinned_args(&json!({}), &rules, &page).unwrap();
-        let tier = pinned["tier"].as_str().unwrap();
-        let state = GhostState::default();
-        // Tier "2" skips tier 1 (`2-direct`) ...
-        assert!(matches!(
-            fetch_route(&state, "www.reddit.com", tier, false, false, false, false),
-            RouteDecision::SkipToSolve
-        ));
-        // ... except for the cold routes, which win over any tier.
-        assert!(matches!(
-            fetch_route(&state, "www.reddit.com", tier, true, false, false, false),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, "www.reddit.com", tier, false, true, false, false),
-            RouteDecision::Cold
-        ));
-        // The adapter gate reads the same pinned argument: no rewrite.
-        assert!(fetch_url_rewrite(&page, &json!({}), false).is_some());
-        assert!(fetch_url_rewrite(&page, &pinned, false).is_none());
     }
 
     #[test]
@@ -6717,7 +3525,7 @@ mod rules_tests {
             None,
             None,
         ];
-        let out = render_fetch_batch(&urls, &results, &markdowns, None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &results, &markdowns, 48_000, &[false; 3]);
         let rows = &out["structuredContent"]["results"];
         assert_eq!(rows[1]["code"], "policy.denied.ip_ban");
         assert_eq!(rows[1]["errorKind"], "permanent");
@@ -6739,7 +3547,7 @@ mod rules_tests {
             .iter()
             .map(|u| policy_error_value(&denial("walled"), u, None))
             .collect();
-        let out = render_fetch_batch(&urls, &denied, &[None, None, None], None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &denied, &[None, None, None], 48_000, &[false; 3]);
         assert_eq!(out["structuredContent"]["ok"], false);
         assert_eq!(out["structuredContent"]["code"], "policy.denied.ip_ban");
         assert_eq!(out["errorKind"], "walled");
@@ -6755,7 +3563,7 @@ mod rules_tests {
                 )
             })
             .collect();
-        let out = render_fetch_batch(&urls, &walled, &[None, None, None], None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &walled, &[None, None, None], 48_000, &[false; 3]);
         assert_eq!(out["structuredContent"]["code"], "wall.blocked");
         assert_eq!(out["errorKind"], "walled");
 
@@ -6769,7 +3577,7 @@ mod rules_tests {
             ),
             walled[2].clone(),
         ];
-        let out = render_fetch_batch(&urls, &mixed, &[None, None, None], None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &mixed, &[None, None, None], 48_000, &[false; 3]);
         assert_ne!(out["structuredContent"]["code"], "policy.denied.ip_ban");
         assert_eq!(out["errorKind"], "transient");
         let rows = &out["structuredContent"]["results"];
@@ -6808,7 +3616,7 @@ mod rules_tests {
                     let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let proxies = [&a, &b].map(|listener| {
-                        crate::transport::proxy::Proxy::parse(&format!(
+                        crate::egress::proxy::Proxy::parse(&format!(
                             "http://{}",
                             listener.local_addr().unwrap()
                         ))
@@ -6858,7 +3666,7 @@ mod rules_tests {
                     }
                     let mut daemon = Daemon::new().await.unwrap();
                     daemon.fetcher = Arc::new(
-                        Fetcher::new(daemon.profile.clone())
+                        Fetcher::new(daemon.fetcher.profile().clone())
                             .unwrap()
                             .with_egress(Arc::clone(&pool)),
                     );
@@ -6897,12 +3705,9 @@ mod rules_tests {
         let (results, targets) = fetch_through_owned_lanes(
             section(&[("banned.example", deny(Some("ip_ban")))]),
             vec![
-                (
-                    json!({"tier": "1"}),
-                    "http://www.banned.example/publication/1",
-                ),
-                (json!({"tier": "1"}), "http://allowed.example/doc"),
-                (json!({"tier": "1"}), "http://allowed.example/hop"),
+                (json!({}), "http://www.banned.example/publication/1"),
+                (json!({}), "http://allowed.example/doc"),
+                (json!({}), "http://allowed.example/hop"),
             ],
         );
         let denied = &results[0]["structuredContent"];
@@ -6944,14 +3749,10 @@ mod rules_tests {
         let (results, targets) = fetch_through_owned_lanes(
             section(&[("www.reddit.com", deny(None))]),
             vec![
-                // The adapter rewrites old. onto www. for its JSON read, and
-                // its fallback retries on www. as well.
-                (json!({"tier": "1"}), "http://old.reddit.com/r/owned/"),
-                // A wiki page has no JSON shape: it stays on the allowed host.
-                (
-                    json!({"tier": "1"}),
-                    "http://old.reddit.com/r/owned/wiki/books",
-                ),
+                // The adapter sends a legacy-host URL to the content host. That
+                // host is denied, and the rewrite's target is judged before
+                // anything leaves: the caller's host is never even dialled.
+                (json!({}), "http://old.reddit.com/r/owned/"),
             ],
         );
         let denied = &results[0]["structuredContent"];
@@ -6962,208 +3763,9 @@ mod rules_tests {
         );
         assert_eq!(denied["rule"], "www.reddit.com");
         assert_eq!(denied["next_action"], MESSAGE);
-        assert_eq!(
-            results[1]["structuredContent"]["ok"], true,
-            "{}",
-            results[1]
-        );
         assert!(
             targets.iter().all(|t| !t.contains("www.reddit.com")),
             "nothing reaches the denied host: {targets:?}"
         );
-        assert!(
-            targets.iter().any(|t| t.contains("old.reddit.com")),
-            "{targets:?}"
-        );
-    }
-
-    // Installs a ruleset into the process config: depends on nextest's
-    // process-per-test.
-    #[test]
-    fn a_rule_tier_replaces_the_tier_argument() {
-        let (results, targets) = fetch_through_owned_lanes(
-            section(&[
-                ("enforced.example", pin(RuleTier::One, true)),
-                ("advisory.example", pin(RuleTier::Two, false)),
-            ]),
-            vec![
-                // Tier "2" would skip HTTP for the browser; the enforced pin
-                // sends the call over HTTP instead.
-                (json!({"tier": "2"}), "http://enforced.example/doc"),
-                // An advisory pin loses to the explicit tier (negative case).
-                (json!({"tier": "1"}), "http://advisory.example/doc"),
-            ],
-        );
-        assert_eq!(
-            results[0]["structuredContent"]["ok"], true,
-            "{}",
-            results[0]
-        );
-        assert_eq!(
-            results[1]["structuredContent"]["ok"], true,
-            "{}",
-            results[1]
-        );
-        // The tier that ran, not just a success: a browser on the runner
-        // could serve call 1 even with the pin ignored.
-        for result in &results {
-            assert_eq!(
-                result["_meta"]["com.donsetch/fetch-debug"]["tier"], "1",
-                "{result}"
-            );
-        }
-        assert!(
-            targets.iter().any(|t| t.contains("enforced.example")),
-            "{targets:?}"
-        );
-        assert!(
-            targets.iter().any(|t| t.contains("advisory.example")),
-            "{targets:?}"
-        );
-    }
-    // Installs config and rewrites the owned cache; nextest's process isolation is required.
-    #[tokio::test]
-    async fn reliability_running_daemon_reloads_same_size_same_timestamp_login() {
-        let mut config = crate::config::DonsetchConfig::default();
-        config.proxy.from_environment = false;
-        crate::config::install(config).unwrap();
-        let path = crate::paths::cache_dir().join("ghost-state.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let state = |value: &str, revision: &str, epoch: u64| {
-            json!({
-                "version": 3, "vault_epoch": epoch,
-                "session_revision": revision,
-                "profiles": {"example.test": {"session_cookies":[{
-                    "domain":"example.test","name":"xs","path":"/","value":value,
-                    "expires_at":2000000000u64,"http_only":true,"secure":true,"same_site":"Lax"
-                }]}}
-            })
-            .to_string()
-        };
-        let first = state("aaaa", "11111111111111111111111111111111", 10);
-        let second = state("bbbb", "22222222222222222222222222222222", 11);
-        assert_eq!(first.len(), second.len());
-        std::fs::write(&path, first).unwrap();
-        let daemon = Arc::new(super::Daemon::new().await.unwrap());
-        daemon.refresh_vault().await;
-        assert!(
-            daemon
-                .fetcher
-                .jar_all_snapshot()
-                .await
-                .iter()
-                .any(|c| c.name == "xs" && c.value == "aaaa")
-        );
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::write(&path, second).unwrap();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-        daemon.refresh_vault().await;
-        assert!(
-            daemon
-                .fetcher
-                .jar_all_snapshot()
-                .await
-                .iter()
-                .any(|c| c.name == "xs" && c.value == "bbbb"),
-            "session rotation was missed because size and timestamp matched"
-        );
-    }
-}
-
-#[cfg(test)]
-mod faithful_and_url_shape_tests {
-    use super::*;
-
-    #[test]
-    fn stringified_arrays_get_a_shape_error_without_coercion_or_echo() {
-        for raw in [
-            "[S88c0S5zH, SGsKUg6Lx]",
-            "  [\"https://a.test\",\"https://b.test\"]",
-            "[x\nforged result",
-            "[]",
-        ] {
-            let error = fetch_url_shape_error(raw).unwrap();
-            assert_eq!(error["structuredContent"]["ok"], false);
-            assert_eq!(error["structuredContent"]["errorKind"], "permanent");
-            assert_eq!(error["structuredContent"]["code"], "fetch.invalid");
-            assert!(
-                error["structuredContent"]["next_action"]
-                    .as_str()
-                    .unwrap()
-                    .contains("real JSON array")
-            );
-            assert!(
-                error["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("stringified array")
-            );
-            assert!(!error.to_string().contains("forged result"));
-        }
-        for raw in [
-            "https://example.com?q=[1]",
-            "http://[::1]:8080/",
-            "S88c0S5zH",
-            "@S88c0S5zH",
-        ] {
-            assert!(fetch_url_shape_error(raw).is_none(), "{raw}");
-        }
-    }
-
-    #[test]
-    fn faithful_result_keeps_source_heading_and_url_in_the_text_body() {
-        let opts = ExtractOptions {
-            faithful: true,
-            selector: Some("article".into()),
-            ..Default::default()
-        };
-        let ex = extract::extract(
-            b"<title>Source heading</title><article><h1>Source heading</h1><p>https://example.org/interview</p><p>Yes.</p></article>",
-            "text/html",
-            "https://example.org/interview",
-            &opts,
-        )
-        .unwrap();
-        assert!(ex.markdown.starts_with("# Source heading\n\nhttps://"));
-        let mut result = finish_result(
-            &ex,
-            "1",
-            200,
-            "ContentOk",
-            "https://example.org/interview",
-            &Trace::default(),
-            0,
-        );
-        apply_faithful_body(&mut result, &ex, &opts);
-        assert_eq!(result["content"][0]["text"], ex.markdown);
-        assert_eq!(result["structuredContent"]["faithful"], true);
-        assert_eq!(result["structuredContent"]["title"], "Source heading");
-    }
-
-    #[test]
-    fn faithful_options_reject_reducing_projections_and_disable_rewrites() {
-        for conflicting in [
-            json!({"focus":"text"}),
-            json!({"toc":true}),
-            json!({"must_contain":"Yes"}),
-            json!({"since_last":true}),
-        ] {
-            let mut args = conflicting;
-            args["faithful"] = json!(true);
-            assert!(fetch_read_options(&args).is_err(), "{args}");
-        }
-        assert!(fetch_read_options(&json!({"faithful":"true"})).is_err());
-        let args = json!({"faithful":true,"selector":"article","section":"s2","offset":200});
-        let opts = fetch_read_options(&args).unwrap();
-        assert!(opts.faithful);
-        assert_eq!(opts.offset, 200);
-        let url = url::Url::parse("https://www.reddit.com/r/rust/").unwrap();
-        assert!(fetch_url_rewrite(&url, &args, false).is_none());
-        assert!(fetch_url_rewrite(&url, &json!({}), false).is_some());
     }
 }

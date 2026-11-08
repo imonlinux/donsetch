@@ -44,7 +44,7 @@ both, then the key string as a tie-break. `enabled = false` removes a rule
 from the candidates. A cascade was rejected because it needs every field to
 stay optional through the merge, and a missed "absent vs default" turns into
 a silent `action = "allow"` override. The cost of winner-takes-all is
-documented for operators: a narrow tier-only rule cancels a broader deny.
+documented for operators: a narrow allow rule cancels a broader deny.
 
 The index is an exact-host map plus a tree map looked up once per suffix of
 the URL's host, so a lookup is a few hash probes, not a scan.
@@ -58,38 +58,26 @@ redirect and rewrite:
 flowchart TD
     A["web_fetch url"] --> B["fetch_input: Denied arm"]
     B -->|denied| E["policy_error_value"]
-    B --> P["rule_pinned_args: tier pin"]
-    P --> I["fetch_single_inner"]
+    B --> I["fetch_single_inner"]
     I --> R["adapter rewrite"]
-    I --> T1["tier-1 redirect loop, every hop"]
-    I --> T2["browser: navigate + CDP request guard"]
+    I --> T1["local redirect loop, every hop"]
     R --> G["guard core: validate_url_basic_with_policy"]
     T1 --> G
-    T2 --> G
     G -->|Denied| E
 ```
 
 1. **Primary**: `web_fetch`'s `fetch_input` guard check. It runs first in
    `fetch_single`, before persona and lane setup and before every cache
-   (search prewarm, render cache, unlocker cache), and again on each
+   (search prewarm, unlocker cache), and again on each
    fallback re-entry. It must match `Denied` before its `guard.ssrf` arm,
    because an explicit code outranks the text classifier.
 2. **Backstop**: the guard core that both `validate_url_basic` and
-   `ensure_url_safe` call. That one place covers the tier-1 redirect loop
-   (`validate_redirect_url` on every hop), adapter rewrites, the browser
-   lane's navigation checks and its CDP request guard, search's engine
+   `ensure_url_safe` call. That one place covers the local fetch's redirect loop
+   (`validate_redirect_url` on every hop), adapter rewrites,
+   `web_screenshot`'s two checks of the URL it is given, search's engine
    queries and prefetch, and doctor. The rule check sits after the
    scheme, credential and host checks and before the SSRF check, so a deny
    holds even with `fetch.allow_private_egress`.
-
-The guard core only refuses. A tier pin needs its own lookup:
-`rule_pinned_args` in `fetch_single` evaluates the caller's URL once and
-hands `fetch_single_inner` a clone of the arguments with `tier` replaced, so
-a rule's tier is indistinguishable from a tier the caller passed (adapter
-rewrite gate and routing included). Fallbacks inherit that pin and are not
-re-evaluated. `rule_tier` holds the precedence table. The only other
-runtime reader of tier pins is search's background pre-solve (`maybe_pre_solve`), which
-skips a host whose winning rule pins tier `"1"` (`rules_keep_browser_off`).
 
 ## The error contract
 
@@ -103,10 +91,9 @@ skips a host whose winning rule pins tier `"1"` (`rules_keep_browser_off`).
   `network.timeout`, a key like `connect.example` read as a dead proxy lane.
   Adding the key back reopens that.
 - **Every routing site calls `policy_error_value`** before the error turns
-  into text: `fetch_input`, the rewritten-URL guard, the tier-1 `Err` arm
-  (above its adapter branch), `fetch_with_actions`, `ghost_escalate` (which
-  returns `GhostFailure::Denied` so a denial never reaches the
-  `kind == "walled"` → paid unlocker gate), `web_screenshot`'s four sites,
+  into text: `fetch_input`, the rewritten-URL guard, the transport `Err` arm
+  (above its adapter branch), `web_screenshot`'s three sites (the URL's two
+  checks and the browser request guard's refusal of the page's own document),
   and the crawl's seed guard. A missed site degrades rather than lies:
   `error_code` has a first arm on the fixed text that yields
   `policy.denied.unspecified`.
@@ -118,7 +105,7 @@ skips a host whose winning rule pins tier `"1"` (`rules_keep_browser_off`).
   it, never by hand.
 - **Catch-all sites that would be silently wrong** got explicit arms:
   `fetch_error_kind`, `fetch_error_code` (now `Option<Cow<str>>`),
-  `lane_note` (no lane verdict), ghost probe stats (no failure class; the
+  `lane_note` (no lane verdict), `state_probe` stats (no failure class; the
   probe re-arms its cadence), search engine outcome (`invalid-config:`, so
   the engine is not quarantined), and the search prefetch (the bot-wall
   shape: score untouched, no quality recorded).
@@ -165,7 +152,7 @@ flowchart LR
   `404`.
 - **A failed seed with nothing else to fetch is a hard error**, judged when
   the result is assembled (`SeedFailure`), not before the workers run,
-  because retries and the browser hook rescue seeds today. Its code follows
+  because retries can still rescue seeds today. Its code follows
   `web_fetch` per cause. Resumed seeds are guarded at the tool entry through
   `resume_store_peek`, which reads the token without consuming it.
 
@@ -195,9 +182,6 @@ so in a comment. The crawl tests use `Crawler::with_rules` to stay pure.
 
 ## Known gaps, accepted for v1
 
-- A redirect the browser follows into a denied host is stopped by the CDP
-  guard but surfaces as a browser navigation error, not `policy.denied`; the
-  crawl's browser hook reports it as text (`GhostHook` returns a `String`).
 - The paid unlocker can return a denied host's page after a redirect on its
   side; the request never leaves from the operator's IP.
 - A rule refusing a phase-1 robots or sitemap fetch is silent: discovery
@@ -229,19 +213,16 @@ Each is additive: no v1 key or output changes meaning when it arrives.
   intermediate redirect hops. Needs a delivery contract the agent reads.
 - **Rules on document requests only, in the browser.** Today the CDP guard
   blocks every request to a denied host that the page session's `Fetch`
-  domain pauses, images and scripts on allowed pages included. It sees no
-  WebSocket, DNS prefetch or preconnect, and probably no request from a
-  cross-site iframe or a worker (`Fetch.enable` runs on the page session
-  only, with no auto-attach; not verified with a real browser). `Fetch.requestPaused` carries `resourceType`, so the rule
+  domain pauses, images and scripts on allowed pages included, and a
+  dedicated worker's requests. It sees no WebSocket, DNS prefetch or
+  preconnect, and no request from a cross-site iframe or a shared or
+  service worker (`Fetch.enable` runs on the page session only, with no
+  auto-attach; the iframe, worker and WebSocket cases measured with
+  Chromium 156). `Fetch.requestPaused` carries `resourceType`, so the rule
   half of the guard could skip subresources while the SSRF half keeps
   applying to everything. Revisit if a deny breaks pages nobody named.
-- **Typed browser denials.** Store the `Denied` the CDP guard saw for a
-  document request in a per-tab slot that navigation returns, so a
-  browser-followed redirect reports the rule; then type `GhostHook`'s error
-  so the crawl keeps it.
 - **A second config file layer** (project-level). The map shape already
   merges per key. Then the duplicate-key error should name each key's layer
-  (`Loaded::origin_of_path` exists for it), and `tier = "auto"` becomes the
-  way to cancel a lower layer's pin.
+  (`Loaded::origin_of_path` exists for it).
 - **A denial sink before the page loop**, so a rule that blocks a robots or
   sitemap fetch is reported instead of silently shrinking discovery.

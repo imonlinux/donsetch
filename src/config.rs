@@ -68,7 +68,6 @@ section!(PathsSection {
 section!(StateSection {
     no_disk_state: bool = false,
     route_memory: RouteMemory = RouteMemory::ReadWrite,
-    cookie_vault: bool = true,
 });
 
 section!(ProxySection {
@@ -140,7 +139,6 @@ section!(BypassSection {
 
 section!(SearchSection {
     google_profile: String = String::new(),
-    ghost_lane: GhostLane = GhostLane::Auto,
     rerank_topup: bool = true,
     rerank_threads: u32 = 0,
     brightdata_zone: String = String::new(),
@@ -162,17 +160,8 @@ section!(SearchSection {
 });
 
 section!(BrowserSection {
-    #[serde(deserialize_with = "deserialize_browser_backend")]
-    backend: BrowserBackend = BrowserBackend::Auto,
     chromium_path: String = String::new(),
-    no_sandbox: bool = false,
-    cloak_auto_download: bool = false,
-    cloak_path: String = String::new(),
-    cloak_version: String = String::new(),
-    cloak_cache_dir: String = String::new(),
     playwright_path: String = String::new(),
-    pool_slots: u32 = 0,
-    xvfb_display: u16 = 0,
     route_probes: bool = true,
     probe_scan_secs: u64 = 120,
     probe_stale_secs: u64 = 21_600,
@@ -238,48 +227,6 @@ pub enum ShadowFetch {
     Auto,
     Always,
     Never,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum GhostLane {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum BrowserBackend {
-    #[default]
-    Auto,
-    #[serde(alias = "chrome", alias = "original")]
-    Chromium,
-    #[serde(alias = "headless", alias = "original-headless")]
-    Headless,
-    #[serde(alias = "cloakbrowser")]
-    Cloak,
-}
-
-/// Normalize browser-backend strings before the enum's serde implementation
-/// applies its canonical names and aliases. The enum remains the only alias
-/// registry, while every config source gets the same trim/case behavior.
-fn deserialize_browser_backend<'de, D>(deserializer: D) -> Result<BrowserBackend, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = <String as serde::Deserialize>::deserialize(deserializer)
-        .map_err(|_| <D::Error as serde::de::Error>::custom("browser backend must be a string"))?;
-    let normalized = raw.trim().to_ascii_lowercase();
-    <BrowserBackend as serde::Deserialize>::deserialize(
-        serde::de::value::StrDeserializer::<D::Error>::new(&normalized),
-    )
-    .map_err(|_| {
-        <D::Error as serde::de::Error>::custom(
-            "unknown browser backend; expected auto, chromium, headless, or cloak",
-        )
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
@@ -823,14 +770,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_ROUTE_MEMORY_READONLY",
         );
     }
-    if legacy_flag("DONSETCH_NO_COOKIE_VAULT") {
-        put(
-            &mut m,
-            "state.cookie_vault",
-            false.into(),
-            "DONSETCH_NO_COOKIE_VAULT",
-        );
-    }
     // fetch
     if legacy_flag("DONSETCH_ALLOW_PRIVATE_EGRESS") {
         put(
@@ -1084,22 +1023,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_GOOGLE_PROFILE",
         );
     }
-    if std::env::var_os("DONSEEK_FORCE_GHOST_LANE").is_some() {
-        put(
-            &mut m,
-            "search.ghost_lane",
-            "always".into(),
-            "DONSEEK_FORCE_GHOST_LANE",
-        );
-    }
-    if std::env::var_os("DONSEEK_NO_GHOST_LANES").is_some() {
-        put(
-            &mut m,
-            "search.ghost_lane",
-            "never".into(),
-            "DONSEEK_NO_GHOST_LANES",
-        );
-    }
     if std::env::var_os("DONSEEK_NO_TOPUP").is_some() {
         put(
             &mut m,
@@ -1133,24 +1056,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
     }
 
     // browser
-    let backend = std::env::var_os("DONSETCH_BROWSER_BACKEND")
-        .map(|value| ("DONSETCH_BROWSER_BACKEND", value))
-        .or_else(|| {
-            std::env::var_os("DONGHOST_BROWSER_BACKEND")
-                .map(|value| ("DONGHOST_BROWSER_BACKEND", value))
-        });
-    if let Some((name, value)) = backend {
-        let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
-        // An empty legacy value historically meant auto. Unknown values stay
-        // in the sparse layer so the winning value is rejected by the typed
-        // enum instead of silently selecting a different browser.
-        let normalized = if normalized.is_empty() {
-            "auto".to_owned()
-        } else {
-            normalized
-        };
-        put(&mut m, "browser.backend", normalized.into(), name);
-    }
     if let Some(v) = std::env::var_os("DONGHOST_CHROME") {
         put(
             &mut m,
@@ -1158,88 +1063,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             v.to_string_lossy().into_owned().into(),
             "DONGHOST_CHROME",
         );
-    }
-    if std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1") {
-        put(
-            &mut m,
-            "browser.no_sandbox",
-            true.into(),
-            "DONGHOST_NO_SANDBOX",
-        );
-    }
-    if std::env::var_os("DONSETCH_CLOAK_AUTO_DOWNLOAD").is_some_and(|v| v == "1") {
-        put(
-            &mut m,
-            "browser.cloak_auto_download",
-            true.into(),
-            "DONSETCH_CLOAK_AUTO_DOWNLOAD",
-        );
-    }
-    if let Some(v) = std::env::var_os("CLOAKBROWSER_BINARY_PATH") {
-        put(
-            &mut m,
-            "browser.cloak_path",
-            v.to_string_lossy().into_owned().into(),
-            "CLOAKBROWSER_BINARY_PATH",
-        );
-    }
-    if let Some(v) = std::env::var_os("CLOAKBROWSER_VERSION") {
-        put(
-            &mut m,
-            "browser.cloak_version",
-            v.to_string_lossy().into_owned().into(),
-            "CLOAKBROWSER_VERSION",
-        );
-    }
-    if let Some(v) = std::env::var_os("CLOAKBROWSER_CACHE_DIR") {
-        put(
-            &mut m,
-            "browser.cloak_cache_dir",
-            v.to_string_lossy().into_owned().into(),
-            "CLOAKBROWSER_CACHE_DIR",
-        );
-    }
-    let no_pool = std::env::var_os("DONSETCH_NO_GHOST_POOL").is_some();
-    if no_pool {
-        put(
-            &mut m,
-            "browser.pool_slots",
-            1i64.into(),
-            "DONSETCH_NO_GHOST_POOL",
-        );
-    } else {
-        match int_env("DONSETCH_GHOST_POOL_SLOTS") {
-            Some(n) => put_num(
-                &mut m,
-                &mut warnings,
-                "browser.pool_slots",
-                "DONSETCH_GHOST_POOL_SLOTS",
-                n,
-                0,
-                16,
-            ),
-            None if std::env::var_os("DONSETCH_GHOST_POOL_SLOTS").is_some() => {
-                warnings.push("ignoring DONSETCH_GHOST_POOL_SLOTS: not a number".into())
-            }
-            None => {}
-        }
-    }
-    if let Some(v) = std::env::var_os("DONSETCH_XVFB_DISPLAY") {
-        match v
-            .to_str()
-            .map(|s| s.trim().trim_start_matches(':').parse::<i64>())
-        {
-            Some(Ok(n)) if (0..=254).contains(&n) => put(
-                &mut m,
-                "browser.xvfb_display",
-                n.into(),
-                "DONSETCH_XVFB_DISPLAY",
-            ),
-            Some(Ok(n)) => warnings.push(format!(
-                "ignoring DONSETCH_XVFB_DISPLAY={n}: out of range 0..=254"
-            )),
-            _ => warnings.push("ignoring DONSETCH_XVFB_DISPLAY: not a display number".into()),
-        }
     }
     if legacy_flag("DONSETCH_NO_ROUTE_PROBES") {
         put(
@@ -1552,13 +1375,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "readwrite",
             "off | readwrite | readonly: per-domain stealth route memory",
         ),
-        (
-            "state",
-            "cookie_vault",
-            FieldKind::Bool,
-            "true",
-            "persist tier-1/tier-2 clearance cookies",
-        ),
         // proxy
         (
             "proxy",
@@ -1681,28 +1497,28 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "h3",
             FieldKind::Bool,
             "false",
-            "opt-in HTTP/3 exit lane",
+            "retired in v5, no effect (accepted so older configs load)",
         ),
         (
             "fetch",
             "alt_svc",
             FieldKind::Bool,
             "true",
-            "honor Alt-Svc upgrade hints",
+            "retired in v5, no effect (accepted so older configs load)",
         ),
         (
             "fetch",
             "shadow_fetch",
             FieldKind::Str,
             "auto",
-            "auto | always | never: tier-1 shadow fetch lane",
+            "retired in v5, no effect (accepted so older configs load)",
         ),
         (
             "fetch",
             "shadow_deadline_ms",
             FieldKind::Int,
             "3000",
-            "shadow-fetch burst deadline in ms",
+            "retired in v5, no effect (accepted so older configs load)",
         ),
         (
             "fetch",
@@ -1848,13 +1664,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "search",
-            "ghost_lane",
-            FieldKind::Str,
-            "auto",
-            "auto | always | never: ghost lane for search results",
-        ),
-        (
-            "search",
             "rerank_topup",
             FieldKind::Bool,
             "true",
@@ -1912,13 +1721,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         // browser
         (
             "browser",
-            "backend",
-            FieldKind::Str,
-            "auto",
-            "auto | chromium | cloak",
-        ),
-        (
-            "browser",
             "chromium_path",
             FieldKind::Str,
             "(discovery)",
@@ -1926,59 +1728,10 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "browser",
-            "no_sandbox",
-            FieldKind::Bool,
-            "false",
-            "run Chromium with --no-sandbox",
-        ),
-        (
-            "browser",
-            "cloak_auto_download",
-            FieldKind::Bool,
-            "false",
-            "allow downloading the cloak browser",
-        ),
-        (
-            "browser",
-            "cloak_path",
-            FieldKind::Str,
-            "(discovery)",
-            "explicit cloak browser binary",
-        ),
-        (
-            "browser",
-            "cloak_version",
-            FieldKind::Str,
-            "(latest)",
-            "pin a cloak browser version",
-        ),
-        (
-            "browser",
-            "cloak_cache_dir",
-            FieldKind::Str,
-            "(platform default)",
-            "cloak browser download cache",
-        ),
-        (
-            "browser",
             "playwright_path",
             FieldKind::Str,
             "(ambient)",
             "extra Playwright browsers root",
-        ),
-        (
-            "browser",
-            "pool_slots",
-            FieldKind::Int,
-            "0 (auto)",
-            "browser pool size; 1..=16, 0 = auto",
-        ),
-        (
-            "browser",
-            "xvfb_display",
-            FieldKind::Int,
-            "0 (auto)",
-            "Xvfb display number; 0 = auto",
         ),
         (
             "browser",
@@ -2120,7 +1873,6 @@ const LEGACY_VARS: &[&str] = &[
     "DONSEEK_NO_DISK_STATE",
     "DONSETCH_NO_ROUTE_MEMORY",
     "DONSETCH_ROUTE_MEMORY_READONLY",
-    "DONSETCH_NO_COOKIE_VAULT",
     "DONSETCH_ALLOW_PRIVATE_EGRESS",
     "DONSETCH_H3",
     "DONSETCH_NO_H3",
@@ -2150,22 +1902,10 @@ const LEGACY_VARS: &[&str] = &[
     "DONSETCH_BYPASS_CACHE_TTL_SECS",
     "DONSETCH_BYPASS_CACHE_MAX_ENTRIES",
     "DONSETCH_GOOGLE_PROFILE",
-    "DONSEEK_FORCE_GHOST_LANE",
-    "DONSEEK_NO_GHOST_LANES",
     "DONSEEK_NO_TOPUP",
     "DONSEEK_RERANK_THREADS",
     "DONSETCH_BRIGHTDATA_ZONE",
-    "DONSETCH_BROWSER_BACKEND",
-    "DONGHOST_BROWSER_BACKEND",
     "DONGHOST_CHROME",
-    "DONGHOST_NO_SANDBOX",
-    "DONSETCH_CLOAK_AUTO_DOWNLOAD",
-    "CLOAKBROWSER_BINARY_PATH",
-    "CLOAKBROWSER_VERSION",
-    "CLOAKBROWSER_CACHE_DIR",
-    "DONSETCH_NO_GHOST_POOL",
-    "DONSETCH_GHOST_POOL_SLOTS",
-    "DONSETCH_XVFB_DISPLAY",
     "DONSETCH_NO_ROUTE_PROBES",
     "DONSETCH_PROBE_SCAN_SECS",
     "DONSETCH_PROBE_STALE_SECS",
@@ -2385,12 +2125,6 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.fetch.shadow_deadline_ms == 0 || c.fetch.shadow_deadline_ms > 60_000 {
         return err("fetch.shadow_deadline_ms must be 1..=60_000".into());
-    }
-    if c.browser.pool_slots > 16 {
-        return err("browser.pool_slots must be 0 (auto) or 1..=16".into());
-    }
-    if c.browser.xvfb_display > 254 {
-        return err("browser.xvfb_display must be 0 (auto) or 1..=254".into());
     }
     if c.browser.probe_scan_secs == 0 || c.browser.probe_scan_secs > 3600 {
         return err("browser.probe_scan_secs must be 1..=3600".into());
@@ -2652,7 +2386,6 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSEEK_NO_DISK_STATE" => ("state", "no_disk_state"),
         "DONSETCH_NO_ROUTE_MEMORY" => ("state", "route_memory"),
         "DONSETCH_ROUTE_MEMORY_READONLY" => ("state", "route_memory"),
-        "DONSETCH_NO_COOKIE_VAULT" => ("state", "cookie_vault"),
         "DONSETCH_ALLOW_PRIVATE_EGRESS" => ("fetch", "allow_private_egress"),
         "DONSETCH_H3" => ("fetch", "h3"),
         "DONSETCH_NO_H3" => ("fetch", "h3"),
@@ -2682,8 +2415,6 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_BYPASS_CACHE_TTL_SECS" => ("bypass", "cache_ttl_secs"),
         "DONSETCH_BYPASS_CACHE_MAX_ENTRIES" => ("bypass", "cache_max_entries"),
         "DONSETCH_GOOGLE_PROFILE" => ("search", "google_profile"),
-        "DONSEEK_FORCE_GHOST_LANE" => ("search", "ghost_lane"),
-        "DONSEEK_NO_GHOST_LANES" => ("search", "ghost_lane"),
         "DONSEEK_NO_TOPUP" => ("search", "rerank_topup"),
         "DONSEEK_RERANK_THREADS" => ("search", "rerank_threads"),
         "DONSETCH_BRIGHTDATA_ZONE" => ("search", "brightdata_zone"),
@@ -2695,16 +2426,7 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_NO_MLDSA_SIGALGS" => ("tls", "mldsa_sigalgs"),
         "DONSETCH_NO_HOST_PACE_FILE" => ("fetch", "host_pace_file"),
         "DONSETCH_BYPASS" => ("bypass", "enabled"),
-        "DONSETCH_BROWSER_BACKEND" | "DONGHOST_BROWSER_BACKEND" => ("browser", "backend"),
         "DONGHOST_CHROME" => ("browser", "chromium_path"),
-        "DONGHOST_NO_SANDBOX" => ("browser", "no_sandbox"),
-        "DONSETCH_CLOAK_AUTO_DOWNLOAD" => ("browser", "cloak_auto_download"),
-        "CLOAKBROWSER_BINARY_PATH" => ("browser", "cloak_path"),
-        "CLOAKBROWSER_VERSION" => ("browser", "cloak_version"),
-        "CLOAKBROWSER_CACHE_DIR" => ("browser", "cloak_cache_dir"),
-        "DONSETCH_NO_GHOST_POOL" => ("browser", "pool_slots"),
-        "DONSETCH_GHOST_POOL_SLOTS" => ("browser", "pool_slots"),
-        "DONSETCH_XVFB_DISPLAY" => ("browser", "xvfb_display"),
         "DONSETCH_NO_ROUTE_PROBES" => ("browser", "route_probes"),
         "DONSETCH_PROBE_SCAN_SECS" => ("browser", "probe_scan_secs"),
         "DONSETCH_PROBE_STALE_SECS" => ("browser", "probe_stale_secs"),
@@ -3106,28 +2828,11 @@ mod tests {
         set_env("DONSETCH_NO_CONFIG_FILE", "1");
         set_env("PLAYWRIGHT_BROWSERS_PATH", "/ambient/playwright");
 
-        let fields = [
-            (
-                "browser.chromium_path",
-                "DONGHOST_CHROME",
-                "DONSETCH_BROWSER__CHROMIUM_PATH",
-            ),
-            (
-                "browser.cloak_path",
-                "CLOAKBROWSER_BINARY_PATH",
-                "DONSETCH_BROWSER__CLOAK_PATH",
-            ),
-            (
-                "browser.cloak_version",
-                "CLOAKBROWSER_VERSION",
-                "DONSETCH_BROWSER__CLOAK_VERSION",
-            ),
-            (
-                "browser.cloak_cache_dir",
-                "CLOAKBROWSER_CACHE_DIR",
-                "DONSETCH_BROWSER__CLOAK_CACHE_DIR",
-            ),
-        ];
+        let fields = [(
+            "browser.chromium_path",
+            "DONGHOST_CHROME",
+            "DONSETCH_BROWSER__CHROMIUM_PATH",
+        )];
 
         let absent = load().expect("absent browser overrides");
         for (path, legacy, _) in fields {
@@ -3447,7 +3152,7 @@ mod tests {
         assert!(!loaded.config.proxy.from_environment);
         assert_eq!(loaded.config.proxy.http, "http://unlocker.local:3128");
         // The resolver must see the slot even with the ambient gate off.
-        let picked = crate::transport::proxy::from_env_for("http://example.com").unwrap();
+        let picked = crate::egress::proxy::from_env_for("http://example.com").unwrap();
         assert!(
             picked.is_some(),
             "an explicit TOML proxy must survive from_environment=false"
@@ -3472,94 +3177,6 @@ mod tests {
         assert_eq!(file_rows[0].1, "h3");
         let defaulted = rows.iter().filter(|r| !r.3.starts_with("file:")).count();
         assert!(defaulted >= 70, "everything else stays default-origin");
-        drop(guard);
-    }
-
-    /// Both historical env names must pass every spelling through the typed
-    /// enum's alias registry, including the normalization the old resolver
-    /// applied before the config migration.
-    #[test]
-    fn legacy_browser_backend_aliases_use_the_typed_parser() {
-        let cases = [
-            ("auto", BrowserBackend::Auto),
-            ("chromium", BrowserBackend::Chromium),
-            ("chrome", BrowserBackend::Chromium),
-            ("original", BrowserBackend::Chromium),
-            ("headless", BrowserBackend::Headless),
-            ("original-headless", BrowserBackend::Headless),
-            ("cloak", BrowserBackend::Cloak),
-            ("cloakbrowser", BrowserBackend::Cloak),
-            ("  ChRoMe  ", BrowserBackend::Chromium),
-            ("\tORIGINAL-HEADLESS\n", BrowserBackend::Headless),
-            (" CloakBrowser ", BrowserBackend::Cloak),
-            (" \t ", BrowserBackend::Auto),
-        ];
-
-        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
-            for (value, expected) in cases {
-                let guard = clean_env();
-                set_env("DONSETCH_NO_CONFIG_FILE", "1");
-                set_env(name, value);
-                let loaded = load()
-                    .unwrap_or_else(|error| panic!("{name}={value:?} should load, got {error}"));
-                assert_eq!(loaded.config.browser.backend, expected, "{name}={value:?}");
-                drop(guard);
-            }
-        }
-    }
-
-    #[test]
-    fn effective_unknown_legacy_browser_backend_fails_without_echoing_it() {
-        const UNKNOWN: &str = "private-backend-marker";
-
-        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
-            let guard = clean_env();
-            set_env("DONSETCH_NO_CONFIG_FILE", "1");
-            set_env(name, UNKNOWN);
-            let error = match load() {
-                Ok(_) => panic!("{name} must not silently fall back to auto"),
-                Err(error) => error.to_string(),
-            };
-            assert!(error.contains("unknown browser backend"), "{error}");
-            assert!(!error.contains(UNKNOWN), "backend value leaked: {error}");
-            drop(guard);
-        }
-    }
-
-    /// Layer precedence applies before typed validation: an invalid legacy
-    /// value that is not effective must not poison a valid modern override.
-    #[test]
-    fn modern_browser_backend_overrides_unknown_legacy_value() {
-        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
-            let guard = clean_env();
-            set_env("DONSETCH_NO_CONFIG_FILE", "1");
-            set_env(name, "private-backend-marker");
-            set_env("DONSETCH_BROWSER__BACKEND", "  ClOaKbRoWsEr  ");
-            let loaded = load().expect("the valid higher-precedence backend must win");
-            assert_eq!(loaded.config.browser.backend, BrowserBackend::Cloak);
-            let origin = origins(&loaded.merged, &loaded.config)
-                .into_iter()
-                .find(|(section, key, _, _)| *section == "browser" && *key == "backend")
-                .expect("browser.backend origin")
-                .3;
-            assert_eq!(origin, "DONSETCH_BROWSER__BACKEND");
-            drop(guard);
-        }
-    }
-
-    /// Kill switch wins: DONSETCH_NO_GHOST_POOL must override a slot
-    /// count, exactly like the pre-config behavior.
-    #[test]
-    fn ghost_pool_kill_switch_wins_over_slot_count() {
-        let guard = clean_env();
-        set_env("DONSETCH_NO_CONFIG_FILE", "1");
-        set_env("DONSETCH_NO_GHOST_POOL", "1");
-        set_env("DONSETCH_GHOST_POOL_SLOTS", "4");
-        let loaded = load().expect("load");
-        assert_eq!(
-            loaded.config.browser.pool_slots, 1,
-            "the kill switch must beat the count"
-        );
         drop(guard);
     }
 

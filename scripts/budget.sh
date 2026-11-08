@@ -33,8 +33,25 @@
 # Both are escapes for a known-idle box, not the default.
 set -eu
 
+# DISK citizenship, same choke point as the CPU cap below: every build, test
+# and fuzz command in this repo comes through this script, so this is where
+# the tree's disk growth is bounded. Cargo never garbage-collects target/:
+# incremental variants accrete one per dep-graph hash change and the dead
+# ones stay forever (measured 2026-10-30: 499 variants, 42G, 370 of them >3
+# days old). guard.sh owns the policy and is age-gated, so it can never
+# delete the variant a build is using right now; ~20ms, and a failure here
+# never fails the build.
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -f "$root/scripts/guard.sh" ]; then
+    sh "$root/scripts/guard.sh" --prune-stale || true
+fi
+
 nproc_now=$(nproc 2>/dev/null || echo 4)
-core_jobs=$(( (nproc_now + 3) / 4 ))
+# Half the threads, not a quarter: profile.codegen-units caps each rustc's own
+# LLVM fan-out (16 instead of 256), so one process no longer claims the whole
+# box. `nice`/`ionice` still put the live session first.
+core_jobs=$(( (nproc_now + 1) / 2 ))
+[ "$core_jobs" -lt 1 ] && core_jobs=1
 
 # MemAvailable is the kernel's own estimate of what we can take without
 # pushing the session into swap; read it rather than trusting total RAM.
@@ -43,8 +60,11 @@ case "$avail_mb" in
     ''|*[!0-9]*) avail_mb=0 ;;
 esac
 mem_jobs=0
-if [ "$avail_mb" -gt 1500 ]; then
-    mem_jobs=$(( (avail_mb - 1500) / 1200 ))
+# ~700 MB per rustc with codegen-units=16 and opt-level 1 deps (measured on
+# this tree). The old 1.2 GB estimate was sized for 256-unit codegen, where
+# one crate could fan out into every core and several GB; that shape is gone.
+if [ "$avail_mb" -gt 1000 ]; then
+    mem_jobs=$(( (avail_mb - 1000) / 700 ))
 fi
 [ "$mem_jobs" -lt 1 ] && mem_jobs=1
 
@@ -68,6 +88,14 @@ export CARGO_MAKEFLAGS="-j$jobs"
 # expensive thing in this graph, and every profile flip used to re-pay
 # it). The cache lives under target/ so it travels with the artifacts.
 # Incremental units are not cached (by design) : this buys the deps.
+# GitHub outage escape hatch: when releases/download 504s, build.sh's pinned
+# prebuilts fall back to the API asset URL on their own, but the v8 crate has no
+# fallback of its own. RELEASE_MIRROR=http://127.0.0.1:18777/v8 (from
+# scripts/release-mirror.py) points every v8 build at a local mirror of the same
+# pinned archive. Unset in normal use.
+if [ -n "${RELEASE_MIRROR:-}" ]; then
+    export RUSTY_V8_MIRROR="$RELEASE_MIRROR"
+fi
 if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
     export CC="${CC:-sccache cc}"

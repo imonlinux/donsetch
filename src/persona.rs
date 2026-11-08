@@ -1,4 +1,4 @@
-//! Per-domain persona store (v4 phase 0.3).
+//! Per-domain persona store.
 //!
 //! Every stealth tool in the market randomizes per request. Modern
 //! bot scoring (JA4 + behavioral + consistency layers) scores
@@ -12,8 +12,10 @@
 //! Phase 0 scope: the store, the coherence checker, the mint/
 //! quarantine lifecycle, and binding of the active global profile
 //! as "persona v1" per domain. Phase 1 diverges header sets per
-//! persona; phase 3 binds ghost entropy (canvas/WebGL/audio) and
-//! proxy exits to the same records.
+//! persona; phase 3 binds proxy exits to the same records. The
+//! viewport and the canvas/WebGL/audio entropy seed are minted and
+//! coherence-checked, but no fetch drives a browser that would use
+//! them.
 //!
 //! Personas are route memory: the DONSETCH_NO_ROUTE_MEMORY and
 //! DONSETCH_ROUTE_MEMORY_READONLY switches cover them too.
@@ -22,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// The active wire identity a persona must agree with. Sourced from
 /// the profile the fetcher actually sends (which itself probes the
-/// installed browser, so ghost and tier 1 claim the same build).
+/// installed browser, so the local fetch claims the installed build).
 #[derive(Clone, Debug)]
 pub struct PersonaCaps {
     pub chrome_major: u32,
@@ -68,9 +70,11 @@ pub struct Persona {
     pub tz: String,
     /// BCP-47-ish locale ("en-US").
     pub locale: String,
-    /// Viewport for ghost tabs (phase 3).
+    /// Viewport pin. Only the coherence check reads it: no fetch
+    /// drives a browser.
     pub viewport: (u32, u32),
-    /// Entropy seed for canvas/WebGL/audio (phase 3). Never 0.
+    /// Entropy seed for canvas/WebGL/audio. Never 0. Only the
+    /// coherence check reads it: no fetch drives a browser.
     pub entropy_seed: u64,
     /// Bound proxy exit id (phase 1+); a persona never crosses exits.
     pub proxy_id: Option<String>,
@@ -214,11 +218,6 @@ impl Persona {
 
     pub fn coherent(&self, caps: &PersonaCaps) -> bool {
         self.coherence_errors(caps).is_empty()
-    }
-
-    /// Ghost wire identity derived from this persona (v4 E2).
-    pub fn ghost_wire(&self) -> crate::ghost::GhostWire {
-        crate::ghost::GhostWire::from_persona(self)
     }
 }
 
@@ -380,19 +379,6 @@ mod tests {
         assert!(!valid_locale("e"));
         assert!(!valid_locale("en-U"));
         assert!(!valid_locale("en-US-x"));
-    }
-
-    #[test]
-    fn ghost_wire_follows_persona_viewport_and_locale() {
-        let mut p = Persona::mint("example.com", &caps(), 1, 1_700_000_000);
-        p.viewport = (1366, 768);
-        p.locale = "de-DE".into();
-        let w = p.ghost_wire();
-        assert_eq!(w.viewport, (1366, 768));
-        assert_eq!(w.locale, "de-DE");
-        // Corrupt viewport is clamped, never passed to Chrome.
-        p.viewport = (10, 10);
-        assert_eq!(p.ghost_wire().viewport, (800, 600));
     }
 
     #[test]

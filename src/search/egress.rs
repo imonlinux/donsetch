@@ -21,12 +21,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::transport::proxy::Proxy;
+use crate::egress::proxy::Proxy;
 
 type PaceGate = Arc<tokio::sync::Mutex<Option<Instant>>>;
 
 /// Process-wide pool (v4 A2). Installed once by the daemon so
-/// ghost launch and doctor can share the same health world as
+/// doctor and the tool paths share the same health world as
 /// search/crawl/fetch without threading Arc through every path.
 static GLOBAL: OnceLock<Arc<EgressPool>> = OnceLock::new();
 
@@ -210,7 +210,7 @@ impl EgressPool {
     }
 
     pub fn from_env() -> Self {
-        Self::new(crate::transport::proxy::load_all())
+        Self::new(crate::egress::proxy::load_all())
     }
 
     /// Load persisted (engine,egress) health and dead-lane benches so a

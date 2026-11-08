@@ -101,7 +101,6 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             .unwrap_or_default();
         if urls.len() > 1 {
             let code = run_bulk_fetch(&daemon, tool, &base_args, &urls, json_mode, quiet).await;
-            crate::fetch::shadow::drain_pending().await;
             daemon.shutdown().await;
             return code;
         }
@@ -159,9 +158,6 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             }
         }
     }
-    // Let page-load realism finish (v4 phase 1.3): the shadow burst
-    // runs in the background; a one-shot CLI would kill it on exit.
-    crate::fetch::shadow::drain_pending().await;
     daemon.shutdown().await;
     code
 }
@@ -354,7 +350,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
             let tokens_est = pick(&sc, &dbg, "tokens_est")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let tier = pick(&sc, &dbg, "tier")
+            let fetch = pick(&sc, &dbg, "fetch")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let verdict = pick(&sc, &dbg, "verdict")
@@ -363,7 +359,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
             let mut parts = vec![
                 format!("{content_len} chars"),
                 format!("~{tokens_est} tokens"),
-                format!("tier {tier}"),
+                format!("fetch: {fetch}"),
                 verdict.to_string(),
             ];
             if let Some(off) = sc.get("next_offset").and_then(|v| v.as_u64())
@@ -371,8 +367,13 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
             {
                 parts.push(format!("next_offset {off}"));
             }
+            // A page the fetch read but found (almost) nothing on is not "ok":
+            // the headline says what the meta says (`content_ok: false`).
             if sc.get("thin").and_then(|v| v.as_bool()).unwrap_or(false) {
-                parts.push("thin".into());
+                return format!(
+                    "[{cmd}] thin: little or no readable content · {}",
+                    parts.join(" · ")
+                );
             }
             format!("[{cmd}] ok · {}", parts.join(" · "))
         }
@@ -606,10 +607,6 @@ pub fn print_top_help() {
     println!("MANAGEMENT:");
     println!("  {:10} Start MCP server (JSON-RPC on stdio)", "mcp");
     println!("  {:10} Manage BYOK search provider keys", "keys");
-    println!(
-        "  {:10} Sign into a site: later fetches replay your session",
-        "login"
-    );
     println!("  {:10} Manage proxy configuration", "proxy");
     println!(
         "  {:10} Explain what the local rules do with a URL (rules test <url>)",
@@ -771,7 +768,7 @@ mod tests {
             "_meta": {
                 "com.donsetch/fetch-debug": {
                     "tokens_est": 4000,
-                    "tier": "1",
+                    "fetch": "local",
                     "verdict": "ContentOk"
                 }
             }
@@ -779,20 +776,31 @@ mod tests {
         let s = stats_line("fetch", &v, 15853);
         assert!(s.contains("15853 chars"));
         assert!(s.contains("~4000 tokens"));
-        assert!(s.contains("tier 1"));
+        assert!(s.contains("fetch: local"));
         assert!(s.contains("ContentOk"));
         assert!(s.contains("next_offset 15923"));
+    }
+
+    #[test]
+    fn a_thin_fetch_does_not_say_ok() {
+        let v = json!({
+            "structuredContent": {"content_ok": false, "read_status": "thin", "thin": true},
+            "_meta": {"com.donsetch/fetch-debug": {"tokens_est": 85, "fetch": "local", "verdict": "ContentOk"}}
+        });
+        let s = stats_line("fetch", &v, 339);
+        assert!(s.starts_with("[fetch] thin:"), "{s}");
+        assert!(!s.contains("] ok"), "{s}");
     }
 
     #[test]
     fn stats_line_fetch_prefers_model_state() {
         // Field present in both surfaces: model state wins over debug.
         let v = json!({
-            "structuredContent": { "tier": "2(ghost)", "verdict": "ContentOk" },
-            "_meta": { "com.donsetch/fetch-debug": { "tier": "1", "verdict": "Blocked" } }
+            "structuredContent": { "fetch": "unlocker", "verdict": "ContentOk" },
+            "_meta": { "com.donsetch/fetch-debug": { "fetch": "local", "verdict": "Blocked" } }
         });
         let s = stats_line("fetch", &v, 0);
-        assert!(s.contains("tier 2(ghost)"));
+        assert!(s.contains("fetch: unlocker"));
         assert!(s.contains("ContentOk"));
     }
 

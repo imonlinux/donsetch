@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use super::*;
 #[allow(clippy::field_reassign_with_default)]
 pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) -> Value {
-    daemon.refresh_vault().await;
     // Resume can work without a url (the seed is stored in the
     // resume state). If url is missing AND no resume token, error.
     let url = match args.get("url").and_then(Value::as_str) {
@@ -26,7 +25,7 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     let mut opts = crawl_options(args);
     let resume = args.get("resume").and_then(Value::as_str).map(String::from);
 
-    // v4 phase 3 delta crawl: pages are re-checked and their fresh
+    // delta crawl: pages are re-checked and their fresh
     // fingerprint compared with page history; only changed or new
     // pages land in the results. Recording happens for every fetched
     // page below, so crawls keep feeding the same memory fetches do.
@@ -57,8 +56,8 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     }
 
     // v3: cancellation + progress. The crawl stops its workers
-    // gracefully on cancel (the stop-flag mechanism) and persists
-    // its resume token : partial progress is never lost.
+    // gracefully on cancel (the stop-flag mechanism). A cancelled
+    // call gets no response, so it keeps no resume token either.
     if let Some(c) = &ctx {
         opts.cancel = Some(c.cancel_receiver());
         let parts = c.progress_parts();
@@ -100,29 +99,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         && let Some(refusal) = seed_guard_error(seed)
     {
         return refusal;
-    }
-
-    // Ghost-warm: if this host was tier-2 solved recently, the
-    // clearance cookies ride tier 1 from page one.
-    if let Some(host) = url::Url::parse(&url)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
-    {
-        let route = daemon.state.lock().await.route_for(&host);
-        if let RouteDecision::Warm(cookies) = route {
-            daemon.fetcher.import_cookies(&cookies).await;
-        }
-    }
-
-    // Map mode: thin static inventories get one bounded rendered read
-    // of the seed through the same ghost path fetch/screenshot own;
-    // any failure keeps the static map (the renderer returns None).
-    if opts.mode == CrawlMode::Map {
-        let daemon = Arc::clone(daemon);
-        opts.render_html = Some(std::sync::Arc::new(move |url: String| {
-            let daemon = Arc::clone(&daemon);
-            Box::pin(async move { rendered_seed_html(&daemon, &url).await })
-        }));
     }
 
     let requested_mode = opts.mode;
@@ -190,80 +166,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         rendered["structuredContent"]["resolved_seed"] = json!(result.seed);
     }
     rendered
-}
-
-/// One rendered read of the seed for a thin map inventory. Returns
-/// (rendered HTML, final URL); None on any failure, and for a read that
-/// is not the seed's content (`rendered_seed_usable`) : the map keeps its
-/// static inventory and never dies because the browser cannot start.
-async fn rendered_seed_html(daemon: &Arc<Daemon>, url: &str) -> Option<(String, String)> {
-    let target = crate::fetch::guards::validate_url_basic(url).ok()?;
-    if crate::fetch::guards::ensure_url_safe(target.as_str())
-        .await
-        .is_err()
-    {
-        return None;
-    }
-    let host = target.host_str()?.to_string();
-    let wire = {
-        let mut state = daemon.state.lock().await;
-        let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
-        state.ensure_persona(&host, &caps);
-        state.ensure_persona_egress(&host);
-        let mut wire = state
-            .personas
-            .get(&host)
-            .filter(|p| p.quarantine_reason.is_none())
-            .map(|p| p.ghost_wire())
-            .unwrap_or_default();
-        let route = daemon.fetcher.route_for_fetch(target.as_str());
-        wire.route = Some(route);
-        wire
-    };
-    let ghost = daemon
-        .ghost_mgr
-        .acquire_for_wire(&daemon.profile, Some(&host), wire)
-        .await
-        .ok()?;
-    let read = daemon
-        .ghost_mgr
-        .read_document(
-            ghost,
-            &daemon.profile,
-            target.as_str(),
-            std::time::Duration::from_secs(20),
-        )
-        .await
-        .ok()?;
-    // The static harvest reads the buffered seed only when it is
-    // ContentOk and 2xx; the rendered one takes the same gate, or a
-    // dead seed's 404 page (site header and footer links) would come
-    // back as a complete map.
-    if !rendered_seed_usable(read.page.outcome, read.page.document.status) {
-        return None;
-    }
-    let ghost = read.guard;
-    let html = ghost.outer_html().await.ok()?;
-    let final_url = ghost
-        .current_url()
-        .await
-        .unwrap_or_else(|_| url.to_string());
-    Some((html, final_url))
-}
-
-/// True when a rendered seed read counts as the seed's content for the
-/// map harvest: the browser outcome is `Content` or `Incomplete`, and
-/// the document's HTTP status, when known, is 2xx. A 404, a wall, a
-/// login or a paywall page is never harvested.
-fn rendered_seed_usable(outcome: ops::BrowserOutcome, status: Option<u16>) -> bool {
-    // Incomplete is a page whose content oracle did not settle in time,
-    // not a refusal; today's harvest reads it and keeps doing so. The
-    // status check is needed beside the outcome: a 404 page with a full
-    // site header classifies as Content by its visible text alone.
-    matches!(
-        outcome,
-        ops::BrowserOutcome::Content | ops::BrowserOutcome::Incomplete
-    ) && status.is_none_or(|s| (200..300).contains(&s))
 }
 
 /// The refusal for a seed the guard rejects, or None when it passes.
@@ -434,7 +336,7 @@ fn seed_failure_error(failure: &crate::crawl::SeedFailure, escalation: Option<Va
                     "wall.blocked"
                 })),
             format!("the site walled the seed fetch ({status})"),
-            "fetch the seed URL with web_fetch, which can escalate to a browser, or use another source",
+            "fetch the seed URL with web_fetch, or use another source",
         ),
         None => (
             if (400..500).contains(&status) {
@@ -536,7 +438,7 @@ fn crawl_options(args: &Value) -> CrawlOptions {
     if let Some(q) = args.get("min_quality").and_then(Value::as_f64) {
         opts.min_quality = q.clamp(0.0, 1.0) as f32;
     }
-    // v4 phase 3: dataset mode is output-format only.
+    // dataset mode is output-format only.
     if args
         .get("dataset")
         .and_then(Value::as_bool)
@@ -554,6 +456,13 @@ pub(super) const QUEUED_PREVIEW: usize = 100;
 
 fn queued_preview(queued: &[String]) -> Value {
     json!(queued.iter().take(QUEUED_PREVIEW).collect::<Vec<_>>())
+}
+
+/// Depth-cut URLs shown in the debug block, beside their count.
+const DEPTH_CUT_SAMPLE: usize = 10;
+
+fn depth_cut_sample(cut: &[String]) -> Value {
+    json!(cut.iter().take(DEPTH_CUT_SAMPLE).collect::<Vec<_>>())
 }
 
 pub(super) fn render_crawl_result(
@@ -680,6 +589,8 @@ pub(super) fn render_crawl_result(
         "map": result.map,
         "queued": queued_preview(&result.queued),
         "queued_total": result.queued.len(),
+        "depth_cut": result.depth_cut.len(),
+        "depth_cut_sample": depth_cut_sample(&result.depth_cut),
         "filtered_out": result.filtered_out,
         "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
         "pages": result.pages.iter().map(|p| json!({
@@ -704,7 +615,7 @@ pub(super) fn render_crawl_result(
     })
 }
 
-/// Dataset mode (v4 phase 3): one JSON object per fetched page,
+/// Dataset mode: one JSON object per fetched page,
 /// JSON Lines. Rows are sorted by URL for deterministic output
 /// (delta-friendly diffs across recrawls). Duplicate content pages
 /// are dropped: a dataset wants one row per page. serde_json does
@@ -801,6 +712,8 @@ pub(super) fn render_crawl_dataset(
         "rows": rows.len(),
         "queued": queued_preview(&result.queued),
         "queued_total": result.queued.len(),
+        "depth_cut": result.depth_cut.len(),
+        "depth_cut_sample": depth_cut_sample(&result.depth_cut),
         "filtered_out": result.filtered_out,
         "skipped": result
             .skipped
@@ -893,6 +806,13 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
 
     // Resume available : always suggest it first.
     if let Some(tok) = &result.resume {
+        // A resume made while the host is still in the penalty box
+        // can stop ThrottledOut again without fetching a queued URL.
+        if result.stop == StopReason::ThrottledOut {
+            return format!(
+                "the host throttled the crawler. Wait a few minutes, then resume={tok} to continue crawling."
+            );
+        }
         return format!(
             "resume={tok} to continue crawling (stopped: {:?}).",
             result.stop
@@ -975,7 +895,7 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
             "crawl hit the time deadline. Increase deadline_s or use resume to continue.".into()
         }
         StopReason::Cancelled => {
-            "crawl cancelled : resume with the token above to continue where it stopped.".into()
+            "crawl cancelled : it kept no resume token; start a new crawl to read the rest.".into()
         }
         StopReason::ThrottledOut => {
             "the host throttled the crawler. Wait a few minutes and resume.".into()
@@ -1082,6 +1002,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: None,
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         };
         let rendered = render_crawl_result(&result, CrawlMode::Map, false);
@@ -1133,6 +1054,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: Some("opaque-resume".into()),
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         };
         let output = render_crawl_result(&result, CrawlMode::Full, false);
@@ -1177,6 +1099,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: Some("tok".into()),
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         };
         for dataset in [false, true] {
@@ -1189,6 +1112,47 @@ mod crawl_output_contract_tests {
             );
             assert_eq!(debug["queued_total"], json!(5_000), "dataset={dataset}");
             assert_eq!(debug["queued"][0], "https://example.com/p/0");
+        }
+    }
+
+    // A depth-cut crawl renders as incomplete with the depth-limit next
+    // action and no resume token, and its debug block carries the count
+    // and a bounded sample. Negative: a drained crawl with no cut stays
+    // complete and reports a zero count.
+    #[test]
+    fn a_depth_limit_stop_is_incomplete_and_counts_its_cut() {
+        let mut result = dataset_fixture();
+        result.skipped.clear();
+        for dataset in [false, true] {
+            let out = render_crawl_result(&result, CrawlMode::Content, dataset);
+            assert_eq!(
+                out["structuredContent"]["complete"], true,
+                "dataset={dataset}"
+            );
+            let debug = &out["_meta"]["com.donsetch/crawl-debug"];
+            assert_eq!(debug["depth_cut"], 0, "dataset={dataset}");
+            assert_eq!(debug["depth_cut_sample"], json!([]), "dataset={dataset}");
+        }
+        result.stop = StopReason::DepthLimit;
+        result.depth_cut = (0..25)
+            .map(|i| format!("https://example.com/docs/deep/{i:02}"))
+            .collect();
+        for dataset in [false, true] {
+            let out = render_crawl_result(&result, CrawlMode::Content, dataset);
+            let state = &out["structuredContent"];
+            assert_eq!(state["complete"], false, "dataset={dataset}");
+            assert_eq!(state["stop"], "DepthLimit", "dataset={dataset}");
+            assert!(state.get("resume").is_none(), "dataset={dataset}");
+            assert_eq!(
+                state["next_action"],
+                "crawl hit the depth limit. Increase max_depth to discover more pages.",
+                "dataset={dataset}"
+            );
+            let debug = &out["_meta"]["com.donsetch/crawl-debug"];
+            assert_eq!(debug["depth_cut"], 25, "dataset={dataset}");
+            let sample = debug["depth_cut_sample"].as_array().unwrap();
+            assert_eq!(sample.len(), super::DEPTH_CUT_SAMPLE, "dataset={dataset}");
+            assert_eq!(sample[0], "https://example.com/docs/deep/00");
         }
     }
 
@@ -1243,6 +1207,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: None,
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         }
     }
@@ -1337,6 +1302,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: None,
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         }
     }
@@ -1472,6 +1438,24 @@ mod crawl_output_contract_tests {
             "wall.challenge Blocked".into(),
         )];
         assert!(super::compute_crawl_next_action(&result).contains("blocked the crawler"));
+    }
+
+    #[test]
+    fn a_throttled_out_stop_with_a_token_says_to_wait_before_resuming() {
+        let mut result = empty_result();
+        result.stop = StopReason::ThrottledOut;
+        result.queued = vec!["https://example.com/docs/b".into()];
+        result.resume = Some("c1a2".into());
+        assert_eq!(
+            super::compute_crawl_next_action(&result),
+            "the host throttled the crawler. Wait a few minutes, then resume=c1a2 to continue crawling."
+        );
+        // Negative: another stop with a token is told to resume, no wait.
+        result.stop = StopReason::MaxPages;
+        assert_eq!(
+            super::compute_crawl_next_action(&result),
+            "resume=c1a2 to continue crawling (stopped: MaxPages)."
+        );
     }
 
     fn seed_failure(status: u16, verdict: Option<&str>) -> crate::crawl::SeedFailure {
@@ -1628,34 +1612,11 @@ mod crawl_output_contract_tests {
         );
     }
 
-    #[test]
-    fn the_rendered_seed_harvest_needs_a_content_like_read() {
-        use crate::ghost::ops::BrowserOutcome as O;
-        assert!(super::rendered_seed_usable(O::Content, Some(200)));
-        assert!(super::rendered_seed_usable(O::Content, None));
-        assert!(super::rendered_seed_usable(O::Incomplete, Some(200)));
-        for refused in [
-            O::NotFound,
-            O::ManagedChallenge,
-            O::HumanRequired,
-            O::AuthRequired,
-            O::Paywall,
-        ] {
-            assert!(
-                !super::rendered_seed_usable(refused, Some(200)),
-                "{refused:?}"
-            );
-        }
-        // A 404 page with a full site header reads as Content.
-        assert!(!super::rendered_seed_usable(O::Content, Some(404)));
-    }
-
     /// A map crawl of one seed answering `seed_status` with a page full of
-    /// links; every other URL is a 404. The renderer applies the rendered
-    /// harvest's gate to a read with the same status.
+    /// links; every other URL is a 404.
     async fn map_crawl_of_seed(seed_status: u16) -> CrawlResult {
         use crate::crawl::governor::{Governor, Lane, LaneKind};
-        use crate::crawl::{CrawlOptions, Crawler, FetchedPage, PageFetcher, RenderFn};
+        use crate::crawl::{CrawlOptions, Crawler, FetchedPage, PageFetcher};
         use crate::detect::walls::Verdict;
         use futures_util::FutureExt;
         use std::sync::Arc;
@@ -1684,7 +1645,7 @@ mod crawl_output_contract_tests {
                     };
                     FetchedPage {
                         lane,
-                        route: Some(crate::transport::request_route::RequestRoute::direct()),
+                        route: Some(crate::egress::request_route::RequestRoute::direct()),
                         url,
                         status,
                         headers: vec![("content-type".into(), "text/html".into())],
@@ -1699,15 +1660,6 @@ mod crawl_output_contract_tests {
                 .boxed()
             },
         );
-        let render: RenderFn = Arc::new(move |url: String| {
-            Box::pin(async move {
-                super::rendered_seed_usable(
-                    crate::ghost::ops::BrowserOutcome::Content,
-                    Some(seed_status),
-                )
-                .then(|| (PAGE.to_string(), url))
-            })
-        });
         let crawler = Crawler::new(
             fetch,
             Arc::new(Governor::new(vec![Lane {
@@ -1722,7 +1674,6 @@ mod crawl_output_contract_tests {
                     mode: CrawlMode::Map,
                     respect_robots: false,
                     deadline: Duration::from_secs(30),
-                    render_html: Some(render),
                     ..Default::default()
                 },
                 None,

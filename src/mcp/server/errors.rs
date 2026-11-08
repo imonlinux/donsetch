@@ -12,6 +12,10 @@ use super::*;
 pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
     match e {
         FetchError::Timeout => "request timed out (the server took too long to respond)".into(),
+        FetchError::SlowTransfer(received) => format!(
+            "the transfer did not finish in time: {} KB arrived and more was coming (a large file or a slow link)",
+            received.div_ceil(1024)
+        ),
         FetchError::TooManyRedirects => "too many redirects (the URL loops)".into(),
         FetchError::InvalidUrl(u) => format!("invalid URL: {u}"),
         FetchError::Tls(msg) => {
@@ -62,7 +66,7 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
             }
         }
         FetchError::ProxyConfig(msg) => format!("proxy configuration error: {msg}"),
-        FetchError::Ghost(msg) => format!("browser automation error: {msg}"),
+        FetchError::Browser(msg) => format!("browser automation error: {msg}"),
         // A name failure is not a policy block: the DNS variants carry
         // the honest message, and the code the agent reads comes from
         // the variant, not from this prose (#248).
@@ -89,6 +93,11 @@ pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String 
             format!("authentication required at {url} (HTTP {status})")
         }
         Verdict::Paywall => format!("paywall: {url} requires payment to view content"),
+        // A 2xx "not found" is the page saying so (a soft 404); naming the
+        // status alone would read as a contradiction.
+        Verdict::SoftNotFound if (200..300).contains(&status) => format!(
+            "not found: {url} is a \"page not found\" page (the server answered HTTP {status}, but the page says the content does not exist)"
+        ),
         Verdict::SoftNotFound => format!("not found: {url} returned HTTP {status}"),
         Verdict::Blocked => {
             // 403/429 without challenge markers = upstream block, not a bot wall.
@@ -101,17 +110,13 @@ pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String 
                 _ => format!("blocked: {url} returned HTTP {status}"),
             }
         }
-        Verdict::Challenge(v) => format!(
-            "bot wall: {url} is protected by {:?} (try fetch with tier=2 for headless browser)",
-            v
-        ),
+        Verdict::Challenge(v) => format!("bot wall: {url} is protected by {:?}", v),
         Verdict::ContentOk => format!("unexpected error: {url} (status {status})"),
     }
 }
 
-/// The fetch tool: tier 1 → verdict → ghost solve/render
-/// → DonSift. Ports the CLI escalation into the daemon,
-/// with warm-start and render cache.
+/// The fetch tool's deadline envelope: the call exceeded
+/// `deadline_ms`; the folded trace shows what was attempted.
 #[allow(clippy::field_reassign_with_default)]
 pub(super) fn deadline_error(url: &str) -> Value {
     let mut trace = Trace::default();
@@ -122,7 +127,7 @@ pub(super) fn deadline_error(url: &str) -> Value {
         Some(json!({
             "url": url,
             "escalation": trace.value(),
-            "next_action": "retry with a higher deadline_ms, or tier=1 (skips browser escalation : the usual deadline eater on walled sites)",
+            "next_action": "retry with a higher deadline_ms",
         })),
     )
 }
@@ -160,12 +165,6 @@ pub(super) fn search_batch_deadline_error(queries: &[String]) -> Value {
     )
 }
 
-/// Ghost render capability shared by the crawl and the search
-/// SERP cascade lane. `skip_cache_read` = never serve a previous
-/// render from the cache (the search lane uses this: a cached
-/// walled SERP would replay "no results" for the whole TTL).
-/// Writes are always kept: the cache still serves normal fetches
-/// of the same URL.
 pub(super) fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &str) -> Value {
     if kind == "permanent" {
         // validate_query rejected the query before any engine or
@@ -265,7 +264,6 @@ fn has_standalone_digits(text: &str, needle: &str) -> bool {
 /// | network.dns / network.timeout / network.ratelimit | transport |
 /// | browser.transport / browser.timeout | browser automation |
 /// | wall.challenge / wall.challenge_unsolved / wall.empty_shell / wall.captcha / wall.paywall / wall.auth | blocked |
-/// | cloak.suspected | tier-1 content is likely decoy |
 /// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
 /// | guard.ssrf | blocked by design |
 /// | `policy.denied.<reason>` | excluded by the operator's local DonSeTch rules; `<reason>` is the rule's subcode, or `unspecified`. Always three segments: prefix-match `policy.denied`, never the whole code |
@@ -415,7 +413,7 @@ pub(super) fn tool_error_structured(
         }
         // The stable code lives where agents read it (inside
         // structuredContent so it survives the TextOnly [meta] fold,
-        // which clones structuredContent). v4.7 uniform envelope: a
+        // which clones structuredContent). : a
         // classified failure is a RETURNED result, never a throw :
         // `ok:false` is the machine failure flag every consumer and
         // client branches on.
@@ -523,11 +521,11 @@ fn moved_page_query(raw: &str) -> Option<String> {
     (!words.is_empty()).then(|| format!("site:{host} {}", words.join(" ")))
 }
 
-/// v4.7 uniform envelope: a classified failure is a NORMAL tool
+/// : a classified failure is a NORMAL tool
 /// result whose envelope carries `ok:false`; nothing raises. Lives on
 /// structuredContent so it survives the TextOnly `[meta]` fold. The
 /// one predicate every consumer branches on (MCP wire, batch
-/// renderers, shot receipts, CLI exit codes).
+/// renderers, CLI exit codes).
 pub(crate) fn is_failure(result: &Value) -> bool {
     result
         .pointer("/structuredContent/ok")
@@ -567,10 +565,10 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
             "verify the URL (typo? deleted page?) : or web_search the page title to find the moved copy".into()
         }
         Some(Verdict::Challenge(_)) if kind == "walled" => {
-            "interactive verification needed; no automated captcha-solving path (by design DonSeTch does not solve captchas)".into()
+            "interactive verification needed : the local system does not solve interactive captchas".into()
         }
         Some(Verdict::Challenge(_)) => {
-            "retry with tier=2 (or tier=auto) : the headless browser solves most JS/cookie challenges".into()
+            "retry later : this challenge may clear on its own".into()
         }
         Some(Verdict::Blocked) => match status {
             429 => "rate limited : wait 30-60s and retry".into(),
@@ -581,7 +579,7 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
             "network failure : a retry may work; if repeated, check this host from another network or choose another source".into()
         }
         _ if kind == "walled" => {
-            "no extractable content behind the wall : use an interactive agent browser for this site".into()
+            "no extractable content behind the wall : use an interactive browser session for this site".into()
         }
         _ if kind == "tls.verify" => {
             "the interception CA is not trusted: export SSL_CERT_FILE pointing at the network's CA bundle and retry (donsetch doctor reports both trust stores)".into()
@@ -598,23 +596,25 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
 /// compromised-CA blocklist, which gets advice of its own.
 pub(super) fn transport_next_action(e: &FetchError, kind: &str) -> String {
     match e {
+        FetchError::SlowTransfer(_) => {
+            "the server is sending: retry with a larger deadline_ms (up to 600000) so the transfer can finish".into()
+        }
         // Still kind tls.verify, but its advice (trust another CA
         // bundle) is the one thing that must not be done here.
-        FetchError::Tls(msg) if crate::transport::tls::is_blocked_ca_failure(msg) => {
+        FetchError::Tls(msg) if crate::error::is_blocked_ca_failure(msg) => {
             "the server's certificate chain uses a CA key known to be compromised: do not retry or change the trust store; choose another source".into()
         }
         _ => next_action_for(None, 0, kind),
     }
 }
 
-/// Escalation trace: the ordered record of what DonSeTch tried :
-/// HTTP → browser → OCR-style fallbacks : with tier, action,
+/// The fetch trace: the ordered record of what DonSeTch tried :
+/// route → local fetch → wall handling : with stage, action,
 /// outcome and per-step latency. Successes expose it through client-only
 /// `_meta`; errors retain actionable state on the model surface.
 #[derive(Default)]
 pub(super) struct Trace {
     steps: Vec<Value>,
-    pub(super) browser_document: Option<crate::ghost::document::Document>,
 }
 
 tokio::task_local! {
@@ -625,25 +625,9 @@ tokio::task_local! {
 }
 
 impl Trace {
-    pub(super) fn observe_browser(&mut self, document: &crate::ghost::document::Document) {
-        self.browser_document = Some(document.clone());
-        self.step(
-            "2",
-            "browser-document",
-            &format!(
-                "generation={} status={}",
-                document.generation,
-                document
-                    .status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "unavailable".into())
-            ),
-            0,
-        );
-    }
-    pub(super) fn step(&mut self, tier: &str, action: &str, outcome: &str, ms: u128) {
+    pub(super) fn step(&mut self, stage: &str, action: &str, outcome: &str, ms: u128) {
         let step = json!({
-            "tier": tier,
+            "stage": stage,
             "action": action,
             "outcome": outcome,
             "ms": ms,
@@ -691,7 +675,10 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         // A resolver that did not answer is as retryable as a connect
         // that did not: the same name can resolve a second later. A name
         // that does not exist (Dns) stays permanent, like an Ssrf block.
-        FetchError::Timeout | FetchError::Io(_) | FetchError::DnsTimeout(_) => "transient",
+        FetchError::Timeout
+        | FetchError::SlowTransfer(_)
+        | FetchError::Io(_)
+        | FetchError::DnsTimeout(_) => "transient",
         // Match on the classifier's own leading sentences, never on
         // hint text : "SSL_CERT_FILE" appears in BOTH hints, and
         // with it in the verify arm (checked first) every egress
@@ -702,7 +689,7 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         {
             "tls.egress"
         }
-        FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => "tls.verify",
+        FetchError::Tls(msg) if crate::error::is_cert_verify_failure(msg) => "tls.verify",
         // The operator chose the kind; the default below would silently
         // turn a `walled` rule into `permanent`.
         FetchError::Denied { kind, .. } => kind,
@@ -718,7 +705,9 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
 /// (`TooManyRedirects`) failures never count: the wire delivered an
 /// answer, the answer was "no".
 pub(super) fn transport_failure_evidence(e: &FetchError) -> bool {
-    fetch_error_kind(e) == "transient" || matches!(e, FetchError::Http(_))
+    // A slow transfer reached the server and kept receiving: the route works.
+    !matches!(e, FetchError::SlowTransfer(_))
+        && (fetch_error_kind(e) == "transient" || matches!(e, FetchError::Http(_)))
 }
 
 /// The stable machine code for a transport failure, taken from the
@@ -738,6 +727,7 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<Cow<'static, str>> {
         // signal (DnsTimeout is transient).
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some(Cow::Borrowed("network.dns")),
         FetchError::Ssrf(_) => Some(Cow::Borrowed("guard.ssrf")),
+        FetchError::SlowTransfer(_) => Some(Cow::Borrowed("network.timeout")),
         FetchError::ProxyConfig(_) => Some(Cow::Borrowed("proxy.config")),
         FetchError::Denied { reason, .. } => {
             Some(Cow::Owned(crate::rules::policy_code(reason.as_deref())))
@@ -751,13 +741,13 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<Cow<'static, str>> {
 /// failures. Mirrors friendly_fetch_error; the strings are API surface.
 pub(super) fn transport_class(e: &FetchError) -> &'static str {
     match e {
-        FetchError::Timeout => "timeout",
+        FetchError::Timeout | FetchError::SlowTransfer(_) => "timeout",
         FetchError::TooManyRedirects => "too_many_redirects",
         FetchError::Dns(_) => "dns",
         FetchError::DnsTimeout(_) => "dns_timeout",
         FetchError::Ssrf(_) => "ssrf",
         FetchError::InvalidUrl(_) => "invalid_url",
-        FetchError::Ghost(_) => "ghost",
+        FetchError::Browser(_) => "browser",
         FetchError::Http(_) | FetchError::NonHttpRedirect(_) => "protocol",
         FetchError::ProxyConfig(_) => "configuration",
         // Not a transport class: no transport failed, a local rule
@@ -812,9 +802,8 @@ mod stitch_tests {
             }
         }
         impl std::error::Error for E {}
-        let classified = |raw: &'static str| {
-            FetchError::Tls(crate::transport::tls::classify_handshake_error(&E(raw)))
-        };
+        let classified =
+            |raw: &'static str| FetchError::Tls(crate::error::classify_handshake_error(&E(raw)));
         // Middlebox kills the handshake: reset / early EOF.
         assert_eq!(
             fetch_error_kind(&classified("connection reset by peer")),
@@ -841,7 +830,7 @@ mod stitch_tests {
     // advice to trust another bundle.
     #[test]
     fn blocked_ca_failure_keeps_tls_verify_but_not_its_advice() {
-        let blocked = FetchError::Tls(crate::transport::tls::BLOCKED_CA_FAILURE.into());
+        let blocked = FetchError::Tls(crate::error::BLOCKED_CA_FAILURE.into());
         assert_eq!(fetch_error_kind(&blocked), "tls.verify");
         let message = friendly_fetch_error(&blocked);
         assert!(
@@ -853,7 +842,7 @@ mod stitch_tests {
         assert!(advice.contains("compromised"), "{advice}");
         assert!(!advice.contains("export SSL_CERT_FILE"), "{advice}");
 
-        let untrusted = FetchError::Tls(crate::transport::tls::classify_handshake_error(
+        let untrusted = FetchError::Tls(crate::error::classify_handshake_error(
             &std::io::Error::other("certificate verify failed: unknown ca"),
         ));
         assert_eq!(
@@ -908,7 +897,7 @@ mod stitch_tests {
             std::env::set_var("NO_PROXY", "");
             std::env::remove_var("no_proxy");
         }
-        let error = crate::transport::proxy::from_env_for("http://example.com/").unwrap_err();
+        let error = crate::egress::proxy::from_env_for("http://example.com/").unwrap_err();
         assert!(
             !transport_failure_evidence(&error),
             "a configuration error must not teach a network failure"
@@ -1012,14 +1001,6 @@ mod stitch_tests {
     #[test]
     pub(super) fn no_next_is_none() {
         assert!(find_rel_next("<html></html>", "https://example.com/").is_none());
-    }
-
-    #[test]
-    pub(super) fn part_frontmatter_stripped() {
-        let part =
-            "# My Story\nhttps://example.com/p2\n> Same description\n\nPart two content here.";
-        assert_eq!(strip_part_frontmatter(part), "Part two content here.");
-        assert_eq!(strip_part_frontmatter("Just content"), "Just content");
     }
 }
 #[cfg(test)]
@@ -1188,7 +1169,7 @@ mod error_code_tests {
         let wall = json!({"verdict": "Challenge(Cloudflare)", "status": 403});
         assert_eq!(
             error_code(
-                "bot wall: http://127.0.0.1:42945/wall is protected by Cloudflare (try fetch with tier=2 for headless browser)",
+                "bot wall: http://127.0.0.1:42945/wall is protected by Cloudflare",
                 Some(&wall)
             ),
             "wall.challenge"
@@ -1235,17 +1216,14 @@ mod error_code_tests {
     #[test]
     pub(super) fn off_list_enum_args_are_a_tool_error() {
         let args = json!({ "url": "https://example.com", "tier": "3" });
-        let v = invalid_args_error("web_fetch", &args).expect("tier=3 must be refused");
+        let v = invalid_args_error("web_fetch", &args).expect("tier must be refused");
         assert_eq!(v["isError"], false);
         assert_eq!(v["structuredContent"]["ok"], false);
         assert_eq!(v["errorKind"], "permanent");
         assert_eq!(v["code"], "fetch.invalid");
         assert_eq!(v["structuredContent"]["code"], "fetch.invalid");
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.starts_with(r#"fetch: tier must be one of "auto", "1", "2"; got "3""#),
-            "{text}"
-        );
+        assert!(text.starts_with("fetch: tier was removed"), "{text}");
         assert!(text.contains("Next action:"), "{text}");
 
         let args = json!({ "url": "https://example.com", "mode": "asdf" });
@@ -1282,8 +1260,8 @@ mod error_code_tests {
 
     #[test]
     pub(super) fn listed_enum_args_and_unknown_tools_pass_through() {
-        let args = json!({ "url": "https://example.com", "tier": "2" });
-        assert!(invalid_args_error("web_fetch", &args).is_none());
+        let args = json!({ "query": "x", "intent": "web" });
+        assert!(invalid_args_error("web_search", &args).is_none());
         assert!(
             invalid_args_error("web_fetch", &json!({ "url": "https://example.com" })).is_none()
         );
@@ -1434,15 +1412,6 @@ mod boundary_tests {
             )
             .is_none()
         );
-        // archive is a valid enum parameter again (restored in the fork);
-        // its values pass validation exactly like any other enum.
-        assert!(
-            invalid_args_error(
-                "web_fetch",
-                &json!({"url":"https://example.com","archive":"only"})
-            )
-            .is_none()
-        );
     }
     #[test]
     fn v471_topic_hint_is_absent_for_roots_and_opaque_paths() {
@@ -1515,7 +1484,7 @@ mod policy_tests {
             "permanent",
             None,
         );
-        let trace = json!([{"tier": "1", "action": "fetch", "outcome": "denied", "ms": 0}]);
+        let trace = json!([{"stage": "local", "action": "fetch", "outcome": "denied", "ms": 0}]);
         let v = policy_error_value(&e, url, Some(trace.clone()));
         assert_eq!(v["code"], crate::rules::policy_code(None));
         assert_eq!(v["code"], "policy.denied.unspecified");
@@ -1673,8 +1642,8 @@ mod transport_class_tests {
             "protocol"
         );
         assert_eq!(
-            transport_class(&FetchError::Ghost("no browser".into())),
-            "ghost"
+            transport_class(&FetchError::Browser("no browser".into())),
+            "browser"
         );
     }
 }

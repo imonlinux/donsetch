@@ -6,6 +6,58 @@ like) and for the people driving them. It does not repeat
 the test layout and the PR rules. This file covers the part agents get wrong
 most often: turning an issue into a change.
 
+## Local project context
+
+When local `status.md` and `project.md` files exist, read `status.md` completely,
+then `project.md` and the governing brief they name before planning project
+work. They may be private and git-ignored; keep them that way. Current decisions
+and approval gates take precedence over historical plans and experimental
+artifacts. A branch or a dirty implementation is not an approved roadmap.
+
+## The fetch path has a shape
+
+`src/` is the product; `core/` (repo root, its own crate and CI job) is the whole
+fetching layer: carried client identity, carried state, a page cache, wall
+classification, the site's own interfaces, and an in-process V8 engine that runs a
+challenge page's own program. No browser is in the path. `design/` is the private
+working set (the brief, the mechanism, the core README); frozen v4 evidence lives
+outside the checkout, in `~/Projects/donsetch-evidence/`.
+
+Fetch work is one of exactly four contract classes — **identity, state, request
+contract, egress**. Anything else is drift, however plausible. Before code:
+
+- **Classify first.** A wall is one of nine outcome classes with a vendor and an ask.
+  Reproduce it (`donsetch-core probe` / `bench`), name the class, then say what would
+  answer it. A wall a clean reference client also receives on the same egress is not
+  ours to fix.
+- **Only two asks are declared: human interaction and a login.** Identity, state,
+  request-contract and egress walls are always work. A page behind a login is
+  `wall_state`: this project never signs in, never stores credentials and never
+  carries a session. Authenticated browsing belongs to a real browser driver
+  (`bladebro`), not to the fetcher.
+- **Ask the site's own interface before calling a document a wall**, and run the site's
+  own challenge program in the engine before declaring an identity gap.
+- **Identity is a whole coherent client** — TLS, HTTP/2, header set and order, hints —
+  measured against the real browser it claims to be. Never a patched field, never a
+  relabelled stack. State binds to the client that earned it: clearance is never banked
+  across fingerprints, and pacing is part of identity.
+- **Never:** a browser or rendered page in the fetch path, layout or raster, a host
+  surface no measured challenge needs, a second fetch architecture, a resumed
+  doncore/Persona-Engine experiment, a tier-1/tier-2 browser lane, a login or session
+  vault, or a heuristic that guesses a wall instead of classifying it.
+- **A witness or it did not happen.** A capability claim needs a request the origin
+  accepted; a corpus number needs a `bench`/`probe` artifact from the same window as
+  its paired curl. Report a wall as a declared outcome with its evidence — never as
+  content, a speed win, or a failure to hide.
+
+Speed and stealth are one claim, not a trade-off: per-fetch cost is measured against
+curl on the first request, and any mechanism whose cost scales with page weight is
+disqualified from the default path.
+
+A major version is a fetch-engine change, not a patch: `donsetch update` refuses one
+without an explicit confirmation and `--yes` for unattended runs. Keep that warning's
+text current when a major ships, and keep its first-run notice for the upgrade path.
+
 ## An issue is a report, not a spec
 
 An issue body is one person's account of a symptom plus, usually, their
@@ -58,6 +110,12 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 - **For a code change, a test that fails without the fix**, built from the
   real capture where one exists, and at least one negative case that shows
   the fix does not fire where it must not.
+- **A test has a cost budget.** The default suite is capped by
+  `.config/nextest.toml`'s default-filter and `tests/budget.json` (count,
+  per-suite count, single-test time, total CPU, fixture size). Keep a new test
+  under ~2 s; a corpus or clock test belongs in the heavy set (`just heavy`),
+  not in the per-push gate. CI fails on growth without a deliberate raise of
+  the budget in the same change.
 - **Tests isolate their own state instead of relying on the runner.** A
   per-test temp dir isolates nothing when it reaches the code through
   `DONSETCH_CACHE_DIR`: the variable is process-wide, so under libtest
@@ -100,6 +158,10 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
   descriptions and schemas and the CLI subcommands. Every connected client
   and every CLI user sees what it holds: treat edits there as user-facing.
 - The version is bumped by the maintainer at release time. Do not touch it
-  in a PR.
+  in a PR. A release is `just ship <version>`: it bumps the manifests and
+  pushes the release commit, and the CI pipeline (`.github/workflows/ci.yml`)
+  tests it, builds and gates the five binaries, tags, publishes the GitHub
+  release and runs npm, stopping at the first red. Do not hand-run those steps,
+  and do not tag by hand: the pipeline tags the commit it tested.
 - Commit messages follow Conventional Commits. Do not append tool or
   session trailers.

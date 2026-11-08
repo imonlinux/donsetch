@@ -524,7 +524,25 @@ fn fold_str(s: &str) -> String {
 /// Conservative: only strips when stem ≥ 3 chars. Better to
 /// under-stem than over-stem (over-stemming merges
 /// unrelated words, hurting BM25 precision).
+/// English stem, with a final consonant + `y` read as `i` (Porter step
+/// 1c) so the singular meets its `-ies` plural: penalty and penalties both
+/// stem to `penalti`.
 fn stem_en(word: &str) -> String {
+    let mut stem = stem_en_suffix(word);
+    let mut rev = stem.chars().rev();
+    if stem.len() >= 3
+        && rev.next() == Some('y')
+        && rev
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() && !"aeiou".contains(c))
+    {
+        stem.pop();
+        stem.push('i');
+    }
+    stem
+}
+
+fn stem_en_suffix(word: &str) -> String {
     let w = word;
     if w.len() < 4 {
         return w.to_string();
@@ -575,10 +593,11 @@ fn stem_en(word: &str) -> String {
             return stem_en_double(stem);
         }
     }
-    // -ly
+    // -ly, but not the verbs in -ply (apply, reply, supply), whose
+    // inflections keep the stem
     if w.ends_with("ly") && w.len() > 3 {
         let stem = &w[..w.len() - 2];
-        if stem.len() >= 3 {
+        if stem.len() >= 3 && !stem.ends_with('p') {
             return stem.to_string();
         }
     }
@@ -804,7 +823,7 @@ fn tokenize_cjk(text: &str, lang: &str) -> Vec<String> {
 // API identifiers and prose headings must agree: TaskGroup matches "task
 // groups", and ExceptionGroup matches "exception group". Keep the public
 // tokenizer's search/frontier contract unchanged; this is passage retrieval.
-fn passage_tokens(text: &str, lang: &LanguageInfo) -> Vec<String> {
+pub(crate) fn passage_tokens(text: &str, lang: &LanguageInfo) -> Vec<String> {
     let mut separated = String::with_capacity(text.len());
     let mut lower = false;
     for ch in text.chars() {
@@ -822,20 +841,25 @@ fn passage_tokens(text: &str, lang: &LanguageInfo) -> Vec<String> {
 /// Used by both `filter` (BM25-only) and `filter_semantic`
 /// (BM25 + cross-encoder union).
 fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
-    let mut qterms = passage_tokens(query, lang);
-    qterms.sort_unstable();
-    qterms.dedup();
-    if qterms.is_empty() || blocks.is_empty() {
-        return vec![0.0; blocks.len()];
-    }
-
-    // Document stats.
+    let qterms = passage_tokens(query, lang);
     let docs: Vec<Vec<String>> = blocks
         .iter()
         .map(|b| passage_tokens(&b.body_text(), lang))
         .collect();
+    bm25_rank(&docs, qterms)
+}
+
+/// BM25 with IDF-weighted query coverage over pre-tokenized passages, one
+/// score per passage (0.0 = no query term). Terms present in at least half
+/// the passages are ignored when the query also has a more selective term.
+pub(crate) fn bm25_rank(docs: &[Vec<String>], mut qterms: Vec<String>) -> Vec<f64> {
+    qterms.sort_unstable();
+    qterms.dedup();
+    if qterms.is_empty() || docs.is_empty() {
+        return vec![0.0; docs.len()];
+    }
     let mut df: HashMap<&str, usize> = HashMap::new();
-    for doc in &docs {
+    for doc in docs {
         let mut seen = std::collections::HashSet::new();
         for t in doc {
             if seen.insert(t.as_str()) {
@@ -852,11 +876,10 @@ fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
     {
         qterms.retain(|q| df.get(q.as_str()).is_none_or(|&n| n * 2 < docs.len()));
     }
-    let n = blocks.len() as f64;
+    let n = docs.len() as f64;
     let avgdl = docs.iter().map(|d| d.len()).sum::<usize>() as f64 / n.max(1.0);
 
-    // Score each block.
-    let mut scores = vec![0.0f64; blocks.len()];
+    let mut scores = vec![0.0f64; docs.len()];
     for (i, doc) in docs.iter().enumerate() {
         let mut tf: HashMap<&str, usize> = HashMap::new();
         for t in doc {
@@ -1572,7 +1595,24 @@ mod tests {
     fn stem_ing() {
         assert_eq!(stem_en("running"), "run");
         assert_eq!(stem_en("typing"), "typ");
-        assert_eq!(stem_en("flying"), "fly");
+        assert_eq!(stem_en("flying"), "fli");
+    }
+
+    #[test]
+    fn stem_singular_meets_its_ies_plural() {
+        for (one, many) in [
+            ("penalty", "penalties"),
+            ("company", "companies"),
+            ("study", "studies"),
+            ("city", "cities"),
+            ("apply", "applies"),
+            ("reply", "replied"),
+        ] {
+            assert_eq!(stem_en(one), stem_en(many), "{one} / {many}");
+        }
+        // A vowel before the y keeps it.
+        assert_eq!(stem_en("keys"), "key");
+        assert_eq!(stem_en("days"), stem_en("day"));
     }
 
     #[test]

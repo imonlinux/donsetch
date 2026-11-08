@@ -9,18 +9,21 @@
 //! Flow:
 //!   1. Fetch `releases.atom`, parse the first `<entry><title>` tag.
 //!   2. Compare with the current version (semver).
-//!   3. Download the platform-correct tarball + SHA256 from
+//!   3. A major version prints what it changes and asks first; `--yes`
+//!      answers for an unattended run (`confirm_major_update`).
+//!   4. Download the platform-correct tarball + SHA256 from
 //!      `releases/download/v<tag>/donsetch-{platform}.tar.gz`.
-//!   4. Verify SHA256.
-//!   5. Extract (flate2 + tar).
-//!   6. Replace the binary in place (atomic on Unix, rename-then-
+//!   5. Verify SHA256.
+//!   6. Extract (flate2 + tar).
+//!   7. Replace the binary in place (atomic on Unix, rename-then-
 //!      write on Windows). Also replaces pdfium.dll and onnxruntime.dll on Windows.
-//!   7. Clean up temp files and old backups.
+//!   8. Clean up temp files and old backups.
 
 use std::path::Path;
 
 use crate::DISPLAY_NAME;
 use crate::cli;
+use crate::cli::download;
 use crate::fetch::client::Fetcher;
 use crate::paths;
 use crate::profile::BrowserProfile;
@@ -28,7 +31,8 @@ use crate::profile::BrowserProfile;
 const REPO: &str = "dondai44423/donsetch";
 
 pub async fn run(args: &[String]) {
-    crate::cli::args::Spec::new("update", "donsetch update", &[]).reject(&args[2..]);
+    crate::cli::args::Spec::new("update", "donsetch update [--yes]", &["--yes", "-y"])
+        .reject(&args[2..]);
     cli::init();
     cli::print_title(&format!("{DISPLAY_NAME} Update"));
 
@@ -71,7 +75,11 @@ pub async fn run(args: &[String]) {
     // ── Latest version (atom feed : no API, no rate limits) ──
 
     let spinner = cli::Spinner::new("checking for updates...");
-    let latest = match fetch_latest_version(&fetcher, is_prerelease(current)).await {
+    let checked = match fetch_feed(&fetcher).await {
+        Ok(body) => check_feed(&body, current),
+        Err(e) => Err(e),
+    };
+    let (latest, offer) = match checked {
         Ok(v) => v,
         Err(e) => {
             spinner.stop();
@@ -86,34 +94,38 @@ pub async fn run(args: &[String]) {
 
     // ── Version comparison ───────────────────────────────────
 
-    let cur_ver = semver::Version::parse(current).ok();
-    let lat_ver = semver::Version::parse(&latest).ok();
-
-    match (cur_ver, lat_ver) {
-        (Some(c), Some(l)) if c == l => {
+    match offer {
+        Offer::UpToDate => {
             println!("  Already up to date.");
             return;
         }
-        (Some(c), Some(l)) if c > l => {
+        Offer::Ahead => {
             println!(
-                "  {} You are ahead of the latest release ({c} > {l}).",
+                "  {} You are ahead of the latest release ({current} > {latest}).",
                 cli::icon_warn(),
             );
             println!("  No update needed.");
             return;
         }
-        _ => {} // Proceed : version is newer or unparseable.
+        Offer::Prerelease => {
+            println!(
+                "  {} Latest published is a prerelease ({latest}); staying on {current}.",
+                cli::icon_warn()
+            );
+            println!("    Install a prerelease explicitly if you want one.");
+            return;
+        }
+        Offer::Newer => {}
     }
 
-    // The atom feed lists prereleases too. A stable install never
-    // moves onto one; a prerelease install (a tester) follows them.
-    if is_prerelease(&latest) && !is_prerelease(current) {
-        println!(
-            "  {} Latest published is a prerelease ({latest}); staying on {current}.",
-            cli::icon_warn()
-        );
-        println!("    Install a prerelease explicitly if you want one.");
-        return;
+    // ── Major-version guard ──────────────────────────────────
+    // A major release is a different fetch engine, not a patch: the v5
+    // update retires v4's browser tier, its login vault and its tier
+    // model. Warn before the download touches the install, and never
+    // install one unattended without --yes.
+    if is_major_jump(current, &latest) && !confirm_major_update(current, &latest, args) {
+        println!("  Update cancelled.");
+        std::process::exit(1);
     }
 
     // ── Platform asset ───────────────────────────────────────
@@ -140,44 +152,8 @@ pub async fn run(args: &[String]) {
     cli::print_kv("asset", &asset_label);
     println!();
 
-    // ── Download tarball ─────────────────────────────────────
-
-    let spinner = cli::Spinner::new(&format!("downloading {asset_label}"));
-    let tarball = match fetcher.fetch(&tarball_url).await {
-        Ok(out) if out.status == 200 => out.body,
-        Ok(out) => {
-            spinner.stop();
-            println!(
-                "  {} Download failed: HTTP {}",
-                cli::icon_fail(),
-                out.status
-            );
-            if out.status == 404 {
-                println!(
-                    "    No prebuilt binary for {} {}.",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH,
-                );
-                println!("    Build from source: cargo install --path .");
-            }
-            std::process::exit(1);
-        }
-        Err(e) => {
-            spinner.stop();
-            println!("  {} Download failed: {e}", cli::icon_fail());
-            std::process::exit(1);
-        }
-    };
-    spinner.stop();
-    let mb = tarball.len() / 1_000_000;
-    let kb = tarball.len() / 1_000;
-    if mb > 0 {
-        println!("  {} downloaded ({mb}MB)", cli::icon_pass());
-    } else {
-        println!("  {} downloaded ({kb}KB)", cli::icon_pass());
-    }
-
-    // ── Download + verify SHA256 ─────────────────────────────
+    // ── Checksum first: a few bytes, and a release without one is refused
+    //    before the big download starts ─────────────────────────────────────
 
     let sha256_text = match fetcher.fetch(&sha256_url).await {
         Ok(out) if out.status == 200 => String::from_utf8_lossy(&out.body).to_string(),
@@ -194,8 +170,87 @@ pub async fn run(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let expected = sha256_text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
 
-    let expected = sha256_text.split_whitespace().next().unwrap_or("");
+    // ── Download tarball ─────────────────────────────────────
+    // Rate-watched and resumable (src/cli/download.rs): a route that crawls is
+    // abandoned for the next one, which continues from the same byte.
+
+    println!("  downloading {asset_label}");
+    let sources = vec![
+        download::Source::Url {
+            label: "GitHub release".into(),
+            url: tarball_url.clone(),
+        },
+        download::Source::GithubAsset {
+            repo: REPO.into(),
+            tag: tag.clone(),
+            name: asset_label.clone(),
+        },
+    ];
+    let routes = download::configured_routes();
+    let switched = std::cell::Cell::new(false);
+    let note = |n: &str| {
+        switched.set(true);
+        println!("  {} {n}", cli::icon_warn());
+    };
+    let mut tarball = match download::download(
+        &sources,
+        &routes,
+        &download::Policy::standard(),
+        |_| {},
+        note,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("  {} Download failed: {e}", cli::icon_fail());
+            if e.contains("HTTP 404") {
+                println!(
+                    "    No prebuilt binary for {} {}.",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                );
+                println!("    Build from source: cargo install --path .");
+            }
+            std::process::exit(1);
+        }
+    };
+    // Bytes spliced from two routes that disagree with the checksum are not
+    // trusted: one more try, from the first route only and without a rate floor.
+    if switched.get() && !expected.is_empty() && sha256_hex(&tarball) != expected {
+        println!(
+            "  {} checksum differs after switching routes; downloading again in one piece",
+            cli::icon_warn()
+        );
+        let patient = download::Policy {
+            min_per_window: 0,
+            ..download::Policy::standard()
+        };
+        tarball =
+            match download::download(&sources[..1], &routes[..1], &patient, |_| {}, |_| {}).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    println!("  {} Download failed: {e}", cli::icon_fail());
+                    std::process::exit(1);
+                }
+            };
+    }
+    let mb = tarball.len() / 1_000_000;
+    let kb = tarball.len() / 1_000;
+    if mb > 0 {
+        println!("  {} downloaded ({mb}MB)", cli::icon_pass());
+    } else {
+        println!("  {} downloaded ({kb}KB)", cli::icon_pass());
+    }
+
+    // ── Verify SHA256 ────────────────────────────────────────
+
     let actual = sha256_hex(&tarball);
 
     if expected.is_empty() || expected != actual {
@@ -288,20 +343,11 @@ fn permission_advice(exe: &Path) -> String {
     return "Check write permissions on the binary's directory".to_string();
 }
 
-/// Fetch the releases.atom feed and parse the release an install
-/// moves to: the newest entry, or for a stable install
-/// (`follow_prereleases` false) the newest that is not a prerelease.
+/// Fetch the releases.atom feed body, for [`check_feed`].
 ///
 /// The atom feed is a regular GitHub web page (not an API call),
 /// so it is NOT subject to the 60-req/hour API rate limit.
-///
-/// Uses the `<id>` tag (not `<title>`) because release titles can
-/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
-/// semver parsing. The `<id>` tag always ends with `/v<version>`.
-async fn fetch_latest_version(
-    fetcher: &Fetcher,
-    follow_prereleases: bool,
-) -> Result<String, String> {
+pub(crate) async fn fetch_feed(fetcher: &Fetcher) -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases.atom");
     let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
 
@@ -309,7 +355,103 @@ async fn fetch_latest_version(
         return Err(format!("HTTP {} from releases feed", out.status));
     }
 
-    latest_in_feed(&String::from_utf8_lossy(&out.body), follow_prereleases)
+    Ok(String::from_utf8_lossy(&out.body).into_owned())
+}
+
+/// Does `latest` cross a major-version boundary above `current`?
+fn is_major_jump(current: &str, latest: &str) -> bool {
+    let (Ok(current), Ok(latest)) = (
+        semver::Version::parse(current),
+        semver::Version::parse(latest),
+    ) else {
+        return false;
+    };
+    latest.major > current.major
+}
+
+/// The warning a major update must pass before it installs.
+///
+/// Interactive installs answer a y/N prompt; a non-interactive one must
+/// pass `--yes`, so a script cannot cross a major version by accident.
+fn confirm_major_update(current: &str, latest: &str, args: &[String]) -> bool {
+    use std::io::{IsTerminal, Write};
+
+    println!();
+    println!("  {} MAJOR UPDATE: {current} -> {latest}", cli::icon_warn());
+    if current.starts_with("4.") && latest.starts_with("5.") {
+        println!("  v5 replaces the v4 fetch architecture; this is not a patch:");
+        println!("    - the fetch path becomes one binary with V8 in-process: no browser,");
+        println!("      no rendering, no tiers. Identity and state are carried and measured;");
+        println!("    - `donsetch login` and the session vault are gone. A login wall is");
+        println!("      reported, never crossed. Authenticated browsing belongs to a browser");
+        println!("      driver (bladebro), not to this fetcher;");
+        println!("    - hard sites will answer differently: some v4 fetches become content,");
+        println!("      some v4 workarounds become declared walls with evidence;");
+        println!("    - v4 state is left in place and ignored by the new engine.");
+    } else {
+        println!("  A major version changes what the fetch path guarantees and can retire");
+        println!("  commands you use. Read the release notes before installing.");
+    }
+    println!();
+    if args.iter().skip(2).any(|a| a == "--yes" || a == "-y") {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        println!("  Not a terminal: re-run with --yes to install this major update.");
+        return false;
+    }
+    print!("  Continue? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// What `donsetch update` does for an install offered a release by
+/// [`check_feed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// The offered release is the installed version: nothing to do.
+    UpToDate,
+    /// The installed version is newer than the offered release:
+    /// nothing to do.
+    Ahead,
+    /// The offered release is a prerelease, newer than the install
+    /// when both are semver, and the install is stable: `update` stays
+    /// put. From [`check_feed`] this happens only when every entry in
+    /// the feed is a prerelease.
+    Prerelease,
+    /// `update` installs the offered release. Also the verdict when
+    /// either version is not semver, outside the `Prerelease` case.
+    Newer,
+}
+
+/// The release a releases.atom `body` offers an install at `current`,
+/// and what `update` does about it. A prerelease install is offered
+/// the newest entry, a stable one the newest stable entry, or the
+/// newest entry when the feed holds only prereleases (see
+/// [`latest_in_feed`]). `update`, `version` and `status` all decide
+/// here.
+pub(crate) fn check_feed(body: &str, current: &str) -> Result<(String, Offer), String> {
+    let latest = latest_in_feed(body, is_prerelease(current))?;
+    let offer = offer(current, &latest);
+    Ok((latest, offer))
+}
+
+/// What `update` does for an install at `current` offered `latest`.
+fn offer(current: &str, latest: &str) -> Offer {
+    let cur = semver::Version::parse(current).ok();
+    let lat = semver::Version::parse(latest).ok();
+    match (cur, lat) {
+        (Some(c), Some(l)) if c == l => Offer::UpToDate,
+        (Some(c), Some(l)) if c > l => Offer::Ahead,
+        // The atom feed lists prereleases too. A stable install never
+        // moves onto one; a prerelease install (a tester) follows them.
+        _ if is_prerelease(latest) && !is_prerelease(current) => Offer::Prerelease,
+        _ => Offer::Newer,
+    }
 }
 
 /// The version a releases.atom body offers an install: its first
@@ -317,6 +459,10 @@ async fn fetch_latest_version(
 /// `follow_prereleases`. A feed holding nothing but prereleases
 /// yields the newest of them, so the caller can name what it is not
 /// moving to.
+///
+/// Uses the `<id>` tag (not `<title>`) because release titles can
+/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
+/// semver parsing. The `<id>` tag always ends with `/v<version>`.
 fn latest_in_feed(body: &str, follow_prereleases: bool) -> Result<String, String> {
     let mut newest: Option<String> = None;
     // Everything before the first <entry> is the feed's own header,
@@ -807,7 +953,7 @@ fn cleanup_previous(exe: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -1243,7 +1389,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn feed(tags: &[&str]) -> String {
+    /// A releases.atom body listing `tags` in feed order.
+    pub(crate) fn feed(tags: &[&str]) -> String {
         let entries: String = tags
             .iter()
             .map(|t| {
@@ -1283,6 +1430,56 @@ mod tests {
     fn a_feed_of_only_prereleases_names_the_newest_one() {
         let body = feed(&["v5.0.0-beta.2", "v5.0.0-beta.1"]);
         assert_eq!(latest_in_feed(&body, false).as_deref(), Ok("5.0.0-beta.2"));
+    }
+
+    // `update`, `version` and `status` all take their verdict from
+    // check_feed, so these are what each of the three reports.
+    #[test]
+    fn a_stable_install_is_offered_the_newest_stable_release() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0"),
+            Ok(("5.0.0".to_string(), Offer::UpToDate))
+        );
+        assert_eq!(
+            check_feed(&body, "4.10.5"),
+            Ok(("5.0.0".to_string(), Offer::Newer))
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.1", "v5.0.0"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0"),
+            Ok(("5.0.1".to_string(), Offer::Newer))
+        );
+        // Nothing stable listed: the newest prerelease is named, and
+        // the install stays put.
+        let body = feed(&["v5.1.0-beta.2", "v5.1.0-beta.1"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0"),
+            Ok(("5.1.0-beta.2".to_string(), Offer::Prerelease))
+        );
+    }
+
+    #[test]
+    fn a_prerelease_install_is_offered_the_newest_entry() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0-beta.1"),
+            Ok(("5.1.0-beta.1".to_string(), Offer::Newer))
+        );
+        assert_eq!(
+            check_feed(&body, "5.1.0-beta.1"),
+            Ok(("5.1.0-beta.1".to_string(), Offer::UpToDate))
+        );
+        assert_eq!(
+            check_feed(&body, "5.2.0-beta.1"),
+            Ok(("5.1.0-beta.1".to_string(), Offer::Ahead))
+        );
+    }
+
+    #[test]
+    fn a_version_that_is_not_semver_is_offered_the_release() {
+        assert_eq!(offer("dev", "5.0.0"), Offer::Newer);
+        assert_eq!(offer("5.0.0", "nightly"), Offer::Newer);
     }
 
     #[test]
@@ -1412,5 +1609,28 @@ mod tests {
         assert!(note.contains("cannot be locked"), "{note}");
         assert!(note.contains(&cause.to_string()), "{note}");
         assert!(note.ends_with(';'), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod major_guard_tests {
+    use super::{confirm_major_update, is_major_jump};
+
+    #[test]
+    fn a_major_jump_is_only_a_major_jump() {
+        assert!(is_major_jump("4.9.0", "5.0.0"));
+        assert!(is_major_jump("5.0.0", "6.0.0"));
+        assert!(!is_major_jump("5.0.0", "5.1.0"));
+        assert!(!is_major_jump("5.1.0", "5.0.0"));
+        assert!(!is_major_jump("not-semver", "5.0.0"));
+    }
+
+    #[test]
+    fn a_major_update_needs_yes_when_nobody_is_watching() {
+        let args: Vec<String> = ["donsetch", "update", "--yes"].map(String::from).to_vec();
+        assert!(confirm_major_update("4.9.0", "5.0.0", &args));
+        let no_args: Vec<String> = ["donsetch", "update"].map(String::from).to_vec();
+        // Unit tests run without a terminal: the prompt is refused.
+        assert!(!confirm_major_update("4.9.0", "5.0.0", &no_args));
     }
 }

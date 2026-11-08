@@ -21,13 +21,8 @@ use super::{ContentKind, ExtractOptions, Extracted, inline};
 const MAX_DEPTH: usize = 100;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    // Respect explicit selectors and TOC : let DonSift handle.
-    if opts.selector.is_some()
-        || opts.toc
-        || opts.focus.is_some()
-        || opts.section.is_some()
-        || opts.must_contain.is_some()
-    {
+    // Crawl's block focus belongs to the generic pipeline.
+    if opts.focus.is_some() {
         return None;
     }
 
@@ -161,6 +156,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
     let (slice, next) = paginate(&md, opts);
     let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(format!("r/{subreddit}")),
@@ -254,6 +250,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
     let (slice, next) = paginate(&md, opts);
     let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(title),

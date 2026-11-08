@@ -25,7 +25,7 @@ pub enum Verdict {
     /// Bot-wall challenge page (maybe JS-less cookie challenge, maybe
     /// full JS challenge). Vendor identified when possible.
     Challenge(Vendor),
-    /// Hard block page (no path forward at this tier).
+    /// Hard block page (no path forward).
     Blocked,
     /// Login required.
     AuthWall,
@@ -50,8 +50,8 @@ pub fn human_verification_wall(body: &[u8], verdict: Verdict) -> bool {
     doc.select(&selector).next().is_some()
 }
 
-/// Whether an HTTP denial warrants a browser observation. Explicit tier and
-/// deadline checks belong to the caller; this policy is shared by fetch/crawl.
+/// Whether an HTTP denial warrants a browser observation. Deadline checks
+/// belong to the caller.
 pub fn browser_recovery(
     status: u16,
     headers: &[(String, String)],
@@ -231,6 +231,21 @@ mod report_audit_tests {
             "<html><title>Homepage Hero Thumbnail (1).jpg</title><body><h1>404: This page could not be found.</h1><p>This page could not be found.</p></body></html>",
         ] {
             assert_eq!(detect(200, &[], html.as_bytes()), Verdict::SoftNotFound);
+        }
+        // No h1: the first h2 leads the page.
+        let medium = "<html><title>Medium</title><body><nav><a>Sign in</a></nav><div>PAGE NOT FOUND</div><h2><span>404</span></h2><h2>Out of nothing, something.</h2><p>You can find (just about) anything on Medium, apparently even a page that doesn't exist.</p></body></html>";
+        assert_eq!(detect(200, &[], medium.as_bytes()), Verdict::SoftNotFound);
+        for html in [
+            // An h1 leads; a "404" section below it is the page's subject.
+            "<html><title>HTTP status codes</title><body><h1>HTTP status codes</h1><h2>404</h2><p>The server cannot find the requested resource. Links that lead to a 404 page are often called broken or dead links.</p></body></html>",
+            // A first h2 that only mentions a 404 is not a not-found heading.
+            "<html><title>Blog</title><body><h2>404 pages that delight</h2><p>Here are twelve examples of error pages that turn a dead end into a reason to stay on the site, with notes on what makes each one work.</p></body></html>",
+        ] {
+            assert_eq!(
+                detect(200, &[], html.as_bytes()),
+                Verdict::ContentOk,
+                "{html}"
+            );
         }
         let login = "<html><title>LinkedIn: Log In or Sign Up</title><body><h1>Welcome to your professional community</h1><form><input type='password'><button>Sign in</button></form></body></html>";
         assert_eq!(detect(200, &[], login.as_bytes()), Verdict::AuthWall);
@@ -436,7 +451,23 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
         .map(crate::extract::inline::visible_text)
         .unwrap_or_default()
         .to_lowercase();
-    if [&title, &h1].iter().any(|heading| {
+    // A page without an `h1` leads with its first `h2` (Medium's missing
+    // post: title "Medium", then `<h2>404</h2>`). Only the not-found check
+    // reads it; sign-in headings keep to the title and `h1`.
+    let lead = if doc
+        .select(&scraper::Selector::parse("h1").unwrap())
+        .next()
+        .is_none()
+    {
+        doc.select(&scraper::Selector::parse("h2").unwrap())
+            .next()
+            .map(crate::extract::inline::visible_text)
+            .unwrap_or_default()
+            .to_lowercase()
+    } else {
+        String::new()
+    };
+    if [&title, &h1, &lead].iter().any(|heading| {
         heading.as_str() == "404"
             || heading.starts_with("404:")
             || heading.starts_with("404 -")
@@ -482,8 +513,9 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
 }
 
 /// Interstitial titles/phrases that vendor challenge pages use in
-/// `<title>` / `<h1>`. Real pages virtually never title themselves
-/// these : a page ABOUT Cloudflare has its own title.
+/// `<title>` / `<h1>`. They are ordinary English too, so a heading
+/// match counts only on a page that is not a substantive document
+/// (see `interstitial_heading`).
 const INTERSTITIAL_TITLES: &[&str] = &[
     "you've been blocked by network security",
     "you are blocked by network security",
@@ -514,13 +546,14 @@ const INTERSTITIAL_MARKERS: &[&str] = &[
 ];
 
 /// Strong interstitial detection: a page whose TITLE or first H1 is
-/// vendor challenge boilerplate, or a near-empty DOM (< 400 visible
-/// chars) that loads a challenge script and has no form. Returns the
-/// vendor when the page is an interstitial.
+/// vendor challenge boilerplate and whose visible text is at most 1200
+/// chars, or a near-empty DOM (< 400 visible chars) that loads a
+/// challenge script and has no form. Returns the vendor when the page
+/// is an interstitial.
 ///
-/// This is the layer that keeps the ghost oracle honest: a rendered
-/// "Just a moment..." page must never satisfy the content-quality
-/// oracle, no matter how many visible chars its boilerplate carries.
+/// This is the layer that keeps extraction honest: a "Just a
+/// moment..." page must not satisfy the content-quality oracle on the
+/// strength of its boilerplate's visible chars.
 pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let scan = &body[..body.len().min(96 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
@@ -542,8 +575,12 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
         }
     }
 
-    // Title/H1 route: strongest signal, immune to visible-text counts.
-    if interstitial_heading(&text) {
+    // Title/H1 route: overrides the near-empty bound below, because a
+    // modern interstitial renders a few hundred chars of boilerplate.
+    // Visible text counts over the whole body, not the scan window,
+    // which can end inside a long head before the prose starts.
+    let visible = visible_text_count(body);
+    if interstitial_heading(&text, visible) {
         return Some(vendor_from_markers(&text).unwrap_or(Vendor::Generic));
     }
 
@@ -557,7 +594,6 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     // widget on the page, the bare `cf-turnstile` shell.
     let turnstile_shell =
         text.contains("challenges.cloudflare.com") && text.contains("cf-turnstile");
-    let visible = visible_text_count(body);
     if visible < 80
         && text.contains("<script")
         && text.contains("kpsdk")
@@ -627,6 +663,119 @@ pub fn human_captcha(body: &[u8]) -> bool {
 /// B). Detection here is marker + size: an interstitial's own words
 /// are a handful of lines, so a long article that merely mentions a
 /// challenge phrase stays content.
+/// Wave W / D4 (2026-10-24): the login-CTA shell. A thin 2xx SSR page whose
+/// visible content is dominated by auth calls-to-action is an authentication
+/// gate, not a hydration failure — a real browser shows exactly this page to
+/// a logged-out visitor (measured: x.com's shell, 436 visible chars, one
+/// nonce'd script, "Continue with phone / Google / Apple … Sign in"). The
+/// honest typing is wall.auth, never "did not hydrate".
+///
+/// Class rule, no per-site anything: the page must be visually thin (< 1200
+/// visible chars — a real article is orders bigger), carry ≥ 2 DISTINCT
+/// auth-CTA markers, and have no passwordless prose substance (no 6+-word
+/// sentence outside the CTA/legal boilerplate). Articles ABOUT login pages
+/// carry one marker and real prose; they never fire.
+pub fn auth_shell(body: &[u8]) -> bool {
+    let visible = visible_text_count(body);
+    if visible == 0 || visible > 1200 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&body[..body.len().min(256 * 1024)]).to_ascii_lowercase();
+    // strip script/style blocks: markers there are code, not CTA
+    let mut clean = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(pos) = rest.find("<script").or_else(|| rest.find("<style")) {
+        clean.push_str(&rest[..pos]);
+        let close = if rest[pos..].starts_with("<script") {
+            "</script"
+        } else {
+            "</style"
+        };
+        match rest[pos..].find(close) {
+            Some(e) => rest = &rest[pos + e + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    clean.push_str(rest);
+    // strip remaining tags: they are not word separators, and a title
+    // gluing onto body text through a tag defeats the sentence split
+    // (measured: the login-tutorial fixture read as one giant sentence).
+    let mut tagless = String::with_capacity(clean.len());
+    let mut rest = clean.as_str();
+    while let Some(lt) = rest.find('<') {
+        tagless.push_str(&rest[..lt]);
+        match rest[lt..].find('>') {
+            Some(gt) => {
+                // a tag is a phrase boundary: split on it (the sentence
+                // split below reads newline as a separator)
+                tagless.push('\n');
+                rest = &rest[lt + gt + 1..];
+            }
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    tagless.push_str(rest);
+    let clean = tagless;
+    const MARKERS: [&str; 14] = [
+        "log in",
+        "sign in",
+        "sign up",
+        "create account",
+        "continue with google",
+        "continue with apple",
+        "continue with phone",
+        "email or username",
+        "username or email",
+        "forgot password",
+        "already have an account",
+        "don't have an account",
+        "register now",
+        "join now",
+    ];
+    let distinct = MARKERS.iter().filter(|m| clean.contains(**m)).count();
+    if distinct < 2 {
+        return false;
+    }
+    // No real prose outside CTAs: a sentence carrying ≥6 words longer than
+    // 3 chars (the shell-text prose bar) that contains no marker and no
+    // legal boilerplate means an article-class page. Brand taglines ("It's
+    // what's happening / X") never reach the bar.
+    let lowered = clean.to_ascii_lowercase();
+    for sentence in lowered.split(['.', '!', '?', '\n', '\u{00b7}']) {
+        let substantial = sentence
+            .split_whitespace()
+            .filter(|w| w.chars().count() > 3)
+            .count();
+        if substantial >= 6 && !MARKERS.iter().any(|m| sentence.contains(m)) {
+            let joined = sentence.trim();
+            let boilerplate = ["terms of service", "privacy policy", "cookie"]
+                .iter()
+                .any(|b| joined.contains(b));
+            if !boilerplate {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Wave W / D5: the micro shell. A 2xx HTML document under 2KB that carries a
+/// script tag can never be real content (the smallest honest pages —
+/// example.com — have no scripts); when its extraction is near-empty it is a
+/// throttle/block shell (measured: bloomberg's 502-byte ok:true body), and it
+/// must surface as an honest thin-shell transient, never as ok content.
+pub fn js_micro_shell(body: &[u8], markdown_len: usize) -> bool {
+    // markdown floor 150: spinner/block-shell level. example.com carries a
+    // script and ~195 chars of REAL prose — a real micro page, never a shell.
+    body.len() < 2048 && markdown_len < 150 && body.windows(7).any(|w| w == b"<script")
+}
+
 pub fn challenge_text(text: &str) -> bool {
     if text.chars().count() > 1200 {
         return false;
@@ -668,7 +817,10 @@ pub fn text_wall(text: &str) -> Option<Verdict> {
 }
 
 /// Inspect both the title and first H1, including text inside nested tags.
-fn interstitial_heading(lower_text: &str) -> bool {
+/// `visible` is the caller's `visible_text_count` for the page: a listed
+/// phrase counts only when `visible` is at most 1200, while the PX
+/// human-gate heading with its widget counts at any size.
+fn interstitial_heading(lower_text: &str, visible: usize) -> bool {
     for (open, close) in [("<title", "</title>"), ("<h1", "</h1>")] {
         let Some(start) = lower_text.find(open) else {
             continue;
@@ -704,7 +856,13 @@ fn interstitial_heading(lower_text: &str) -> bool {
                 {
                     return true;
                 }
-                if INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
+                // The phrases also title ordinary documents ("Troubleshoot
+                // access denied errors", "Just a Moment (song) lyrics").
+                // An interstitial's own words are a handful of lines, so
+                // a substantive page keeps its content verdict. 1200 is
+                // the visible-text bound content_gate already uses for
+                // substantive articles.
+                if visible <= 1200 && INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
                     return true;
                 }
             }
@@ -814,7 +972,7 @@ fn classify_wall(
             return Verdict::Challenge(Vendor::Cloudflare);
         }
         // No challenge markers : WAF block (403) or
-        // origin error (503). Ghost solve won't help.
+        // origin error (503). There is nothing to solve.
         return Verdict::Blocked;
     }
     // DataDome: the x-datadome header is present on ALL responses
@@ -972,9 +1130,10 @@ fn classify_wall(
     }
     // Instagram's logged-out shell: a sign-up gate. The profile
     // content is behind login BY DESIGN, so the verdict is Login,
-    // never Challenge (there is nothing to solve). Escalating to
-    // the ghost just renders the same wall and fails with "no
-    // real content was extractable" (live case: /cristiano/).
+    // never Challenge (there is nothing to solve). A browser
+    // renders the same wall: the old browser tier failed on it
+    // with "no real content was extractable" (live case:
+    // /cristiano/).
     if text.len() < 12_000
         && (text.contains("log in to see photos and videos from friends")
             || text.contains("sign up to see photos and videos"))
@@ -996,7 +1155,10 @@ fn classify_wall(
     if (text.contains("prove your humanity")
         || text.contains("not for bots")
         || text.contains("please wait for verification"))
-        && (interstitial_heading(text) || visible_text_count(text.as_bytes()) < 120)
+        && {
+            let visible = visible_text_count(text.as_bytes());
+            interstitial_heading(text, visible) || visible < 120
+        }
     {
         return Verdict::Challenge(Vendor::Generic);
     }
@@ -1462,6 +1624,62 @@ mod tests {
     }
 
     #[test]
+    fn wall_heading_on_block_page_with_boilerplate_stays_interstitial() {
+        // Block pages render a few hundred chars of vendor prose: more
+        // than the near-empty route admits, far short of a document. The
+        // heading route must keep them walls in the title and in the h1.
+        let prose = "This website is using a security service to protect itself from online attacks. The action you just performed triggered the security solution. ";
+        for (title, h1) in [
+            ("Access denied", "Access denied"),
+            ("Just a moment...", "Just a moment..."),
+            ("example.com", "One more step"),
+        ] {
+            let html = format!(
+                "<html><head><title>{title}</title></head><body><h1>{h1}</h1><p>{}</p><p>Ray ID: 8a1b2c3d4e5f6789</p></body></html>",
+                prose.repeat(4)
+            );
+            let visible = visible_text_count(html.as_bytes());
+            assert!((400..=1200).contains(&visible), "{h1}: visible={visible}");
+            assert!(detect_interstitial(html.as_bytes()).is_some(), "{h1}");
+            let http = detect(200, &[], html.as_bytes());
+            let dom = detect_dom_smart(html.as_bytes());
+            assert!(
+                matches!(http, Verdict::Challenge(_)) && matches!(dom, Verdict::Challenge(_)),
+                "{h1}: http={http:?} dom={dom:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn articles_whose_titles_contain_wall_phrases_are_content() {
+        // Ordinary documents titled with a listed phrase, at both layers.
+        let mut wrong = Vec::new();
+        for title in [
+            "Troubleshoot access denied (403 Forbidden) errors in Amazon S3",
+            "Access denied error when you open a file in Windows",
+            "Airport security check: what to expect",
+            "Just a Moment (song) lyrics",
+            "One more step: finishing your Python setup",
+        ] {
+            let html = format!(
+                "<html><head><title>{title}</title></head><body><main><article><h1>{title}</h1>{}</article></main></body></html>",
+                "<p>This guide walks through bucket policies, IAM conditions and the request headers the service evaluates before it answers a request.</p>"
+                    .repeat(20)
+            );
+            let http = detect(200, &[], html.as_bytes());
+            let dom = detect_dom_smart(html.as_bytes());
+            if http != Verdict::ContentOk || dom != Verdict::ContentOk {
+                wrong.push(format!("{title:?}: http={http:?} dom={dom:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "articles scored as walls:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
     fn real_page_titled_about_security_is_content() {
         // A security article has its own title and real text.
         let body = b"<html><head><title>Web Security Guide 2026</title></head><body><h1>Web Security Guide</h1><p>This article explains how security checks work on the modern web, what a security service does, and how verification flows are designed. It covers many topics in substantial depth for readers.</p></body></html>";
@@ -1515,8 +1733,8 @@ mod tests {
     /// glassdoor 2026-09 golden fixture: CF block pages put EVERY
     /// challenge marker past the 64KB narrow window (nearest at
     /// byte ~126k inside a 241KB bilingual shell). The 403 must be
-    /// a Challenge, never a Blocked (Blocked skips escalation and
-    /// the fetch dies on tier 1 alone).
+    /// a Challenge, never a Blocked (Blocked reads as a terminal block,
+    /// not a wall class).
     #[test]
     fn glassdoor_cf_block_markers_beyond_64k() {
         let mut body = vec![b' '; 150_000]; // bilingual shell padding
@@ -1544,7 +1762,7 @@ mod tests {
 
 // Reddit's 2026 JS-challenge: a nonce form auto-submitting
 // itself with essentially no prose (live case: the whole
-// r/technology shell scored ContentOk at tier 1).
+// r/technology shell scored ContentOk on the local fetch).
 #[test]
 fn reddit_nonce_form_shell_is_challenge() {
     let body = "<!doctype html><html><head><title>Reddit</title></head><body><form><input type=hidden name=nonce value=a4e5c47fd8fd981e></form><script>document.forms[0].submit()</script></body></html>";
@@ -1630,6 +1848,53 @@ mod reliability_tests {
         assert!(!human_verification_wall(
             article.as_bytes(),
             detect(200, &[], article.as_bytes())
+        ));
+    }
+}
+
+#[cfg(test)]
+mod wave_w_honesty_tests {
+    use super::*;
+
+    #[test]
+    fn wave_w_x_com_login_shell_is_an_auth_gate() {
+        let shell = "<html><head><meta property=\"og:title\" content=\"X. It&#x27;s what&#x27;s happening / X\"/><script nonce=\"a\">window.__INITIAL_STATE__={}</script></head><body><h1>X. It&#x27;s what&#x27;s happening / X</h1><main><h2>Happening now</h2><button>Continue with phone</button><button>Continue with Google</button><button>Continue with Apple</button><span>or</span><form><input placeholder=\"Email or username\"/></form><button>Continue</button><p>By continuing, you agree to our Terms of Service , Privacy Policy and Cookie Use.</p><span>Already have an account? <a>Sign in</a></span></main></body></html>";
+        assert!(
+            auth_shell(shell.as_bytes()),
+            "the x.com shell must type auth"
+        );
+    }
+
+    #[test]
+    fn wave_w_login_tutorial_article_is_not_an_auth_gate() {
+        let article = "<html><body><article><h1>Log in to Vercel with CI</h1><p>A practical authentication tutorial with working code and deployment instructions for continuous integration.</p><p>This guide explains how to sign in safely using environment secrets and scoped tokens.</p></article></body></html>";
+        assert!(!auth_shell(article.as_bytes()));
+        assert!(!auth_shell(
+            b"<h1>Log in to Vercel</h1><form><input type='password'></form>"
+        ));
+    }
+
+    #[test]
+    fn wave_w_micro_shell_needs_a_script_and_near_empty_extraction() {
+        assert!(js_micro_shell(
+            b"<html><body><script>window.x=1</script><p>ok</p></body></html>",
+            16
+        ));
+        // example.com (2026-10 content): tiny page WITH a script and real
+        // prose — a real micro page, never a shell
+        assert!(!js_micro_shell(
+            b"<html><head><title>Example Domain</title></head><body><script src=\"/s.js\"></script><h1>Example Domain</h1><p>This domain is for use in illustrative examples in documents. You may use this domain in literature without prior coordination.</p></body></html>",
+            195
+        ));
+        // a block shell: script + a spinner sentence only
+        assert!(js_micro_shell(
+            b"<html><body><script src=\"/x.js\"></script><p>Please wait.</p></body></html>",
+            30
+        ));
+        // scripted but with real extracted prose
+        assert!(!js_micro_shell(
+            b"<html><body><script>x</script><p>word word word word word word word word word word word word</p></body></html>",
+            420
         ));
     }
 }

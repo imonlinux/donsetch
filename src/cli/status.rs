@@ -13,13 +13,12 @@
 
 use crate::DISPLAY_NAME;
 use crate::cli;
+use crate::cli::update::{self, Offer};
+use crate::egress::proxy;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
 use crate::search::byok::store::ByokConfig;
-use crate::transport::proxy;
 use serde_json::json;
-
-const REPO: &str = "dondai44423/donsetch";
 
 /// Usage text, shared by `donsetch status --help` and `donsetch help status`.
 pub fn help() {
@@ -42,24 +41,13 @@ pub async fn run(args: &[String]) {
     // ── Version + update ────────────────────────────────────
 
     let fetcher = Fetcher::new(BrowserProfile::host_default());
-    let latest = match &fetcher {
-        Ok(f) => fetch_latest_version(f).await.ok(),
+    let feed = match &fetcher {
+        Ok(f) => update::fetch_feed(f).await.ok(),
         Err(_) => None,
     };
 
     // "update state" is the machine value; the human line renders it.
-    let update_state = match &latest {
-        Some(latest) => {
-            let cur = semver::Version::parse(current).ok();
-            let lat = semver::Version::parse(latest).ok();
-            match (cur, lat) {
-                (Some(c), Some(l)) if c == l => "up_to_date",
-                (Some(c), Some(l)) if c > l => "ahead",
-                _ => "update_available",
-            }
-        }
-        None => "offline",
-    };
+    let (latest, update_state) = update_fields(current, feed.as_deref());
     let version_human = match (update_state, latest.as_deref()) {
         ("up_to_date", _) => format!("{} (up to date)", cli::green(current)),
         ("ahead", Some(latest)) => format!("{} (ahead of {latest})", cli::green(current)),
@@ -147,13 +135,9 @@ pub async fn run(args: &[String]) {
 
     // Resolution may probe a browser; keep that blocking operation off the
     // async executor. Status never triggers a public binary download.
-    let browser = tokio::task::spawn_blocking(crate::ghost::resolve_browser_without_download)
+    let browser = tokio::task::spawn_blocking(crate::browser::resolve_browser_without_download)
         .await
-        .unwrap_or_else(|e| {
-            Err(crate::error::FetchError::ghost(format!(
-                "browser resolution task failed: {e}"
-            )))
-        });
+        .unwrap_or_else(|e| Err(format!("browser resolution task failed: {e}")));
     let browser_human = match &browser {
         Ok(info) => info.describe(),
         Err(error) => format!("unavailable: {error}"),
@@ -161,7 +145,6 @@ pub async fn run(args: &[String]) {
     let browser_json = match &browser {
         Ok(info) => json!({
             "available": true,
-            "backend": info.backend.as_str(),
             "source": info.source,
             "path": info.path.display().to_string(),
             "version": info.version,
@@ -172,7 +155,7 @@ pub async fn run(args: &[String]) {
     let ghost_state = cache.join("ghost-state.json");
     let has_state = ghost_state.exists();
     let domains = if has_state {
-        crate::ghost::cache::GhostState::load().profiles.len()
+        crate::state::GhostState::load().profiles.len()
     } else {
         0
     };
@@ -195,19 +178,19 @@ pub async fn run(args: &[String]) {
         (
             "warn",
             format!(
-                "{} browser unavailable: tier 2 unavailable",
+                "{} browser unavailable: screenshot will not work",
                 cli::red("warn")
             ),
         )
     };
 
-    // v4 phase 0: route-memory visibility (the self-improvement
+    // route-memory visibility (the self-improvement
     // loop must be observable, never magic).
     let route_memory_off =
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off;
     let route_read_only =
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly;
-    let state = crate::ghost::cache::GhostState::load();
+    let state = crate::state::GhostState::load();
     let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
     let route_line = if route_memory_off {
         "off (state.route_memory = off)".to_string()
@@ -223,17 +206,8 @@ pub async fn run(args: &[String]) {
             if state.probes_total > 0 {
                 line.push_str(&format!(" · {} probes", state.probes_total));
             }
-            if state.tier1_cookie_count() > 0 {
-                line.push_str(&format!(" · {} vaulted", state.tier1_cookie_count()));
-            }
-            if state.shadowed_assets_total > 0 {
-                line.push_str(&format!(" · {} shadowed", state.shadowed_assets_total));
-            }
             if state.prewarmed_served_total > 0 {
                 line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
-            }
-            if state.pool_served_total > 0 {
-                line.push_str(&format!(" · {} warm", state.pool_served_total));
             }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
@@ -248,7 +222,7 @@ pub async fn run(args: &[String]) {
 
     // v4 B5 Improve receipts: the self-improvement loop must be
     // observable, never magic. Warm-hit + cooldown + trust health.
-    let warm_hits = state.pool_served_total + state.prewarmed_served_total;
+    let warm_hits = state.prewarmed_served_total;
     let low_trust = {
         // Local search-trust snapshot without spinning a Searcher.
         let (t, ti, f) = crate::search::persist_load_for_status();
@@ -298,7 +272,6 @@ pub async fn run(args: &[String]) {
                     "flaky": flaky,
                     "personas": state.personas.len(),
                     "probes": state.probes_total,
-                    "vaulted": state.tier1_cookie_count(),
                 },
                 "improve": {
                     "warm_ready": warm,
@@ -378,40 +351,64 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Fetch the latest version from the GitHub releases.atom feed.
-/// Same logic as version.rs : no API, no rate limits.
-async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
-    let url = format!("https://github.com/{REPO}/releases.atom");
-    let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
+/// `latest` and `update_state` for an install at `current`, from a
+/// releases.atom `feed` body (None: no answer, "offline"). The state
+/// is what `donsetch update` would do: "update_available" only when it
+/// would install `latest`, and "up_to_date" also when `latest` is a
+/// prerelease that a stable install stays off.
+fn update_fields(current: &str, feed: Option<&str>) -> (Option<String>, &'static str) {
+    match feed.map(|body| update::check_feed(body, current)) {
+        Some(Ok((latest, offer))) => {
+            let state = match offer {
+                Offer::UpToDate | Offer::Prerelease => "up_to_date",
+                Offer::Ahead => "ahead",
+                Offer::Newer => "update_available",
+            };
+            (Some(latest), state)
+        }
+        Some(Err(_)) | None => (None, "offline"),
+    }
+}
 
-    if out.status != 200 {
-        return Err(format!("HTTP {} from releases feed", out.status));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::update::tests::feed;
+
+    // `update` keeps a stable install on the newest stable release
+    // when a prerelease tops the feed. Agents act on update_state, so
+    // it must not say update_available for the prerelease.
+    #[test]
+    fn a_stable_install_is_not_told_to_update_to_a_prerelease() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.0.0".to_string()), "up_to_date")
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.1", "v5.0.0"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.0.1".to_string()), "update_available")
+        );
+        let body = feed(&["v5.1.0-beta.2", "v5.1.0-beta.1"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.1.0-beta.2".to_string()), "up_to_date")
+        );
     }
 
-    let body = String::from_utf8_lossy(&out.body);
-
-    let entry_pos = body
-        .find("<entry>")
-        .ok_or_else(|| "no releases found in feed".to_string())?;
-
-    let id_tag = body[entry_pos..]
-        .find("<id>")
-        .ok_or_else(|| "could not parse feed: no <id> in first entry".to_string())?
-        + entry_pos;
-
-    let content_start = body[id_tag..]
-        .find('>')
-        .ok_or_else(|| "could not parse feed: malformed <id>".to_string())?
-        + id_tag
-        + 1;
-
-    let content_end = body[content_start..]
-        .find("</id>")
-        .ok_or_else(|| "could not parse feed: no </id>".to_string())?
-        + content_start;
-
-    let id_content = body[content_start..content_end].trim();
-    let tag = id_content.rsplit('/').next().unwrap_or(id_content);
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    Ok(version.to_string())
+    #[test]
+    fn a_newer_release_the_install_follows_is_update_available() {
+        let body = feed(&["v5.0.1", "v5.0.0"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.0.1".to_string()), "update_available")
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0"]);
+        assert_eq!(
+            update_fields("5.0.0-beta.1", Some(body.as_str())),
+            (Some("5.1.0-beta.1".to_string()), "update_available")
+        );
+        assert_eq!(update_fields("5.0.0", None), (None, "offline"));
+    }
 }

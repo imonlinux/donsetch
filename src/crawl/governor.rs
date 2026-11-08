@@ -582,9 +582,9 @@ fn prune_hosts(hosts: &mut HashMap<String, HostPenalty>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::proxy::Proxy;
     use crate::fetch::client::Fetcher;
     use crate::search::egress::EgressPool;
-    use crate::transport::proxy::Proxy;
     use std::sync::Arc;
 
     async fn owned_status_crawl(
@@ -627,7 +627,6 @@ mod tests {
         let (crawler, governor) = super::super::real::build(
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap()),
             Arc::clone(&pool),
-            None,
         );
         let result = crawler
             .crawl(
@@ -637,7 +636,10 @@ mod tests {
                     respect_robots: false,
                     max_pages: 1,
                     max_depth: 0,
-                    deadline: std::time::Duration::from_secs(2),
+                    // A hang guard, not a speed assertion. Windows takes ~2 s to
+                    // refuse a loopback connection (measured on a runner), so a
+                    // test that touches a closed port costs seconds there.
+                    deadline: std::time::Duration::from_secs(15),
                     ..Default::default()
                 },
                 None,
@@ -847,7 +849,7 @@ mod tests {
         }
     }
 
-    // v4 phase 3 (law 11): the adaptive ladder is capped. At the
+    // (law 11): the adaptive ladder is capped. At the
     // top rung the wait must never exceed MAX_LADDER_WAIT, whatever
     // the jitter draws. Pre-cap, rung 6 reached ~16s.
     #[test]

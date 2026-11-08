@@ -7,8 +7,8 @@ use super::metadata::Meta;
 /// #292: every omission marker starts with this. The fetch layer
 /// counts the markers for `structuredContent.omitted_repeats`.
 pub(crate) const REPEATED_MARKER_PREFIX: &str = "*[repeated ";
-/// Compact output silently drops duplicates shorter than this threshold.
-/// Faithful reads bypass this cleanup, including for short answers.
+/// Below this length a duplicate is dropped without a marker:
+/// badges and one-word labels carry nothing a reader would miss.
 const MIN_MARKED_DUP: usize = 24;
 /// Opening characters quoted in a marker, so a reader can tell
 /// which block was dropped. Capped: the quote is a hint, not the
@@ -84,11 +84,7 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
     // Repeated boilerplate sections collapse before rendering
     // (#288), and a marker takes a dropped section's place (#292):
     // see `collapse_repeats`.
-    let (kept, omitted) = if opts.faithful {
-        (kept.to_vec(), Vec::new())
-    } else {
-        collapse_repeats(kept)
-    };
+    let (kept, omitted) = collapse_repeats(kept);
     let mut out = String::new();
 
     // Frontmatter : compact, agent-first.
@@ -96,38 +92,49 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
         matches!(b, Block::Heading { level: 1, text, .. }
             if Some(text) == meta.title.as_ref())
     });
-    if !opts.faithful {
-        if let Some(t) = &meta.title
-            && !first_is_title
-        {
-            out.push_str(&format!("# {t}\n"));
+    if let Some(t) = meta
+        .title
+        .as_deref()
+        .map(one_line)
+        .filter(|t| !t.is_empty())
+        && !first_is_title
+    {
+        out.push_str(&format!("# {t}\n"));
+    }
+    let mut byline_parts: Vec<String> = Vec::new();
+    for part in [
+        meta.site.as_deref(),
+        meta.byline.as_deref(),
+        meta.published.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(one_line)
+    {
+        if !part.is_empty() {
+            byline_parts.push(part);
         }
-        let mut byline_parts: Vec<&str> = Vec::new();
-        if let Some(s) = &meta.site {
-            byline_parts.push(s);
-        }
-        if let Some(b) = &meta.byline {
-            byline_parts.push(b);
-        }
-        if let Some(p) = &meta.published {
-            byline_parts.push(p);
-        }
-        if !byline_parts.is_empty() {
-            out.push_str(&byline_parts.join(" · "));
-            out.push('\n');
-        }
-        out.push_str(url);
-        out.push('\n');
-        // Description as a one-line summary : agents use it to
-        // decide relevance before reading the body. Always surface it
-        // (capped): for JS-rendered SPAs the meta description is often
-        // the only real content in the initial HTML.
-        if let Some(d) = &meta.description {
-            let trimmed: String = d.chars().take(500).collect();
-            out.push_str(&format!("> {}\n", trimmed));
-        }
+    }
+    if !byline_parts.is_empty() {
+        out.push_str(&byline_parts.join(" · "));
         out.push('\n');
     }
+    out.push_str(url);
+    out.push('\n');
+    // Description as a one-line summary : agents use it to
+    // decide relevance before reading the body. Always surface it
+    // (capped): for JS-rendered SPAs the meta description is often
+    // the only real content in the initial HTML.
+    if let Some(d) = meta
+        .description
+        .as_deref()
+        .map(one_line)
+        .filter(|d| !d.is_empty())
+    {
+        let trimmed: String = d.chars().take(500).collect();
+        out.push_str(&format!("> {trimmed}\n"));
+    }
+    out.push('\n');
 
     let mut last_path: Vec<String> = Vec::new();
     let mut last_was_heading = true; // frontmatter counts
@@ -158,8 +165,7 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 // but only if the frontmatter title was actually
                 // shown. If first_is_title, the frontmatter was
                 // skipped, so this H1 IS the title display.
-                if !opts.faithful
-                    && !title_heading_dropped
+                if !title_heading_dropped
                     && *level == 1
                     && Some(text) == meta.title.as_ref()
                     && !first_is_title
@@ -174,48 +180,41 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 md, link_density, ..
             } => {
                 // Bare-link / one-word lines: pure noise.
-                if !opts.faithful && md.len() < 25 && *link_density > 0.9 {
+                if md.len() < 25 && *link_density > 0.9 {
                     continue;
                 }
                 // A widget's serialized data dumped into a text node
                 // is not prose (#288).
-                if !opts.faithful && looks_like_data_blob(md) {
+                if looks_like_data_blob(md) {
                     continue;
                 }
                 // Exact duplicate of an earlier block (#292). A
                 // block that opens its own section is the
                 // section's content, so it is never suppressed;
                 // anywhere else `dup_action` decides.
-                if !opts.faithful {
-                    let key = normalize(md);
-                    match seen.get(&key).copied() {
-                        Some(first_seen_at) if !prev_heading => {
-                            match dup_action(md, first_seen_at) {
-                                DupAction::Silent => continue,
-                                DupAction::Mark(marker) => {
-                                    out.push_str(&marker);
-                                    out.push_str("\n\n");
-                                    continue;
-                                }
-                                // Falls through and emits the block below.
-                                DupAction::Keep => {}
-                            }
+                let key = normalize(md);
+                match seen.get(&key).copied() {
+                    Some(first_seen_at) if !prev_heading => match dup_action(md, first_seen_at) {
+                        DupAction::Silent => continue,
+                        DupAction::Mark(marker) => {
+                            out.push_str(&marker);
+                            out.push_str("\n\n");
+                            continue;
                         }
-                        Some(_) => {}
-                        None => {
-                            seen.insert(key, idx + 1);
-                        }
+                        // Falls through and emits the block below.
+                        DupAction::Keep => {}
+                    },
+                    Some(_) => {}
+                    None => {
+                        seen.insert(key, idx + 1);
                     }
                 }
                 // Bare numbers: vote counts, rank numbers.
-                if !opts.faithful
-                    && md.len() < 8
-                    && md.chars().all(|c| c.is_ascii_digit() || c == ',')
-                {
+                if md.len() < 8 && md.chars().all(|c| c.is_ascii_digit() || c == ',') {
                     continue;
                 }
                 // Wiki section-edit junk: "[edit]", "[ edit ]".
-                if !opts.faithful && md.len() < 14 {
+                if md.len() < 14 {
                     let inner = md.trim_matches(['[', ']']).trim();
                     if !inner.is_empty()
                         && inner.chars().all(|c| c.is_alphabetic() || c == ' ')
@@ -241,7 +240,7 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 ..
             } => {
                 // Link-farm drop: many items, all bare links.
-                if !opts.faithful && items.len() > 6 && *link_density > 0.8 && !opts.include_links {
+                if items.len() > 6 && *link_density > 0.8 && !opts.include_links {
                     continue;
                 }
                 emit_path(
@@ -272,11 +271,13 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 }
                 let mut h = headers.clone();
                 h.resize(cols, String::new());
+                let h: Vec<String> = h.iter().map(|c| table_cell(c)).collect();
                 out.push_str(&format!("| {} |\n", h.join(" | ")));
                 out.push_str(&format!("|{}\n", " --- |".repeat(cols)));
                 for row in rows {
                     let mut r = row.clone();
                     r.resize(cols, String::new());
+                    let r: Vec<String> = r.iter().map(|c| table_cell(c)).collect();
                     out.push_str(&format!("| {} |\n", r.join(" | ")));
                 }
                 if *truncated {
@@ -309,20 +310,9 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 }
                 out.push('\n');
             }
-            Block::Media { alt, src, .. } => {
-                // Token war: media lines are opt-in. (Segmentation
-                // still records them for on-demand OCR.)
-                if !opts.include_media {
-                    continue;
-                }
-                emit_path(
-                    &mut out,
-                    block.path(),
-                    &mut last_path,
-                    &mut last_was_heading,
-                );
-                out.push_str(&format!("![{alt}]({src})\n\n"));
-            }
+            // Media is never rendered: segmentation records it for
+            // image_text OCR, which reads the words instead.
+            Block::Media { .. } => continue,
         }
         last_was_heading = false;
         prev_heading = matches!(block, Block::Heading { .. });
@@ -526,11 +516,42 @@ fn looks_like_data_blob(md: &str) -> bool {
     t.matches("\":").count() >= 4
 }
 
+/// One table cell as markdown: a literal `|` ends the column and a newline
+/// ends the row, either of which silently shifts every later cell. Pipes
+/// already escaped by a producer are left alone, so the escape cannot
+/// double.
+fn table_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev = '\0';
+    for c in s.chars() {
+        match c {
+            '|' if prev != '\\' => {
+                out.push('\\');
+                out.push('|');
+            }
+            '\n' | '\r' | '\t' => out.push(' '),
+            _ => out.push(c),
+        }
+        prev = c;
+    }
+    out.trim().to_string()
+}
+
 fn normalize(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// One line of plain text, whitespace collapsed.
+///
+/// A `content="…"` attribute, a `<title>` or a byline may carry newlines
+/// and tabs; emitted raw they break the heading, the byline or the `>`
+/// summary they land in — and a summary that breaks out of its quote is
+/// prose the reader cannot tell from the page's own.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Emit the heading breadcrumb when the path changes mid-focus

@@ -9,8 +9,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
-use futures_util::FutureExt;
-
 mod crawl_tool;
 mod errors;
 mod fetch_tool;
@@ -23,29 +21,23 @@ use crate::detect::walls::{Vendor, Verdict};
 use crate::error::FetchError;
 use crate::extract::{self, ExtractOptions};
 use crate::fetch::client::Fetcher;
-use crate::ghost::cache::{CookieRecord, GhostState, RouteDecision};
-use crate::ghost::manager::GhostManager;
-use crate::ghost::ops;
 use crate::profile::BrowserProfile;
 use crate::search::byok::ByokSearcher;
 use crate::search::egress::EgressPool;
 use crate::search::intent::Intent;
 use crate::search::{self, Searcher};
+use crate::state::GhostState;
 use errors::*;
 // The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
 // rendering paths branch on the same signal the wire carries.
 pub(crate) use errors::is_failure;
-pub(crate) use fetch_tool::is_pdf_url_like;
 use fetch_tool::*;
-use search_tool::*;
 
 use super::tools;
 
 /// Shared daemon state, built once, lives forever.
 pub struct Daemon {
     fetcher: Arc<Fetcher>,
-    profile: BrowserProfile,
-    ghost_mgr: Arc<GhostManager>,
     state: Arc<Mutex<GhostState>>,
     searcher: Arc<Searcher>,
     byok: ByokSearcher,
@@ -54,22 +46,11 @@ pub struct Daemon {
     /// Session-local search references are useful only to a persistent caller.
     pub(crate) search_handles: bool,
     history: Arc<std::sync::Mutex<crate::pages::history::PageHistory>>,
-    /// Cookie revision from the atomic vault snapshot. Timestamps and size
-    /// cannot identify equal-size replacements on every supported platform.
-    vault_seen: tokio::sync::Mutex<Option<String>>,
-    /// One background pre-solve at a time: search hints for a walled
-    /// domain trigger a solve while the agent is still reading
-    /// results. Cheap spinlock: a lost race just skips the win.
-    pre_solve_busy: std::sync::atomic::AtomicBool,
-    /// Background route-memory prober handle (v4 phase 0.2);
+    /// Background route-memory prober handle;
     /// aborted on shutdown.
     probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Owned startup proxy probes; cancelled on shutdown or daemon drop.
     preflight_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Background pre-solve handle (search wall hint): owned like the
-    /// prober; `pre_solve_busy` is taken BEFORE the spawn, so at most
-    /// one pre-solve exists and the slot holds the live handle.
-    pre_solve_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -80,72 +61,20 @@ impl Daemon {
         crate::search::egress::install_global(std::sync::Arc::clone(&egress));
         let fetcher =
             Arc::new(Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)));
-        let ghost_mgr = GhostManager::new().await;
-        crate::ghost::cache::ensure_session_identity();
+        crate::state::ensure_session_identity();
         let state = Arc::new(Mutex::new(GhostState::load()));
 
-        // Tier 1 starts the session with the vault too: a domain
-        // that serves without JS gets an authenticated plain-HTTP
-        // fetch on the very first request after a restart, not
-        // only after the browser has visited it once.
-        {
-            let sessions = crate::ghost::cache::load_session_cookies();
-            // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
-            // The vault outranks the jar echo for a key both hold: a
-            // logged-out render can write anonymous values for a
-            // login cookie's name, and replaying those keeps every
-            // later fetch anonymous until the jar is cleared (#319).
-            let jar = if crate::config::cfg().state.cookie_vault {
-                state.lock().await.tier1_cookies.clone()
-            } else {
-                Vec::new()
-            };
-            let replay = crate::ghost::cache::vault_over_jar(&sessions, &jar);
-            fetcher.import_vault_cookies(&replay).await;
-        }
+        let (crawler, _gov) =
+            crawl_real::build(Arc::clone(&fetcher), std::sync::Arc::clone(&egress));
 
-        // Build ghost escalation hook for the crawl: renders
-        // JS-only pages in the headless browser so SPA sites
-        // yield real content instead of empty shells. Capped at
-        // 3 per crawl by the orchestrator. The search clone runs
-        // the SAME machinery but never serves from the render
-        // cache: a cached walled SERP would replay as "no
-        // results" forever inside one TTL window.
-        let ghost_hook = make_ghost_hook(
-            Arc::clone(&ghost_mgr),
-            profile.clone(),
-            Arc::clone(&fetcher),
-            Arc::clone(&state),
-            false,
-        );
-        let search_ghost = make_ghost_hook(
-            Arc::clone(&ghost_mgr),
-            profile.clone(),
-            Arc::clone(&fetcher),
-            Arc::clone(&state),
-            true,
-        );
-
-        let (crawler, _gov) = crawl_real::build(
-            Arc::clone(&fetcher),
-            std::sync::Arc::clone(&egress),
-            Some(Arc::clone(&state)),
-        );
-        let crawler = crawler.with_ghost(ghost_hook);
-
-        let searcher = Arc::new(
-            Searcher::new_shared(
-                Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)),
-                egress,
-            )
-            .with_ghost(search_ghost),
-        );
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)),
+            egress,
+        ));
         let preflight_task = searcher.preflight();
 
         Ok(Self {
             fetcher,
-            profile,
-            ghost_mgr,
             state,
             searcher,
             byok: ByokSearcher::new(),
@@ -155,22 +84,19 @@ impl Daemon {
             history: Arc::new(std::sync::Mutex::new(
                 crate::pages::history::PageHistory::load(),
             )),
-            vault_seen: tokio::sync::Mutex::new(None),
-            pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
             probe_task: std::sync::Mutex::new(None),
             preflight_task: std::sync::Mutex::new(Some(preflight_task)),
-            pre_solve_task: std::sync::Mutex::new(None),
         })
     }
 
-    /// Spawn the background route-memory prober (v4 phase 0.2).
+    /// Spawn the background route-memory prober.
     /// Called once the daemon is inside its runtime; one-shot CLI
     /// paths never call it, so short-lived processes stay clean.
     pub fn start_prober(self: &Arc<Self>) {
         if !crate::config::cfg().browser.route_probes {
             return;
         }
-        let handle = crate::ghost::probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
+        let handle = crate::state_probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
         let mut slot = self
             .probe_task
             .lock()
@@ -182,13 +108,12 @@ impl Daemon {
         *slot = Some(handle);
     }
 
-    /// Shutdown: kill ghost browser + Xvfb (if owned).
+    /// Shutdown: cancel every daemon-owned helper task and join it.
     /// Called by the CLI before exit; by the MCP daemon on close.
     pub async fn shutdown(&self) {
         // Every daemon-owned helper is cancelled AND joined: the startup
-        // probes, the route-memory prober, the background pre-solve. An
-        // orphaned helper would keep working for a retired daemon (and
-        // keep its Arcs alive).
+        // probes and the route-memory prober. An orphaned helper would
+        // keep working for a retired daemon (and keep its Arcs alive).
         let preflight = self
             .preflight_task
             .lock()
@@ -207,55 +132,12 @@ impl Daemon {
             task.abort();
             let _ = task.await;
         }
-        let pre_solve = self
-            .pre_solve_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(task) = pre_solve {
-            task.abort();
-            let _ = task.await;
-        }
-        self.ghost_mgr.shutdown().await;
-    }
-
-    /// Resync the tier-1 cookie jar after login/logout/rotation. The
-    /// hot path reads a bounded trailer; parse only after a real cookie change.
-    pub async fn refresh_vault(&self) {
-        let Some(sig) = crate::ghost::cache::disk_session_stamp() else {
-            return;
-        };
-        let mut seen = self.vault_seen.lock().await;
-        if seen.as_ref() != Some(&sig) {
-            let disk = GhostState::load();
-            let stamp = disk.session_stamp();
-            let sessions: Vec<_> = disk
-                .profiles
-                .values()
-                .flat_map(|p| &p.session_cookies)
-                .filter(|c| crate::ghost::cache::is_session_usable(c))
-                .cloned()
-                .collect();
-            self.state.lock().await.merge_vault_from_disk(&disk);
-            let jar = if crate::config::cfg().state.cookie_vault {
-                disk.tier1_cookies.clone()
-            } else {
-                Vec::new()
-            };
-            let cookies = crate::ghost::cache::vault_over_jar(&sessions, &jar);
-            self.fetcher.reset_to(&cookies).await;
-            *seen = Some(stamp);
-        }
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        for slot in [
-            &mut self.preflight_task,
-            &mut self.probe_task,
-            &mut self.pre_solve_task,
-        ] {
+        for slot in [&mut self.preflight_task, &mut self.probe_task] {
             if let Some(task) = slot
                 .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -435,9 +317,31 @@ pub async fn handle(
         let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
         let progress_tx = progress_token.as_ref().map(|_| ptx);
         let writer_tx = writer_tx.clone();
+        // Progress ends at the cancel: the client that cancelled no
+        // longer tracks the request's progress token (the TypeScript SDK
+        // drops the token's handler before it sends
+        // notifications/cancelled), and beats still queued then are
+        // dropped. A cancel sender dropped without a cancel is the call
+        // ending normally, and every beat it queued is still forwarded.
+        let mut cancel_seen = cancel_rx.clone();
         let forwarder = tokio::spawn(async move {
-            while let Some(line) = prx.recv().await {
-                let _ = writer_tx.send(line).await;
+            let cancelled = async move {
+                if cancel_seen.wait_for(|cancelled| *cancelled).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(cancelled);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut cancelled => break,
+                    line = prx.recv() => match line {
+                        Some(line) => {
+                            let _ = writer_tx.send(line).await;
+                        }
+                        None => break,
+                    },
+                }
             }
         });
         let ctx = ToolCtx {
@@ -446,8 +350,9 @@ pub async fn handle(
             progress_tx,
         };
         let result = call_tool_ctx(daemon, &params, Some(ctx)).await;
-        // Deregister + stop forwarding progress. The forwarder ends
-        // when ptx drops : it moved into ctx, dropped at await end.
+        // Deregister + stop forwarding progress. The forwarder ends at
+        // the cancel, or when ptx drops : it moved into ctx, dropped at
+        // await end.
         if let Some(r) = rid {
             cancels
                 .lock()
@@ -669,7 +574,7 @@ mod preflight_lifecycle_tests {
         crate::config::install(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         std::fs::write(
-            crate::transport::proxy::config_path(),
+            crate::egress::proxy::config_path(),
             format!("http://{}\n", listener.local_addr().unwrap()),
         )
         .unwrap();
@@ -777,45 +682,271 @@ mod prober_lifecycle_tests {
 }
 
 #[cfg(test)]
-mod pre_solve_lifecycle_tests {
-    use super::Daemon;
+mod crawl_cancel_tests {
+    use super::{CancelMap, Daemon, cancel_key, handle};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
-    // The handle is tracked on the daemon (owned, never detached); a
-    // task that bails at its route check clears the busy guard; shutdown
-    // takes the slot. The full solve path launches browsers and is
-    // covered by the native fixture tests.
-    #[tokio::test]
-    async fn stealth_v3_pre_solve_handle_is_owned_and_cancelled() {
-        let mut config = crate::config::DonsetchConfig::default();
-        config.fetch.allow_private_egress = true;
-        config.proxy.from_environment = false;
-        crate::config::install(config).unwrap();
-        let daemon = std::sync::Arc::new(Daemon::new().await.unwrap());
-        super::search_tool::maybe_pre_solve(&daemon, Some("http://owned-pre-solve.example/"));
-        assert!(
-            daemon.pre_solve_task.lock().unwrap().is_some(),
-            "the pre-solve must be tracked, not detached"
-        );
-        for _ in 0..100 {
-            if !daemon
-                .pre_solve_busy
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                break;
+    /// A loopback site. `/slow/` and `/fast/` each link to eight pages,
+    /// and a `/slow/` page answers 1.5 s after its request; `/lone/` links
+    /// nowhere. Every request path is reported on the returned channel.
+    async fn site() -> (String, mpsc::UnboundedReceiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, requests) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") && head.len() < 16384 {
+                        match socket.read_u8().await {
+                            Ok(byte) => head.push(byte),
+                            Err(_) => return,
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&head)
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    let _ = seen.send(path.clone());
+                    let section = path.trim_start_matches('/').split('/').next().unwrap_or("");
+                    let index = path.ends_with('/');
+                    if section == "slow" && !index {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    let links: String = if index && section != "lone" {
+                        (1..=8)
+                            .map(|i| {
+                                format!("<li><a href=\"/{section}/p{i}\">Field notes {i}</a></li>")
+                            })
+                            .collect()
+                    } else {
+                        String::new()
+                    };
+                    let body = format!(
+                        "<html><head><title>Notes {path}</title></head><body><article>\
+                         <h1>Notes {path}</h1><p>{}</p><ul>{links}</ul></article></body></html>",
+                        format!("An observation recorded at {path} for a reader. ").repeat(40)
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+        (base, requests)
+    }
+
+    async fn daemon() -> Arc<Daemon> {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        Arc::new(Daemon::new().await.unwrap())
+    }
+
+    fn crawl_call(id: i64, args: Value, progress_token: Option<&str>) -> String {
+        let mut params = json!({ "name": "web_crawl", "arguments": args });
+        if let Some(token) = progress_token {
+            params["_meta"] = json!({ "progressToken": token });
         }
-        assert!(
-            !daemon
-                .pre_solve_busy
-                .load(std::sync::atomic::Ordering::SeqCst),
-            "the route-check bail must clear the busy guard"
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params }).to_string()
+    }
+
+    fn progress_params(line: &str) -> Option<Value> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        (v["method"] == "notifications/progress").then(|| v["params"].clone())
+    }
+
+    /// The call's state: `structuredContent`, or the leading `[meta]`
+    /// line a text-only session folds it into.
+    fn state(response: &Value) -> Value {
+        let result = &response["result"];
+        if result.get("structuredContent").is_some() {
+            return result["structuredContent"].clone();
+        }
+        let meta = result["content"][0]["text"].as_str().unwrap_or_default();
+        serde_json::from_str(meta.trim_start_matches("[meta] ").trim_end())
+            .unwrap_or_else(|_| panic!("no state in {response}"))
+    }
+
+    fn drain(out: &mut mpsc::Receiver<String>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = out.try_recv() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// The token files in the process cache root's resume store.
+    fn stored_tokens() -> Vec<String> {
+        let dir = crate::paths::cache_dir().join("crawl-resumes");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// One uncancelled call through `handle`, with the writer lines its
+    /// progress forwarder sent.
+    async fn answered(daemon: &Arc<Daemon>, line: String) -> (Value, Vec<String>) {
+        let cancels: CancelMap = Arc::default();
+        let mode = crate::mcp::compat::ModeCell::new();
+        let (writer, mut out) = mpsc::channel::<String>(256);
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle(daemon, &line, &cancels, &writer, &mode),
+        )
+        .await
+        .expect("the call is answered when its crawl ends")
+        .expect("an uncancelled call gets a response");
+        (serde_json::from_str(&response).unwrap(), drain(&mut out))
+    }
+
+    // Drives `handle` the way the stdio transport does: one cancel
+    // registry, one writer channel, and the cancel delivered by taking
+    // the call's sender out of the registry and sending true. Installs the
+    // process config and reads the process cache root's resume store:
+    // depends on nextest's process-per-test.
+    #[tokio::test]
+    async fn a_cancelled_crawl_sends_no_progress_after_the_cancel_and_stores_no_token() {
+        let (base, mut requests) = site().await;
+        let daemon = daemon().await;
+        let cancels: CancelMap = Arc::default();
+        let (writer, mut out) = mpsc::channel::<String>(256);
+        let line = crawl_call(
+            7,
+            json!({
+                "url": format!("{base}/slow/"),
+                "mode": "content",
+                "respect_robots": false,
+                "max_pages": 20,
+                "deadline_s": 60,
+            }),
+            Some("pt-7"),
         );
-        daemon.shutdown().await;
-        assert!(
-            daemon.pre_solve_task.lock().unwrap().is_none(),
-            "shutdown must take the owned pre-solve"
+        let call = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            let cancels = Arc::clone(&cancels);
+            async move {
+                let mode = crate::mcp::compat::ModeCell::new();
+                handle(&daemon, &line, &cancels, &writer, &mode).await
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(20), out.recv())
+            .await
+            .expect("a first progress beat")
+            .expect("the writer is open");
+        assert!(progress_params(&first).is_some(), "{first}");
+        // Cancel while a page fetch is in flight: the fixture holds every
+        // /slow/pN answer for 1.5 s, so no page completes before the cancel.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(path) = requests.recv().await {
+                if path.starts_with("/slow/p") {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the crawl requests a /slow/ page");
+        let before = drain(&mut out);
+        assert!(before.is_empty(), "a page completed early: {before:?}");
+        let sender = cancels
+            .lock()
+            .unwrap()
+            .remove(&cancel_key(&json!(7)).unwrap())
+            .expect("the running call is registered");
+        let _ = sender.send(true);
+        drop(sender);
+
+        let returned = tokio::time::timeout(Duration::from_secs(15), call).await;
+        let after = drain(&mut out);
+        let beats: Vec<&String> = after
+            .iter()
+            .filter(|l| progress_params(l).is_some())
+            .collect();
+        assert!(beats.is_empty(), "progress after the cancel: {beats:?}");
+        assert!(after.is_empty(), "lines after the cancel: {after:?}");
+        let returned = returned
+            .expect("the cancelled call returns once its crawl stops")
+            .unwrap();
+        assert_eq!(returned, None, "a cancelled request gets no response");
+        assert_eq!(
+            stored_tokens(),
+            Vec::<String>::new(),
+            "a cancelled crawl stored a resume token no response carries"
         );
+    }
+
+    // Negative: an uncancelled crawl keeps its progress and its response,
+    // and a budget stop still stores the token its response carries.
+    // Installs the process config and reads the process cache root's
+    // resume store: depends on nextest's process-per-test.
+    #[tokio::test]
+    async fn an_uncancelled_crawl_keeps_its_progress_and_its_resume_token() {
+        let (base, _requests) = site().await;
+        let daemon = daemon().await;
+
+        let (response, lines) = answered(
+            &daemon,
+            crawl_call(
+                8,
+                json!({
+                    "url": format!("{base}/lone/"),
+                    "mode": "content",
+                    "respect_robots": false,
+                    "deadline_s": 30,
+                }),
+                Some("pt-8"),
+            ),
+        )
+        .await;
+        assert_eq!(response["id"], 8);
+        let sc = &state(&response);
+        assert_eq!(sc["ok"], true, "{response}");
+        assert_eq!(sc["stop"], "FrontierEmpty", "{response}");
+        let beats: Vec<Value> = lines.iter().filter_map(|l| progress_params(l)).collect();
+        assert_eq!(
+            beats,
+            vec![json!({ "progressToken": "pt-8", "progress": 1, "message": "1 pages, 0 queued" })],
+            "{lines:?}"
+        );
+
+        let (response, _) = answered(
+            &daemon,
+            crawl_call(
+                9,
+                json!({
+                    "url": format!("{base}/fast/"),
+                    "mode": "content",
+                    "respect_robots": false,
+                    "max_pages": 2,
+                    "deadline_s": 30,
+                }),
+                None,
+            ),
+        )
+        .await;
+        let sc = &state(&response);
+        assert_eq!(sc["stop"], "MaxPages", "{response}");
+        let token = sc["resume"].as_str().unwrap_or_else(|| {
+            panic!("a budget stop with queued pages carries a token: {response}")
+        });
+        assert_eq!(stored_tokens(), vec![format!("{token}.json")]);
     }
 }

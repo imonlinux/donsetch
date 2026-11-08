@@ -1,25 +1,42 @@
 # cargo-nextest config: https://nexte.st/docs/configuration/
 #
-# NEXTEST 0.9.x IGNORES config-level `cargo-profile` (verified on
-# 0.9.143). The ONLY working pin is the CLI flag: `--cargo-profile ci`
-# in the Justfile and CI recipes. An unprotected `cargo nextest run`
-# compiles the whole dependency graph under the DEBUG profile (21G
-# of target/debug in two days, the 110G catch before that, and 4.6G
-# in one scoped run today). Scoped local runs go through
-# `just t <filter>`; raw nextest calls must carry the flag.
+# NEXTEST 0.9.x IGNORES config-level `cargo-profile` (verified on 0.9.143). The
+# ONLY working pin is the CLI flag, `--cargo-profile fast` (or `dist-thin` for
+# the heavy lane): the Justfile recipes and ci.yml carry it. An unprotected
+# `cargo nextest run` compiles the whole dependency graph under the DEBUG
+# profile (21G of target/debug in two days, 110G before that).
 #
-# Local: `cargo nextest run`           → fail-fast, stop at first red
-# CI:    `cargo nextest run --profile ci` → run everything, show all
+# Local: `cargo nextest run`               -> fail-fast, stop at first red
+# CI:    `cargo nextest run --profile ci`  -> run everything, show all
 
 [profile.default]
 fail-fast = true
+# The per-edit suite stays under a minute: these tests are real but parse a
+# 501-page PDF, scan a large corpus PDF, or spend 20 seconds proving a timing
+# ceiling. They run in the `heavy` lane (`just heavy`, nightly CI) with
+# --ignore-default-filter. A new test that needs more than ~10 s belongs here,
+# not in the default gate.
+default-filter = 'not (test(soak::soak_rss_stays_bounded) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling))' 
 # A hung test must fail locally too, not wedge the terminal forever.
 # Slightly longer than ci: local runs often share the box with a build.
 slow-timeout = { period = "60s", terminate-after = 1 }
 [profile.ci]
 fail-fast = false
-# A hung test (native code deadlock inside PDFium/ONNX has
-# happened before on aarch64) must fail the job in a bounded
-# time, not wedge it until the workflow timeout. 30s per test
-# then hard-terminate.
-slow-timeout = { period = "30s", terminate-after = 1 }
+# A hung test (native code deadlock inside PDFium/ONNX has happened before on
+# aarch64) must fail the job in a bounded time, not wedge it until the workflow
+# timeout. 30 s is a warning, 60 s a hard terminate: the loop profile is
+# opt-level 0 and the Windows/macOS runners are 3-4x slower than a desktop.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# Failures are what a person reads: show them again in the summary and keep the
+# passing tests out of the log.
+status-level = "slow"
+final-status-level = "fail"
+
+# The progit corpus book (501 pages) parses in ~57s on this box: inside
+# the 60s default only when the box is idle; under full-suite parallelism
+# it crosses and would be terminated although it is healthy. Corpus PDFs
+# are not committed, so CI skips this test and its profile stays untouched.
+[[profile.default.overrides]]
+filter = 'test(pdf::tests::progit_book)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+

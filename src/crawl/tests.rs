@@ -11,44 +11,8 @@ use std::time::Duration;
 use futures_util::FutureExt;
 
 use super::governor::{Governor, Lane, LaneKind};
-use super::{
-    CrawlMode, CrawlOptions, Crawler, FetchedPage, GHOST_BUDGET, PageFetcher, StopReason,
-    claim_ghost_slot,
-};
+use super::{CrawlMode, CrawlOptions, Crawler, FetchedPage, PageFetcher, StopReason};
 use crate::detect::walls::Verdict;
-
-// The escalation budget is shared by every worker. A load-then-
-// fetch_sub gate let two workers pass at budget == 1 and wrap the
-// counter to usize::MAX, after which every later check passed. The
-// atomic claim must hand out exactly GHOST_BUDGET slots however many
-// threads race for them, and the counter must end at 0, not wrap.
-#[test]
-fn ghost_budget_is_claimed_exactly_budget_times_under_contention() {
-    for _ in 0..20 {
-        let budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
-        let claimed = Arc::new(AtomicUsize::new(0));
-        let go = Arc::new(std::sync::Barrier::new(8));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let (budget, claimed, go) = (budget.clone(), claimed.clone(), go.clone());
-                std::thread::spawn(move || {
-                    go.wait();
-                    for _ in 0..100 {
-                        if claim_ghost_slot(&budget) {
-                            claimed.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
-        }
-        assert_eq!(claimed.load(Ordering::SeqCst), GHOST_BUDGET);
-        assert_eq!(budget.load(Ordering::SeqCst), 0, "counter wrapped");
-        assert!(!claim_ghost_slot(&budget), "exhausted budget must refuse");
-    }
-}
 
 /// A scripted site: URL → (status, body). Missing URL = 404.
 struct MockSite {
@@ -148,7 +112,7 @@ impl MockSite {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
                             lane: _lane.clone(),
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: 429,
                             headers: vec![],
@@ -170,7 +134,7 @@ impl MockSite {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
                             lane: _lane.clone(),
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: 500,
                             headers: vec![],
@@ -189,7 +153,7 @@ impl MockSite {
                     match pages.get(&url) {
                         Some((status, body)) => FetchedPage {
                             lane: _lane.clone(),
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: *status,
                             headers: vec![("content-type".into(), ct)],
@@ -202,7 +166,7 @@ impl MockSite {
                         },
                         None => FetchedPage {
                             lane: _lane,
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: 404,
                             headers: vec![],
@@ -243,354 +207,8 @@ fn html(title: &str, body: &str) -> String {
     )
 }
 
-fn classifying_fetcher(inner: PageFetcher) -> PageFetcher {
-    Arc::new(move |url, lane, referer, gate| {
-        let inner = Arc::clone(&inner);
-        async move {
-            let mut page = inner(url, lane, referer, gate).await;
-            page.verdict = crate::detect::walls::detect(page.status, &page.headers, &page.body);
-            page
-        }
-        .boxed()
-    })
-}
-
 #[tokio::test]
-async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
-    for thin in [false, true] {
-        for stalled in [false, true] {
-            let seed = "https://ex.com/start";
-            let shell = format!(
-                "<html><body><div id='app'></div><script>{}</script></body></html>",
-                "/* owned shell */".repeat(400)
-            );
-            let (fetch, hits) = MockSite::new()
-                .page(
-                    seed,
-                    if thin { 200 } else { 403 },
-                    if thin { &shell } else { "Access denied" },
-                )
-                .fetcher();
-            let first_read = Arc::new(Mutex::new(None));
-            let read_anchor = Arc::clone(&first_read);
-            let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
-                let fetch = Arc::clone(&fetch);
-                let read_anchor = Arc::clone(&read_anchor);
-                async move {
-                    read_anchor
-                        .lock()
-                        .unwrap()
-                        .get_or_insert_with(std::time::Instant::now);
-                    // A renewed browser budget must include time already
-                    // spent in this HTTP read, independent of setup noise.
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    fetch(url, lane, referer, gate).await
-                }
-                .boxed()
-            });
-            let calls = Arc::new(AtomicUsize::new(0));
-            let reached = Arc::clone(&calls);
-            let cancelled = Arc::new(Mutex::new(None));
-            let cancelled_hook = Arc::clone(&cancelled);
-            let budget = Duration::from_millis(800);
-            let hook_anchor = Arc::clone(&first_read);
-            let hook: super::GhostHook = Arc::new(move |request| {
-                let reached = Arc::clone(&reached);
-                let hook_anchor = Arc::clone(&hook_anchor);
-                let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
-                *cancelled_hook.lock().unwrap() = Some(receiver);
-                async move {
-                    let _held_until_cancelled = sender;
-                    reached.fetch_add(1, Ordering::SeqCst);
-                    // Crawl freezes its deadline before the first HTTP read.
-                    // Anchoring here excludes construction/configuration IO;
-                    // renewing after the read exceeds this bound without
-                    // relying on a platform-specific scheduling allowance.
-                    let read_started = hook_anchor.lock().unwrap().unwrap();
-                    assert!(request.deadline <= read_started + budget);
-                    if stalled {
-                        futures_util::future::pending::<()>().await;
-                    }
-                    Ok(super::GhostRender {
-                        html: html(
-                            "Bounded browser content",
-                            "Useful evidence within the caller's remaining time.",
-                        ),
-                        document: crate::ghost::document::Document {
-                            url: request.url,
-                            status: Some(201),
-                            generation: 7,
-                            ..Default::default()
-                        },
-                    })
-                }
-                .boxed()
-            });
-            let crawler = Crawler::new(classifying_fetcher(fetch), gov()).with_ghost(hook);
-            let started = std::time::Instant::now();
-            let result = crawler
-                .crawl(
-                    seed,
-                    CrawlOptions {
-                        mode: CrawlMode::Content,
-                        respect_robots: false,
-                        max_pages: 1,
-                        max_depth: 0,
-                        deadline: budget,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                1,
-                "thin={thin}, stalled={stalled}"
-            );
-            assert_eq!(hits.lock().unwrap().as_slice(), [seed]);
-            assert!(started.elapsed() < budget + Duration::from_millis(300));
-            assert!(matches!(
-                cancelled.lock().unwrap().as_mut().unwrap().try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-            ));
-            if stalled {
-                assert_eq!(result.stop, StopReason::Deadline);
-                assert!(
-                    !result
-                        .pages
-                        .iter()
-                        .any(|page| page.markdown.contains("Bounded browser content"))
-                );
-            } else {
-                assert_eq!(result.pages.len(), 1);
-                assert!(result.pages[0].markdown.contains("Bounded browser content"));
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn stealth_v3_browser_redirects_obey_scope_host_and_robots_for_wall_and_thin_pages() {
-    for thin in [false, true] {
-        for target in [
-            "https://ex.com/outside",
-            "https://other.example/allowed",
-            "https://ex.com/robots-denied",
-        ] {
-            let seed = "https://ex.com/start";
-            let shell = format!(
-                "<html><body><div id='app'></div><script>{}</script></body></html>",
-                "/* owned shell */".repeat(400)
-            );
-            let (fetch, _) = MockSite::new()
-                .page(
-                    "https://ex.com/robots.txt",
-                    200,
-                    "User-agent: *\nDisallow: /robots-denied\n",
-                )
-                .page(
-                    seed,
-                    if thin { 200 } else { 403 },
-                    if thin {
-                        &shell
-                    } else {
-                        "<html><body>Access denied</body></html>"
-                    },
-                )
-                .fetcher();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let reached = Arc::clone(&calls);
-            let hook: super::GhostHook = Arc::new(move |_| {
-                reached.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    Ok(super::GhostRender {
-                        html: html(
-                            "Owned browser document",
-                            "The final browser document supplies its own evidence.",
-                        ),
-                        document: crate::ghost::document::Document {
-                            url: target.into(),
-                            status: Some(201),
-                            generation: 7,
-                            ..Default::default()
-                        },
-                    })
-                }
-                .boxed()
-            });
-            let result = Crawler::new(classifying_fetcher(fetch), gov())
-                .with_ghost(hook)
-                .crawl(
-                    seed,
-                    CrawlOptions {
-                        mode: CrawlMode::Content,
-                        deadline: Duration::from_secs(30),
-                        include_paths: vec!["/*".into()],
-                        exclude_paths: vec!["/outside".into()],
-                        max_pages: 1,
-                        max_depth: 0,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                1,
-                "browser branch not reached: thin={thin}, target={target}"
-            );
-            assert!(
-                result.pages.is_empty(),
-                "out-of-scope browser content returned: thin={thin}, target={target}"
-            );
-            assert!(
-                result
-                    .skipped
-                    .iter()
-                    .any(|(_, reason)| reason.contains("redirected out of scope")),
-                "{:?}",
-                result.skipped
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn stealth_v3_allowed_browser_redirect_owns_url_and_relative_links() {
-    for thin in [false, true] {
-        let seed = "https://ex.com/start";
-        let final_url = "https://ex.com/allowed/final";
-        let shell = format!(
-            "<html><body><div id='app'></div><script>{}</script></body></html>",
-            "/* owned shell */".repeat(400)
-        );
-        let (fetch, hits) = MockSite::new()
-            .page(
-                seed,
-                if thin { 200 } else { 403 },
-                if thin {
-                    &shell
-                } else {
-                    "<html><body>Access denied</body></html>"
-                },
-            )
-            .page(
-                "https://ex.com/allowed/next",
-                200,
-                &html(
-                    "Distinct child",
-                    "A second document with independent research evidence.",
-                ),
-            )
-            .fetcher();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let reached = Arc::clone(&calls);
-        let hook: super::GhostHook = Arc::new(move |_| {
-            reached.fetch_add(1, Ordering::SeqCst);
-            async move {
-                Ok(super::GhostRender {
-                    html: html(
-                        "Owned final document",
-                        "The browser final URL owns this content.",
-                    ) + "<a href='next'>Next chapter</a><a href='final'>Self document</a>",
-                    document: crate::ghost::document::Document {
-                        url: final_url.into(),
-                        status: Some(201),
-                        generation: 7,
-                        ..Default::default()
-                    },
-                })
-            }
-            .boxed()
-        });
-        let result = Crawler::new(classifying_fetcher(fetch), gov())
-            .with_ghost(hook)
-            .crawl(
-                seed,
-                CrawlOptions {
-                    mode: CrawlMode::Content,
-                    deadline: Duration::from_secs(30),
-                    respect_robots: false,
-                    include_paths: vec!["/*".into()],
-                    max_pages: 2,
-                    max_depth: 1,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(result.pages.iter().any(|page| page.url == final_url && page.markdown.contains("Owned final document")),
-            "thin={thin}, pages={:?}, skipped={:?}", result.pages.iter().map(|page| (&page.url, &page.markdown)).collect::<Vec<_>>(), result.skipped);
-        assert!(
-            result
-                .pages
-                .iter()
-                .any(|page| page.url == "https://ex.com/allowed/next")
-        );
-        assert_eq!(
-            result
-                .pages
-                .iter()
-                .find(|page| page.url == "https://ex.com/allowed/next")
-                .unwrap()
-                .parent
-                .as_deref(),
-            Some(final_url)
-        );
-        assert!(!result.pages.iter().any(|page| page.url == seed));
-        assert!(
-            !result.queued.iter().any(|url| url == final_url),
-            "the browser final document is already visited"
-        );
-        assert!(
-            !hits.lock().unwrap().iter().any(|url| url == final_url),
-            "the browser final document must not be fetched again"
-        );
-        assert!(
-            hits.lock()
-                .unwrap()
-                .iter()
-                .any(|url| url == "https://ex.com/allowed/next")
-        );
-    }
-}
-
-#[tokio::test]
-async fn stealth_v3_browser_unknown_status_never_inherits_http_denial() {
-    let (fetch, _) = MockSite::new()
-        .page("https://ex.com/", 403, "Access denied")
-        .fetcher();
-    let mut page = fetch("https://ex.com/".into(), "owned-lane".into(), None, None).await;
-    let route = page.route.clone();
-    page.apply_render(super::GhostRender {
-        html: html("Owned browser", "Content with no observed network status."),
-        document: crate::ghost::document::Document {
-            url: "https://ex.com/final".into(),
-            status: None,
-            generation: 3,
-            ..Default::default()
-        },
-    });
-    assert_eq!(
-        page.status, 0,
-        "zero is unknown, not a synthesized200 or inherited403"
-    );
-    assert_eq!(page.url, "https://ex.com/final");
-    assert_eq!(page.route, route);
-    assert_eq!(page.lane, "owned-lane");
-    assert!(
-        String::from_utf8(page.body)
-            .unwrap()
-            .contains("Owned browser")
-    );
-}
-
-#[tokio::test]
-async fn stealth_v3_http_redirect_outside_scope_does_not_start_browser() {
+async fn stealth_v3_http_redirect_outside_scope_is_skipped() {
     let seed = "https://ex.com/start";
     let (inner, hits) = MockSite::new().page(seed, 403, "Access denied").fetcher();
     let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
@@ -603,14 +221,7 @@ async fn stealth_v3_http_redirect_outside_scope_does_not_start_browser() {
         }
         .boxed()
     });
-    let calls = Arc::new(AtomicUsize::new(0));
-    let reached = Arc::clone(&calls);
-    let hook: super::GhostHook = Arc::new(move |_| {
-        reached.fetch_add(1, Ordering::SeqCst);
-        async { Err("out-of-scope browser must not start".into()) }.boxed()
-    });
     let result = Crawler::new(fetch, gov())
-        .with_ghost(hook)
         .crawl(
             seed,
             CrawlOptions {
@@ -626,7 +237,6 @@ async fn stealth_v3_http_redirect_outside_scope_does_not_start_browser() {
         .await
         .unwrap();
     assert_eq!(hits.lock().unwrap().as_slice(), [seed]);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(result.pages.is_empty());
     assert!(
         result
@@ -754,7 +364,7 @@ async fn wave450_deadline_bounds_discovery_and_page_io() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             FetchedPage {
                 lane,
-                route: Some(crate::transport::request_route::RequestRoute::direct()),
+                route: Some(crate::egress::request_route::RequestRoute::direct()),
                 url,
                 status: 200,
                 headers: vec![],
@@ -1004,65 +614,81 @@ async fn map_mode_falls_back_to_seed_links_without_a_sitemap() {
     assert!(!hits.iter().any(|h| h.ends_with("/b")));
 }
 
-// The audit's "5 URLs from a rich site": JS-built navigation (mdBook
-// sidebars) never appears in raw HTML, so a thin static map merges one
-// rendered read of the seed through the same filter. Render failure or
-// absence keeps the static map : the browser is an enhancement, never
-// a dependency.
-#[tokio::test]
-async fn map_mode_merges_a_rendered_inventory_when_static_is_thin() {
-    let seed = "<html><head><title>seed</title></head><body><article>\
-        <p>content words here for extraction threshold passing yes indeed</p>\
-        <a href=\"/a\">Page A</a><a href=\"/b\">Page B</a></article></body></html>";
-    let site = MockSite::new()
-        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
-        .page("https://ex.com/", 200, seed);
-    let (fetch, hits) = site.fetcher();
-    let crawler = Crawler::new(fetch, gov());
-    let mut o = opts();
-    o.mode = CrawlMode::Map;
-    o.deadline = Duration::from_secs(120); // the render guard needs headroom
-    let rendered = "<html><body><a href=\"/c\">C</a><a href=\"/d\">D</a>\
-        <a href=\"/e\">E</a></body></html>"
-        .to_string();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_in = Arc::clone(&calls);
-    o.render_html = Some(Arc::new(move |_url: String| {
-        let rendered = rendered.clone();
-        let calls = Arc::clone(&calls_in);
-        Box::pin(async move {
-            calls.fetch_add(1, Ordering::Relaxed);
-            Some((rendered, "https://ex.com/".to_string()))
-        })
-    }));
-    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1, "one bounded render");
-    for path in ["/a", "/b", "/c", "/d", "/e"] {
-        assert!(
-            r.map.iter().any(|u| u.ends_with(path)),
-            "missing {path}: {:?}",
-            r.map
-        );
-    }
-    // The rendered read must not fetch the linked pages themselves.
-    {
-        let hits = hits
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(!hits.iter().any(|h| h.ends_with("/c")));
-    }
+const ONE_LINK_SEED: &str = "<html><head><title>seed</title></head><body><article>\
+    <p>content words here for extraction threshold passing yes indeed</p>\
+    <a href=\"/a\">Page A</a></article></body></html>";
 
-    // Without a renderer the static map stands unchanged.
-    let site = MockSite::new()
+// A UTF-8 byte-order mark before `<?xml`: the map is the sitemap's
+// three pages, not the one link the seed page carries.
+#[tokio::test]
+async fn map_mode_reads_a_sitemap_behind_a_byte_order_mark() {
+    let sitemap = "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+        <url><loc>https://ex.com/a</loc></url>\n\
+        <url><loc>https://ex.com/b</loc></url>\n\
+        <url><loc>https://ex.com/c</loc></url>\n\
+        </urlset>\n";
+    let (fetch, _) = MockSite::new()
         .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
-        .page("https://ex.com/", 200, seed);
-    let (fetch, _) = site.fetcher();
-    let crawler = Crawler::new(fetch, gov());
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, ONE_LINK_SEED)
+        .fetcher();
     let mut o = opts();
     o.mode = CrawlMode::Map;
-    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
-    assert!(r.map.iter().any(|u| u.ends_with("/a")));
-    assert!(!r.map.iter().any(|u| u.ends_with("/c")));
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (r.map.as_slice(), r.inventory.source, r.inventory.complete),
+        (
+            &[
+                "https://ex.com/a".to_string(),
+                "https://ex.com/b".to_string(),
+                "https://ex.com/c".to_string()
+            ][..],
+            "sitemap",
+            true
+        ),
+        "(map, inventory.source, inventory.complete)"
+    );
+}
+
+// A sitemap read to its end that lists no page leaves the map to the
+// seed's links, and a seed-link map does not make the inventory
+// complete.
+#[tokio::test]
+async fn map_mode_seed_links_behind_an_empty_sitemap_are_not_complete() {
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page(
+            "https://ex.com/sitemap.xml",
+            200,
+            "<?xml version=\"1.0\"?>\n<urlset></urlset>\n",
+        )
+        .page("https://ex.com/", 200, ONE_LINK_SEED)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            r.map.as_slice(),
+            r.inventory.source,
+            r.inventory.complete,
+            r.stop
+        ),
+        (
+            &["https://ex.com/a".to_string()][..],
+            "seed-links",
+            false,
+            StopReason::FrontierEmpty
+        ),
+        "(map, inventory.source, inventory.complete, stop)"
+    );
 }
 
 // V06: the map is relevance-ranked against the seed, not a pure
@@ -1742,6 +1368,119 @@ async fn crawl_throttle_recovers_and_continues() {
     let _ = MockSite::new().hit_count();
 }
 
+// A 429 boxes the host. When the next pop finds the box still up and
+// nothing else queued, the crawl stops ThrottledOut. The URL that pop
+// took was never fetched: it stays queued under a resume token, and a
+// resume once the host answers again fetches it. The 429'd URL is a
+// permanent skip, and the resume does not request it again.
+// Uses the resume store under the per-process test cache root, so it
+// depends on nextest's process-per-test.
+#[tokio::test]
+async fn a_throttled_out_crawl_resumes_the_url_it_never_fetched() {
+    let root = linking_page("root", &["/a", "/b"]);
+    let site = || {
+        MockSite::new()
+            .page("https://ex.com/", 200, &root)
+            .page("https://ex.com/a", 200, &html("A", "alpha"))
+            .page("https://ex.com/b", 200, &html("B", "beta"))
+    };
+    let (fetch, _) = site()
+        .throttle_n("https://ex.com/a", 1)
+        .throttle_n("https://ex.com/b", 1)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.shape = false;
+    o.max_pages = 10;
+    let r1 = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    let state = format!(
+        "stop={:?} resume={:?} pages={:?} skipped={:?} queued={:?}",
+        r1.stop,
+        r1.resume,
+        r1.pages.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+        r1.skipped,
+        r1.queued
+    );
+    // The first link popped got the 429; the second was popped while
+    // the host was boxed.
+    assert_eq!(r1.stop, StopReason::ThrottledOut, "{state}");
+    assert_eq!(r1.skipped.len(), 1, "{state}");
+    let throttled = r1.skipped[0].0.clone();
+    let untried = if throttled == "https://ex.com/a" {
+        "https://ex.com/b"
+    } else {
+        "https://ex.com/a"
+    };
+    assert_eq!(r1.queued, [untried], "{state}");
+    let token = r1.resume.expect(&state);
+
+    // A fresh crawl stack, as a new process gets: the box one 429 sets
+    // is under a second, and the governor's disk state keeps whole
+    // seconds.
+    let (fetch, hits) = site().fetcher();
+    let r2 = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, Some(&token))
+        .await
+        .unwrap();
+    assert!(
+        r2.pages.iter().any(|p| p.url == untried),
+        "resume stop={:?} pages={:?} skipped={:?}",
+        r2.stop,
+        r2.pages.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+        r2.skipped
+    );
+    assert_eq!(r2.stop, StopReason::FrontierEmpty);
+    assert_eq!(
+        hits_matching(&hits, &throttled),
+        0,
+        "the 429'd URL was requested again: {:?}",
+        hits.lock().unwrap()
+    );
+}
+
+// Negative for the test above: a crawl that meets no 429 reads every
+// link and ends FrontierEmpty with nothing queued and no token, and a
+// 404 is a permanent skip, requested once.
+#[tokio::test]
+async fn an_unthrottled_crawl_with_a_404_ends_without_a_resume_token() {
+    let (fetch, hits) = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &linking_page("root", &["/a", "/b", "/gone"]),
+        )
+        .page("https://ex.com/a", 200, &html("A", "alpha"))
+        .page("https://ex.com/b", 200, &html("B", "beta"))
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.shape = false;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let mut pages: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    pages.sort_unstable();
+    let state = format!(
+        "stop={:?} resume={:?} pages={pages:?} skipped={:?} queued={:?}",
+        r.stop, r.resume, r.skipped, r.queued
+    );
+    assert_eq!(
+        pages,
+        ["https://ex.com/", "https://ex.com/a", "https://ex.com/b"],
+        "{state}"
+    );
+    assert_eq!(r.stop, StopReason::FrontierEmpty, "{state}");
+    assert!(r.queued.is_empty() && r.resume.is_none(), "{state}");
+    assert_eq!(r.skipped.len(), 1, "{state}");
+    assert_eq!(r.skipped[0].0, "https://ex.com/gone", "{state}");
+    assert_eq!(hits_matching(&hits, "/gone"), 1, "{state}");
+}
+
 #[tokio::test]
 async fn crawl_char_budget_caps_total() {
     let big = html("Big", &"word ".repeat(5000));
@@ -2405,6 +2144,7 @@ fn concurrent_issues_survive_each_other() {
                     queue: Vec::new(),
                     seen: Vec::new(),
                     denied: Default::default(),
+                    depth_cut: Vec::new(),
                 };
                 super::resume_store_issue(&tok, &state);
                 barrier.wait();
@@ -2508,6 +2248,7 @@ async fn wave450_invalid_seed_does_not_consume_a_resume_token() {
         queue: Vec::new(),
         seen: Vec::new(),
         denied: Default::default(),
+        depth_cut: Vec::new(),
     };
     super::resume_store_issue(token, &state);
     let site = MockSite::new();
@@ -3167,12 +2908,10 @@ async fn map_mode_failed_seed_replaces_the_empty_map_row() {
     assert!(failure.has_sitemap_phase);
 }
 
-// Map mode's rendered read of a thin seed honors the seed's robots
-// verdict: a seed robots.txt disallows is neither fetched nor rendered.
-// map_mode_merges_a_rendered_inventory_when_static_is_thin is the
-// negative case (robots allow, one render).
+// Map mode honors the seed's robots verdict: a seed robots.txt
+// disallows is not mapped.
 #[tokio::test]
-async fn map_mode_never_renders_a_robots_refused_seed() {
+async fn map_mode_never_maps_a_robots_refused_seed() {
     let (fetch, _) = MockSite::new()
         .page(
             "https://ex.com/robots.txt",
@@ -3181,26 +2920,12 @@ async fn map_mode_never_renders_a_robots_refused_seed() {
         )
         .page("https://ex.com/", 200, &linking_page("Seed", &["/a"]))
         .fetcher();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_in = Arc::clone(&calls);
     let mut o = opts();
     o.mode = CrawlMode::Map;
-    o.deadline = Duration::from_secs(120); // the render guard needs headroom
-    o.render_html = Some(Arc::new(move |_url: String| {
-        let calls = Arc::clone(&calls_in);
-        Box::pin(async move {
-            calls.fetch_add(1, Ordering::Relaxed);
-            Some((
-                "<html><body><a href=\"/c\">C</a></body></html>".to_string(),
-                "https://ex.com/".to_string(),
-            ))
-        })
-    }));
     let r = Crawler::new(fetch, gov())
         .crawl("https://ex.com/", o, None)
         .await
         .unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 0, "no render");
     assert!(r.map.is_empty());
     assert_eq!(
         r.seed_failure.and_then(|f| f.robots),
@@ -3228,6 +2953,7 @@ fn a_resume_state_without_denials_still_loads() {
         queue: Vec::new(),
         seen: Vec::new(),
         denied: denied.clone(),
+        depth_cut: Vec::new(),
     };
     let back: super::ResumeState =
         serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
@@ -3287,6 +3013,7 @@ fn resume_store_peek_reads_the_seed_without_consuming_the_token() {
         queue: Vec::new(),
         seen: Vec::new(),
         denied: Default::default(),
+        depth_cut: Vec::new(),
     };
     super::resume_store_issue(token, &state);
     assert_eq!(
@@ -3372,6 +3099,287 @@ async fn reliability_small_page_and_total_caps_are_hard() {
     assert_eq!(r.pages.len(), 1);
     assert!(r.pages[0].chars <= 100, "{}", r.pages[0].chars);
     assert!(r.pages[0].next_offset.is_some());
+}
+
+// ── Depth limit ───────────────────────────────────────────
+
+/// `https://ex.com/` links `/d1`, `/d1` links `/d2`, and so on down to
+/// `/d{deepest}`, which links nothing.
+fn depth_chain(deepest: usize) -> MockSite {
+    let path = |i: usize| {
+        if i == 0 {
+            "/".to_string()
+        } else {
+            format!("/d{i}")
+        }
+    };
+    let mut site = MockSite::new();
+    for i in 0..deepest {
+        site = site.page(
+            &format!("https://ex.com{}", path(i)),
+            200,
+            &linking_page(&format!("page {i}"), &[&path(i + 1)]),
+        );
+    }
+    site.page(
+        &format!("https://ex.com{}", path(deepest)),
+        200,
+        &html("Deepest", "the end of the chain"),
+    )
+}
+
+fn depth_opts(max_depth: u32) -> CrawlOptions {
+    CrawlOptions {
+        mode: CrawlMode::Content,
+        max_pages: 10,
+        max_depth,
+        ..opts()
+    }
+}
+
+// max_depth 2 reads `/`, `/d1` and `/d2`, and `/d2` links `/d3`: the
+// frontier drains, but the reachable scope was not read.
+#[tokio::test]
+async fn a_crawl_cut_by_max_depth_stops_depth_limit() {
+    let (fetch, hits) = depth_chain(3).fetcher();
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", depth_opts(2), None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(got.len(), 3, "pages={got:?}");
+    assert_eq!(hits_matching(&hits, "/d3"), 0, "/d3 is past max_depth");
+    assert_eq!(
+        r.stop,
+        StopReason::DepthLimit,
+        "pages={got:?} skipped={:?} queued={:?}",
+        r.skipped,
+        r.queued
+    );
+    assert_eq!(r.depth_cut, ["https://ex.com/d3"]);
+    assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+    assert!(r.resume.is_none(), "nothing was queued to resume");
+}
+
+// Negative: a site whose last page sits within max_depth, read with the
+// limit at that page or past it, drains as a complete read.
+#[tokio::test]
+async fn a_crawl_that_reads_its_scope_within_max_depth_stays_frontier_empty() {
+    for (deepest, max_depth) in [(2, 2), (3, 3), (2, 8)] {
+        let (fetch, hits) = depth_chain(deepest).fetcher();
+        let r = Crawler::new(fetch, gov())
+            .crawl("https://ex.com/", depth_opts(max_depth), None)
+            .await
+            .unwrap();
+        let case = format!("deepest={deepest} max_depth={max_depth}");
+        assert_eq!(r.pages.len(), deepest + 1, "{case}");
+        assert_eq!(hits_matching(&hits, &format!("/d{deepest}")), 1, "{case}");
+        assert_eq!(
+            r.stop,
+            StopReason::FrontierEmpty,
+            "{case}: {:?}",
+            r.depth_cut
+        );
+        assert!(r.depth_cut.is_empty(), "{case}: {:?}", r.depth_cut);
+    }
+}
+
+// Negative: at the limit, a link the harvest would not have queued is no
+// cut: already seen (fetched or queued, fragment or not), another host,
+// excluded, disallowed by robots.txt, a translated variant of a fetched
+// page, or not a web link.
+#[tokio::test]
+async fn links_the_harvest_would_not_queue_are_not_depth_cut() {
+    let (fetch, hits) = MockSite::new()
+        .page(
+            "https://ex.com/robots.txt",
+            200,
+            "User-agent: *\nDisallow: /private/\n",
+        )
+        .page(
+            "https://ex.com/",
+            200,
+            &linking_page("root", &["/d1", "/side"]),
+        )
+        .page(
+            "https://ex.com/side",
+            200,
+            &html("Side", "linked by the seed"),
+        )
+        .page("https://ex.com/d1", 200, &linking_page("d1", &["/d2"]))
+        .page(
+            "https://ex.com/d2",
+            200,
+            &linking_page(
+                "d2",
+                &[
+                    "/",
+                    "/d1",
+                    "/side",
+                    "/d1#part",
+                    "https://other.example/x",
+                    "/skip/me",
+                    "/private/p",
+                    "/de/d1",
+                    "mailto:team@ex.com",
+                ],
+            ),
+        )
+        .fetcher();
+    let o = CrawlOptions {
+        exclude_paths: vec!["/skip/*".into()],
+        ..depth_opts(2)
+    };
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.pages.len(), 4, "{:?}", r.skipped);
+    assert!(r.depth_cut.is_empty(), "{:?}", r.depth_cut);
+    assert_eq!(r.stop, StopReason::FrontierEmpty);
+    for never in ["other.example", "/skip/", "/private/", "/de/"] {
+        assert_eq!(hits_matching(&hits, never), 0, "{never}");
+    }
+}
+
+// Negative: a link a local rule refuses is no cut, since the harvest
+// would have refused it too. Control: the same link without the rule.
+#[tokio::test]
+async fn a_rule_denied_link_at_the_limit_is_not_depth_cut() {
+    let site = || {
+        MockSite::new()
+            .page("https://ex.com/", 200, &linking_page("root", &["/d1"]))
+            .page(
+                "https://ex.com/d1",
+                200,
+                &linking_page("d1", &["https://blocked.example/x"]),
+            )
+            .fetcher()
+            .0
+    };
+    let o = CrawlOptions {
+        same_host: false,
+        respect_robots: false,
+        ..depth_opts(1)
+    };
+    let r = Crawler::new(site(), gov())
+        .with_rules(deny_rules(&[("blocked.example", None)]))
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    assert!(r.depth_cut.is_empty(), "{:?}", r.depth_cut);
+    assert_eq!(r.stop, StopReason::FrontierEmpty);
+
+    let r = Crawler::new(site(), gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.depth_cut, ["https://blocked.example/x"]);
+    assert_eq!(r.stop, StopReason::DepthLimit);
+}
+
+// Below the seed the focus gate drops links that do not match: at the
+// limit those are no cut, a matching one is.
+#[tokio::test]
+async fn the_focus_gate_applies_at_the_limit() {
+    async fn focus_crawl(at_limit: &[&str]) -> super::CrawlResult {
+        let (fetch, hits) = MockSite::new()
+            .page("https://ex.com/", 200, &linking_page("root", &["/alpha-1"]))
+            .page(
+                "https://ex.com/alpha-1",
+                200,
+                &linking_page("alpha one", at_limit),
+            )
+            .fetcher();
+        let o = CrawlOptions {
+            focus: Some("alpha".into()),
+            ..depth_opts(1)
+        };
+        let r = Crawler::new(fetch, gov())
+            .crawl("https://ex.com/", o, None)
+            .await
+            .unwrap();
+        assert_eq!(hits_matching(&hits, "/alpha-1"), 1);
+        r
+    }
+    let r = focus_crawl(&["/beta"]).await;
+    assert!(r.depth_cut.is_empty(), "{:?}", r.depth_cut);
+    assert_eq!(r.stop, StopReason::FrontierEmpty);
+
+    let r = focus_crawl(&["/beta", "/alpha-2"]).await;
+    assert_eq!(r.depth_cut, ["https://ex.com/alpha-2"]);
+    assert_eq!(r.stop, StopReason::DepthLimit);
+}
+
+// Full mode queues sitemap entries at depth 1. Under max_depth 0 they
+// are the depth cut, never fetched and not a skip row each.
+#[tokio::test]
+async fn sitemap_entries_past_max_depth_zero_are_the_depth_cut() {
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/", 200, &html("Home", "the seed page"))
+        .page(
+            "https://ex.com/sitemap.xml",
+            200,
+            "<urlset><url><loc>https://ex.com/a</loc></url>\
+             <url><loc>https://ex.com/b</loc></url></urlset>",
+        )
+        .page("https://ex.com/a", 200, &html("A", "page a"))
+        .page("https://ex.com/b", 200, &html("B", "page b"))
+        .fetcher();
+    let o = CrawlOptions {
+        mode: CrawlMode::Full,
+        ..depth_opts(0)
+    };
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.pages.len(), 1);
+    assert_eq!(hits_matching(&hits, "ex.com/a"), 0);
+    assert_eq!(hits_matching(&hits, "ex.com/b"), 0);
+    assert!(
+        r.skipped.iter().all(|(_, why)| !why.contains("depth")),
+        "{:?}",
+        r.skipped
+    );
+    assert_eq!(r.depth_cut, ["https://ex.com/a", "https://ex.com/b"]);
+    assert_eq!(r.stop, StopReason::DepthLimit);
+}
+
+// A resumed crawl keeps the earlier run's depth cut: run 1 cuts the link
+// under the one page it reads past the seed and stops on its page budget,
+// run 2 reads the other page and drains. Uses the resume store under the
+// per-process test cache root, so it depends on nextest's
+// process-per-test.
+#[tokio::test]
+async fn a_resumed_crawl_keeps_the_earlier_depth_cut() {
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/", 200, &linking_page("root", &["/a", "/b"]))
+        .page("https://ex.com/a", 200, &linking_page("a", &["/deep-a"]))
+        .page("https://ex.com/b", 200, &linking_page("b", &["/deep-b"]))
+        .fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let o = CrawlOptions {
+        max_pages: 2,
+        ..depth_opts(1)
+    };
+    let r1 = crawler
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(r1.stop, StopReason::MaxPages);
+    assert_eq!(r1.depth_cut.len(), 1, "{:?}", r1.depth_cut);
+    let token = r1.resume.expect("stopped with a page queued");
+
+    let o = CrawlOptions { max_pages: 10, ..o };
+    let r2 = crawler.crawl("", o, Some(&token)).await.unwrap();
+    assert_eq!(r2.pages.len(), 1);
+    assert_eq!(
+        r2.depth_cut,
+        ["https://ex.com/deep-a", "https://ex.com/deep-b"]
+    );
+    assert_eq!(r2.stop, StopReason::DepthLimit);
+    assert_eq!(hits_matching(&hits, "/deep-"), 0);
 }
 
 #[tokio::test]
@@ -3491,4 +3499,389 @@ async fn reliability_map_limit_can_expand_without_false_completeness() {
     assert_eq!(r.map.len(), 450);
     assert!(r.inventory.complete);
     assert_eq!(r.stop, StopReason::FrontierEmpty);
+}
+
+// ── Locale dedup key ───────────────────────────────────────────
+// The translated-variant dedup merges URLs that differ only in a locale
+// prefix, and same-site twins (a `www.` host, plain http on an https
+// seed's host). The query, the host, the port and the path's case keep
+// pages apart.
+
+fn site_with(pages: &[(&str, String)]) -> MockSite {
+    let mut site = MockSite::new();
+    for (url, body) in pages {
+        site = site.page(url, 200, body);
+    }
+    site
+}
+
+// Query-addressed pages on one path are distinct pages: forum topics,
+// `?page=N` pagination, `index.php?title=` wikis. A path-only key
+// filtered every one after the first as a "translated variant".
+#[tokio::test]
+async fn query_variants_of_one_path_are_all_crawled() {
+    let seed = linking_page("forum", &["/topic?id=1", "/topic?id=2", "/topic?id=3"]);
+    let mut pages = vec![("https://ex.com/", seed)];
+    let bodies: Vec<(String, String)> = (1..=3)
+        .map(|i| {
+            (
+                format!("https://ex.com/topic?id={i}"),
+                html(&format!("Topic {i}"), &format!("distinct topic number {i}")),
+            )
+        })
+        .collect();
+    for (u, b) in &bodies {
+        pages.push((u.as_str(), b.clone()));
+    }
+    let (fetch, hits) = site_with(&pages).fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        hits_matching(&hits, "/topic?id="),
+        3,
+        "every topic must be fetched; pages={got:?} stop={:?} filtered_out={} skipped={:?} queued={:?}",
+        r.stop,
+        r.filtered_out,
+        r.skipped,
+        r.queued
+    );
+}
+
+// `<link rel="next">` pagination by query string is followed. Page 2
+// has the seed's own path, which a path-only key dropped at harvest.
+#[tokio::test]
+async fn query_pagination_is_followed() {
+    let p1 = "<html><head><title>list p1</title><link rel=\"next\" href=\"/news/list?page=2\"/></head><body><article><p>first page of the list with enough words for the extractor threshold pass</p></article></body></html>";
+    let p2 = "<html><head><title>list p2</title><link rel=\"next\" href=\"/news/list?page=3\"/></head><body><article><p>second page of the list with different words for the extractor threshold</p></article></body></html>";
+    let p3 = "<html><head><title>list p3</title></head><body><article><p>third page of the list with yet other words for the extractor threshold pass</p></article></body></html>";
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/news/list", 200, p1)
+        .page("https://ex.com/news/list?page=2", 200, p2)
+        .page("https://ex.com/news/list?page=3", 200, p3)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/news/list", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "page=2") == 1 && hits_matching(&hits, "page=3") == 1,
+        "rel=next pages must be fetched; pages={got:?} stop={:?} filtered_out={}",
+        r.stop,
+        r.filtered_out
+    );
+}
+
+// Map mode keeps every query-addressed sitemap entry. A path-only key
+// collapsed them to the first.
+#[tokio::test]
+async fn map_keeps_query_addressed_sitemap_entries() {
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/product?id=1</loc></url>\
+        <url><loc>https://ex.com/product?id=2</loc></url>\
+        <url><loc>https://ex.com/product?id=3</loc></url>\
+        </urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.map.len(),
+        3,
+        "three distinct sitemap URLs, map={:?} inventory.complete={}",
+        r.map,
+        r.inventory.complete
+    );
+}
+
+// With same_host=false, each linked host's "/" is its own page. A
+// path-only key treated every other host's "/" as a "translated variant"
+// of the seed's.
+#[tokio::test]
+async fn any_host_crawl_fetches_each_hosts_root() {
+    let seed = linking_page("hub", &["https://other.example/", "https://third.example/"]);
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/", 200, &seed)
+        .page(
+            "https://other.example/",
+            200,
+            &html("Other", "other site home"),
+        )
+        .page(
+            "https://third.example/",
+            200,
+            &html("Third", "third site home"),
+        )
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.same_host = false;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "https://other.example/") >= 1
+            && hits_matching(&hits, "https://third.example/") >= 1,
+        "linked hosts' home pages must be fetched; pages={got:?} filtered_out={} hits={:?}",
+        r.filtered_out,
+        hits.lock().unwrap()
+    );
+}
+
+// Full mode seeds the frontier from the sitemap through the same key,
+// so query-addressed sitemap entries are all fetched.
+#[tokio::test]
+async fn full_mode_seeds_every_query_addressed_sitemap_entry() {
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/product?id=1</loc></url>\
+        <url><loc>https://ex.com/product?id=2</loc></url>\
+        <url><loc>https://ex.com/product?id=3</loc></url>\
+        </urlset>";
+    let mut site = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &html("Shop", "shop home without links"),
+        )
+        .page("https://ex.com/sitemap.xml", 200, sitemap);
+    for i in 1..=3 {
+        site = site.page(
+            &format!("https://ex.com/product?id={i}"),
+            200,
+            &html(&format!("Product {i}"), &format!("product number {i}")),
+        );
+    }
+    let (fetch, hits) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        hits_matching(&hits, "/product?id="),
+        3,
+        "pages={got:?} stop={:?} hits={:?}",
+        r.stop,
+        hits.lock().unwrap()
+    );
+}
+
+// Map mode without a sitemap falls back to the seed page's links, through
+// the same key, so query-addressed links are all mapped.
+#[tokio::test]
+async fn map_seed_links_keep_query_addressed_pages() {
+    let (fetch, _) = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &linking_page("hub", &["/p?id=1", "/p?id=2", "/p?id=3"]),
+        )
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.map.iter().filter(|u| u.contains("/p?id=")).count(),
+        3,
+        "map={:?}",
+        r.map
+    );
+}
+
+// Both sides of the locale key in one test. URLs that differ only in a
+// locale prefix are still one page, fetched once and mapped once: the
+// negative case, which fails if the key stops cutting the prefix. The
+// query keeps translated pages with different ids apart: /de/item?id=2
+// fails on a path-only key.
+#[tokio::test]
+async fn translated_variants_still_collapse_to_one_page() {
+    let variants = [
+        "/en/guide",
+        "/de/guide",
+        "/fr/guide",
+        "/en/item?id=1",
+        "/de/item?id=1",
+        "/de/item?id=2",
+    ];
+    let hub = linking_page("hub", &variants);
+    let mut site = MockSite::new().page("https://ex.com/", 200, &hub);
+    for (i, path) in variants.iter().enumerate() {
+        site = site.page(
+            &format!("https://ex.com{path}"),
+            200,
+            &html(
+                &format!("Variant {i}"),
+                &format!("distinct body number {i}"),
+            ),
+        );
+    }
+    let (fetch, hits) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "/guide") == 1
+            && hits_matching(&hits, "/item?id=1") == 1
+            && hits_matching(&hits, "/item?id=2") == 1,
+        "one fetch per translated page; pages={got:?} hits={:?}",
+        hits.lock().unwrap()
+    );
+    assert_eq!(r.filtered_out, 3, "pages={got:?}");
+
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/en/guide</loc></url>\
+        <url><loc>https://ex.com/de/guide</loc></url>\
+        <url><loc>https://ex.com/en/item?id=1</loc></url>\
+        <url><loc>https://ex.com/de/item?id=1</loc></url>\
+        <url><loc>https://ex.com/en/item?id=2</loc></url>\
+        </urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.map.len(), 3, "map={:?}", r.map);
+    assert!(
+        r.map.iter().any(|u| u.ends_with("/item?id=2")),
+        "map={:?}",
+        r.map
+    );
+}
+
+// Negative case for the URL key: same-site twins of one page, a
+// `www.` host and plain http on the seed's host under an https seed, are
+// still one page, fetched once and mapped once, as under a path-only
+// key. Path case is not a twin (see `frontier::locale_canonical`).
+#[tokio::test]
+async fn same_site_twins_are_fetched_once() {
+    let twins = [
+        "/a",
+        "https://www.ex.com/a",
+        "http://ex.com/a",
+        "http://www.ex.com/a",
+    ];
+    let mut links = twins.to_vec();
+    links.push("/b");
+    let same = html("Page A", "the one page a");
+    let mut site = MockSite::new()
+        .page("https://ex.com/", 200, &linking_page("hub", &links))
+        .page("https://ex.com/b", 200, &html("Page B", "page b"));
+    for twin in ["https://ex.com/a", twins[1], twins[2], twins[3]] {
+        site = site.page(twin, 200, &same);
+    }
+    let (fetch, hits) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "ex.com/a") == 1 && hits_matching(&hits, "ex.com/b") == 1,
+        "one fetch per page; pages={got:?} skipped={:?} hits={:?}",
+        r.skipped,
+        hits.lock().unwrap()
+    );
+    assert_eq!(got.len(), 3, "seed, one twin of /a, /b: pages={got:?}");
+    assert!(!r.pages.iter().any(|p| p.duplicate), "pages={got:?}");
+
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/a</loc></url>\
+        <url><loc>https://www.ex.com/a</loc></url>\
+        <url><loc>http://ex.com/a</loc></url>\
+        <url><loc>https://ex.com/b</loc></url>\
+        </urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.map, ["https://ex.com/a", "https://ex.com/b"]);
+}
+
+// A gate rides each worker request into the fetch layer, which can hold
+// the request after the crawl has returned.
+#[tokio::test]
+async fn a_redirect_gate_keeps_the_scope_and_none_of_the_callbacks() {
+    use tokio::sync::mpsc::error::TryRecvError;
+    let (fetch, _) = MockSite::new()
+        .page(
+            "https://ex.com/robots.txt",
+            200,
+            "User-agent: *\nDisallow: /docs/blocked\n",
+        )
+        .fetcher();
+    let (sink, mut beats) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let options = CrawlOptions {
+        same_host: true,
+        respect_robots: true,
+        include_paths: vec!["/docs/*".into()],
+        exclude_paths: vec!["/docs/private/*".into()],
+        progress: Some(Arc::new(move |done, _queued| {
+            let _ = sink.send(done);
+        })),
+        ..opts()
+    };
+    let gate = super::build_redirect_gate(
+        &fetch,
+        &Arc::new(super::sitemap::RobotsCache::new()),
+        &gov(),
+        "ex.com",
+        &options,
+    )
+    .expect("a crawl gate");
+    drop(options);
+    assert_eq!(
+        beats.try_recv(),
+        Err(TryRecvError::Disconnected),
+        "the gate keeps the crawl's progress sink alive"
+    );
+    // The gate still rules on every part of the scope it was built from.
+    let allows = |url: &str| gate(url.parse().unwrap());
+    assert!(allows("https://ex.com/docs/a").await);
+    assert!(!allows("https://other.com/docs/a").await, "same host");
+    assert!(!allows("https://ex.com/blog/a").await, "include_paths");
+    assert!(
+        !allows("https://ex.com/docs/private/a").await,
+        "exclude_paths"
+    );
+    assert!(!allows("https://ex.com/docs/blocked").await, "robots");
 }

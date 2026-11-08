@@ -184,6 +184,19 @@ pub fn skip(el: ElementRef<'_>) -> bool {
     if name == "math" {
         return false;
     }
+    if inline_popup(el) {
+        return true;
+    }
+    // An inactive tab is hidden until its tab is clicked: its panel is
+    // the page's content all the same (a pricing page's other plans).
+    // A carousel's cloned slide copies a real one and stays skipped.
+    if e.attr("role") == Some("tabpanel")
+        && !e
+            .attr("class")
+            .is_some_and(|c| c.to_ascii_lowercase().contains("clone"))
+    {
+        return false;
+    }
     if e.attr("hidden").is_some() && !has_math_descendant(el) {
         return true;
     }
@@ -222,6 +235,30 @@ pub fn skip(el: ElementRef<'_>) -> bool {
         }
     }
     false
+}
+
+/// A hover popup inside running text: a glossary definition or tooltip
+/// (`<span class="term-ref">subject<span class="term-tip">…</span></span>`)
+/// that a browser shows only on hover. Read inline it splices the
+/// definition into the sentence. Only a span whose class names a tooltip,
+/// popover or tip and whose parent is itself inline: a "tip" callout box
+/// in a document is a block and stays.
+fn inline_popup(el: ElementRef<'_>) -> bool {
+    let e = el.value();
+    if e.name() != "span" {
+        return false;
+    }
+    let popup = e.classes().any(|c| {
+        let c = c.to_ascii_lowercase();
+        c.contains("tooltip")
+            || c.contains("popover")
+            || c.split(['-', '_']).any(|part| part == "tip")
+    });
+    popup
+        && el
+            .parent()
+            .and_then(ElementRef::wrap)
+            .is_some_and(|p| crate::extract::blocks::INLINE_TAGS.contains(&p.value().name()))
 }
 
 /// Class/id heuristic: LIKELY boilerplate. Caller decides
@@ -302,6 +339,52 @@ mod ad_slot_tests {
         let root = document.root_element();
         let el = root.children().filter_map(ElementRef::wrap).next().unwrap();
         skip(el)
+    }
+
+    #[test]
+    fn an_inline_glossary_popup_is_not_read_into_the_sentence() {
+        let html = Html::parse_fragment(
+            r#"<p>shall be <span class="term-ref">subject<span class="term-tip"><span>subject</span><span>for the purpose of testing, means a person</span></span></span> to fines</p>"#,
+        );
+        let tip = html
+            .select(&scraper::Selector::parse(".term-tip").unwrap())
+            .next()
+            .unwrap();
+        assert!(skip(tip));
+        let p = html
+            .select(&scraper::Selector::parse("p").unwrap())
+            .next()
+            .unwrap();
+        let opts = crate::extract::ExtractOptions::default();
+        assert_eq!(
+            crate::extract::inline::markdown(p, "https://example.com/", &opts).0,
+            "shall be subject to fines"
+        );
+        // A tip callout is a block of the document, and a span that is not
+        // nested in running text is not a popup.
+        assert!(!skipped(r#"<div class="tip"><p>Run it twice.</p></div>"#));
+        assert!(!skipped(r#"<span class="tooltip-host">Hover me</span>"#));
+    }
+
+    #[test]
+    fn an_inactive_tab_panel_is_content() {
+        assert!(!skipped(
+            r#"<div role="tabpanel" aria-hidden="true" inert=""><table><tr><td>CPU time</td><td>$0.02</td></tr></table></div>"#
+        ));
+        assert!(!skipped(
+            r#"<div role="tabpanel" hidden><p>Annual plans</p></div>"#
+        ));
+        assert!(!skipped(
+            r#"<div role="tabpanel" style="display:none"><p>Annual plans</p></div>"#
+        ));
+        // Hidden content that is not a tab panel stays out, and so does a
+        // carousel's clone of a slide.
+        assert!(skipped(
+            r#"<div aria-hidden="true"><p>Annual plans</p></div>"#
+        ));
+        assert!(skipped(
+            r#"<div role="tabpanel" class="slick-slide slick-cloned" aria-hidden="true"><p>Slide</p></div>"#
+        ));
     }
 
     // #288: ad slots never ship as content.

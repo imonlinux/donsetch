@@ -1,13 +1,15 @@
 //! DonSift : the extraction engine of DonSeTch.
 //!
 //! HTML bytes in → agent-native markdown out. Block model, not
-//! article text: typed blocks with heading breadcrumbs power BM25
-//! focus, stable pagination, and token-war rendering policies.
+//! article text: typed blocks with heading breadcrumbs power crawl's
+//! BM25 focus, stable pagination, and token-war rendering policies.
+//! `web_fetch` views the extracted markdown through [`view`].
 //!
 //! Pipeline: decode charset → parse once (no mutation) → metadata →
-//! scope (selector or density-scored main) → segment blocks →
-//! focus filter → render markdown → paginate.
+//! density-scored main → segment blocks → focus filter → render
+//! markdown → paginate.
 
+mod amount;
 pub mod blocks;
 pub mod charset;
 pub mod fallback;
@@ -25,69 +27,33 @@ pub mod quality;
 pub mod reddit;
 pub mod render;
 pub mod score;
+pub mod view;
 
 #[cfg(test)]
 mod tests;
 
 use scraper::Html;
 
+/// How to extract a document. `web_fetch`'s views (outline, section, focus
+/// passages, must_contain) project the extracted markdown afterwards, in
+/// [`view`]; crawl narrows each page with `focus` here.
 #[derive(Default, Clone)]
 pub struct ExtractOptions {
-    /// Preserve selected HTML body text, order and repetitions without token-saving cleanup.
-    pub faithful: bool,
     /// BM25 relevance query: keep only blocks matching, with context.
     pub focus: Option<String>,
-    /// CSS selector: extract only from matching subtrees.
-    pub selector: Option<String>,
     /// Max chars of markdown to return (default 16_000).
     pub max_chars: Option<usize>,
     /// Resume offset into the (post-focus) markdown.
     pub offset: usize,
     /// Keep [text](url) links; default strips to text (token saver).
     pub include_links: bool,
-    /// Keep ![alt](src) media lines; default drops them.
-    pub include_media: bool,
-    /// Outline only: heading tree, no body text. Lets an
-    /// agent read structure first, then target a section.
-    pub toc: bool,
-    /// Scope to one heading section (substring, case-
-    /// insensitive). Pairs with toc.
-    pub section: Option<String>,
-    /// Probe (v3): verification query : when set, the extraction
-    /// runs in full but the output is reduced to hit/no-hit plus
-    /// short context excerpts around matches. The page never
-    /// enters the agent's context wholesale. Case-insensitive
-    /// substring; `/re/` syntax = regex.
-    pub must_contain: Option<String>,
-}
-
-impl ExtractOptions {
-    /// A regex probe: `must_contain` wrapped in slashes.
-    pub fn probe_is_regex(&self) -> bool {
-        self.must_contain.as_deref().is_some_and(|m| {
-            if !m.starts_with('/') || m.len() < 3 {
-                return false;
-            }
-            let inner = &m[1..];
-            match inner.rfind('/') {
-                Some(pos) if pos >= 1 => inner[pos + 1..].chars().all(char::is_alphabetic),
-                _ => false,
-            }
-        })
-    }
-
-    /// The probe pattern with regex slashes and trailing flags stripped.
-    pub fn probe_pattern(&self) -> &str {
-        match &self.must_contain {
-            Some(m) if self.probe_is_regex() => {
-                let inner = &m[1..];
-                let at = inner.rfind('/').unwrap_or(inner.len());
-                &inner[..at]
-            }
-            Some(m) => m,
-            None => "",
-        }
-    }
+    /// Keep links as their real addresses. The default hands the caller
+    /// short handles in their place, once the document is rendered.
+    pub link_urls: bool,
+    /// The fetch layer verified this body as content: bot-wall markers in it
+    /// (an interstitial's words, a vendor script) are not a wall. Login walls
+    /// and paywalls are still reported.
+    pub verified: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -117,18 +83,28 @@ pub struct Extracted {
     pub focus_omitted: bool,
     /// Rough token estimate (chars / 4) of the returned markdown.
     pub tokens_est: usize,
-    /// True when the page was large but almost no content
-    /// extracted : a JS shell. Tier 2's job.
+    /// True when the read is not the page's content: an app shell, a
+    /// sign-in gate, a loading placeholder or a notice standing in for
+    /// it. For an HTML document this is the substance verdict in `page`,
+    /// never a size: a short page with real content is not thin.
     pub thin: bool,
+    /// The substance verdict for the HTML document this read came from
+    /// (`detect::substance`). None when the text did not come from the
+    /// document's DOM: a PDF, a feed, an adapter or embedded data.
+    pub page: Option<crate::detect::substance::Verdict>,
     /// Best-guess content kind from block composition.
     /// Conservative: only non-Page when confident.
     pub content_kind: ContentKind,
-    /// Declared primary language subtag, or "unknown" without a declaration.
+    /// Where `lang` came from: "html_lang" or "meta" (a declaration, which
+    /// can be wrong), or None when the page declared nothing. Without a
+    /// declaration `lang` is "unknown" rather than a guess from the script.
+    pub lang_source: Option<&'static str>,
+    /// Dominant writing script actually observed in the text, independent of
+    /// any declaration (drives tokenization: CJK, Devanagari, Latin).
+    pub script: Option<language::Script>,
+    /// Detected language (BCP-47 code: "en", "zh", "ja", etc.).
     #[allow(dead_code)]
     pub lang: String,
-    pub lang_source: Option<&'static str>,
-    /// Observed dominant writing script, independent of language.
-    pub script: Option<language::Script>,
     /// Quality score 0.0..1.0 : content density, metadata
     /// completeness, structure diversity. Helps agents
     /// decide if content is trustworthy.
@@ -168,11 +144,6 @@ pub enum ContentKind {
 #[derive(Debug)]
 pub enum ExtractError {
     Wall(crate::detect::walls::Verdict),
-    BadSelector(String),
-    SelectorNoMatch {
-        selector: String,
-        inspected: usize,
-    },
     /// The body was refused (nesting gate) or the parse did not finish off the worker (budget, or the task died).
     Failed(String),
 }
@@ -181,14 +152,6 @@ impl std::fmt::Display for ExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExtractError::Wall(v) => write!(f, "access wall: {v:?}"),
-            ExtractError::BadSelector(s) => write!(f, "invalid CSS selector: {s}"),
-            ExtractError::SelectorNoMatch {
-                selector,
-                inspected,
-            } => write!(
-                f,
-                "CSS selector {selector:?} matched no elements ({inspected} inspected)"
-            ),
             ExtractError::Failed(s) => write!(f, "{s}"),
         }
     }
@@ -397,18 +360,8 @@ pub fn extract(
     let ct = content_type.to_lowercase();
     let is_pdf = body.len() >= 5 && body.starts_with(b"%PDF-") || ct.contains("pdf");
 
-    if let Some(selector) = &opts.selector {
-        scraper::Selector::parse(selector)
-            .map_err(|_| ExtractError::BadSelector(selector.clone()))?;
-        if is_pdf || (!ct.contains("html") && !body_starts_with_html(body)) {
-            return Err(ExtractError::SelectorNoMatch {
-                selector: selector.clone(),
-                inspected: 0,
-            });
-        }
-    }
-
     if !is_pdf
+        && !opts.verified
         && body_starts_with_html(body)
         && let Some(vendor) = crate::detect::walls::detect_interstitial(body)
     {
@@ -417,7 +370,7 @@ pub fn extract(
         ));
     }
 
-    if opts.selector.is_none() && !is_pdf && (ct.contains("xml") || body.starts_with(b"<?xml")) {
+    if !is_pdf && (ct.contains("xml") || body.starts_with(b"<?xml")) {
         let text = charset::decode(body, content_type);
         let mut entries = Vec::new();
         crate::crawl::sitemap::parse_sitemap(&text, &mut entries, 10_000);
@@ -426,19 +379,9 @@ pub fn extract(
                 .iter()
                 .map(|e| format!("- {}\n", e.loc))
                 .collect::<String>();
-            // The inventory is generated text, so the plain-text notice
-            // (its size, curl advice) would describe the wrong bytes.
-            let mut ex = extract(
-                inventory.as_bytes(),
-                "text/plain; charset=utf-8",
-                url,
-                &without_read_filters(opts),
-            )?;
+            let mut ex = extract(inventory.as_bytes(), "text/plain; charset=utf-8", url, opts)?;
             ex.via = Some("format:sitemap");
             ex.content_kind = ContentKind::Listing;
-            note_skipped_filters(&mut ex, opts, || {
-                "sitemap, shown as its URL list : filtering it is not supported".to_string()
-            });
             return Ok(ex);
         }
     }
@@ -446,10 +389,9 @@ pub fn extract(
     // Feeds (RSS/Atom/JSON Feed): structured rendering, never a
     // raw XML blob. Checked BEFORE passthrough : feed content
     // types (text/xml, application/rss+xml…) never say "html".
-    if opts.selector.is_none()
-        && !is_pdf
+    if !is_pdf
         && feed::is_feed(&ct, body)
-        && let Some(ex) = feed::extract(body, url, opts)
+        && let Some(ex) = feed::extract(body, content_type, url, opts)
     {
         return Ok(ex);
     }
@@ -458,10 +400,7 @@ pub fn extract(
     // registry's URL rewrites (reddit .json, package APIs) render
     // structured : BEFORE the non-HTML passthrough so adapter JSON
     // never dumps raw.
-    if opts.selector.is_none()
-        && !is_pdf
-        && let Some(ex) = crate::adapters::extract_json(body, &ct, url, opts)
-    {
+    if !is_pdf && let Some(ex) = crate::adapters::extract_json(body, &ct, url, opts) {
         return Ok(ex);
     }
 
@@ -472,45 +411,16 @@ pub fn extract(
         !ct.is_empty() && !ct.contains("html") && !is_pdf && body_starts_with_html(body);
 
     if !ct.is_empty() && !ct.contains("html") && !is_pdf && !plain_is_html {
-        // Probe applies to non-HTML bodies too. A must_contain on a
-        // text/plain or json/xml response returns MATCH/NO-MATCH plus
-        // excerpts like the HTML path, never the full document.
-        let text = String::from_utf8_lossy(body);
-        if let Some(v) = crate::detect::walls::text_wall(&text) {
-            return Err(ExtractError::Wall(v));
-        }
-        if let Some(pattern) = &opts.must_contain
-            && !pattern.trim().is_empty()
+        let text = charset::decode_declared(body, content_type);
+        if let Some(v) = crate::detect::walls::text_wall(&text)
+            && !(opts.verified && bot_wall(v))
         {
-            let md = probe_render(&text, opts.probe_pattern(), opts.probe_is_regex());
-            return Ok(Extracted {
-                tokens_est: md.len() / 4,
-                total_chars: text.len(),
-                markdown: md,
-                title: None,
-                byline: None,
-                published: None,
-                site: None,
-                next_offset: None,
-                thin: false,
-                content_kind: ContentKind::Page,
-                blocks_total: 1,
-                blocks_shown: 1,
-                focus_omitted: false,
-                lang: "unknown".to_string(),
-                lang_source: None,
-                script: None,
-                quality: 1.0,
-                pdf_pages: None,
-                images: vec![],
-                fingerprint: None,
-                via: Some("format:text"),
-                partial: None,
-            });
+            return Err(ExtractError::Wall(v));
         }
         let (slice, next) = paginate(&text, opts.offset, max_chars);
 
-        let mut ex = Extracted {
+        return Ok(Extracted {
+            page: None,
             tokens_est: slice.len() / 4,
             total_chars: text.len(),
             markdown: slice,
@@ -525,6 +435,7 @@ pub fn extract(
             thin: false,
             content_kind: ContentKind::Page,
             lang: "unknown".to_string(),
+
             lang_source: None,
             script: None,
             quality: 0.0,
@@ -533,26 +444,7 @@ pub fn extract(
             fingerprint: None,
             via: Some("format:text"),
             partial: None,
-        };
-        // focus, section and toc work on the block model, and this
-        // branch builds none: the whole body is one slice. They could
-        // work on markdown, whose headings and paragraphs map onto
-        // Heading and Para blocks, but that needs a markdown parser
-        // (none is a dependency today) feeding the text through
-        // downstream(). Splitting on blank lines, as
-        // focus::expand_code_blocks does for large code blocks, would
-        // serve focus on any text but not toc or section. Until then,
-        // say the filters were skipped instead of dropping them.
-        let media = notice_media_type(&ct);
-        let size = text.len();
-        note_skipped_filters(&mut ex, opts, || {
-            format!(
-                "{media} response, no HTML or PDF structure : showing raw text ({size} bytes). \
-                 To read it whole, prefer curl or wget saving to a file if your environment allows it, \
-                 otherwise set max_chars to at least {size}. To find a passage, use must_contain, then offset"
-            )
         });
-        return Ok(ex);
     }
 
     // --- PDF: DonSheet parses bytes into the same block model. ---
@@ -571,6 +463,7 @@ pub fn extract(
                     url,
                     opts,
                     max_chars,
+                    None,
                     None,
                 );
             }
@@ -614,31 +507,28 @@ pub fn extract(
     // Reddit dedicated extractor: bypasses DonSift for
     // old.reddit.com, produces compact structured output.
     // Returns None for non-reddit or unrecognized pages.
-    if !opts.faithful
-        && let Some(extracted) = reddit::extract(&html_text, url, opts)
-    {
+    if let Some(extracted) = reddit::extract(&html_text, url, opts) {
         return Ok(extracted);
     }
 
     // Hacker News dedicated extractor: the comment tree is a
     // table layout the generic pipeline mangles. Full comment
     // text with authors and reply depth.
-    if !opts.faithful
-        && let Some(extracted) = hn::extract(&html_text, url, opts)
-    {
+    if let Some(extracted) = hn::extract(&html_text, url, opts) {
         return Ok(extracted);
     }
 
     // Domain-intelligence adapters (v3): GitHub / Stack Exchange /
     // Wikipedia infobox / docs-framework pages restructured.
-    if !opts.faithful
-        && let Some(extracted) = crate::adapters::extract_html(&html_text, url, opts)
-    {
+    if let Some(extracted) = crate::adapters::extract_html(&html_text, url, opts) {
         return Ok(extracted);
     }
 
     let doc = Html::parse_document(&html_text);
-    let base = metadata::base_url(&doc).unwrap_or_else(|| url.to_string());
+    // What the document carries, read once from its structure: the thin
+    // verdict for every read of it below.
+    let page = crate::detect::substance::assess(&doc, url);
+    let base = metadata::base_url(&doc, url);
     let mut meta = metadata::metadata(&doc);
     if url::Url::parse(url)
         .ok()
@@ -652,7 +542,7 @@ pub fn extract(
     let lang_info = language::detect(&doc);
 
     // A large page that yields almost nothing is a JS
-    // shell (Medium, SPAs) : flag it for tier 2 routing.
+    // shell (Medium, SPAs) : flag it.
     let thin_flag = raw_len > 50_000;
 
     // Skeleton/SPA loading detection. Only use aria-busy :
@@ -664,46 +554,29 @@ pub fn extract(
     // to_lowercase() allocation just to count three markers.
     let has_skeletons = count_ascii_ci(&html_text, "aria-busy=\"true\"", 3) >= 3;
 
-    // Explicit scopes never widen, including when a selected region is tiny.
-    let roots: Vec<scraper::ElementRef<'_>> = match &opts.selector {
-        Some(sel) => {
-            let parsed = scraper::Selector::parse(sel)
-                .map_err(|_| ExtractError::BadSelector(sel.clone()))?;
-            let matched: Vec<scraper::ElementRef<'_>> = doc.select(&parsed).collect();
-            if matched.is_empty() {
-                return Err(ExtractError::SelectorNoMatch {
-                    selector: sel.clone(),
-                    inspected: doc
-                        .root_element()
-                        .descendants()
-                        .filter_map(scraper::ElementRef::wrap)
-                        .count(),
-                });
-            } else if opts.faithful {
-                let ids: std::collections::HashSet<_> = matched.iter().map(|el| el.id()).collect();
-                matched
-                    .iter()
-                    .copied()
-                    .filter(|el| !el.ancestors().any(|ancestor| ids.contains(&ancestor.id())))
-                    .collect()
-            } else {
-                matched
-            }
-        }
-        None => score::find_main(&doc).into_iter().collect(),
-    };
+    let roots: Vec<scraper::ElementRef<'_>> = score::find_main(&doc).into_iter().collect();
 
     // Segment into typed blocks.
     let mut all_blocks = Vec::new();
     for root in &roots {
         blocks::segment(*root, &base, opts, &mut all_blocks);
     }
+    // A site that answers script-less clients in <noscript> ("NO", "NOPE.")
+    // has said its content there; when that is the only substance, it is
+    // the page.
+    let noscript_only = page.substance > 0 && page.substance == page.noscript_text.len();
+    if noscript_only {
+        for text in &page.noscript_text {
+            all_blocks.push(blocks::Block::Para {
+                md: text.clone(),
+                link_density: 0.0,
+                path: Vec::new(),
+            });
+        }
+    }
 
-    let neutral_identity = if opts.include_links || opts.include_media {
-        let neutral = ExtractOptions {
-            selector: opts.selector.clone(),
-            ..Default::default()
-        };
+    let neutral_identity = if opts.include_links {
+        let neutral = ExtractOptions::default();
         let mut neutral_blocks = Vec::new();
         for root in &roots {
             blocks::segment(*root, &base, &neutral, &mut neutral_blocks);
@@ -731,14 +604,8 @@ pub fn extract(
         opts,
         max_chars,
         neutral_identity,
+        Some(page.verdict),
     )?;
-
-    // A TOC is a complete projection, not a failed short extraction. Once
-    // downstream has built the outline, content-oriented rescue paths must
-    // not replace it with the page body.
-    if opts.faithful || opts.toc || opts.selector.is_some() {
-        return Ok(extracted);
-    }
 
     // JSON-in-script rescue: SPAs (Next.js/React/YouTube) embed
     // their content as a JS-assigned JSON blob. DonSift sees an
@@ -758,6 +625,19 @@ pub fn extract(
         if js.images.is_empty() {
             js.images = extracted.images.clone();
         }
+        // A document already judged content stays content. Otherwise the
+        // recovered state is judged like the document: by its substance,
+        // never by its length.
+        let verdict = if page.verdict.is_content() {
+            page.verdict
+        } else {
+            match crate::detect::substance::assess_lines(js.markdown.lines()) {
+                v if v.is_content() => v,
+                _ => page.verdict,
+            }
+        };
+        js.thin = !verdict.is_content();
+        js.page = Some(verdict);
         return Ok(js);
     }
 
@@ -781,6 +661,9 @@ pub fn extract(
         if fb.images.is_empty() {
             fb.images = extracted.images.clone();
         }
+        // The fallback reads the same document: its verdict holds.
+        fb.thin = !page.verdict.is_content();
+        fb.page = Some(page.verdict);
         return Ok(fb);
     }
     Ok(extracted)
@@ -803,6 +686,7 @@ fn body_starts_with_html(body: &[u8]) -> bool {
 fn empty_pdf(url: &str, reason: &str) -> Extracted {
     let md = format!("{url}\n\n*[pdf: {reason}]*\n");
     Extracted {
+        page: None,
         tokens_est: md.len() / 4,
         total_chars: md.len(),
         markdown: md,
@@ -817,6 +701,7 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
         thin: false,
         content_kind: ContentKind::Page,
         lang: "unknown".to_string(),
+
         lang_source: None,
         script: None,
         quality: 0.0,
@@ -826,6 +711,11 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
         via: None,
         partial: None,
     }
+}
+
+fn bot_wall(verdict: crate::detect::walls::Verdict) -> bool {
+    use crate::detect::walls::Verdict;
+    matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked)
 }
 
 /// Shared downstream: TOC → section scope → focus BM25 → render →
@@ -846,6 +736,7 @@ fn downstream(
     opts: &ExtractOptions,
     max_chars: usize,
     neutral_identity: Option<String>,
+    page: Option<crate::detect::substance::Verdict>,
 ) -> Result<Extracted, ExtractError> {
     let identity = neutral_identity.unwrap_or_else(|| {
         render::render(
@@ -857,117 +748,10 @@ fn downstream(
     });
     if pdf_pages.is_none()
         && let Some(v) = crate::detect::walls::text_wall(&identity)
+        && !(opts.verified && bot_wall(v))
     {
         return Err(ExtractError::Wall(v));
     }
-    // TOC mode: heading tree only, with stable section IDs and
-    // per-section size labels so the agent can target and budget
-    // before reading anything.
-    if opts.toc {
-        let mut md = String::new();
-        if let Some(t) = &meta.title {
-            md.push_str(&format!("# {t}\n\n"));
-        }
-        let mut shown = 0usize;
-        let sizes = section_sizes(&all_blocks);
-        for b in &all_blocks {
-            if let blocks::Block::Heading { level, text, .. } = b {
-                let indent = "  ".repeat((*level as usize).saturating_sub(1));
-                let size = sizes.get(shown).copied().unwrap_or(0);
-                md.push_str(&format!(
-                    "{indent}- [s{}] {} · {}\n",
-                    shown + 1,
-                    text,
-                    size_label(size)
-                ));
-                shown += 1;
-            }
-        }
-        if shown == 0 {
-            md.push_str("*(no headings : flat page)*\n");
-        } else {
-            md.push_str("\n*fetch with section=\"sN\" (or a heading name) to read that part*\n");
-        }
-        let total_chars = md.len();
-        let (slice, next) = paginate_public(&md, opts.offset, max_chars);
-        return Ok(Extracted {
-            tokens_est: slice.len() / 4,
-            total_chars,
-            markdown: slice,
-            title: meta.title.clone(),
-            byline: meta.byline.clone(),
-            published: meta.published.clone(),
-            site: meta.site.clone(),
-            next_offset: next,
-            blocks_total: all_blocks.len(),
-            blocks_shown: shown,
-            focus_omitted: false,
-            thin: false,
-            content_kind: ContentKind::Page,
-            lang: lang_info.code.clone(),
-            lang_source: lang_info.source,
-            script: Some(lang_info.script),
-            quality: 0.0,
-            pdf_pages: None,
-            images: Vec::new(),
-            fingerprint: None,
-            via: None,
-            partial: None,
-        });
-    }
-
-    // Section scope: keep blocks under a matching heading.
-    // v3: "sN" (case-insensitive) targets the Nth heading exactly
-    // as the toc numbered it; anything else is a substring match
-    // on heading text.
-    let mut section_missed = false;
-    let mut section_hit = false;
-    if let Some(sec) = &opts.section {
-        let needle = sec.to_lowercase();
-        let by_id: Option<usize> = needle
-            .strip_prefix('s')
-            .filter(|_| needle.len() >= 2 && needle[1..].chars().all(|c| c.is_ascii_digit()))
-            .and_then(|n| n.parse::<usize>().ok())
-            .map(|n| n.saturating_sub(1));
-        let mut heading_idx = 0usize;
-        let mut in_section = false;
-        let mut section_level = 0u8;
-        let mut kept_idx: Vec<usize> = Vec::new();
-        for (i, b) in all_blocks.iter().enumerate() {
-            if let blocks::Block::Heading { level, text, .. } = b {
-                if in_section && *level <= section_level {
-                    // Section ends at the next heading
-                    // of same-or-higher level.
-                    in_section = false;
-                }
-                if !in_section {
-                    let matched = match by_id {
-                        Some(id) => heading_idx == id,
-                        None => text.to_lowercase().contains(&needle),
-                    };
-                    if matched {
-                        in_section = true;
-                        section_level = *level;
-                    }
-                }
-                heading_idx += 1;
-            }
-            if in_section {
-                kept_idx.push(i);
-            }
-        }
-        if !kept_idx.is_empty() {
-            section_hit = true;
-            all_blocks = kept_idx
-                .into_iter()
-                .map(|i| all_blocks[i].clone())
-                .collect();
-        } else {
-            // No match → full page, but SIGNAL it.
-            section_missed = true;
-        }
-    }
-
     // Code block fission: split large code blocks into sub-blocks
     // so focus can score and select relevant parts of structured
     // content (JSON schemas, large code listings) instead of
@@ -1024,25 +808,22 @@ fn downstream(
     // Render markdown (frontmatter + blocks) then paginate.
     let mut full = render::render(meta, url, &kept, opts);
 
+    // Empty page → silence looks like a bug. Judged on the render
+    // alone, before the engine notes go on top: a document that
+    // yields nothing keeps the notes that say why.
+    if !focus_fell_back && (full.trim().is_empty() || (blocks_total == 0 && meta.title.is_none())) {
+        full = format!("{url}\n\n*(no extractable content)*\n");
+    }
+
     // Engine notes first (PDF scan flags etc.) : they frame any
     // other trust signal that follows.
     for note in &notes {
         full = format!("*[pdf: {note}]*\n\n{full}");
     }
 
-    // Agent-trust signals, inline in the content:
-    // - focus miss → agent must not quote wrong content
-    // - empty page → silence looks like a bug
-    if focus_fell_back {
-        if let Some(q) = &opts.focus {
-            full = format!("*[focus \"{q}\": no matches : showing full content]*\n\n{full}");
-        }
-    } else if section_missed {
-        if let Some(s) = &opts.section {
-            full = format!("*[section \"{s}\": not found : showing full content]*\n\n{full}");
-        }
-    } else if full.trim().is_empty() || (blocks_total == 0 && meta.title.is_none()) {
-        full = format!("{url}\n\n*(no extractable content)*\n");
+    // Focus miss → agent must not quote wrong content.
+    if focus_fell_back && let Some(q) = &opts.focus {
+        full = format!("*[focus \"{q}\": no matches : showing full content]*\n\n{full}");
     }
 
     // The manifest goes after the fell-back/missed notices (which
@@ -1059,10 +840,9 @@ fn downstream(
     // omission manifest are included. Preserve explicit miss/engine notes.
     let neutral = ExtractOptions {
         include_links: opts.include_links,
-        include_media: opts.include_media,
         ..Default::default()
     };
-    let unfocused = if opts.focus.is_some() && (opts.include_links || opts.include_media) {
+    let unfocused = if opts.focus.is_some() && opts.include_links {
         std::borrow::Cow::Owned(render::render(
             meta,
             url,
@@ -1074,8 +854,6 @@ fn downstream(
     };
     if opts.focus.is_some()
         && !focus_fell_back
-        && !section_missed
-        && !section_hit
         && notes.is_empty()
         && full.len().saturating_mul(5) > unfocused.len().saturating_mul(4)
     {
@@ -1087,10 +865,10 @@ fn downstream(
         focus_omitted = false;
         kept = all_blocks.iter().collect();
     }
-    // JS-shell warning: agent must know the content
-    // below is likely incomplete. On tier=auto the MCP
-    // fetch escalates to the browser itself : this note
-    // only surfaces on an explicit tier=1 request.
+    // JS-shell warning: the agent must know the content
+    // below is likely incomplete : the local engine could
+    // not hydrate this page. Thin reads keep the note;
+    // the fetch tool fails this class honestly instead.
     //
     // Thinness: the extraction yield is the truth. Any page over
     // 5KB that yields < 800 chars is a shell (the 27KB-challenge-
@@ -1114,7 +892,7 @@ fn downstream(
     // small section on a 400KB page used to escalate to ghost and
     // return the full page instead of the section).
     // Shell detection measures source yield, never the deliberately narrowed
-    // focus projection. Otherwise a successful focus triggers browser recovery.
+    // focus projection. Otherwise a successful focus would read as a shell.
     let source_len = identity.len();
     let density = if raw_len > 0 {
         source_len as f64 / raw_len as f64
@@ -1126,16 +904,41 @@ fn downstream(
     // from a complete binary document, so HTML shell heuristics must never
     // label a short PDF as a JS-rendered page.
     let is_pdf = pdf_pages.is_some();
+    // An HTML document carries its substance verdict: thin is what the
+    // document says, never its size (a three-word page with a date and a
+    // count is content; a 3 KB navigation frame is not). Text without a
+    // document (embedded data) keeps the yield rule.
     let thin = !is_pdf
-        && opts.selector.is_none()
-        && !section_hit
-        && ((source_len < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
-            || (thin_flag && has_skeletons && source_len < 4000)
-            || is_shell);
+        && match page {
+            Some(verdict) => !verdict.is_content(),
+            None => {
+                (source_len < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
+                    || (thin_flag && has_skeletons && source_len < 4000)
+                    || is_shell
+            }
+        };
     if thin {
-        full = format!(
-            "*[note: large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell; use tier=auto to render with a real browser.]*\n\n{full}"
-        );
+        let note = match page {
+            Some(crate::detect::substance::Verdict::AuthGate) => {
+                "the page is a sign-in page; the text below is its prompts, not the content"
+            }
+            Some(crate::detect::substance::Verdict::Loading) => {
+                "the page shows a loading placeholder; its content renders in a browser"
+            }
+            Some(crate::detect::substance::Verdict::Notice) => {
+                "the page shows a notice in place of its content"
+            }
+            Some(crate::detect::substance::Verdict::Empty) => {
+                "the document has no visible text; the page is built by scripts in a browser"
+            }
+            Some(_) => {
+                "the page is a client-rendered frame (navigation, labels, legal lines); its content renders in a browser"
+            }
+            None => {
+                "large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell."
+            }
+        };
+        full = format!("*[note: {note}]*\n\n{full}");
     }
     let (slice, next) = paginate(&full, opts.offset, max_chars);
     let tokens_est = slice.len() / 4;
@@ -1143,41 +946,8 @@ fn downstream(
     let content_kind = classify(&kept);
     let quality = quality_score(meta, &kept, blocks_total, raw_len, &lang_info);
 
-    // Probe mode (v3): the page resolved fully (tiers, walls and
-    // all) but the agent only asked a verification question. The
-    // output collapses to a verdict + short context excerpts :
-    // the page itself never enters the agent's context.
-    if let Some(pattern) = &opts.must_contain
-        && !pattern.trim().is_empty()
-    {
-        let md = probe_render(&full, opts.probe_pattern(), opts.probe_is_regex());
-        return Ok(Extracted {
-            tokens_est: md.len() / 4,
-            total_chars: full.len(),
-            markdown: md,
-            next_offset: None,
-            thin: false,
-            content_kind: ContentKind::Page,
-            title: meta.title.clone(),
-            byline: meta.byline.clone(),
-            published: meta.published.clone(),
-            site: meta.site.clone(),
-            blocks_total,
-            blocks_shown,
-            focus_omitted,
-            lang: lang_info.code.clone(),
-            lang_source: lang_info.source,
-            script: Some(lang_info.script),
-            quality,
-            pdf_pages,
-            images,
-            fingerprint: None,
-            via: None,
-            partial: None,
-        });
-    }
-
     Ok(Extracted {
+        page,
         markdown: slice,
         title: meta.title.clone(),
         byline: meta.byline.clone(),
@@ -1192,6 +962,7 @@ fn downstream(
         thin,
         content_kind,
         lang: lang_info.code.clone(),
+
         lang_source: lang_info.source,
         script: Some(lang_info.script),
         quality,
@@ -1201,223 +972,6 @@ fn downstream(
         via: None,
         partial: None,
     })
-}
-
-/// Probe rendering (v3): verdict + up to three context excerpts
-/// around matches, whitespace-collapsed to one line each. The
-/// honest answer to "does this page mention X?" at ~3 lines of
-/// output instead of 16k chars.
-pub fn probe_render(text: &str, pattern: &str, is_regex: bool) -> String {
-    let total = text.chars().count();
-    let report = |hits: Option<Vec<(usize, usize)>>| -> String {
-        match hits {
-            None => format!("probe: invalid regex /{pattern}/ : use a plain substring instead"),
-            Some(v) if v.is_empty() => {
-                format!("probe: NO MATCH for {pattern:?} in {total} chars of content")
-            }
-            Some(v) => {
-                let mut out = format!(
-                    "probe: MATCH : {} hit{} for {pattern:?}\n",
-                    v.len(),
-                    if v.len() == 1 { "" } else { "s" }
-                );
-                for (i, (s, e)) in v.iter().take(3).enumerate() {
-                    let ctx = context_around(text, *s, *e, 90);
-                    out.push_str(&format!("[{}] {ctx}\n", i + 1));
-                }
-                if v.len() > 3 {
-                    out.push_str(&format!("(+{} more)\n", v.len() - 3));
-                }
-                out
-            }
-        }
-    };
-
-    // Both modes go through one case-insensitive regex so every hit
-    // is a byte offset into `text` itself. The old substring path
-    // searched a separately lowercased copy, whose offsets drift
-    // from the real text as soon as case folding changes a byte
-    // length ('İ' -> "i̇"); and both paths then fed those BYTE
-    // offsets to a context window that treated them as CHAR indices,
-    // so on any page with non-ASCII text before the hit the excerpt
-    // landed after the match and did not contain it.
-    let source = if is_regex {
-        std::borrow::Cow::Borrowed(pattern)
-    } else {
-        std::borrow::Cow::Owned(regex::escape(pattern))
-    };
-    match regex::RegexBuilder::new(&source)
-        .case_insensitive(true)
-        .size_limit(1 << 20)
-        .build()
-    {
-        Ok(re) => {
-            let hits: Vec<(usize, usize)> = re
-                .find_iter(text)
-                .map(|m| (m.start(), m.end()))
-                .take(50)
-                .collect();
-            report(Some(hits))
-        }
-        // A literal can only fail to build by blowing the size
-        // limit (a multi-KB pattern under (?i) expands into Unicode
-        // classes); it is never "invalid", so search it as bytes
-        // instead. ASCII case-insensitive is the honest fallback:
-        // non-ASCII bytes must match exactly, which also keeps every
-        // hit on a char boundary.
-        Err(_) if !is_regex => report(Some(literal_hits(text, pattern))),
-        Err(_) => report(None),
-    }
-}
-
-/// Separates the filter names from the explanation in the notice a
-/// result leads with when it could not apply them.
-const FILTERS_SKIPPED_MARK: &str = " not applied: ";
-
-/// The read filters among focus, section and toc that `opts` asks for.
-fn requested_filters(opts: &ExtractOptions) -> Vec<&'static str> {
-    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
-    let mut names = Vec::new();
-    if set(&opts.focus) {
-        names.push("focus");
-    }
-    if set(&opts.section) {
-        names.push("section");
-    }
-    if opts.toc {
-        names.push("toc");
-    }
-    names
-}
-
-/// The media type of `content_type` for a notice: parameters dropped,
-/// only media-type characters kept, at most 64 bytes, and "non-HTML"
-/// when nothing is left. The header comes from the server, so it must
-/// not be able to write arbitrary text into the notice.
-fn notice_media_type(content_type: &str) -> &str {
-    let media = content_type.split(';').next().unwrap_or_default().trim();
-    let valid = !media.is_empty()
-        && media.len() <= 64
-        && media
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/!#$&^_.+-".contains(&b));
-    if valid { media } else { "non-HTML" }
-}
-
-/// `opts` without focus, section and toc.
-fn without_read_filters(opts: &ExtractOptions) -> ExtractOptions {
-    ExtractOptions {
-        focus: None,
-        section: None,
-        toc: false,
-        ..opts.clone()
-    }
-}
-
-/// Leads `ex` with a notice naming the read filters `opts` asks for and
-/// `why` they were not applied; leaves `ex` alone when `opts` asks for
-/// none, or runs a `must_contain` probe. The notice sits outside the
-/// max_chars budget and leaves `next_offset` an offset into the source.
-pub(crate) fn note_skipped_filters(
-    ex: &mut Extracted,
-    opts: &ExtractOptions,
-    why: impl FnOnce() -> String,
-) {
-    // A probe replaces the body, and the result state recognizes it
-    // by its leading "probe: ", which a notice in front would hide.
-    let probe = opts
-        .must_contain
-        .as_deref()
-        .is_some_and(|p| !p.trim().is_empty());
-    let names = requested_filters(opts);
-    if probe || names.is_empty() {
-        return;
-    }
-    let notice = format!(
-        "*[{}{FILTERS_SKIPPED_MARK}{}]*\n\n",
-        names.join(", "),
-        why()
-    );
-    ex.total_chars += notice.len();
-    ex.markdown.insert_str(0, &notice);
-    ex.tokens_est = ex.markdown.len() / 4;
-}
-
-/// Read filters named by a leading skipped-filters notice. Parses the
-/// text only, so a source that itself starts with such a notice for
-/// known filter names is reported the same way.
-pub fn skipped_filters(markdown: &str) -> Vec<&str> {
-    let names = markdown
-        .strip_prefix("*[")
-        .and_then(|rest| rest.split_once(FILTERS_SKIPPED_MARK))
-        .map(|(names, _)| names.split(", ").collect::<Vec<_>>())
-        .unwrap_or_default();
-    // Raw text can itself start with "*[", so accept only the names
-    // the notice can carry.
-    if names
-        .iter()
-        .all(|n| matches!(*n, "focus" | "section" | "toc"))
-    {
-        names
-    } else {
-        Vec::new()
-    }
-}
-
-/// Byte-window search for a literal `needle` in `text`, ASCII
-/// case-insensitive. Non-ASCII bytes compare exactly, so a match
-/// start is always a char boundary (a UTF-8 lead byte or ASCII, never
-/// a continuation byte) and `start + needle.len()` is too.
-fn literal_hits(text: &str, needle: &str) -> Vec<(usize, usize)> {
-    let (hay, nb) = (text.as_bytes(), needle.as_bytes());
-    if nb.is_empty() || nb.len() > hay.len() {
-        return Vec::new();
-    }
-    let mut hits = Vec::new();
-    let mut from = 0;
-    while from + nb.len() <= hay.len() {
-        match hay[from..]
-            .windows(nb.len())
-            .position(|w| w.eq_ignore_ascii_case(nb))
-        {
-            Some(pos) => {
-                let start = from + pos;
-                hits.push((start, start + nb.len()));
-                from = start + nb.len();
-                if hits.len() >= 50 {
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-    hits
-}
-
-/// One-line context window around a match, ellipsized and
-/// whitespace-collapsed. `start`/`end` are BYTE offsets into `text`
-/// (char boundaries, as regex matches are); `pad` is in chars.
-fn context_around(text: &str, start: usize, end: usize, pad: usize) -> String {
-    let byte_lo = if pad == 0 {
-        start
-    } else {
-        text[..start]
-            .char_indices()
-            .rev()
-            .nth(pad - 1)
-            .map(|(b, _)| b)
-            .unwrap_or(0)
-    };
-    let byte_hi = text[end..]
-        .char_indices()
-        .nth(pad)
-        .map(|(b, _)| end + b)
-        .unwrap_or(text.len());
-    let window = &text[byte_lo..byte_hi];
-    let collapsed: String = window.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prefix = if byte_lo > 0 { "…" } else { "" };
-    let suffix = if byte_hi < text.len() { "…" } else { "" };
-    format!("{prefix}{collapsed}{suffix}")
 }
 
 /// One-line accounting of what the focus filter dropped: block
@@ -1467,42 +1021,6 @@ fn dropped_manifest(all: &[blocks::Block], kept: &[&blocks::Block]) -> Option<St
     Some(line)
 }
 
-/// Compact char-count label for toc lines: "1.2k", "840".
-fn size_label(chars: usize) -> String {
-    if chars >= 1000 {
-        format!("{:.1}k", chars as f64 / 1000.0)
-    } else {
-        chars.to_string()
-    }
-}
-
-/// Per-heading content size, in heading order: the heading's own
-/// chars plus every following block until the next heading of
-/// same-or-higher level (subsections included). Powers the toc's
-/// size labels : the agent's fetch-cost signal before it reads.
-fn section_sizes(all: &[blocks::Block]) -> Vec<usize> {
-    let mut sizes = Vec::new();
-    let mut i = 0;
-    while i < all.len() {
-        if let blocks::Block::Heading { level, .. } = &all[i] {
-            let mut size = all[i].chars();
-            let mut j = i + 1;
-            while j < all.len() {
-                if let blocks::Block::Heading { level: l2, .. } = &all[j]
-                    && *l2 <= *level
-                {
-                    break;
-                }
-                size += all[j].chars();
-                j += 1;
-            }
-            sizes.push(size);
-        }
-        i += 1;
-    }
-    sizes
-}
-
 /// Char-budget slice at a UTF-8 boundary, preferring a block
 /// boundary ("\n\n") near the cut. Returns (slice, next_offset).
 fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usize>) {
@@ -1531,8 +1049,11 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     if end < text.len() {
         // Prefer a block boundary within the last quarter of the window.
         let window_start = ceil_char_boundary(text, start + (end - start) * 3 / 4);
-        if let Some(pos) = text[window_start..end].rfind("\n\n") {
-            end = window_start + pos;
+        // A page always advances: a boundary at the very start of a tiny
+        // window would hand back the same offset forever.
+        let cut = window_start + soft_cut(&text[window_start..end]);
+        if cut > start {
+            end = cut;
         }
     }
     let next = if end < text.len() { Some(end) } else { None };
@@ -1547,6 +1068,53 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
         }
     }
     (slice, next)
+}
+
+/// Where to end a page inside its last quarter `tail`: a block break, else
+/// a line break (a table row stays whole), else a space that is not inside
+/// a link, else the hard cut. Returns a byte offset into `tail`; the next
+/// page resumes there, so nothing is skipped whichever boundary is chosen.
+fn soft_cut(tail: &str) -> usize {
+    if let Some(pos) = tail.rfind("\n\n").or_else(|| tail.rfind('\n')) {
+        return pos;
+    }
+    // A cut inside `[text](url` leaves a link that goes nowhere: end the
+    // page before the link instead.
+    let mut limit = tail.len();
+    if let Some(open) = tail.rfind("](")
+        && !tail[open..].contains(')')
+        && let Some(label) = tail[..open].rfind('[')
+    {
+        limit = label;
+    }
+    tail[..limit].rfind(' ').unwrap_or(limit)
+}
+
+/// One element's content as markdown blocks (headings, paragraphs, lists,
+/// code, tables, quotes), with no page frontmatter: for an adapter that lays
+/// out a post or comment body inside its own page. Falls back to the
+/// element's inline rendering when the block walk finds nothing.
+pub(crate) fn element_markdown(
+    root: scraper::ElementRef<'_>,
+    base: &str,
+    opts: &ExtractOptions,
+) -> String {
+    let mut found = Vec::new();
+    blocks::segment(root, base, opts, &mut found);
+    let meta = metadata::Meta {
+        title: None,
+        byline: None,
+        published: None,
+        site: None,
+        description: None,
+        canonical: None,
+    };
+    let md = render::render(&meta, "", &found.iter().collect::<Vec<_>>(), opts);
+    let md = md.trim();
+    if md.is_empty() {
+        return inline::markdown(root, base, opts).0.trim().to_string();
+    }
+    md.to_string()
 }
 
 /// Shared pagination for dedicated extractors (reddit, hn).

@@ -1,9 +1,9 @@
 # Local rules
 
 Local rules are a table of per-host rules you write in `donsetch.toml`. A
-rule can refuse a URL before any request is made, handing the agent your own
-instructions instead of the page, or pin the fetch tier for a host. DonSeTch
-ships no rules: the table is empty until you write one.
+rule can refuse a URL before any request is made, handing the agent your
+own instructions instead of the page. DonSeTch ships no rules: the table
+is empty until you write one.
 
 The typical use is a site that bans your IP when an agent works through it
 at machine speed. ResearchGate is the case that started this feature
@@ -43,13 +43,6 @@ excluded by the operator's local DonSeTch rules `example.org` (another source ma
 Next action: do not fetch this site with curl, scripts or another HTTP client: it bans our IP for automated access. Use BladeBrowser (a real browser at human pace), or ask the human operator to download the file
 ```
 
-A rule that only pins the tier:
-
-```toml
-[rules.url."example.gov"]
-tier = "2"               # go straight to the browser for this host
-```
-
 A rule kept in the file but switched off:
 
 ```toml
@@ -87,11 +80,9 @@ Every field is optional, except that a `deny` rule needs a `message`.
 | `message` | string | for `deny`: your guidance, passed to the agent verbatim as its next action; required and non-blank |
 | `kind` | `"walled"` (default), `"permanent"` | for `deny`: `walled` means "get it elsewhere", `permanent` means "do not pursue it"; sets the agent's `errorKind` and the CLI exit code |
 | `reason` | `[a-z0-9_]+` | for `deny`: a subcode; the error code becomes `policy.denied.<reason>` |
-| `tier` | `"auto"`, `"1"`, `"2"` | the tier this host is fetched with, as if the call had passed `tier` |
-| `tier_enforce` | `false` (default), `true` | `true` makes `tier` win over a tier the call passed explicitly |
 
-Unknown fields are a load error, and so is an `action`, `kind` or `tier`
-value outside the list. `message`, `kind` and `reason` are read only on a
+Unknown fields are a load error, and so is an `action` or `kind` value
+outside the list. `message`, `kind` and `reason` are read only on a
 `deny` rule; on an `allow` rule they are ignored rather than rejected.
 
 The error code always has three segments: `policy.denied.ip_ban`, or
@@ -270,12 +261,11 @@ merged with each other. Candidates rank by:
 A rule with `enabled = false` drops out of the ranking, and the most specific
 remaining rule wins.
 
-### A narrow tier rule cancels a broad deny
+### A narrow allow rule cancels a broad deny
 
 A narrower rule replaces a broader one entirely, `action` included, and
-`action` defaults to `allow`. So a narrow rule written only to set `tier`
-also allows, and under a broader deny it cancels the deny for everything it
-covers:
+`action` defaults to `allow`. So a narrow rule written only to allow one
+host also cancels the deny for everything it covers:
 
 ```toml
 [rules.url."example.org"]
@@ -283,21 +273,19 @@ action  = "deny"
 message = "do not fetch this site with curl, scripts or another HTTP client: it bans our IP for automated access. Use BladeBrowser (a real browser at human pace), or ask the human operator to download the file"
 
 [rules.url."www.example.org"]
-tier = "2"    # wins for www. as the longer host: action is "allow", the deny is gone
+action = "allow"    # wins for www. as the longer host: the deny is gone
 ```
 
 Here `https://example.org/…` is denied, and `https://www.example.org/…`
-is fetched with the browser. To keep a host denied, a narrower rule must
-restate the deny itself (`action = "deny"` plus a `message`), at which point
-its `tier` is moot, since a denied URL is never fetched. `donsetch rules test
+is fetched normally. To keep a host denied, a narrower rule must restate
+the deny itself (`action = "deny"` plus a `message`). `donsetch rules test
 <url>` shows the winner and every rule it beat, which is how to spot this.
 
 ### Layers
 
 Today there is one config file, so this matters only when several layers
 appear: the merge between layers happens per field, before rules are ranked.
-A higher layer that sets only `tier` on a key keeps the lower layer's
-`action` and `message`. There is no way to delete a key from a lower layer;
+There is no way to delete a key from a lower layer;
 `enabled = false` neutralizes it. A higher layer that turns a `deny` into an
 `allow` still carries the lower layer's `message`, `kind` and `reason`, which
 is why those fields are ignored on an `allow` rule rather than rejected.
@@ -305,7 +293,7 @@ is why those fields are ignored on an `allow` rule rather than rejected.
 ## Switching rules off
 
 Rules are on by default. Three switches turn them off, all with the same
-effect: the command runs as if the table were empty, tier pins included.
+effect: the command runs as if the table were empty.
 
 - `[rules] mode = "off"` in `donsetch.toml`.
 - `DONSETCH_RULES__MODE=off` in the environment, for example in one MCP
@@ -341,9 +329,8 @@ A deny means "this content is not returned", not only "this host is not
 contacted". The check runs before anything else in a call, so a denied URL
 mints no persona, picks no proxy lane and reads no cache:
 
-- the live fetch, on every tier;
+- the live fetch;
 - a page the search already prefetched and parked for the follow-up fetch;
-- the browser render cache;
 - the paid unlocker's local cache.
 
 The same check guards every request DonSeTch sends, so it also covers:
@@ -468,65 +455,6 @@ and walled is the least severe failure, so a batch mixing a denied URL with a
 transient failure exits 2. The `code` of each row, not the exit code, tells a
 script that a rule fired.
 
-## Tier pins
-
-A rule's `tier` acts exactly as if the caller had passed `tier` itself. It
-replaces the call's argument before anything reads it, so a rule's `"2"` and
-an explicit `tier=2` never behave differently.
-
-| rule | the call passes | the fetch uses |
-| --- | --- | --- |
-| no `tier` | anything | what the call asked for |
-| `tier = "2"` | nothing, or `auto` | 2 |
-| `tier = "2"` | `1` | 1: the explicit argument wins |
-| `tier = "2"`, `tier_enforce = true` | `1` | 2: the rule wins |
-| `tier = "1"`, `tier_enforce = true` | `2` | 1: the rule wins |
-| `tier = "auto"`, `tier_enforce = true` | `1` or `2` | auto: the rule wins |
-| `tier = "auto"` | anything | what the call asked for |
-
-Nearly every call arrives as `auto`, so an advisory rule (the default) applies
-in full; `tier_enforce = true` matters only against an agent that explicitly
-asked for the other tier. No tool argument can lift a `deny`, with or without
-`tier_enforce`.
-
-`tier = "auto"` with `tier_enforce = true` makes a host ignore the tier an
-agent asks for: DonSeTch's own escalation decides, as if the call had passed
-nothing. Without `tier_enforce`, `"auto"` changes nothing today. It is
-accepted so that, once there is more than one config file layer, a higher
-layer can cancel a lower layer's pin: a key cannot be removed from a lower
-layer, only overridden.
-
-The pin is chosen once per URL, on the URL the caller asked for. In a batch
-each URL gets its own pin. An adapter's fallback to another URL on the same
-site keeps the pin chosen for the original URL.
-
-Things to know before pinning a host:
-
-- **PDF-shaped URLs and JSON endpoints still go over HTTP first.** A path
-  ending in `.pdf`, with a `pdf` segment or ending in `/pdf`, and a path ending
-  in `.json`, are fetched over plain HTTP first whatever the tier, rule or
-  `tier_enforce` included, because a browser cannot extract either. A JSON
-  response never escalates to the browser.
-- **Tier `"2"` turns off the walled-PDF recovery.** Under `auto`, a PDF that
-  answers with a bot wall is recovered by solving the wall in the browser and
-  retrying over HTTP with its cookies. Tier `"2"`, from a rule or from the
-  call, turns that retry off, so a walled PDF comes back as Chrome's PDF
-  viewer instead of the document. A URL that serves a PDF without looking
-  like one gets no HTTP route at all under tier `"2"`. `donsetch rules test`
-  warns about PDF-shaped URLs under a tier-`"2"` rule.
-- **Tier `"2"` skips adapters.** On a host with an adapter (reddit, PyPI, npm
-  and the others) the URL is not rewritten to the adapter's API and goes
-  straight to the browser.
-- **Tier `"1"` never escalates.** A host pinned to tier `"1"` fails with a
-  walled error on a bot wall, even one DonSeTch detected, rather than opening
-  the browser or the unlocker. With `tier_enforce = true` that is "never use
-  the browser on this host". A tier `"1"` pin, advisory or enforced, also
-  keeps the browser solve that `web_search` starts in the background for a
-  walled top result off that host.
-- **The result does not say a rule chose the tier.** `tier_used` and the CLI
-  stats report the effective tier, and a tier learned from earlier walls
-  looks the same. `donsetch rules test <url>` tells them apart.
-
 ## Checking your rules
 
 ### `donsetch rules test <url>`
@@ -534,7 +462,7 @@ Things to know before pinning a host:
 Explains, offline, what your rules do with one URL: every matching rule, most
 specific first, the one that wins, and the winner's fields with the config
 layer each came from. Nothing is fetched. With the two example.org rules from
-[A narrow tier rule cancels a broad deny](#a-narrow-tier-rule-cancels-a-broad-deny)
+[A narrow allow rule cancels a broad deny](#a-narrow-allow-rule-cancels-a-broad-deny)
 plus `reason = "ip_ban"`:
 
 ```
@@ -548,9 +476,7 @@ Matching rules, most specific first:
 
 Winning rule: [rules.url."www.example.org"]
   action        allow                    (default)
-  tier          2                        (file:/home/me/.config/donsetch/donsetch.toml)
-  tier_enforce  false                    (default)
-Effect: allowed; tier "2" applies unless the call passes an explicit tier.
+Effect: allowed.
 ```
 
 ```
@@ -573,12 +499,7 @@ A disabled match is listed as `disabled (enabled = false)`. A URL no rule
 matches prints `No rule matches this URL: it is fetched as if no rule
 existed.` When rules are off, the first line is `Rules are OFF (mode = "off",
 from <origin>): nothing below is enforced.`, and the matches are still
-explained below it. Under a tier-`"2"` winner on a PDF-shaped URL the report
-ends with:
-
-```
-warning: tier "2" turns off the cookie retry that recovers walled PDFs; this URL may come back as Chrome's PDF viewer, not the document
-```
+explained below it.
 
 The URL must be absolute, with its scheme.
 
@@ -615,8 +536,8 @@ and origins, like every other knob. The rule table itself is not listed; use
 - **A denied CDN can hide a sitemap.** If a site serves its sitemap from a
   host you deny, a CDN most plausibly, that sitemap is not loaded and the
   crawl says nothing about it: discovery is quietly smaller and the crawl
-  still reports a normal finish. In map mode the inventory then falls back to the seed page's links
-  and one rendered read of the seed, so the map comes back smaller rather than
+  still reports a normal finish. In map mode the inventory then falls back to the seed page's links,
+  so the map comes back smaller rather than
   empty. If that finds nothing either, the map is not reported complete and
   its skip reason reads "no sitemap found at common locations and the seed
   page exposed no usable links", which is misleading when a sitemap existed
@@ -635,22 +556,25 @@ and origins, like every other knob. The rule table itself is not listed; use
   not in the denied section or its count. Skipped pages appear only in the
   crawl's debug data for the client (`_meta`), not in its text or `[meta]`;
   the crawl is then reported not `complete`.
-- **The browser reports some refusals as browser errors.** `policy.denied`
-  appears only when the URL the browser was sent to is itself denied, or the
-  page lands on a denied URL. A redirect the browser follows into a denied
-  host is blocked, and surfaces as a browser navigation error; in a crawl the
-  skip reason reads `ghost escalation failed: …`. A navigation the page starts
-  on its own after loading (a script or meta refresh) is blocked the same way
-  and surfaces as a failed page. A subresource from a denied host (an image, a
-  script) is dropped silently from any page the browser renders.
+- **The browser drops a denied subresource silently.** `web_screenshot`
+  refuses the capture with `policy.denied` when the URL it was sent to is
+  denied, when a redirect the browser follows leads into a denied host, and
+  when the page navigates there on its own (a script or meta refresh) before
+  the capture is taken. A subresource from a denied host (an image, a script,
+  a `fetch()`) is blocked without a report: that request fails inside the
+  page and the capture goes ahead without it.
 - **The browser check sees only the page's own HTTP requests.** It intercepts
   the requests Chrome pauses for the page through the DevTools `Fetch`
-  domain. A WebSocket and a preconnect hint are not checked, so a page on an
-  allowed host can still make the browser open a connection to a denied host;
-  a DNS prefetch hint only looks up the host's name. Requests made inside a
-  cross-site iframe or by a worker the page starts are probably not checked
-  either. This list is read from the code and from how Chrome's DevTools
-  protocol works, not from a test with a real browser.
+  domain: the page's navigation and redirects, its subresources and
+  `fetch()` calls, and those of a dedicated worker it starts. A WebSocket and
+  a preconnect hint are not checked, so a page on an allowed host can still
+  make the browser open a connection to a denied host; a DNS prefetch hint
+  only looks up the host's name. Requests made inside a cross-site iframe, or
+  by a shared or service worker the page starts, are not checked either.
+  With headless Chromium 156, a WebSocket, a cross-site iframe's image and
+  `fetch()`, and a shared and a service worker's `fetch()` all reached a
+  denied host; the preconnect and DNS prefetch cases are read from how
+  Chrome's DevTools protocol works, not tested.
 - **Changing rules does not rewrite a resumable crawl.** After you remove or
   narrow a rule, a resumed crawl neither fetches the URLs the earlier run
   denied nor stops listing them: they stay in the crawl's seen set and in its

@@ -1,16 +1,13 @@
 # DonSeTch private working docs + build artifacts
 status.md
 project.md
-design.md
 
 # Private design blueprints — never public
 design/
 
-# V5 working docs — private (plan + discussion, decision log)
-v5/
-
 # Rust
 /target
+/core/target
 # Machine-specific cargo config (libclang/bindgen env — differs per OS)
 .cargo/
 
@@ -30,7 +27,8 @@ bench/battle-corpus/
 bench/improve/out/
 
 # Vendored PDFium static libraries (build.rs auto-downloads)
-vendor/
+# Root-anchored: the committed forks live in core/vendor.
+/vendor/
 
 # PDF corpus binaries (download via scripts/download-corpus.sh)
 tests/pdf-corpus/*.pdf
@@ -46,3 +44,10 @@ npm/LICENSE
 *.tgz
 bench/regression-results.json
 /libonnxruntime.so
+
+
+# Private core working material (corpus, fixtures, bench artifacts)
+/core/runs/
+/core/hard-corpus.json
+/core/fixtures/
+__pycache__/

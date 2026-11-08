@@ -34,7 +34,7 @@ use persist::{
     load_quality_disk, save_cache_disk, save_health_disk_if_dirty, save_outcome_disk_if_dirty,
     save_quality_disk_if_dirty,
 };
-use tasks::{EngineResult, TaskFut, engine_task, ghost_engine_task, vertical_task};
+use tasks::{EngineResult, TaskFut, engine_task, vertical_task};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -129,23 +129,72 @@ fn current_year() -> i64 {
     era * 400 + yoe + 1
 }
 
-/// Normalize a query for cache keys: casing, punctuation
-/// and stopwords don't change intent, so they don't get
-/// to spend egress budget twice.
+/// Normalize a query for cache and single-flight keys. Casing,
+/// punctuation and stopwords collapse. These stay distinct: `+` and
+/// `#` as word characters (`c++`, `c#`), a `-` that starts a token (an
+/// exclusion, of a word or of a quoted phrase), a `"…"` phrase with
+/// its stopwords, an uppercase `OR`, and the `site:`, `filetype:` and
+/// `intitle:` operators as [`query::compile`] reads them, appended in
+/// that order after the terms.
 fn norm_query(q: &str) -> String {
     const STOP: &[&str] = &[
         "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at", "to", "for", "and",
         "or", "what", "which", "how", "do", "does", "i", "you", "it",
     ];
-    // '+' is kept (as the intent tokenizer does): stripping it made
-    // "rust vs c++ performance" and "rust vs c performance" share
-    // one cache key, serving the first query's results to the
-    // second as cached.
-    q.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '+')
-        .filter(|w| !w.is_empty() && !STOP.contains(w))
-        .collect::<Vec<_>>()
-        .join(" ")
+    fn words(s: &str) -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    let compiled = query::compile(q);
+    let mut key: Vec<String> = Vec::new();
+    // Odd segments are inside double quotes; an unterminated quote
+    // runs to the end of the query.
+    let segments: Vec<&str> = compiled.text.split('"').collect();
+    let mut exclude_phrase = false;
+    for (i, segment) in segments.iter().enumerate() {
+        if i % 2 == 1 {
+            let phrase = words(segment);
+            if !phrase.is_empty() {
+                let sign = if exclude_phrase { "-" } else { "" };
+                key.push(format!("{sign}\"{}\"", phrase.join(" ")));
+            }
+            continue;
+        }
+        // `-"…"`: a lone `-` right before the opening quote.
+        exclude_phrase = i + 1 < segments.len()
+            && segment
+                .strip_suffix('-')
+                .is_some_and(|head| head.is_empty() || head.ends_with(char::is_whitespace));
+        for token in segment.split_whitespace() {
+            if token == "OR" {
+                key.push(token.to_string());
+            } else if let Some(excluded) = token.strip_prefix('-') {
+                let excluded = words(excluded);
+                if !excluded.is_empty() {
+                    key.push(format!("-{}", excluded.join("-")));
+                }
+            } else {
+                key.extend(
+                    words(token)
+                        .into_iter()
+                        .filter(|w| !STOP.contains(&w.as_str())),
+                );
+            }
+        }
+    }
+    if let Some(site) = compiled.site {
+        key.push(format!("site:{site}"));
+    }
+    if let Some(filetype) = compiled.filetype {
+        key.push(format!("filetype:{filetype}"));
+    }
+    if let Some(title) = compiled.intitle {
+        key.push(format!("intitle:\"{}\"", title.to_lowercase()));
+    }
+    key.join(" ")
 }
 
 /// Cache key for BYOK provider results (issue #195). The `byok|`
@@ -253,11 +302,6 @@ pub struct Searcher {
     /// subsequent `web_fetch` of a top result (search → fetch
     /// is THE agent pipeline). One-shot, TTL'd, bounded.
     prewarms: std::sync::Arc<std::sync::Mutex<PrewarmCache>>,
-    /// Browser render capability (2026 Google serves a JS
-    /// shell to plain HTTP but renders fine in our own
-    /// headless Chrome: live-proven). Used ONLY by the
-    /// thinness-gated cascade lane; None in test builds.
-    ghost: Option<crate::crawl::GhostHook>,
     /// B3: learned host quality (www-stripped host -> EWMA).
     /// Filled by enrich/prefetch outcomes; nudges ranking
     /// slightly after enough samples. Kill: search.quality_prior.
@@ -370,7 +414,6 @@ impl Searcher {
             inflight: Mutex::new(std::collections::HashSet::new()),
             byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
-            ghost: None,
             quality: Mutex::new(load_quality_disk()),
             quality_dirty: std::sync::atomic::AtomicBool::new(false),
             outcome: Mutex::new(load_outcome_disk()),
@@ -381,12 +424,6 @@ impl Searcher {
     /// The shared egress pool (crawl/fetch attach the same Arc).
     pub fn egress_pool(&self) -> &std::sync::Arc<EgressPool> {
         &self.pool
-    }
-
-    /// Attach the browser-render capability (cascade lane).
-    pub fn with_ghost(mut self, ghost: crate::crawl::GhostHook) -> Self {
-        self.ghost = Some(ghost);
-        self
     }
 
     /// v3 F1: warm-handoff store : filled by enrichment, drained
@@ -723,7 +760,7 @@ impl Searcher {
         // site:github.com / site:stackoverflow.com / etc. join the
         // fan-out as the site's own API.
         if let Some(site) = &compiled.site
-            && let Some(sv) = query::site_vertical(site)
+            && let Some(sv) = query::site_vertical(query::site_scope(site).0)
             && !verticals.contains(&sv)
         {
             verticals.push(sv);
@@ -943,71 +980,25 @@ impl Searcher {
                 previous,
             )));
         }
-        // Start the independent browser index alongside recovery requests.
-        // Waiting for failed HTTP retries first only delays a lane that can
-        // succeed without them. A healthy first merge keeps the cheap path.
-        let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
-        let google_http_ok = outcomes
-            .iter()
-            .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
-        let lane_permitted = self.ghost.is_some()
-            && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
-            && !self.quarantined("google_ghost");
-        let browser_recovery = async {
-            if !lane_permitted
-                || !google_ghost_wanted(force_lane, google_http_ok, ok_engines, ok_hits)
-            {
-                return Vec::new();
-            }
-            let hook = self.ghost.as_ref().unwrap().clone();
-            let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
-            if budget.is_zero() {
-                return vec![(
-                    "google_ghost".to_string(),
-                    Err(("budget-skipped".into(), "ghost".into(), true)),
-                )];
-            }
-            vec![
-                ghost_engine_task(
-                    "google_ghost".to_string(),
-                    query.to_string(),
-                    hook,
-                    &self.pool,
-                    budget,
-                )
-                .await,
-            ]
-        };
-        let (retry_outcomes, lane_outcomes) = tokio::join!(
-            futures_util::future::join_all(retry_futures),
-            browser_recovery
-        );
+        let retry_outcomes = futures_util::future::join_all(retry_futures).await;
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
         // C5: best instant answer across lanes (first non-empty wins
         // by engine trust order, which outcomes already respect).
         let mut instant: Option<instant::InstantAnswer> = None;
-        let all: Vec<(String, EngineResult)> = outcomes
-            .into_iter()
-            .chain(retry_outcomes)
-            .chain(lane_outcomes)
-            .collect();
+        let all: Vec<(String, EngineResult)> = outcomes.into_iter().chain(retry_outcomes).collect();
         for (label, outcome) in all {
             let profile = label.split_once('@').map(|(_, p)| p.to_string());
             let engine = engine_name(&label).to_string();
-            let ghost_lane = engine == "google_ghost";
             match outcome {
                 Ok((hits, ms, egress_id, was_engine, lane_instant)) => {
                     let base = engine_health_key(&engine);
                     self.record_outcome(base, true);
-                    if was_engine && !ghost_lane {
-                        // "ghost" is not an egress id: pool
-                        // bookkeeping must not record lanes that
-                        // the pool never assigned.
+                    if was_engine {
                         self.pool.report_ok(&engine, &egress_id);
                     }
-                    if was_engine || ghost_lane {
+                    if was_engine {
                         self.bump_trust(base, intent, true);
                     }
                     if instant.is_none()
@@ -1033,7 +1024,7 @@ impl Searcher {
                     if is_engine_fault(&status) {
                         self.record_outcome(base, false);
                     }
-                    if (was_engine || ghost_lane) && !ghost_lane {
+                    if was_engine {
                         if status.starts_with("dead") {
                             self.pool.report_dead(&egress_id);
                         } else if status == "auth-fail" {
@@ -1042,7 +1033,7 @@ impl Searcher {
                             self.pool.report_blocked(&engine, &egress_id);
                         }
                     }
-                    if (was_engine || ghost_lane) && is_engine_fault(&status) {
+                    if was_engine && is_engine_fault(&status) {
                         self.bump_trust_status(base, intent, false, &status);
                     }
                     report.push(EngineReport {
@@ -1397,13 +1388,7 @@ fn engine_health_key(engine: &str) -> &str {
     if engine == "google" {
         return "google_http_v1";
     }
-    // Different Google transports can fail independently; only ranking groups
-    // them into one index family. A WML block must not quarantine the browser.
-    if engine == "google_ghost" {
-        engine
-    } else {
-        egress::health_key(engine)
-    }
+    egress::health_key(engine)
 }
 
 fn retry_engine_failure(status: &str) -> bool {
@@ -1423,16 +1408,6 @@ async fn bounded_retry(
     tokio::time::timeout(budget, task)
         .await
         .unwrap_or_else(|_| (engine, Err(("retry-timeout".into(), egress, was_engine))))
-}
-
-fn google_ghost_wanted(force: bool, http_ok: bool, engines_ok: usize, hits_ok: usize) -> bool {
-    force || (!http_ok && ghost_lane_wanted(engines_ok, hits_ok))
-}
-
-/// Thinness gate for the ghost cascade lane. A successful HTTP Google
-/// response already supplies that index; the caller skips the browser then.
-fn ghost_lane_wanted(engines_ok: usize, hits_ok: usize) -> bool {
-    engines_ok < 3 || hits_ok < 15
 }
 
 /// Input hygiene for the search surface. Empty queries waste a
@@ -1479,6 +1454,9 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
 ///
 /// Matches `domain.com` and any subdomain `*.domain.com`.
 /// Case-insensitive. Strips `www.` prefix before comparison.
+/// `site:domain.com/path` also requires the URL path to start with
+/// `/path`; a scheme in the value (`site:https://domain.com`) is
+/// ignored.
 /// (#190) site: filters BYOK results too: the same filtering and count
 /// semantics as the local engine sweeps. Redirect rows whose target
 /// host can not match the scanned domain (google goto proxies) drop;
@@ -1495,18 +1473,20 @@ pub(crate) fn site_filter(query: &str, results: &mut Vec<Merged>) {
             }
         }
     }
-    let Some(domain) = site_domain else {
+    let Some(site) = site_domain else {
         return;
     };
+    let (domain, path) = query::site_scope(&site);
     // Use raw host (not host_of which strips www.) so
     // `site:www.wikipedia.org` matches only www., while
     // `site:wikipedia.org` matches all subdomains.
     results.retain(|r| {
-        let host = url::Url::parse(&r.url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-            .unwrap_or_default();
-        host == domain || host.ends_with(&format!(".{domain}"))
+        let Ok(u) = url::Url::parse(&r.url) else {
+            return false;
+        };
+        let host = u.host_str().map(|h| h.to_lowercase()).unwrap_or_default();
+        (host == domain || host.ends_with(&format!(".{domain}")))
+            && query::site_path_matches(&u, path)
     });
 }
 
@@ -1549,34 +1529,37 @@ mod tests {
         let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxies = [&a, &b].map(|listener| {
-            crate::transport::proxy::Proxy::parse(&format!(
+            crate::egress::proxy::Proxy::parse(&format!(
                 "http://{}",
                 listener.local_addr().unwrap()
             ))
             .unwrap()
         });
         let acceptor = if matches!(case, ProbeCase::Healthy) {
-            use boring::ssl::{SslAcceptor, SslMethod};
+            // The mock proxy terminates the tunnel with a self-signed cert
+            // for api.ipify.org; the client trusts it through SSL_CERT_FILE
+            // (the engine's BoringSSL reads default verify paths from
+            // SSL_CERT_FILE/SSL_CERT_DIR, same as the old transport did).
             let cert = rcgen::generate_simple_self_signed(vec!["api.ipify.org".into()]).unwrap();
             let bundle = crate::paths::cache_dir().join("owned-probe-ca.pem");
             std::fs::write(&bundle, cert.cert.pem()).unwrap();
             // Nextest gives this owned trust bundle its own process.
             unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
-            let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-            acceptor
-                .set_certificate(&boring::x509::X509::from_der(cert.cert.der()).unwrap())
-                .unwrap();
-            acceptor
-                .set_private_key(
-                    &boring::pkey::PKey::private_key_from_der(&cert.signing_key.serialize_der())
-                        .unwrap(),
+            let mut config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![rustls_pki_types::CertificateDer::from(
+                        cert.cert.der().to_vec(),
+                    )],
+                    rustls_pki_types::PrivateKeyDer::Pkcs8(
+                        rustls_pki_types::PrivatePkcs8KeyDer::from(
+                            cert.signing_key.serialize_der(),
+                        ),
+                    ),
                 )
                 .unwrap();
-            acceptor.set_alpn_select_callback(|_, peer| {
-                boring::ssl::select_next_proto(b"\x08http/1.1", peer)
-                    .ok_or(boring::ssl::AlpnError::NOACK)
-            });
-            Some(Arc::new(acceptor.build()))
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(config))))
         } else {
             None
         };
@@ -1613,7 +1596,7 @@ mod tests {
                     release.notified().await;
                     if let Some(acceptor) = acceptor {
                         socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
-                        let mut tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                        let mut tls = acceptor.accept(socket).await.unwrap();
                         let mut request = Vec::new();
                         while !request.ends_with(b"\r\n\r\n") {
                             assert!(request.len() < 16384);
@@ -1721,7 +1704,7 @@ mod tests {
         for _ in 0..8 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             proxies.push(
-                crate::transport::proxy::Proxy::parse(&format!(
+                crate::egress::proxy::Proxy::parse(&format!(
                     "http://{}",
                     listener.local_addr().unwrap()
                 ))
@@ -1927,9 +1910,105 @@ mod tests {
         assert!(s.byok_cache_get("shared query", Intent::News, 5).is_none());
     }
 
+    const JAGUAR_REVIEW: &str = "https://cars.example/jaguar-f-type-review";
+
+    /// Bench every engine and vertical the queries would fan out to,
+    /// so a search the cache does not answer fails at once with
+    /// "all engines failed" instead of reaching the network.
+    fn bench_every_source(s: &Searcher, queries: &[&str]) {
+        let mut failures = s.failures.lock().unwrap();
+        let engines = intent::engines_for(Intent::Web).iter().copied();
+        for e in engines.map(engine_health_key) {
+            failures.insert(e.to_string(), (3, Instant::now()));
+        }
+        for q in queries {
+            for v in intent::verticals_for(Intent::Web, q) {
+                failures.insert(v.to_string(), (3, Instant::now()));
+            }
+        }
+    }
+
+    /// Store a local-path entry the way `search_inner` keys it.
+    fn seed_local_cache(s: &Searcher, query: &str, url: &str) {
+        let key = format!("{}|{}", norm_query(query), Intent::Web.code());
+        s.cache
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), vec![merged(url)], 12, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_query_is_not_served_the_included_results() {
+        let s = test_searcher();
+        bench_every_source(&s, &["jaguar car", "jaguar -car"]);
+        seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
+        // Negative: a repeat of the cached query is still a hit.
+        let repeat = s
+            .search("jaguar car", 5, Some(Intent::Web))
+            .await
+            .expect("a repeat query is served from the cache");
+        assert!(repeat.cached);
+        assert_eq!(repeat.results[0].url, JAGUAR_REVIEW);
+        let excluded = s.search("jaguar -car", 5, Some(Intent::Web)).await;
+        assert!(
+            matches!(&excluded, Err(e) if e.to_string().contains("all engines failed")),
+            "\"jaguar -car\" must miss the \"jaguar car\" entry, got {:?}",
+            excluded.map(|out| (out.cached, out.results))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_query_does_not_join_the_included_flight() {
+        let s = test_searcher();
+        bench_every_source(&s, &["jaguar car", "jaguar -car"]);
+        // A "jaguar car" leader is in flight. A follower polls for its
+        // cache write for up to 12 s before running on its own.
+        let leader = format!("{}|{}", norm_query("jaguar car"), Intent::Web.code());
+        s.inflight.lock().unwrap().insert(leader);
+        // Negative: an identical query joins the flight and is served
+        // what the leader publishes.
+        let (joined, ()) = tokio::join!(s.search("jaguar car", 5, Some(Intent::Web)), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
+        });
+        let joined = joined.expect("a follower is served the leader's results");
+        assert!(joined.cached);
+        assert_eq!(joined.results[0].url, JAGUAR_REVIEW);
+        // Drop the published entry: only the flight can hold the next
+        // query back now.
+        s.cache.lock().unwrap().clear();
+        let excluded = tokio::time::timeout(
+            Duration::from_secs(3),
+            s.search("jaguar -car", 5, Some(Intent::Web)),
+        )
+        .await;
+        assert!(
+            matches!(&excluded, Ok(Err(_))),
+            "\"jaguar -car\" waited on the \"jaguar car\" flight: {excluded:?}"
+        );
+    }
+
+    #[test]
+    fn a_byok_exclusion_query_misses_the_included_entry() {
+        let s = test_searcher();
+        s.byok_cache_put("jaguar car", &byok_outcome("serper", &[JAGUAR_REVIEW]));
+        // Negative: a repeat of the cached query is still a hit.
+        let repeat = s
+            .byok_cache_get("jaguar car", Intent::Web, 5)
+            .expect("a repeat query is served from the cache");
+        assert!(repeat.cached);
+        assert_eq!(repeat.results[0].url, JAGUAR_REVIEW);
+        let excluded = s.byok_cache_get("jaguar -car", Intent::Web, 5);
+        assert!(
+            excluded.is_none(),
+            "\"jaguar -car\" was served the provider's \"jaguar car\" answer: {:?}",
+            excluded.map(|out| out.results)
+        );
+    }
+
     #[test]
     fn regression_unavailable_google_does_not_stop_other_assignments() {
-        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
         let id = proxy.id();
         let pool = EgressPool::new(vec![proxy]);
         pool.report_blocked("google", &id);
@@ -1950,7 +2029,7 @@ mod tests {
     #[test]
     fn assignments_preserve_proxy_spreading_and_shared_direct_lane() {
         let proxies = ["http://127.0.0.1:12345", "http://127.0.0.1:12346"]
-            .map(|url| crate::transport::proxy::Proxy::parse(url).unwrap())
+            .map(|url| crate::egress::proxy::Proxy::parse(url).unwrap())
             .to_vec();
         let pool = EgressPool::new(proxies);
         let assignments = ["bing", "yahoo", "brave", "ddg"]
@@ -1965,18 +2044,10 @@ mod tests {
     }
 
     #[test]
-    fn google_transport_health_is_separate_but_index_family_is_shared() {
+    fn google_transport_health_key_is_transport_specific() {
         assert_eq!(engine_health_key("google@6230-05.50"), "google_http_v1");
         assert_ne!(engine_health_key("google"), "google");
-        assert_ne!(
-            engine_health_key("google"),
-            engine_health_key("google_ghost")
-        );
         assert_eq!(engine_health_key("ddg_html"), "ddg");
-        assert_eq!(
-            rank::engine_family("google"),
-            rank::engine_family("google_ghost")
-        );
     }
 
     #[test]
@@ -1990,14 +2061,6 @@ mod tests {
         let reloaded: EngineReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
         assert_eq!(reloaded.profile.as_deref(), Some("6230-04.44"));
-    }
-
-    #[test]
-    fn successful_google_http_skips_browser_unless_explicitly_forced() {
-        assert!(!google_ghost_wanted(false, true, 1, 3));
-        assert!(google_ghost_wanted(false, false, 1, 3));
-        assert!(!google_ghost_wanted(false, false, 4, 20));
-        assert!(google_ghost_wanted(true, true, 4, 20));
     }
 
     #[test]
@@ -2078,7 +2141,6 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(!intent::engines_for(intent).contains(&"google_ghost"));
         }
     }
 
@@ -2097,7 +2159,6 @@ mod tests {
         assert!(is_engine_fault("blocked:403"));
         assert!(is_engine_fault("blocked:captcha"));
         assert!(is_engine_fault("empty-parse"));
-        assert!(is_engine_fault("ghost-timeout"));
         assert!(is_engine_fault("timeout"));
         assert!(is_engine_fault("no-url"));
         assert!(is_engine_fault("net"));
@@ -2159,14 +2220,6 @@ mod tests {
     }
 
     #[test]
-    fn google_ghost_is_its_own_family_for_ranking_math() {
-        assert_eq!(rank::engine_family("google_ghost"), "google");
-        assert_eq!(rank::engine_family("google"), "google");
-        // Not a vertical: full RRF mass, no vertical-only penalty.
-        assert!(!rank::is_vertical("google_ghost"));
-    }
-
-    #[test]
     fn family_count_dedups_shared_indexes() {
         let mut r = Merged {
             title: "t".into(),
@@ -2180,7 +2233,7 @@ mod tests {
             ("bing".into(), 0),
             ("ddg".into(), 3),
             ("yahoo".into(), 5),
-            ("google_ghost".into(), 2),
+            ("google".into(), 2),
             ("brave".into(), 4),
         ];
         // 5 engines, 3 families (bing family dedups to one opinion).
@@ -2339,23 +2392,87 @@ mod tests {
     }
 
     #[test]
-    fn ghost_lane_gate_needs_real_thinness_or_force() {
-        // A healthy merge never pays a browser render.
-        assert!(!ghost_lane_wanted(5, 40));
-        assert!(!ghost_lane_wanted(3, 16));
-        // Thin merge on either axis fires the lane.
-        assert!(ghost_lane_wanted(2, 40), "few engines ok");
-        assert!(ghost_lane_wanted(4, 12), "thin hits");
-        assert!(ghost_lane_wanted(0, 0));
-    }
-
-    #[test]
     fn norm_query_collapses_variants() {
         assert_eq!(
             norm_query("Rust Async: the Runtime, comparison!"),
             norm_query("rust async runtime comparison")
         );
         assert_ne!(norm_query("kafka vs nats"), norm_query("kafka"));
+        // A plain query's key is its lowercased words minus stopwords.
+        assert_eq!(
+            norm_query("Rust Async: the Runtime, comparison!"),
+            "rust async runtime comparison"
+        );
+        // Punctuation that is not an operator still collapses.
+        for (a, b) in [
+            ("x-ray machine", "x ray machine"),
+            ("jaguar - car", "jaguar car"),
+            ("rust or go", "rust go"),
+            ("rust site:github.com", "rust site:GitHub.com/"),
+        ] {
+            assert_eq!(norm_query(a), norm_query(b), "{a:?} vs {b:?}");
+        }
+        // An operator keeps each pair apart.
+        for (a, b) in [
+            ("jaguar car", "jaguar -car"),
+            ("rust async", "\"rust async\""),
+            ("c tutorial", "c# tutorial"),
+            ("rust go", "rust OR go"),
+            ("jaguar \"the car\"", "jaguar -\"the car\""),
+            ("rust site github com", "rust site:github.com"),
+            ("rust filetype pdf", "rust filetype:pdf"),
+            ("intitle rust", "intitle:rust"),
+        ] {
+            assert_ne!(norm_query(a), norm_query(b), "{a:?} vs {b:?}");
+        }
+    }
+
+    /// A restarted searcher must count the time no process ran: an
+    /// entry fresh at save and three days old on disk is not served.
+    /// Reaches search-cache.json through the per-process test cache
+    /// root, so it relies on nextest's process per test.
+    #[tokio::test]
+    async fn persisted_cache_entry_counts_time_spent_stopped() {
+        let query = "tokio runtime overview";
+        let key = format!("{}|{}", norm_query(query), Intent::Web.code());
+        let mut map = persist::CacheMap::new();
+        map.insert(
+            key.clone(),
+            (
+                Instant::now(),
+                vec![merged("https://tokio.rs/")],
+                12,
+                Vec::new(),
+            ),
+        );
+        persist::save_cache_disk(&map);
+        let path = crate::paths::cache_dir().join("search-cache.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // The daemon was stopped for three days after that save: move
+        // the entry's stored time back by three days. The file mtime is
+        // not read by the loader, so backdating it would simulate nothing.
+        // Only a Unix write time can be moved back: an age-at-save
+        // field is 0 here and would stay 0.
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let stored = doc[0][1].as_u64().unwrap();
+        assert!(
+            stored > 3 * 86_400,
+            "stored field {stored} is not a Unix write time, so it cannot be moved 3 days back; on disk: {}",
+            &raw[..raw.len().min(160)]
+        );
+        doc[0][1] = (stored - 3 * 86_400).into();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let s = Searcher::new(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            EgressPool::new(Vec::new()),
+        );
+        // Checked on the searcher's own cache: a search() call would
+        // send the query to live engines.
+        assert!(
+            !s.cache.lock().unwrap().contains_key(&key),
+            "an entry saved 3 days ago (Web TTL 30 min) was loaded as fresh; on disk: {}",
+            &raw[..raw.len().min(160)]
+        );
     }
 
     #[test]
@@ -2666,5 +2783,57 @@ mod tests {
         ];
         site_filter("rust site:www.wikipedia.org", &mut results);
         assert_eq!(results.len(), 1, "www.wikipedia.org matches www. only");
+    }
+
+    #[test]
+    fn site_filter_with_a_path_keeps_only_that_subtree() {
+        let mut results = vec![
+            merged("https://github.com/tokio-rs/tokio"),
+            merged("https://github.com/rust-lang/rust"),
+            merged("https://example.com/tokio-rs/tokio"),
+            merged("https://github.com/"),
+            merged("https://github.com/Tokio-RS/mio"),
+        ];
+        site_filter("runtime site:github.com/tokio-rs/", &mut results);
+        let kept: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "https://github.com/tokio-rs/tokio",
+                "https://github.com/Tokio-RS/mio"
+            ],
+            "on-host hits outside /tokio-rs and off-host hits on the same path drop"
+        );
+    }
+
+    #[test]
+    fn site_filter_ignores_a_scheme_in_the_value() {
+        let mut results = vec![
+            merged("https://docs.rs/tokio/latest/tokio/"),
+            merged("http://docs.rs/serde"),
+            merged("https://crates.io/crates/tokio"),
+        ];
+        site_filter("tokio site:https://docs.rs", &mut results);
+        assert_eq!(results.len(), 2, "docs.rs on any scheme, crates.io drops");
+        assert!(results.iter().all(|r| r.url.contains("://docs.rs/")));
+    }
+
+    #[test]
+    fn site_operator_with_a_path_keeps_on_site_results() {
+        let mut results = vec![
+            merged("https://github.com/tokio-rs/tokio"),
+            merged("https://github.com/tokio-rs/axum"),
+            merged("https://example.com/tokio"),
+        ];
+        site_filter("runtime site:github.com/tokio-rs", &mut results);
+        let kept: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "https://github.com/tokio-rs/tokio",
+                "https://github.com/tokio-rs/axum"
+            ],
+            "site:github.com/tokio-rs must keep the github.com/tokio-rs results"
+        );
     }
 }

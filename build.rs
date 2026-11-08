@@ -94,7 +94,15 @@ fn main() {
     let os = env::var("CARGO_CFG_TARGET_OS").expect("no target os");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("no target arch");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("no manifest dir"));
-    let vendored = manifest.join("vendor").join("pdfium");
+    // `vendor/pdfium` holds whatever archive the last host build downloaded, so a
+    // cross build (an aarch64 binary from an x86_64 machine) would link the
+    // host's objects and fail with "incompatible with aarch64linux". The override
+    // gives that target its own directory, fetched and verified like the default.
+    println!("cargo:rerun-if-env-changed=DONSETCH_PDFIUM_DIR");
+    let vendored = env::var_os("DONSETCH_PDFIUM_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest.join("vendor").join("pdfium"));
     let libdir = vendored.join("lib");
 
     let is_windows = os == "windows";
@@ -211,33 +219,40 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src/display_name.rs");
 
-    // ── LLD auto-detection (Linux) ────────────────────────────
+    // ── Linker selection (Linux) ──────────────────────────────
     //
-    // The PDFium static archives are produced by LLVM/Clang. GNU ld
-    // on some versions/architectures can't parse the ELF machine type
-    // of LLVM-generated archive members — notably aarch64 with GNU
-    // ld 2.42+ reports "architecture: UNKNOWN!" and skips them as
-    // incompatible. Newer GNU binutils (2.44+) on x86_64 also reject
-    // LLVM CREL relocations in the same archives.
+    // The PDFium static archives are produced by LLVM/Clang with CREL
+    // (compact relocation) sections. A linker that does not know CREL does not
+    // always say so: GNU ld before 2.44 and lld before 20 skip the unknown
+    // section type, the link succeeds, and every relocation in those objects is
+    // silently left unapplied. libc++'s `iostream` init is one: its
+    // `.init_array` slot stays zero, so the binary calls a null constructor
+    // before `main` and dies with SIGSEGV at address 0 (linux-aarch64 CI,
+    // 2026-11-07, where apt's lld 18 was the linker). Newer GNU ld (2.44+)
+    // rejects CREL outright; aarch64 GNU ld also skips LLVM members as
+    // "architecture: UNKNOWN".
     //
-    // LLD handles both correctly. If ld.lld is available, we inject
-    // -fuse-ld=lld into the link step so the compiler driver (cc/gcc)
-    // uses LLD instead of GNU ld. This is transparent to the user —
-    // no RUSTFLAGS or .cargo/config.toml needed.
+    // So the link must be done by an lld of LLVM 20 or later. The toolchain's
+    // own `rust-lld` is always as new as rustc's LLVM and needs no install, so it
+    // is preferred; `ld.lld` from PATH is the fallback when it is at least that new.
+    // Both are handed to the compiler driver (`-fuse-ld=lld` plus `-B` for where
+    // the driver finds `ld.lld`), so an older `ld.lld` earlier in PATH cannot win.
     if os == "linux" || os == "android" {
-        let lld_available = Command::new("ld.lld")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if lld_available {
-            println!("cargo:rustc-link-arg=-fuse-ld=lld");
-        } else if arch == "aarch64" {
-            eprintln!(
-                "warning: donsetch: LLD not found. GNU ld on aarch64 may fail \
-                 to link LLVM-produced PDFium archives. \
-                 Install lld (e.g., apt install lld / pkg install lld) and rebuild."
-            );
+        match crel_capable_lld() {
+            Some(dir) => {
+                println!("cargo:rustc-link-arg=-fuse-ld=lld");
+                if let Some(dir) = dir {
+                    println!("cargo:rustc-link-arg=-B{}", dir.display());
+                }
+            }
+            None if user_chose_a_linker() => {}
+            None => println!(
+                "cargo:warning=donsetch: no lld of LLVM 20 or later found. The PDFium \
+                 static archives use CREL relocations, which an older linker skips \
+                 without an error, producing a binary that crashes before main. \
+                 Use a Rust toolchain that ships rust-lld, install lld 20+, or name \
+                 a CREL-capable linker (mold 2.38+) in RUSTFLAGS."
+            ),
         }
     }
 
@@ -435,6 +450,159 @@ fn target_pair(os: &str, arch: &str) -> &'static str {
     }
 }
 
+/// The oldest LLVM whose lld reads CREL relocations without an experimental flag.
+const LLD_WITH_CREL: u32 = 20;
+
+/// `Some(None)`: the `ld.lld` the driver already finds is new enough.
+/// `Some(Some(dir))`: pass `-B<dir>` so the driver finds the `ld.lld` in `dir`.
+/// `None`: no lld that reads CREL.
+fn crel_capable_lld() -> Option<Option<PathBuf>> {
+    // The toolchain's own lld, as new as rustc's LLVM.
+    if let Some(dir) = toolchain_lld_dir()
+        && lld_major(&dir.join("ld.lld")).is_some_and(|major| major >= LLD_WITH_CREL)
+    {
+        return Some(Some(dir));
+    }
+    // Otherwise the newest `ld.lld` on PATH, if it is new enough.
+    let path = env::var_os("PATH")?;
+    let mut best: Option<(u32, PathBuf)> = None;
+    let mut first: Option<PathBuf> = None;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join("ld.lld");
+        if let Some(major) = lld_major(&candidate) {
+            first.get_or_insert_with(|| dir.clone());
+            if best.as_ref().is_none_or(|(have, _)| major > *have) {
+                best = Some((major, dir));
+            }
+        }
+    }
+    let (major, dir) = best?;
+    if major < LLD_WITH_CREL {
+        return None;
+    }
+    // The first `ld.lld` in PATH is the one the driver would pick on its own.
+    Some((first.as_ref() != Some(&dir)).then_some(dir))
+}
+
+/// `<sysroot>/lib/rustlib/<host>/bin/gcc-ld`: the directory where the toolchain
+/// keeps an `ld.lld` for a compiler driver to find through `-B`.
+fn toolchain_lld_dir() -> Option<PathBuf> {
+    let rustc = env::var_os("RUSTC")?;
+    let host = env::var("HOST").ok()?;
+    let out = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    let sysroot = String::from_utf8(out.stdout).ok()?;
+    let dir = PathBuf::from(sysroot.trim())
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("bin")
+        .join("gcc-ld");
+    dir.join("ld.lld").is_file().then_some(dir)
+}
+
+/// The LLVM major version of the lld at `path`, from "LLD 22.1.8 (...)" (a distro
+/// prefixes its name: "Debian LLD 18.1.3 (...)").
+fn lld_major(path: &Path) -> Option<u32> {
+    let out = Command::new(path).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut words = text.split_whitespace().skip_while(|word| *word != "LLD");
+    words.next()?;
+    words.next()?.split('.').next()?.parse().ok()
+}
+
+/// True when RUSTFLAGS already names a linker or a `-fuse-ld`, which is the
+/// user's decision (this repo's own mold config is one).
+fn user_chose_a_linker() -> bool {
+    env::var("CARGO_ENCODED_RUSTFLAGS")
+        .map(|flags| flags.contains("fuse-ld") || flags.contains("linker="))
+        .unwrap_or(false)
+}
+
+/// Download one pinned release asset to `dest`, returning whether it landed.
+///
+/// GitHub's `releases/download` transfer path answers 504 under load while the
+/// same asset is healthy through the REST API (measured 2026-11-08: every
+/// platform leg of the v5.1.0 release failed on that 504). So: the plain path
+/// first, then the authenticated API asset URL. Both land in `dest` and every
+/// caller verifies a pinned sha256 afterwards, so the fallback cannot change
+/// what a build ends up using.
+fn download_release_asset(dest: &Path, url: &str) -> bool {
+    let try_curl = |target: &str| {
+        Command::new("curl")
+            .args([
+                "-fSL",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--retry",
+                "3",
+                "-o",
+            ])
+            .arg(dest)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or_else(|e| panic!("download: failed to spawn curl ({e}) — install curl"))
+    };
+    if try_curl(url) {
+        return true;
+    }
+    // https://github.com/<owner>/<repo>/releases/download/<tag>/<name>
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let Some(name) = rest.rsplit('/').next() else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let Some(&tag) = parts.get(4) else {
+        return false;
+    };
+    let (Some(owner), Some(repo)) = (parts.first(), parts.get(1)) else {
+        return false;
+    };
+    // The tag segment is URL-encoded: pdfium-static tags a release
+    // `chromium/7809`, and a raw slash in the path answers 404, which then
+    // reads as "no such asset" when the asset is right there.
+    let tag = tag.replace('/', "%2F");
+    let api = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{owner}/{repo}/releases/tags/{tag}"),
+            "--jq",
+            &format!(".assets[]|select(.name==\"{name}\")|.url"),
+        ])
+        .output();
+    let Ok(out) = api else { return false };
+    let asset_url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || asset_url.is_empty() {
+        eprintln!("download: no API asset URL for {name} ({url})");
+        return false;
+    }
+    eprintln!("download: retrying {name} through the API asset URL");
+    Command::new("curl")
+        .args([
+            "-fSL",
+            "--retry",
+            "3",
+            "-H",
+            "Accept: application/octet-stream",
+            "-o",
+        ])
+        .arg(dest)
+        .arg(&asset_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Download the pinned PDFium release into `vendored` when missing.
 ///
 /// Linux/macOS: static archive from kognitos/pdfium-static.
@@ -480,26 +648,11 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
     let tgz = vendored.join(&tgz_name);
     let _ = fs::create_dir_all(vendored);
 
+    // Same rule as ONNX: a stale or partial tarball is deleted, never reused.
+    let _ = fs::remove_file(&tgz);
     eprintln!("donsetch build: fetching pdfium {pair} from {url}");
-    let status = Command::new("curl")
-        .args([
-            "-fSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "3",
-            "-o",
-        ])
-        .arg(&tgz)
-        .arg(&url)
-        .status()
-        .unwrap_or_else(|e| {
-            panic!("pdfium: failed to spawn curl ({e}) — install curl: apt install curl")
-        });
-    if !status.success() {
-        panic!("pdfium: curl download failed for {url}");
+    if !download_release_asset(&tgz, &url) {
+        panic!("pdfium: download failed for {url}");
     }
 
     let mut f = fs::File::open(&tgz).expect("pdfium: cannot open downloaded tarball");
@@ -655,24 +808,12 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         OnnxArchive::Tgz => "onnx.tgz",
         OnnxArchive::Zip => "onnx.zip",
     });
+    // A stale archive (an older pin, a partial download) must never be
+    // extracted under a new hash: start from nothing and re-fetch.
+    let _ = fs::remove_file(&tarball);
     eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
-    let status = Command::new("curl")
-        .args([
-            "-fSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "3",
-            "-o",
-        ])
-        .arg(&tarball)
-        .arg(info.url)
-        .status()
-        .unwrap_or_else(|e| panic!("ONNX: failed to spawn curl ({e})"));
-    if !status.success() {
-        panic!("ONNX: curl download failed for {}", info.url);
+    if !download_release_asset(&tarball, info.url) {
+        panic!("ONNX: download failed for {}", info.url);
     }
 
     // 2. Verify SHA-256.

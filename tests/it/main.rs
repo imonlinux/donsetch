@@ -64,20 +64,23 @@ pub(crate) fn sandbox() -> std::path::PathBuf {
     .clone()
 }
 
-mod auth_login;
 mod bypass_live;
 mod cli_surface;
 mod crawl_fresh_fetch;
 mod daemon_boot_stays_alive;
+mod disk_state;
 mod egress_proxy;
+mod fetch_views;
 mod focus_regressions;
-mod ghost_state_boundaries;
+#[cfg(all(unix, feature = "http"))]
+mod mcp_http_stop;
 mod mcp_tool_call_does_not_abort;
 mod request_class;
 mod revalidate_redirect;
 mod rules_off_switch;
 mod secure_cookie_leak;
 mod soak;
+mod state_boundaries;
 mod state_sandbox;
 mod stderr_pipe_closed;
 mod token_invariants;

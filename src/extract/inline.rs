@@ -22,7 +22,7 @@ pub fn element_markdown(
     let emph = Emphasis::of(el);
     let (text, density) = markdown_impl(el, base, opts, false, emph);
     let md = match el.value().name() {
-        "a" if opts.include_links => el
+        "a" if opts.include_links && !text.trim().is_empty() => el
             .value()
             .attr("href")
             .and_then(|href| absolutize(base, href))
@@ -151,6 +151,22 @@ pub fn plain(el: ElementRef<'_>) -> String {
     visible_text(el)
 }
 
+/// True when text running straight on from an element's words starts a
+/// new word a browser would show apart: a badge or label (`TL;DR`,
+/// `Note:`, `NEW`) set off by style, then a capitalised word. A word split
+/// across elements (`<b>T</b>he`, `<span>Java</span>Script`) never
+/// matches: its left side ends in a lowercase letter or its right side
+/// does not start a capitalised word.
+fn label_glued(buf: &str, text: &str) -> bool {
+    let Some(left) = buf.trim_end_matches(['*', '_']).chars().next_back() else {
+        return false;
+    };
+    let mut right = text.chars();
+    let starts_word = right.next().is_some_and(char::is_uppercase)
+        && right.next().is_some_and(char::is_lowercase);
+    starts_word && (left.is_uppercase() || matches!(left, ':' | ';' | '.' | '!' | '?'))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     el: ElementRef<'_>,
@@ -169,11 +185,16 @@ fn render(
     // The last sibling run's closing marker, so the next run of the
     // same kind can continue it instead of opening right after it.
     let mut closer = None;
+    let mut after_element = false;
     for child in el.children() {
+        let element_before = std::mem::replace(&mut after_element, child.value().is_element());
         match child.value() {
             Node::Text(t) => {
                 let s = t.text.as_ref();
                 if !s.trim().is_empty() {
+                    if element_before && label_glued(buf, s) {
+                        buf.push(' ');
+                    }
                     buf.push_str(&escape_md_text(s, buf, emph.any()));
                     *total += s.trim().len();
                 } else if !s.is_empty() && !buf.is_empty() && !buf.ends_with(is_edge) {
@@ -267,11 +288,11 @@ fn render(
                         }
                     }
                     // Superscript: keep the content (`^{...}`)
-                    // unless it is a wiki-citation marker ([1],
-                    // bare digits) : those are pure token waste.
+                    // unless it is a citation marker ([1], a linked
+                    // footnote number) : those are pure token waste.
                     "sup" => {
                         let t = plain(c);
-                        if !t.is_empty() && (opts.faithful || !is_citation_marker(&t)) {
+                        if !t.is_empty() && !is_citation_marker(c, &t) {
                             buf.push_str(&format!("^{{{t}}}"));
                             *total += t.len();
                         }
@@ -296,15 +317,10 @@ fn render(
                     // (multi-paragraph comments, list items): at
                     // least a space : the words must never fuse.
                     "p" | "li" | "div" | "blockquote" => {
-                        if opts.faithful {
-                            buf.push_str("\0\0");
-                        } else if !buf.is_empty() && !buf.ends_with(' ') {
+                        if !buf.is_empty() && !buf.ends_with(' ') {
                             buf.push(' ');
                         }
                         render(c, base, opts, buf, total, link, depth + 1, false, inner);
-                        if opts.faithful {
-                            buf.push_str("\0\0");
-                        }
                     }
                     _ => {
                         if crate::extract::junk::skip(c) {
@@ -551,7 +567,27 @@ fn push_emphasized(
 /// boundaries is handled.
 /// With `in_emphasis`, a `*` or `_` that is the node's first or last
 /// non-whitespace character is always escaped.
+/// The words of a text that is wholly `**words**`: one bold span, its
+/// words starting and ending on a visible character, no `*` inside.
+fn leaked_bold(s: &str) -> Option<&str> {
+    let inner = s.trim().strip_prefix("**")?.strip_suffix("**")?;
+    let edges_visible = inner
+        .chars()
+        .next()
+        .zip(inner.chars().next_back())
+        .is_some_and(|(a, z)| !a.is_whitespace() && !z.is_whitespace());
+    (edges_visible && !inner.contains('*')).then_some(inner)
+}
+
 fn escape_md_text(s: &str, buf: &str, in_emphasis: bool) -> String {
+    // A page whose CMS printed its markdown unrendered (`**Plan**` as
+    // the whole text of a table header) meant bold: keep the markers,
+    // escape only what is inside them.
+    if !in_emphasis && let Some(inner) = leaked_bold(s) {
+        let lead = &s[..s.len() - s.trim_start().len()];
+        let tail = &s[s.trim_end().len()..];
+        return format!("{lead}**{}**{tail}", escape_md_text(inner, "*", false));
+    }
     let chars: Vec<char> = s.chars().collect();
     // Inside emphasis, the node's outermost visible characters can
     // land next to a marker (`push_emphasized` moves edge whitespace
@@ -638,10 +674,14 @@ fn is_punct_or_ws(c: char) -> bool {
     c.is_whitespace() || is_punct(c)
 }
 
-/// Wiki citation markers: "[1]", "[12]", "[a]", "[1][2]".
-/// These superscripts are reference noise; real superscripts
-/// (exponents, ordinal suffixes like "th") survive.
-fn is_citation_marker(t: &str) -> bool {
+/// Whether the superscript `sup`, with plain text `t`, is a citation
+/// marker: up to three digits or one lowercase letter, either
+/// bracketed ("[1]", "[12]", "[a]") or linked
+/// (`<sup><a href="#fn1">1</a></sup>`, or `<a href="#fn1"><sup>1</sup></a>`
+/// where the link holds nothing else). These are reference noise.
+/// Every other superscript is content and survives: bare numbers and
+/// letters (km^{2}, 10^{9}, x^{n}) and ordinal suffixes ("th").
+fn is_citation_marker(sup: ElementRef<'_>, t: &str) -> bool {
     let stripped: String = t.chars().filter(|c| !c.is_whitespace()).collect();
     if stripped.is_empty() {
         return true;
@@ -651,8 +691,25 @@ fn is_citation_marker(t: &str) -> bool {
         return true;
     }
     // Digits (up to 3) or a single footnote letter.
-    (inner.len() <= 3 && inner.chars().all(|c| c.is_ascii_digit()))
-        || inner.len() == 1 && inner.chars().all(|c| c.is_ascii_lowercase())
+    let shaped = (inner.len() <= 3 && inner.chars().all(|c| c.is_ascii_digit()))
+        || inner.len() == 1 && inner.chars().all(|c| c.is_ascii_lowercase());
+    // That shape is also the shape of an exponent or a unit power
+    // (km<sup>2</sup>, 10<sup>9</sup>, x<sup>n</sup>): only brackets
+    // or a link mark it as a reference.
+    shaped && (inner.len() < stripped.len() || is_linked(sup, t))
+}
+
+/// Whether the superscript holds a link, or is the whole text of the
+/// nearest link around it.
+fn is_linked(sup: ElementRef<'_>, t: &str) -> bool {
+    let is_link =
+        |el: ElementRef<'_>| el.value().name() == "a" && el.value().attr("href").is_some();
+    sup.descendent_elements().any(is_link)
+        || sup
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .find(|el| el.value().name() == "a")
+            .is_some_and(|a| is_link(a) && plain(a) == t)
 }
 
 /// Collapse raw inline-rendered text the same way markdown() does.
@@ -743,16 +800,12 @@ mod tests {
         let document = Html::parse_fragment(html);
         let root = document.root_element();
         let opts = super::super::ExtractOptions {
-            faithful: false,
             focus: None,
-            selector: None,
             max_chars: None,
             offset: 0,
             include_links: false,
-            include_media: false,
-            toc: false,
-            section: None,
-            must_contain: None,
+            link_urls: false,
+            verified: false,
         };
         markdown(root, "https://example.com/", &opts).0
     }
@@ -783,16 +836,12 @@ mod tests {
         let document = Html::parse_fragment(html);
         let root = document.root_element();
         let opts = super::super::ExtractOptions {
-            faithful: false,
             focus: None,
-            selector: None,
             max_chars: None,
             offset: 0,
             include_links: links,
-            include_media: false,
-            toc: false,
-            section: None,
-            must_contain: None,
+            link_urls: false,
+            verified: false,
         };
         markdown(root, "https://example.com/", &opts).0
     }
@@ -853,6 +902,60 @@ mod tests {
     fn intraword_asterisks_are_escaped() {
         let result = render_inline("<p>a*b*c</p>");
         assert_eq!(result, "a\\*b\\*c");
+    }
+
+    #[test]
+    fn a_label_badge_is_not_glued_to_the_sentence() {
+        let opts = super::super::ExtractOptions::default();
+        let md = |h: &str| {
+            let html = Html::parse_fragment(h);
+            let p = html
+                .select(&scraper::Selector::parse("p").unwrap())
+                .next()
+                .unwrap();
+            markdown(p, "https://example.com/", &opts).0
+        };
+        assert_eq!(
+            md("<p><span>TL;DR</span>Three tiers apply.</p>"),
+            "TL;DR Three tiers apply."
+        );
+        assert_eq!(
+            md("<p><b>Note:</b>The fee is due.</p>"),
+            "**Note:** The fee is due."
+        );
+        assert_eq!(
+            md("<p><span>NEW</span>Faster builds</p>"),
+            "NEW Faster builds"
+        );
+        // Words split across elements stay whole.
+        assert_eq!(md("<p><span>T</span>he cat</p>"), "The cat");
+        assert_eq!(
+            md("<p><span>Java</span>Script engines</p>"),
+            "JavaScript engines"
+        );
+        assert_eq!(md("<p><span>U.S.</span>-based</p>"), "U.S.-based");
+        assert_eq!(md("<p><abbr>HTML</abbr>5 parser</p>"), "HTML5 parser");
+    }
+
+    #[test]
+    fn leaked_markdown_bold_stays_bold() {
+        let html = Html::parse_fragment(
+            "<p><b>x</b></p><table><tr><th>**Maximum Penalty**</th><th>**a*b**</th><th>** spaced **</th></tr></table>",
+        );
+        let opts = super::super::ExtractOptions::default();
+        let th: Vec<String> = html
+            .select(&scraper::Selector::parse("th").unwrap())
+            .map(|el| markdown(el, "https://example.com/", &opts).0)
+            .collect();
+        assert_eq!(th[0], "**Maximum Penalty**");
+        // Anything else that looks like markers stays literal.
+        assert!(
+            th[1].starts_with("\\*") && th[2].starts_with("\\*"),
+            "{th:?}"
+        );
+        assert_eq!(leaked_bold("**x**"), Some("x"));
+        assert_eq!(leaked_bold("****"), None);
+        assert_eq!(leaked_bold("a **x**"), None);
     }
 
     #[test]
@@ -1149,30 +1252,6 @@ mod tests {
         assert_eq!(render_inline("<p>a <br> b</p>"), "a\nb");
     }
 
-    fn render_faithful(html: &str) -> String {
-        let document = Html::parse_fragment(html);
-        let opts = super::super::ExtractOptions {
-            faithful: true,
-            ..Default::default()
-        };
-        markdown(document.root_element(), "https://example.com/", &opts).0
-    }
-
-    // Faithful mode marks paragraph breaks inside inline content with
-    // a doubled sentinel: it stays outside the markers, and no space
-    // follows it.
-    #[test]
-    fn faithful_paragraph_breaks_stay_outside_the_markers() {
-        assert_eq!(
-            render_faithful("<div>x <strong><div>a</div></strong> b</div>").trim(),
-            "x\n\n**a**\n\nb"
-        );
-        assert_eq!(
-            render_faithful("<div><div>a</div> <b>b</b></div>").trim(),
-            "a\n\n**b**"
-        );
-    }
-
     // Link density of three paragraphs: a link inside bold counts as
     // plain text (0.0), a plain link counts as a link (0.5), and the
     // spaces around a link's text count as link text too (0.75).
@@ -1198,6 +1277,37 @@ mod tests {
             density(r#"<p>x <a href="https://e.example/"> y </a></p>"#),
             0.75
         );
+    }
+
+    // A bare number or letter in <sup> is an exponent or a unit
+    // power, never dropped as a citation, including inside a link
+    // that carries more text than the superscript.
+    #[test]
+    fn bare_superscripts_are_kept() {
+        assert_eq!(
+            render_inline(
+                "<p>1,000 km<sup>2</sup>, 10<sup>9</sup>, x<sup>n</sup>, the 19<sup>th</sup></p>"
+            ),
+            "1,000 km^{2}, 10^{9}, x^{n}, the 19^{th}"
+        );
+        assert_eq!(
+            render_inline(r##"<p>See <a href="#volume">10<sup>9</sup> cubic metres</a>.</p>"##),
+            "See 10^{9} cubic metres."
+        );
+    }
+
+    // Negative case: footnote markers that are bracketed or linked
+    // stay dropped (kramdown/Hugo, pandoc, Wikipedia shapes).
+    #[test]
+    fn bracketed_and_linked_footnote_markers_are_dropped() {
+        for html in [
+            r##"<p>Claim.<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" class="footnote">1</a></sup> Next</p>"##,
+            r##"<p>Claim.<a href="#fn1" class="footnote-ref" id="fnref1" role="doc-noteref"><sup>1</sup></a> Next</p>"##,
+            r##"<p>Claim.<sup class="reference"><a href="#cite_note-a">[a]</a></sup> Next</p>"##,
+            "<p>Claim.<sup>[12]</sup> Next</p>",
+        ] {
+            assert_eq!(render_inline(html), "Claim. Next", "{html}");
+        }
     }
 }
 

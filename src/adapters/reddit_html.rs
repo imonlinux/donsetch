@@ -22,9 +22,6 @@ use crate::extract::{ContentKind, ExtractOptions, Extracted, PartialContent, inl
 const MAX_ITEMS: usize = 40;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() {
-        return None;
-    }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
     if !crate::adapters::is_reddit_host(host) {
@@ -47,8 +44,8 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         render_about(&doc).map(|(md, title, n)| (md, title, ContentKind::Article, n, None))
     } else {
         // Listings, and any other page carrying posts (search
-        // results, a ghost-rendered profile feed). Profile pages
-        // as served at tier 1 carry their pinned/recent items and
+        // results, a user's profile feed). Profile pages
+        // as served locally carry their pinned/recent items and
         // stream the rest; the card keys on the user, not the
         // feed item's "u_<name>" prefixed label.
         render_listing(&doc, html).map(|(md, mut title, n)| {
@@ -78,6 +75,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     let lang_info = crate::extract::language::detect(&doc);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(title),

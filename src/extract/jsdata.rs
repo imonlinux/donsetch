@@ -213,10 +213,6 @@ struct Blob {
 /// Entry point. Returns `Some` only when meaningful content was
 /// recovered from embedded JSON.
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() || opts.toc {
-        return None;
-    }
-
     let blobs = find_blobs(html);
     if blobs.is_empty() {
         return None;
@@ -230,6 +226,33 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             walk(&value, "", &mut items, &mut order, 0);
         }
     }
+    finish(items, html, None, url, opts)
+}
+
+/// One inline state object (a page's JSON global, `name` for diagnostics)
+/// read as content: the same walk, scoring and rendering as the HTML path.
+/// `None` when it carries no content (UI chrome only).
+pub fn extract_state(
+    name: &str,
+    json: &str,
+    url: &str,
+    opts: &ExtractOptions,
+) -> Option<Extracted> {
+    let _ = name;
+    let value: Value = serde_json::from_str(json).ok()?;
+    let mut items: Vec<Item> = Vec::new();
+    let mut order: usize = 0;
+    walk(&value, "", &mut items, &mut order, 0);
+    finish(items, "", None, url, opts)
+}
+
+fn finish(
+    items: Vec<Item>,
+    html: &str,
+    _direct: Option<&()>,
+    url: &str,
+    opts: &ExtractOptions,
+) -> Option<Extracted> {
     if items.is_empty() {
         return None;
     }
@@ -255,16 +278,16 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         return None;
     }
 
-    // Render markdown.
-    let doc = Html::parse_document(html);
-    let preferred_title = super::metadata::metadata(&doc).title;
-    let mut lang_info = super::language::detect(&doc);
+    // Render markdown. (Empty html = the direct state path: no document
+    // to mine a title from.)
+    let preferred_title = if html.is_empty() {
+        None
+    } else {
+        super::metadata::metadata(&Html::parse_document(html)).title
+    };
     let (md, title) = render(&kept, url, preferred_title);
-    let observed = super::language::detect_from_text(&md);
-    lang_info.script = observed.script;
-    lang_info.scripts = observed.scripts;
 
-    if opts.focus.is_some() || opts.section.is_some() || opts.must_contain.is_some() {
+    if opts.focus.is_some() {
         // Rescued data earns the same read controls as ordinary DOM content.
         let mut blocks = Vec::new();
         for item in &kept {
@@ -301,11 +324,12 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             false,
             false,
             Vec::new(),
-            lang_info,
+            super::language::detect_from_text(&md),
             None,
             url,
             opts,
             opts.max_chars.unwrap_or(16_000).max(200),
+            None,
             None,
         )
         .ok();
@@ -313,6 +337,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title,
@@ -326,9 +351,10 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         focus_omitted: false,
         thin: total < 800,
         content_kind: ContentKind::Page,
-        lang: lang_info.code.clone(),
-        lang_source: lang_info.source,
-        script: Some(lang_info.script),
+        lang: guess_lang(&md),
+
+        lang_source: None,
+        script: None,
         quality: 0.7,
         pdf_pages: None,
         images: Vec::new(),
@@ -623,10 +649,8 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
             break;
         };
         let tag_end = tag_start + tag_end_rel;
-        if quoted
-            .iter()
-            .any(|needle| html[tag_start..tag_end].contains(needle))
-        {
+        let tag = &html[tag_start..tag_end];
+        if quoted.iter().any(|needle| tag.contains(needle)) && !tag_id(tag).is_some_and(chrome_id) {
             let body_start = tag_end + 1;
             let rest = &html[body_start..];
             if let Some(cs) = rest.find("</script>") {
@@ -639,6 +663,134 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
         from = tag_end + 1;
     }
     out
+}
+
+/// The `id` attribute of an opening tag's text, if it has one.
+fn tag_id(tag: &str) -> Option<&str> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("id") {
+        let at = from + rel;
+        from = at + 2;
+        // `id` as a whole attribute name, not the tail of `data-id`.
+        if !lower[..at].ends_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = tag[at + 2..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &rest[1..];
+        return body.find(quote).map(|end| &body[..end]);
+    }
+    None
+}
+
+/// Words that name an application's own settings inside its state:
+/// configuration, feature flags and experiments, environment, analytics,
+/// and the interface's translations. A subtree under such a key describes
+/// the app, never the page.
+const CONFIG_WORDS: &[&str] = &[
+    "config",
+    "configuration",
+    "settings",
+    "flags",
+    "experiments",
+    "env",
+    "analytics",
+    "tracking",
+    "i18n",
+    "l10n",
+    "translations",
+];
+
+/// Whether a state key names the app's configuration (`config`,
+/// `variantFlags`, `siteSettings`, `i18n`), matched by whole word so
+/// `configurable`, `environment` or `content` are read as usual. A false
+/// hit drops one subtree from the rescue; the document's own reading is
+/// untouched.
+fn config_key(key: &str) -> bool {
+    id_words(key)
+        .iter()
+        .any(|w| CONFIG_WORDS.contains(&w.as_str()))
+}
+
+/// The words an identifier is made of: split at punctuation and at
+/// camelCase humps (`AnalyticsConfigurationJSON` → analytics,
+/// configuration, json), lowercased.
+fn id_words(id: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in id.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let chars: Vec<char> = part.chars().collect();
+        let mut word = String::new();
+        for (i, &c) in chars.iter().enumerate() {
+            let hump = c.is_ascii_uppercase()
+                && i > 0
+                && (chars[i - 1].is_ascii_lowercase()
+                    || chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase())
+                        && chars[i - 1].is_ascii_uppercase());
+            if hump && !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            word.push(c.to_ascii_lowercase());
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// Words that name what a page's chrome stores as JSON: its navigation,
+/// header and footer, banners and sign-up prompts, configuration and
+/// feature flags, analytics, translations, and bundler bookkeeping.
+const CHROME_WORDS: &[&str] = &[
+    "nav",
+    "navigation",
+    "navbar",
+    "menu",
+    "megamenu",
+    "header",
+    "footer",
+    "banner",
+    "modal",
+    "popup",
+    "newsletter",
+    "signup",
+    "onetap",
+    "consent",
+    "cookie",
+    "cookies",
+    "config",
+    "configuration",
+    "settings",
+    "flags",
+    "env",
+    "analytics",
+    "tracking",
+    "tracker",
+    "rum",
+    "chunks",
+    "preloads",
+    "i18n",
+    "l10n",
+    "translations",
+    "weglot",
+    "alternates",
+];
+
+/// Whether a JSON script's `id` says it holds page chrome rather than the
+/// page: `_indeed_gnav_config`, `__PFS_TOPNAV_DATA__`, `aws-rum-config`,
+/// `StickyBannerTop`. Matched by whole word (and `…nav` compounds), so
+/// `__NEXT_DATA__`, `initial-props` or a `Home` component are never
+/// taken for chrome. A false hit drops one blob from the rescue; the
+/// document's own reading is untouched.
+fn chrome_id(id: &str) -> bool {
+    id_words(id)
+        .iter()
+        .any(|w| CHROME_WORDS.contains(&w.as_str()) || (w.len() > 3 && w.ends_with("nav")))
 }
 
 /// Extract a balanced JS object/array starting at `s`. Handles
@@ -724,7 +876,8 @@ fn walk(value: &Value, path: &str, out: &mut Vec<Item>, order: &mut usize, depth
                         | "user_agent"
                         | "supported_locales"
                         | "compMap"
-                ) {
+                ) || config_key(k)
+                {
                     continue;
                 }
                 let np = if path.is_empty() {
@@ -818,6 +971,32 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     if !t.contains(' ') && len >= 40 {
         return (0.0, false);
     }
+    // Wave W: route/manifest fragments (SPA state ships route tables:
+    // "/webcast/wallet_api/withdraw/v2") — space-free multi-segment paths
+    // are navigation data, never content.
+    if !t.contains(' ') && t.matches('/').count() >= 2 {
+        return (0.0, false);
+    }
+    // Wave W: config/identifier junk — snake_case machine tokens
+    // ("row_video_only_v86_predict500_copp_full") and embedded UA strings.
+    if !t.contains(' ') && (t.matches('_').count() >= 3 || t.matches('.').count() >= 3) {
+        return (0.0, false);
+    }
+    if t.starts_with("Mozilla/") {
+        return (0.0, false);
+    }
+    if class_list(t) {
+        return (0.0, false);
+    }
+    // Machine names: a space-free ASCII token that is a module or bundle name
+    // ("RSTWebWorkerEntrypointBundle"), a hash ("914fa4f6f16ffaeccc81bd5264e520d2"),
+    // or a route key ("www/collage-creation-tool", "conversation/:id"). A
+    // reader's word has no inner capitals after a lowercase run more than
+    // twice, no hex run, no path separator. Space-free scripts (CJK) are not
+    // ASCII and never reach this.
+    if !t.contains(char::is_whitespace) && t.is_ascii() && machine_token(t) {
+        return (0.0, false);
+    }
     let letters: usize = t.chars().filter(|c| c.is_ascii_alphabetic()).count();
     let tot: usize = t.chars().count();
     if letters == 0 || (letters as f32 / tot.max(1) as f32) < 0.25 {
@@ -888,6 +1067,57 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     }
 
     (score.max(0.0), title_like)
+}
+
+/// A style class list that app state carries as a `className` string
+/// ("font-semibold m-0 break-words", "mt-(--spacing-sm-px) text-muted"):
+/// lowercase ASCII tokens, no sentence punctuation, mostly hyphenated or
+/// variant-prefixed. Three or more such tokens, or two when one has a
+/// utility's mark (a digit step `m-0`, `--`, `(`, `:`, `[`, `/`). A pair of
+/// plain hyphenated words ("machine-learning deep-learning") is not one.
+fn class_list(t: &str) -> bool {
+    let tokens: Vec<&str> = t.split_whitespace().collect();
+    let n = tokens.len();
+    if n < 2
+        || !tokens.iter().all(|tok| {
+            tok.is_ascii()
+                && !tok.bytes().any(|b| b.is_ascii_uppercase())
+                && !tok.ends_with(['.', ',', ';', '!', '?'])
+        })
+    {
+        return false;
+    }
+    let styled = tokens.iter().filter(|tok| tok.contains(['-', ':'])).count();
+    let marked = tokens.iter().any(|tok| {
+        tok.contains("--")
+            || tok.contains(['(', ':', '[', '/'])
+            || tok
+                .as_bytes()
+                .windows(2)
+                .any(|w| w[0] == b'-' && w[1].is_ascii_digit())
+    });
+    (n >= 3 && styled * 3 >= n * 2) || (styled * 2 >= n && marked)
+}
+
+/// A space-free token that names something to a program, not to a reader.
+fn machine_token(t: &str) -> bool {
+    let humps = t
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
+        .count();
+    let hex = t.len() >= 16 && t.bytes().all(|b| b.is_ascii_hexdigit());
+    // A long lowerCamelCase name ("cinematicContainerRenderer") or a long
+    // all-lowercase kebab key ("engagement-panel-comments-section"). Short
+    // brand spellings ("iPadOS", "eBay") and hyphenated words
+    // ("state-of-the-art") stay words.
+    let lower_camel =
+        humps >= 2 && t.len() >= 12 && t.starts_with(|c: char| c.is_ascii_lowercase());
+    let kebab = t.len() >= 20
+        && t.matches('-').count() >= 3
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    humps >= 3 || lower_camel || kebab || hex || t.contains(['/', '_', ':', '[', '"', '\\'])
 }
 
 /// `key=value[_]key=value` attribute fragments (viewports, meta
@@ -979,6 +1209,12 @@ fn render(items: &[Item], url: &str, preferred_title: Option<String>) -> (String
         }
         let clean = strip_html(&it.text);
         let clean = clean.trim();
+        // A short title-like item heads what follows: as a markdown
+        // heading, fetch's outline, section and focus can address it.
+        if it.title_like && !clean.is_empty() && clean.chars().count() <= 200 {
+            md.push_str(&format!("## {clean}\n\n"));
+            continue;
+        }
         if clean.chars().count() < 25 {
             continue;
         }
@@ -1034,6 +1270,19 @@ fn extract_site(url: &str) -> Option<String> {
         .and_then(|u| u.host_str().map(|h| h.to_string()))
 }
 
+fn guess_lang(md: &str) -> String {
+    // Light heuristic: if it contains CJK, say so; else "en".
+    if md.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        "zh".into()
+    } else if md.chars().any(|c| ('\u{ac00}'..='\u{d7af}').contains(&c)) {
+        "ko".into()
+    } else if md.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)) {
+        "ja".into()
+    } else {
+        "en".into()
+    }
+}
+
 /// Apply caller's max_chars/offset (shared shape with DonSift).
 fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
     let max = opts.max_chars.unwrap_or(16_000).max(200);
@@ -1042,6 +1291,111 @@ fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
+    // Ids seen on live pages: what chrome names its JSON, and what pages
+    // name their content.
+    #[test]
+    fn a_json_script_named_for_page_chrome_is_not_content() {
+        for chrome in [
+            "_indeed_gnav_config",
+            "_indeed_gnav_footer_config",
+            "__PFS_TOPNAV_DATA__",
+            "__PFS_PRODUCTNAV_DATA__",
+            "raspberry-semrush-navigation-data",
+            "js-react-on-rails-component-Nav-react-component-1a2b",
+            "js-react-on-rails-component-Footer-react-component-9f",
+            "js-react-on-rails-component-StickyBannerTop-react-component-3",
+            "js-react-on-rails-component-MarketingModal-react-component-7",
+            "NewsletterSignup__json",
+            "client-env",
+            "wp-emoji-settings",
+            "AnalyticsConfigurationJSON",
+            "aws-rum-config",
+            "page-kit-flags-embed",
+            "__LOADABLE_REQUIRED_CHUNKS__",
+            "weglot-data",
+            "locale-alternates",
+        ] {
+            assert!(super::chrome_id(chrome), "{chrome}");
+        }
+        for content in [
+            "__NEXT_DATA__",
+            "__NUXT_DATA__",
+            "initial-props",
+            "redux-store-state",
+            "serialized-server-data",
+            "crate-metadata",
+            "ng-state",
+            "fin-trending-tickers",
+            "js-react-on-rails-component-Home-react-component-1a",
+            "ProductJson-product-template",
+            "canvas-data",
+        ] {
+            assert!(!super::chrome_id(content), "{content}");
+        }
+    }
+
+    #[test]
+    fn the_rescue_reads_no_chrome_json() {
+        // The same prose is content under a page's data id and chrome under
+        // a navigation config's.
+        let payload = serde_json::json!({"children": [
+            {"title": "Are you still interested in this job opportunity?"},
+            {"text": "Thanks for the opportunity, but I am no longer interested at this time. I will reach back out if things change. ".repeat(6)}
+        ]});
+        let page = |id: &str| {
+            format!(
+                r#"<title>Job Search</title><script id="{id}" type="application/json">{payload}</script>"#
+            )
+        };
+        let url = "https://example.com/";
+        assert!(super::extract(&page("_indeed_gnav_config"), url, &Default::default()).is_none());
+        assert!(super::extract(&page("__NEXT_DATA__"), url, &Default::default()).is_some());
+        assert_eq!(
+            super::tag_id(r#"<script data-id="x" id='page-data' type="application/json""#),
+            Some("page-data")
+        );
+        assert_eq!(
+            super::tag_id(r#"<script data-id="x" type="application/json""#),
+            None
+        );
+    }
+
+    #[test]
+    fn the_rescue_reads_no_app_configuration_from_the_state() {
+        // Medium's missing-post shell: the page's state carries the app's
+        // payment plans and build under `config` and its experiments under
+        // `variantFlags`; the article, when there is one, sits beside them.
+        let state = |post: &str| {
+            serde_json::json!({
+                "config": {"version": "main-20261106-194312-0396eea50c", "paypal": {"monthlyPlan": {
+                    "name": "Medium Membership (Monthly) with setup fee",
+                    "description": "Unlimited access to the best and brightest stories on Medium. Membership billed monthly."
+                }}},
+                "variantFlags": [{"name": "enable_tick_landing_page", "description": "Shows the new landing page to readers who arrive from search."}],
+                "siteSettings": {"tagline": "Where good ideas find you, every single day of the week."},
+                "configurable": {"text": format!("{post} ")},
+                "post": {"content": post},
+            })
+        };
+        let page = |post: &str| {
+            format!(
+                "<title>Medium</title><script>window.__PRELOADED_STATE__ = {};</script>",
+                state(post)
+            )
+        };
+        let url = "https://medium.com/@someone/a-post-123";
+        let missing = super::extract(&page(""), url, &Default::default());
+        assert!(missing.is_none(), "{:?}", missing.map(|e| e.markdown));
+        let story = "The river had been rising for three days before anyone in the valley thought to move the grain. ".repeat(6);
+        let ex = super::extract(&page(&story), url, &Default::default()).unwrap();
+        assert!(ex.markdown.contains("The river had been rising"));
+        for noise in ["Membership", "main-2026", "landing page", "good ideas"] {
+            assert!(!ex.markdown.contains(noise), "{noise}: {}", ex.markdown);
+        }
+        assert!(super::config_key("featureFlags") && super::config_key("i18n"));
+        assert!(!super::config_key("configurable") && !super::config_key("environment"));
+    }
+
     #[test]
     fn report_audit_js_rescue_excludes_bootstrap_configuration_without_losing_prose() {
         let payload = serde_json::json!({"require": [
@@ -1074,24 +1428,44 @@ mod tests {
         let html = format!(
             "<title>Company information</title><script type='application/json'>{payload}</script>"
         );
-        let options = crate::extract::ExtractOptions {
-            section: Some("Funding history".into()),
-            ..Default::default()
-        };
-        let selected = super::extract(&html, "https://example.com/company", &options).unwrap();
-        assert!(selected.markdown.contains("a billion dollars"));
-        assert!(!selected.markdown.contains("assembly equipment"));
-        let probed = super::extract(
-            &html,
-            "https://example.com/company",
-            &crate::extract::ExtractOptions {
-                must_contain: Some("a billion dollars".into()),
-                ..Default::default()
+        // fetch's views reach the rescued evidence through its headings.
+        use crate::extract::view::{self, Term, View};
+        let whole =
+            super::extract(&html, "https://example.com/company", &Default::default()).unwrap();
+        let selected = view::render(
+            &whole.markdown,
+            &View {
+                section: Some("Funding history".into()),
+                max_chars: 100_000,
+                ..View::default()
             },
-        )
-        .unwrap();
-        assert!(probed.markdown.contains("MATCH"));
-        assert!(probed.markdown.len() < 1000);
+            None,
+        );
+        assert!(
+            selected.text.contains("a billion dollars"),
+            "{}",
+            selected.text
+        );
+        assert!(
+            !selected.text.contains("assembly equipment"),
+            "{}",
+            selected.text
+        );
+        let probed = view::render(
+            &whole.markdown,
+            &View {
+                must_contain: vec![Term::parse("a billion dollars").unwrap()],
+                ..View::default()
+            },
+            None,
+        );
+        assert_eq!(
+            probed.verdict,
+            Some(view::Verdict::Match),
+            "{}",
+            probed.text
+        );
+        assert!(probed.text.len() < 1000);
         let focused = super::extract(
             &html,
             "https://example.com/company",
@@ -1147,6 +1521,76 @@ mod tests {
         };
         let cut = super::extract(&html, "https://www.figma.com/", &opts).unwrap();
         assert!(cut.markdown.len() <= 200 && cut.next_offset.is_some());
+    }
+
+    #[test]
+    fn machine_names_in_page_data_are_not_content() {
+        // Shapes captured 2026-11-07: WhatsApp's worker bundles (under `name`),
+        // Pinterest's route table and asset hashes (under `children`). Alone
+        // they were served as the page; beside real text they must not lead it.
+        let payload = serde_json::json!({
+            "workers": [
+                {"name": "RSTWebWorkerEntrypointBundle"},
+                {"name": "WAWebVoipVideoRendererWorkerBundle"},
+                {"name": "ZenonSignalingSharedWorkerV2Bundle"}
+            ],
+            "children": [
+                {"id": "www/collage-creation-tool", "entry": "www/creator-onboarding-landing"},
+                {"text": "conversation/:conversation_id"},
+                {"text": "914fa4f6f16ffaeccc81bd5264e520d2"},
+                {"title": "Today was my last day at the old start-up"},
+                {"text": "Next up is a little start-up in Palo Alto, where the work is about sharing what people find. ".repeat(5)}
+            ]
+        });
+        let html = format!(
+            "<html><title>Pin</title><script type='application/json'>{payload}</script><body></body></html>"
+        );
+        let ex = super::extract(&html, "https://www.pinterest.com/pin/1/", &opts()).unwrap();
+        for junk in [
+            "WorkerBundle",
+            "collage-creation",
+            ":conversation_id",
+            "914fa4f6",
+        ] {
+            assert!(!ex.markdown.contains(junk), "{junk} in {}", ex.markdown);
+        }
+        assert!(ex.markdown.contains("Today was my last day"));
+        assert!(ex.markdown.contains("little start-up in Palo Alto"));
+        // Machine names alone recover nothing.
+        let names = serde_json::json!({"workers": (0..40)
+            .map(|n| serde_json::json!({"name": format!("WAWebModule{n}RendererWorkerBundle")}))
+            .collect::<Vec<_>>()});
+        let html = format!("<html><script type='application/json'>{names}</script></html>");
+        assert!(super::extract(&html, "https://web.whatsapp.com/", &opts()).is_none());
+        // Words a reader uses stay: a product name with one inner capital, CJK.
+        assert!(super::class_list(
+            "font-semibold m-0 break-words font-heading-3 text-heading-3 leading-heading-3"
+        ));
+        assert!(super::class_list(
+            "mt-(--spacing-sm-px) text-(length:--text-caption-1-size) text-muted-foreground"
+        ));
+        assert!(super::class_list("flex px-4"));
+        assert!(!super::class_list("machine-learning deep-learning"));
+        assert!(!super::class_list("a well-known, state-of-the-art tool"));
+        assert!(!super::class_list("Use --dry-run first"));
+        assert!(!super::class_list("e-mail"));
+        assert!(!super::machine_token("PlayStation"));
+        assert!(!super::machine_token("McDonald's"));
+        assert!(super::machine_token("RSTWebWorkerEntrypointBundle"));
+        // YouTube's renderer and panel names.
+        assert!(super::machine_token("cinematicContainerRenderer"));
+        assert!(super::machine_token("expandableMetadataRenderer"));
+        assert!(super::machine_token("engagement-panel-comments-section"));
+        for word in [
+            "iPadOS",
+            "eBay",
+            "iPhone",
+            "state-of-the-art",
+            "JavaScript",
+            "mother-in-law",
+        ] {
+            assert!(!super::machine_token(word), "{word}");
+        }
     }
 
     /// Fuzzer find (CI, 2026-08-22): a global-assignment match at
@@ -1215,17 +1659,7 @@ mod tests {
     use crate::extract::ExtractOptions;
 
     fn opts() -> ExtractOptions {
-        ExtractOptions {
-            selector: None,
-            toc: false,
-            max_chars: None,
-            offset: 0,
-            focus: None,
-            include_links: false,
-            include_media: false,
-            section: None,
-            ..Default::default()
-        }
+        ExtractOptions::default()
     }
 
     #[test]
@@ -1397,5 +1831,62 @@ mod strip_html_guard_tests {
         assert!(!out.contains("leak"), "{out}");
         assert!(out.contains("Hello"), "{out}");
         assert!(out.contains("world"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod wave_w_state_walk {
+    use super::*;
+
+    #[test]
+    fn wave_walks_a_content_bearing_state() {
+        let json = format!(
+            "{{\"videos\":[{}]}}",
+            (0..12)
+                .map(|i| {
+                    let notes = format!(
+                        "Episode {} notes: {}",
+                        i,
+                        "A deep dive into transport design, stealth and honesty signals. ".repeat(3)
+                    );
+                    format!(
+                        "{{\"title\":\"Episode {} — building fast fetch tiers\",\"description\":\"{}\"}}",
+                        i, notes
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let opts = ExtractOptions::default();
+        let ex = extract_state("feed", &json, "https://example.tv/", &opts)
+            .expect("a content-bearing state must extract");
+        assert!(ex.total_chars > 400, "total_chars={}", ex.total_chars);
+        assert!(!ex.thin, "state content is not thin");
+        assert!(ex.markdown.contains("Episode 0"), "titles must survive");
+    }
+
+    #[test]
+    fn wave_a_content_free_state_is_honestly_rejected() {
+        // The logged-out youtube.com variant ships a ytInitialData with UI
+        // chrome only (no consent cookies -> no feed): the walker must NOT
+        // dress it up as content.
+        let Ok(json) = std::fs::read_to_string("/var/tmp/v5wave/ytstate.json") else {
+            // The captured blob is ephemeral; the same property is pinned
+            // synthetically so the assertion never silently disappears:
+            // UI-chrome-only state must be rejected, not dressed as content.
+            let chrome_only = "{\"header\":{\"title\":\"YouTube\",\"menu\":[{\"label\":\"About\"},{\"label\":\"Press\"},{\"label\":\"Copyright\"},{\"label\":\"Contact us\"},{\"label\":\"Creators\"},{\"label\":\"Advertise\"},{\"label\":\"Developers\"}]}}";
+            assert!(
+                extract_state(
+                    "ytInitialData",
+                    chrome_only,
+                    "https://www.youtube.com/",
+                    &ExtractOptions::default()
+                )
+                .is_none()
+            );
+            return;
+        };
+        let opts = ExtractOptions::default();
+        assert!(extract_state("ytInitialData", &json, "https://www.youtube.com/", &opts).is_none());
     }
 }

@@ -89,10 +89,10 @@ impl BrowserProfile {
 
     /// Chrome `major` on the given platform. The TLS/H2 tables are
     /// the Chrome 150 capture (stable across adjacent versions);
-    /// the UA and client hints carry the real version so the ghost
-    /// browser and tier 1 advertise the SAME identity : clearance
-    /// cookies are bound to it, and a ghost solving on Chromium 151
-    /// while tier 1 claims 150 gets its replays rejected.
+    /// the UA and client hints carry the real version so the browser
+    /// and the local fetch advertise the SAME identity : clearance
+    /// cookies are bound to it, and mismatched identity claims get
+    /// their replays rejected.
     ///
     /// `branded` = the host binary is Google-Chrome-branded (it has a
     /// third Sec-CH-UA brand). Distro Chromium sends only
@@ -149,8 +149,8 @@ impl BrowserProfile {
 
     /// Default: host-coherent identity (a Windows agent looks like Windows Chrome).
     /// The major version AND the brand set (distro Chromium vs Google Chrome)
-    /// are probed from the INSTALLED browser (ghost + tier 1 must claim the
-    /// same version and brand list).
+    /// are probed from the INSTALLED browser (the local fetch must claim
+    /// the same version and brand list).
     pub fn host_default() -> Self {
         let (major, branded) = match probe_installed() {
             Some((m, b)) => (Some(m), b),
@@ -168,7 +168,7 @@ impl BrowserProfile {
         self.h1_headers_for_class(host, path, RequestClass::Navigation)
     }
 
-    /// Class-aware header sets (v4 phase 1.2). A real browser does
+    /// Class-aware header sets. A real browser does
     /// not send one header set for everything: navigations carry
     /// upgrade-insecure-requests + sec-fetch-user + the document
     /// Accept; subresources carry per-type Accept, no-cors mode,
@@ -192,7 +192,7 @@ impl BrowserProfile {
             ("sec-ch-ua-platform".into(), format!("\"{}\"", self.platform.ch_platform())),
             ("upgrade-insecure-requests".into(), "1".into()),
             ("user-agent".into(), self.user_agent.clone()),
-            ("accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".into()),
+            ("accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".into()),
             ("sec-fetch-site".into(), "none".into()),
             ("sec-fetch-mode".into(), "navigate".into()),
             ("sec-fetch-user".into(), "?1".into()),
@@ -246,7 +246,7 @@ impl BrowserProfile {
 /// header on a .ru page is served the English stub (and is a mild
 /// incoherence signal). Derived from the host TLD and non-Latin
 /// script in the path; everything else stays Chrome-default en-US.
-/// What kind of request this is (v4 phase 1.2): header sets and
+/// What kind of request this is: header sets and
 /// JA4H profiles differ per class, so the wire must too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestClass {
@@ -267,10 +267,10 @@ pub enum RequestClass {
 impl RequestClass {
     /// The per-class Accept value and sec-fetch-dest, matching what
     /// Chrome sends for the same subresource type.
-    fn accept_and_dest(self) -> (String, String) {
+    pub(crate) fn accept_and_dest(self) -> (String, String) {
         match self {
             RequestClass::Navigation => (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
                     .to_string(),
                 "document".to_string(),
             ),
@@ -342,13 +342,13 @@ pub fn accept_language_with_persona(_host: &str, _path: &str, persona_locale: &s
 ///    their own version under `HKCU\Software\<Name>\BLBeacon\version`
 ///    (Google Chrome, Chromium, Microsoft Edge, Thorium, …). Reading
 ///    it costs zero browser launches : no window, no hang, no orphaned
-///    processes. This is the tier-1-friendly path: tier 1 never needs
+///    processes. This is the local-fetch-friendly path: the local fetch never needs
 ///    to spawn a real browser just to know what version to claim.
 /// 2. **Spawned `--version` probe, hard timeboxed.** Only reached
 ///    when the registry has nothing (custom forks with no BLBeacon
 ///    entry). The child is killed : whole tree on Windows : if it
 ///    does not answer within `PROBE_SPAWN_TIMEOUT`, so a wedged
-///    browser can never block tier 1 startup or leave processes behind.
+///    browser can never block local fetch startup or leave processes behind.
 ///
 /// The result is cached in a `OnceLock` so the probe runs at most
 /// once per process.
@@ -356,7 +356,7 @@ static PROBED: std::sync::OnceLock<Option<(u32, bool)>> = std::sync::OnceLock::n
 
 /// Hard cap on the spawned `--version` probe. Chrome 129 on Windows
 /// is known to hang (or crash-loop its network/GPU services) under
-/// `--headless=new`; without this cap tier 1 blocks forever at boot.
+/// `--headless=new`; without this cap the local fetch blocks forever at boot.
 const PROBE_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// (major, google-chrome-branded).
@@ -367,7 +367,7 @@ pub(crate) fn probe_installed() -> Option<(u32, bool)> {
             return Some((major, branded));
         }
         // Fallback: ask the binary, but never let it hang or orphan.
-        let browser = crate::ghost::resolve_browser_without_download().ok()?;
+        let browser = crate::browser::resolve_browser_without_download().ok()?;
         let path = browser.path.to_string_lossy().to_string();
         let banner = probe_version_string_at_path(&path)?;
         let branded = banner.contains("Google Chrome") || banner.contains("Google Chrome Canary");
@@ -497,8 +497,7 @@ fn registry_string(
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Probe a specific Chromium-family executable without changing the selected
-/// backend. Used by the browser resolver for Chromium and CloakBrowser alike.
+/// Probe a specific Chromium-family executable and return its major version.
 pub(crate) fn probe_version_at_path(path: &str) -> Option<u32> {
     probe_version_string_at_path(path).and_then(|v| parse_version_major(&v))
 }
@@ -509,11 +508,11 @@ pub(crate) fn probe_version_string_at_path(path: &str) -> Option<String> {
 }
 
 pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, String> {
-    // One spawn per binary per process. Ghost launches, doctor,
-    // status, and cloak resolution all walk through here, and each
+    // One spawn per binary per process. Browser resolution for
+    // screenshots, login, doctor and status walks through here, and each
     // call used to pay a chrome --version spawn (~100-200ms plus a
-    // fork on some platforms). The daemon launches ghosts often
-    // enough that caching is a real win; Ok results never change
+    // fork on some platforms). The daemon resolves the browser on every
+    // screenshot, so caching is a real win; Ok results never change
     // for a given on-disk path, and Err results stay recalculated
     // so a transient startup hiccup is not sticky.
     static PROBE_CACHE: std::sync::OnceLock<
@@ -546,8 +545,8 @@ pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, 
         if result.is_ok() {
             guard.insert(path.to_string(), result.clone().ok());
             // Small cache: this map holds one entry per distinct binary
-            // path (system chromium, a playwright build, a cloak binary,
-            // an edge install). Never grows unbounded in practice; the
+            // path (system chromium, a playwright build, an edge
+            // install). Never grows unbounded in practice; the
             // paths are bounded by discoverable binaries on the host.
             if guard.len() > 16 {
                 guard.clear();
@@ -560,7 +559,18 @@ pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, 
     result
 }
 
+/// The browser's version banner. On Windows it comes from the file's version
+/// resource when there is one; otherwise the binary is asked with `--version`,
+/// under the probe's deadline.
 fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
+    // `chrome.exe --version` neither prints nor exits (a GUI subsystem
+    // binary), so launching it would burn the whole timeout on every process.
+    // Only a file without a version resource, such as a console wrapper, is
+    // launched.
+    #[cfg(windows)]
+    if let Some(banner) = pe_version::banner(std::path::Path::new(path)) {
+        return Ok(banner);
+    }
     let mut cmd = std::process::Command::new(path);
     cmd.arg("--version");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -675,6 +685,12 @@ mod probe_cache_tests {
 }
 
 mod version_probe;
+
+// Windows reads the browser's version out of the file instead of running it
+// (`chrome.exe --version` never answers there); the reader is portable, so every
+// platform's suite exercises it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pe_version;
 
 /// Capture stdout and process completion under one post-spawn deadline.
 /// OS spawn and teardown latency are not a hard real-time guarantee.

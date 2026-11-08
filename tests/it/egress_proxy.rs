@@ -246,7 +246,7 @@ async fn persona_fetch_uses_the_env_proxy_like_fetch_does() {
     ))
     .expect("fetcher builds");
     let out = fetcher
-        .fetch_persona("http://console.example/persona", None)
+        .fetch_persona("http://console.example/persona")
         .await
         .expect("persona fetch through the env proxy");
     assert_eq!(String::from_utf8_lossy(&out.body), "plain-http");
@@ -464,7 +464,7 @@ async fn stealth_v3_invalid_ambient_proxy_never_dials_direct() {
     let fetcher =
         donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
             .unwrap();
-    let result = fetcher.fetch_persona(&url, None).await;
+    let result = fetcher.fetch_persona(&url).await;
     let direct_reached = server.await.unwrap();
     assert!(
         !direct_reached,
@@ -518,12 +518,12 @@ async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_control
             .unwrap();
     let url = format!("http://{address}/owned");
     assert_eq!(
-        fetcher.fetch_persona(&url, None).await.unwrap().body,
+        fetcher.fetch_persona(&url).await.unwrap().body,
         b"explicit direct bypass"
     );
     unsafe { std::env::set_var("NO_PROXY", "") };
-    let proxy = donsetch::transport::proxy::Proxy::parse(&format!("http://alice:secret@{address}"))
-        .unwrap();
+    let proxy =
+        donsetch::egress::proxy::Proxy::parse(&format!("http://alice:secret@{address}")).unwrap();
     assert_eq!(
         fetcher
             .fetch_via_jar_ref(&url, Some(&proxy), true, None)
@@ -540,8 +540,8 @@ async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_control
 
 #[tokio::test]
 async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
+    use donsetch::egress::proxy::Proxy;
     use donsetch::search::egress::EgressPool;
-    use donsetch::transport::proxy::Proxy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     crate::sandbox();
     unsafe {
@@ -577,9 +577,12 @@ async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
             .await
             .unwrap();
     });
+    // A hang guard, not a speed assertion. Windows takes ~2 s to refuse a
+    // loopback connection (measured on a runner), so a test that touches a
+    // closed port costs seconds there.
     let out = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        fetcher.fetch_persona_on_route(url, None, Some(&selected)),
+        std::time::Duration::from_secs(15),
+        fetcher.fetch_persona_on_route(url, Some(&selected)),
     )
     .await
     .unwrap()

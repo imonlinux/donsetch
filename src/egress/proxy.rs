@@ -1,0 +1,2221 @@
+//! Proxy support : the search engine's egress-diversity
+//! layer. Residential proxies let each engine see a
+//! different IP, each below rate limits.
+//!
+//! Two protocols: HTTP CONNECT (RFC 7231 §4.3.6) and
+//! SOCKS5 (RFC 1928 + RFC 1929 auth). SOCKS5 matters
+//! because many residential-proxy providers offer
+//! SOCKS5-only lines : and SOCKS5 sends the target host
+//! as a domain name so the PROXY resolves DNS, not us
+//! (no local DNS leak = stealth-preserving).
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use crate::error::FetchError;
+
+const PROXY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// One outer ceiling for the whole dial+handshake (S3): the per-step
+/// `PROXY_TIMEOUT`s used to stack (a SOCKS5 handshake is up to nine
+/// steps, ~108s worst case on a line that accepts TCP then stalls
+/// mid-handshake; ~36s on CONNECT), and every fetch attempt
+/// re-paid it before the lane finally benched. 30s covers a healthy
+/// handshake (a few RTTs) with room for a slow dial.
+const PROXY_CONNECT_BUDGET: Duration = Duration::from_secs(30);
+
+/// True when `host` matches a NO_PROXY entry. Comma-separated
+/// suffix match: "example.com" matches "foo.example.com".
+/// "*" disables all proxying.
+#[cfg(test)]
+fn no_proxy_match(host: &str) -> bool {
+    no_proxy_match_value(host, &no_proxy_value())
+}
+
+pub(crate) fn no_proxy_value() -> String {
+    let cfg = crate::config::cfg();
+    if !cfg.proxy.no_proxy.is_empty() {
+        cfg.proxy.no_proxy.clone()
+    } else {
+        std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) fn no_proxy_match_value(host: &str, no_proxy: &str) -> bool {
+    if no_proxy.is_empty() {
+        return false;
+    }
+    // The host as delivered is bare ("::1", "example.com"); entries
+    // may be bracketed IPv6 ("[::1]"), CIDR ("192.168.0.0/16") or
+    // "host:port" (curl 7.86+ supports all of these; E1).
+    let host_unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let host = host_unbracketed.trim_end_matches('.');
+    let host_ip: Option<std::net::IpAddr> = host_unbracketed.parse().ok();
+    for entry in no_proxy.split(',') {
+        let entry = entry.trim();
+        if entry == "*" {
+            return true;
+        }
+        // host:port: the port is scoped extra detail; the host part is
+        // what matters for matching. Bracket-first for the bracketed
+        // form ("[::1]:8443"): the port split below refuses any host
+        // part containing ':' (a bare "::1" must not lose its last
+        // segment to the port rule), which made every bracketed IPv6 +
+        // port entry match nothing at all, not even the bare host.
+        let entry_no_port = if let Some(rest) = entry.strip_prefix('[') {
+            match rest.split_once(']') {
+                Some((inner, tail))
+                    if tail.is_empty()
+                        || tail
+                            .strip_prefix(':')
+                            .is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok()) =>
+                {
+                    &entry[..inner.len() + 2] // "[inner]" with its bracket
+                }
+                _ => entry,
+            }
+        } else {
+            entry
+                .rsplit_once(':')
+                .filter(|(h, p)| !p.is_empty() && p.parse::<u16>().is_ok() && !h.contains(':'))
+                .map(|(h, _)| h)
+                .unwrap_or(entry)
+        };
+        let entry = entry_no_port
+            .strip_prefix('[')
+            .and_then(|e| e.strip_suffix(']'))
+            .unwrap_or(entry_no_port);
+        // CIDR: an entry with a prefix length matches hosts whose
+        // address falls inside the network.
+        if let Some((net, bits)) = entry.split_once('/') {
+            if let (Ok(net_ip), Ok(prefix)) = (net.parse::<std::net::IpAddr>(), bits.parse::<u8>())
+                && let Some(host_ip) = host_ip
+                && cidr_match(host_ip, net_ip, prefix)
+            {
+                return true;
+            }
+            continue;
+        }
+        // Literal IP entry matches a literal IP host exactly (after
+        // bracket stripping); a bare IPv6 entry like "::1" also lands
+        // on this arm via host_unbracketed == entry.
+        if let Ok(entry_ip) = entry.parse::<std::net::IpAddr>()
+            && host_ip.is_some()
+        {
+            if host_ip == Some(entry_ip) {
+                return true;
+            }
+            continue;
+        }
+        let entry = entry
+            .strip_prefix('.')
+            .unwrap_or(entry)
+            .trim_end_matches('.');
+        if entry.is_empty() {
+            continue;
+        }
+        if host.eq_ignore_ascii_case(entry) {
+            return true;
+        }
+        // host.ends_with(&format!(".{entry}")) without the per-entry
+        // allocation: the char before a matching suffix must be '.'.
+        if host.len() > entry.len()
+            && host
+                .get(host.len() - entry.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(entry))
+            && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Prefix-compare two addresses of the same family (v4 over v6 is
+/// never a match).
+fn cidr_match(host: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
+    match (host, net) {
+        (std::net::IpAddr::V4(h), std::net::IpAddr::V4(n)) => {
+            if bits > 32 {
+                return false;
+            }
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            (u32::from(h) & mask) == (u32::from(n) & mask)
+        }
+        (std::net::IpAddr::V6(h), std::net::IpAddr::V6(n)) => {
+            if bits > 128 {
+                return false;
+            }
+            let (hb, nb) = (h.octets(), n.octets());
+            let full = bits as usize / 8;
+            if hb[..full] != nb[..full] {
+                return false;
+            }
+            let rem = bits % 8;
+            if rem == 0 {
+                return true;
+            }
+            let mask = u8::MAX << (8 - rem);
+            (hb[full] & mask) == (nb[full] & mask)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProxyScheme {
+    Http,
+    Socks5,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Proxy {
+    pub host: String,
+    pub port: u16,
+    /// Decoded user name: the bytes the proxy receives.
+    pub user: String,
+    /// Decoded password: the bytes the proxy receives.
+    pub pass: String,
+    pub scheme: ProxyScheme,
+}
+
+/// Redacts `pass`: a derived Debug would print the plaintext proxy
+/// password into any log/error output that formats a `Proxy` with
+/// `{:?}`. No such call site exists today, but nothing stops one
+/// being added later without anyone noticing the leak.
+impl std::fmt::Debug for Proxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Proxy")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &"***")
+            .field("scheme", &self.scheme)
+            .finish()
+    }
+}
+
+impl Proxy {
+    /// Accepts:
+    ///   "socks5://user:pass@host:port"
+    ///   "http://user:pass@host:port"
+    ///   "user:pass@host:port"  (bare = HTTP CONNECT, backward compat)
+    ///   "host:port"            (no auth, HTTP CONNECT)
+    ///
+    /// In every form `user` and `pass` are percent-decoded userinfo
+    /// (RFC 3986 §3.2.1): "p%40ss" is the password "p@ss". A '%' that does
+    /// not start two hex digits stays a literal '%', and a field whose
+    /// escapes do not decode to UTF-8 is kept as written. Raw reserved
+    /// characters are accepted as written: auth ends at the last '@' and the
+    /// user name at the first ':'.
+    ///
+    /// Errors are `FetchError::ProxyConfig`: a proxy reference that does not
+    /// parse is a configuration problem, never origin evidence. `http:` in
+    /// front of "bad port" read as a transport failure of the target site.
+    pub fn parse(s: &str) -> Result<Self, FetchError> {
+        let (scheme, rest) = match s.split_once("://") {
+            Some((scheme, rest)) => match scheme.to_ascii_lowercase().as_str() {
+                "http" => (ProxyScheme::Http, rest),
+                "socks5" | "socks5h" => (ProxyScheme::Socks5, rest),
+                _ => {
+                    return Err(FetchError::ProxyConfig(
+                        "unsupported scheme (supported: http://, socks5://, socks5h://)".into(),
+                    ));
+                }
+            },
+            None => (ProxyScheme::Http, s),
+        };
+
+        // Split auth@addr : auth is optional. The address (host:port)
+        // can never contain '@', so split at the LAST one: user and
+        // password both may.
+        let (user, pass, addr) = match rest.rsplit_once('@') {
+            Some((auth, addr)) => {
+                let (u, p) = auth.split_once(':').ok_or_else(|| {
+                    FetchError::ProxyConfig(
+                        "bad auth (expected scheme://user:pass@host:port)".into(),
+                    )
+                })?;
+                // Decode after splitting: an escaped '@' or ':' is part of
+                // a field, never a separator.
+                (decode_userinfo(u), decode_userinfo(p), addr)
+            }
+            None => (String::new(), String::new(), rest),
+        };
+
+        let (host, port) = addr
+            .rsplit_once(':')
+            .ok_or_else(|| FetchError::ProxyConfig("bad address (expected host:port)".into()))?;
+        // rsplit_once handles IPv6 brackets too: [::1]:1080 → ("[::1]", "1080")
+        let port: u16 = port
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| FetchError::ProxyConfig("bad port (expected 1-65535)".into()))?;
+        // Strip IPv6 brackets if present.
+        if host.is_empty()
+            || host
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(FetchError::ProxyConfig("invalid host".into()));
+        }
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let host = if let Ok(address) = bare.parse::<std::net::Ipv6Addr>() {
+            address.to_string()
+        } else {
+            url::Host::parse(host)
+                .map_err(|_| FetchError::ProxyConfig("invalid host".into()))?
+                .to_string()
+        };
+
+        Ok(Self {
+            host,
+            port,
+            user,
+            pass,
+            scheme,
+        })
+    }
+
+    /// Endpoint id for lane health tracking.
+    pub fn id(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Opaque connection identity including protocol and credentials.
+    /// Credential changes may select a different exit at the same endpoint.
+    pub fn connection_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update([match self.scheme {
+            ProxyScheme::Http => 0,
+            ProxyScheme::Socks5 => 1,
+        }]);
+        hash.update(self.port.to_be_bytes());
+        for field in [&self.host, &self.user, &self.pass] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// True when traffic goes through an HTTP CONNECT hop: these are
+    /// TLS-terminating middleboxes in interception networks, so the
+    /// fetch layer switches to the interception-safe handshake.
+    pub fn is_http_connect(&self) -> bool {
+        self.scheme == ProxyScheme::Http
+    }
+
+    /// Raw TCP dial to the proxy itself, for absolute-form plaintext
+    /// requests (http:// targets through an HTTP proxy need no tunnel).
+    pub async fn connect_tcp(&self) -> Result<TcpStream, FetchError> {
+        Ok(tokio::time::timeout(
+            PROXY_TIMEOUT,
+            TcpStream::connect((self.host.as_str(), self.port)),
+        )
+        .await
+        .map_err(|_| FetchError::Timeout)??)
+    }
+
+    /// TCP to the proxy, then tunnel the target through it
+    /// via HTTP CONNECT or SOCKS5 depending on scheme.
+    pub async fn connect(
+        &self,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<TcpStream, FetchError> {
+        self.connect_within(target_host, target_port, PROXY_CONNECT_BUDGET)
+            .await
+    }
+
+    /// `connect` under an explicit whole-operation budget; separated so
+    /// tests can prove the ceiling with a millisecond-scale bound
+    /// instead of stalling the suite for the real 30s.
+    async fn connect_within(
+        &self,
+        target_host: &str,
+        target_port: u16,
+        budget: Duration,
+    ) -> Result<TcpStream, FetchError> {
+        tokio::time::timeout(budget, async {
+            let mut stream = self.connect_tcp().await?;
+            stream.set_nodelay(true).ok();
+
+            match self.scheme {
+                ProxyScheme::Http => {
+                    self.http_connect(&mut stream, target_host, target_port)
+                        .await?
+                }
+                ProxyScheme::Socks5 => {
+                    self.socks5_handshake(&mut stream, target_host, target_port)
+                        .await?
+                }
+            }
+            Ok::<TcpStream, FetchError>(stream)
+        })
+        .await
+        .map_err(|_| FetchError::Timeout)
+        .and_then(|inner| inner)
+    }
+
+    /// `Proxy-Authorization` value for this proxy, if credentialed.
+    /// CONNECT tunnels and SOCKS5 authenticate in-protocol, but the
+    /// raw absolute-form plaintext hop has no tunnel setup to carry
+    /// credentials : each request must send this header itself.
+    pub fn proxy_authorization(&self) -> Option<String> {
+        // A password alone counts: some providers hand out a token
+        // with an empty user name. Dropping the credential silently
+        // surfaced as a bare 407 instead.
+        if self.user.is_empty() && self.pass.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Basic {}",
+            base64(&format!("{}:{}", self.user, self.pass))
+        ))
+    }
+
+    // ── HTTP CONNECT (RFC 7231 §4.3.6) ──
+
+    async fn http_connect(
+        &self,
+        stream: &mut TcpStream,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<(), FetchError> {
+        // A bare IPv6 literal ("2001:db8::1") must bracket for the
+        // request line and the Host header (RFC 3986): unbracketed it
+        // is ambiguous between host and port. Already-bracketed
+        // literals and hostnames pass through unchanged.
+        let target = bracketed_ipv6(target_host);
+        let req = match self.proxy_authorization() {
+            None => format!(
+                "CONNECT {target}:{target_port} HTTP/1.1\r\n\
+                 Host: {target}:{target_port}\r\n\
+                 Proxy-Connection: keep-alive\r\n\r\n"
+            ),
+            Some(auth) => format!(
+                "CONNECT {target}:{target_port} HTTP/1.1\r\n\
+                 Host: {target}:{target_port}\r\n\
+                 Proxy-Authorization: {auth}\r\n\
+                 Proxy-Connection: keep-alive\r\n\r\n"
+            ),
+        };
+        tokio::time::timeout(PROXY_TIMEOUT, stream.write_all(req.as_bytes()))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+
+        // Read the response head (until \r\n\r\n).
+        let mut buf = Vec::with_capacity(512);
+        let mut byte = [0u8; 1];
+        let read_head = async {
+            while !buf.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).await? == 0 {
+                    return Err(FetchError::Http("proxy: closed during CONNECT".into()));
+                }
+                buf.push(byte[0]);
+                if buf.len() > 4096 {
+                    return Err(FetchError::Http("proxy: huge CONNECT response".into()));
+                }
+            }
+            Ok::<(), FetchError>(())
+        };
+        tokio::time::timeout(PROXY_TIMEOUT, read_head)
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+
+        let head = String::from_utf8_lossy(&buf);
+        let status: u32 = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if status != 200 {
+            return Err(FetchError::Http(format!(
+                "proxy {} CONNECT -> {status}",
+                self.id()
+            )));
+        }
+        Ok(())
+    }
+
+    // ── SOCKS5 (RFC 1928 + RFC 1929 auth) ──
+
+    async fn socks5_handshake(
+        &self,
+        stream: &mut TcpStream,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<(), FetchError> {
+        // Step 1: greeting : offer no-auth (0x00) and, when RFC 1929
+        // can actually be satisfied, username/password (0x02). ULEN
+        // and PLEN are both 1..255, so a shape with an empty field
+        // (":token@host", "user@host") has no valid sub-negotiation:
+        // it offers no-auth alone rather than sending a zero-length
+        // field a strict server rejects. The token still rides the
+        // CONNECT header and the raw-hop Proxy-Authorization (HTTP
+        // side).
+        let has_auth = !self.user.is_empty() && !self.pass.is_empty();
+        let methods: &[u8] = if has_auth { &[0x00, 0x02] } else { &[0x00] };
+        let greeting = {
+            let mut g = vec![0x05, methods.len() as u8];
+            g.extend_from_slice(methods);
+            g
+        };
+        tokio::time::timeout(PROXY_TIMEOUT, stream.write_all(&greeting))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+
+        // Step 2: server selects a method.
+        let mut sel = [0u8; 2];
+        tokio::time::timeout(PROXY_TIMEOUT, stream.read_exact(&mut sel))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+        if sel[0] != 0x05 {
+            return Err(FetchError::Http(format!(
+                "proxy {} SOCKS5: bad version {}",
+                self.id(),
+                sel[0]
+            )));
+        }
+        match sel[1] {
+            0x00 => {} // no auth needed
+            0x02 if has_auth => {
+                // RFC 1929: username/password sub-negotiation.
+                let user = self.user.as_bytes();
+                let pass = self.pass.as_bytes();
+                if user.len() > 255 || pass.len() > 255 {
+                    return Err(FetchError::Http(format!(
+                        "proxy {} SOCKS5: credentials too long",
+                        self.id()
+                    )));
+                }
+                let mut auth_req = vec![0x01, user.len() as u8];
+                auth_req.extend_from_slice(user);
+                auth_req.push(pass.len() as u8);
+                auth_req.extend_from_slice(pass);
+                tokio::time::timeout(PROXY_TIMEOUT, stream.write_all(&auth_req))
+                    .await
+                    .map_err(|_| FetchError::Timeout)??;
+
+                let mut auth_resp = [0u8; 2];
+                tokio::time::timeout(PROXY_TIMEOUT, stream.read_exact(&mut auth_resp))
+                    .await
+                    .map_err(|_| FetchError::Timeout)??;
+                if auth_resp[1] != 0x00 {
+                    return Err(FetchError::Http(format!(
+                        "proxy {} SOCKS5: auth failed (status {})",
+                        self.id(),
+                        auth_resp[1]
+                    )));
+                }
+            }
+            0xFF => {
+                return Err(FetchError::Http(format!(
+                    "proxy {} SOCKS5: no acceptable methods",
+                    self.id()
+                )));
+            }
+            other => {
+                return Err(FetchError::Http(format!(
+                    "proxy {} SOCKS5: unsupported method {:#04x}",
+                    self.id(),
+                    other
+                )));
+            }
+        }
+
+        // Step 3: CONNECT request. Names go as DOMAIN (ATYP 0x03) so
+        // the proxy resolves DNS : no local DNS leak, stealth-
+        // preserving. An IP LITERAL goes as its native address type
+        // (RFC 1928 §5) instead: a literal shipped as a "domain" is a
+        // name no resolver can answer ("[::1]" least of all), so
+        // literal targets used to die with "host unreachable".
+        let bare = target_host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(target_host);
+        let mut req = vec![
+            0x05, // VER
+            0x01, // CMD = CONNECT
+            0x00, // RSV
+        ];
+        if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
+            req.push(0x04); // ATYP = IPv6 address
+            req.extend_from_slice(&v6.octets());
+        } else if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
+            req.push(0x01); // ATYP = IPv4 address
+            req.extend_from_slice(&v4.octets());
+        } else {
+            let host_bytes = bare.as_bytes();
+            if host_bytes.len() > 255 {
+                return Err(FetchError::Http(format!(
+                    "proxy {} SOCKS5: hostname too long",
+                    self.id()
+                )));
+            }
+            req.push(0x03); // ATYP = domain name
+            req.push(host_bytes.len() as u8);
+            req.extend_from_slice(host_bytes);
+        }
+        req.extend_from_slice(&target_port.to_be_bytes());
+        tokio::time::timeout(PROXY_TIMEOUT, stream.write_all(&req))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+
+        // Step 4: server reply.
+        // VER(1) | REP(1) | RSV(1) | ATYP(1) | BND.ADDR(variable) | BND.PORT(2)
+        let mut header = [0u8; 4];
+        tokio::time::timeout(PROXY_TIMEOUT, stream.read_exact(&mut header))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+        if header[0] != 0x05 {
+            return Err(FetchError::Http(format!(
+                "proxy {} SOCKS5: bad reply version {}",
+                self.id(),
+                header[0]
+            )));
+        }
+        if header[1] != 0x00 {
+            // Map RFC 1928 reply codes to readable errors.
+            let reason = match header[1] {
+                0x01 => "general failure",
+                0x02 => "connection not allowed",
+                0x03 => "network unreachable",
+                0x04 => "host unreachable",
+                0x05 => "connection refused",
+                0x06 => "TTL expired",
+                0x07 => "command not supported",
+                0x08 => "address type not supported",
+                code => {
+                    return Err(FetchError::Http(format!(
+                        "proxy {} SOCKS5: reply error {:#04x}",
+                        self.id(),
+                        code
+                    )));
+                }
+            };
+            return Err(FetchError::Http(format!(
+                "proxy {} SOCKS5: {reason}",
+                self.id()
+            )));
+        }
+
+        // Skip BND.ADDR + BND.PORT : we don't need the
+        // bound address, just consume it so the stream is
+        // clean for the caller's TLS handshake.
+        let addr_len = match header[3] {
+            0x01 => 4, // IPv4
+            0x03 => {
+                // domain: read 1 length byte, then that many
+                let mut len = [0u8; 1];
+                tokio::time::timeout(PROXY_TIMEOUT, stream.read_exact(&mut len))
+                    .await
+                    .map_err(|_| FetchError::Timeout)??;
+                len[0] as usize
+            }
+            0x04 => 16, // IPv6
+            other => {
+                return Err(FetchError::Http(format!(
+                    "proxy {} SOCKS5: bad ATYP {:#04x} in reply",
+                    self.id(),
+                    other
+                )));
+            }
+        };
+        // For domain ATYP we already consumed the length byte
+        // above; for IPv4/IPv6 addr_len is the full address.
+        let mut discard = vec![0u8; addr_len + 2]; // +2 for BND.PORT
+        tokio::time::timeout(PROXY_TIMEOUT, stream.read_exact(&mut discard))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+
+        Ok(())
+    }
+
+    /// Reconstruct the proxy URL string from parsed fields.
+    /// Handles IPv6 bracketing. Used for config-file round-trip:
+    /// credentials are percent-encoded, so `parse` reads back this proxy.
+    pub fn to_url(&self) -> String {
+        self.url_with_scheme(scheme_str(self.scheme))
+    }
+
+    /// The URL the v5 engine takes for this lane. SOCKS5 hands the TARGET
+    /// NAME to the proxy (`socks5h` = remote resolve — what the old
+    /// transport sent too: ATYP=3 domain), so the egress lane resolves and
+    /// the host is never leaked to the local resolver. `to_url` stays the
+    /// config/display form. Credentials are percent-encoded: the engine
+    /// decodes userinfo and sends `user` and `pass` byte for byte.
+    pub fn wire_url(&self) -> String {
+        let scheme = match self.scheme {
+            ProxyScheme::Http => "http",
+            ProxyScheme::Socks5 => "socks5h",
+        };
+        self.url_with_scheme(scheme)
+    }
+
+    fn url_with_scheme(&self, scheme: &str) -> String {
+        let host = bracketed_host(&self.host);
+        // user-or-pass: a token-only password must survive the
+        // save/load round trip instead of being dropped silently.
+        if self.user.is_empty() && self.pass.is_empty() {
+            format!("{scheme}://{host}:{}", self.port)
+        } else {
+            // A raw '/', '?' or '#' in a field would end the authority
+            // there, and the URL parser would take a host out of the
+            // credential.
+            format!(
+                "{scheme}://{}:{}@{host}:{}",
+                encode_userinfo(&self.user, false),
+                encode_userinfo(&self.pass, true),
+                self.port
+            )
+        }
+    }
+
+    /// Credential-free native proxy URI for Chromium's `--proxy-server` map.
+    /// Authenticated routes require the browser's owned credential relay.
+    pub fn chrome_proxy_arg(&self) -> String {
+        format!(
+            "{}://{}:{}",
+            scheme_str(self.scheme),
+            bracketed_host(&self.host),
+            self.port
+        )
+    }
+}
+
+fn scheme_str(scheme: ProxyScheme) -> &'static str {
+    match scheme {
+        ProxyScheme::Http => "http",
+        ProxyScheme::Socks5 => "socks5",
+    }
+}
+
+fn bracketed_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+/// Percent-encode one credential field for a proxy URL. Unreserved and
+/// sub-delims characters stay raw (RFC 3986 §3.2.1 userinfo), and ':' too
+/// when `keep_colon` (the password: the user name ends at the first ':').
+/// Every other byte is escaped, '%' included, so the result holds no URL
+/// delimiter and `decode_userinfo` turns it back into `field`.
+fn encode_userinfo(field: &str, keep_colon: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(field.len());
+    for &byte in field.as_bytes() {
+        let raw = byte.is_ascii_alphanumeric()
+            || b"-._~!$&'()*+,;=".contains(&byte)
+            || (keep_colon && byte == b':');
+        if raw {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
+}
+
+/// Percent-decode one credential field (RFC 3986 §2.1). A '%' that does not
+/// start two hex digits stays a literal '%'. A field whose decoded bytes are
+/// not UTF-8 is returned as written.
+fn decode_userinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    // A `String` cannot hold such a credential; kept as written it still
+    // loads, round-trips through the config file and goes out literally.
+    String::from_utf8(out).unwrap_or_else(|_| field.to_string())
+}
+
+/// Bracket a bare IPv6 literal for wire use ("CONNECT host:port",
+/// "Host: host:port"): unbracketed, "2001:db8::1:8443" is ambiguous
+/// between host and port. Hostnames, already-bracketed literals and
+/// anything that is not an IPv6 address pass through unchanged.
+fn bracketed_ipv6(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{bare}]")
+    } else {
+        host.to_string()
+    }
+}
+
+// ── Config file ──────────────────────────────────────────────
+//
+// The proxy config is a plain text file (one URL per line, #
+// comments, blanks ignored) at cache_dir/proxies.txt. The MCP
+// server and search engine read it at startup via `load_all()`,
+// which merges the file with DONSEEK_PROXIES (env overrides file
+// for duplicate host:port).
+
+/// Path to the proxy config file.
+pub fn config_path() -> PathBuf {
+    crate::paths::cache_dir().join("proxies.txt")
+}
+
+/// Load proxies from the config file. Returns empty vec if the
+/// file doesn't exist (not an error : first run).
+pub fn load_config() -> Vec<Proxy> {
+    load_config_verbose().0
+}
+
+/// Same as `load_config` but reports how many non-comment lines were
+/// dropped as unparseable (Q1: a typo in proxies.txt used to mean a
+/// silently absent proxy). `(proxies, skipped)`.
+pub fn load_config_verbose() -> (Vec<Proxy>, usize) {
+    let path = config_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return (Vec::new(), 0);
+    };
+    parse_lines_verbose(&content)
+}
+
+/// Load the configured proxy pool: `[proxy] pool` in the layered config
+/// (comma-separated). Historically the `DONSEEK_PROXIES` env var.
+pub fn load_env() -> Vec<Proxy> {
+    crate::config::cfg()
+        .proxy
+        .pool
+        .iter()
+        .filter_map(|s| Proxy::parse(s.trim()).ok())
+        .collect()
+}
+
+/// Load all proxies: config file first, then env var overrides
+/// duplicates by host:port. This is what the MCP server and
+/// search engine call at startup.
+pub fn load_all() -> Vec<Proxy> {
+    let mut proxies = load_config();
+    for ep in load_env() {
+        if let Some(pos) = proxies.iter().position(|p| p.id() == ep.id()) {
+            proxies[pos] = ep;
+        } else {
+            proxies.push(ep);
+        }
+    }
+    proxies
+}
+
+/// Env proxy variable that counts only when non-empty: curl treats a
+/// variable set to "" as unset, so `HTTPS_PROXY=""` must fall
+/// through to https_proxy / ALL_PROXY instead of short-circuiting the
+/// chain with an empty value.
+pub(crate) fn env_proxy_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Detect a proxy for a given URL: the layered config's [proxy] slots
+/// first (https / http, then all), then the standard environment
+/// variables (HTTPS_PROXY for https://, HTTP_PROXY for http://,
+/// ALL_PROXY for both; lowercase variants included) when
+/// `proxy.from_environment` allows them. NO_PROXY is respected:
+/// comma-separated host suffixes that bypass the proxy.
+///
+/// The env layer follows the curl/wget convention, so
+/// `HTTP_PROXY=http://proxy:8080` works out of the box. SOCKS5 proxies
+/// via `ALL_PROXY=socks5://host:port` are also supported. An empty
+/// value counts as unset (curl parity): it does not starve the
+/// fallbacks after it.
+pub fn from_env_for(url: &str) -> Result<Option<Proxy>, FetchError> {
+    super::request_route::RequestRoute::configured().proxy_for(url)
+}
+
+/// Save proxies to the config file. Atomic write (temp + rename).
+/// Sets 0600 on Unix (credentials present).
+pub fn save_config(proxies: &[Proxy]) -> std::io::Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut content = String::from("# DonSeTch proxy configuration\n");
+    for p in proxies {
+        content.push_str(&p.to_url());
+        content.push('\n');
+    }
+    let tmp = path.with_extension("txt.tmp");
+    // 0600 from creation: write-then-chmod left `proxies.txt.tmp`
+    // (passwords inside) world-readable between the two calls, and
+    // permanently on a crash in between.
+    crate::config::write_private(&tmp, content.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Parse proxy URLs from text: one per line, # comments and
+/// blank lines ignored.
+fn parse_lines_verbose(content: &str) -> (Vec<Proxy>, usize) {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match Proxy::parse(line) {
+            Ok(p) => out.push(p),
+            Err(_) => skipped += 1,
+        }
+    }
+    (out, skipped)
+}
+
+pub(crate) fn base64(input: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(input.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stealth_v3_no_proxy_normalizes_host_case_and_ip_spelling() {
+        assert!(super::no_proxy_match_value(
+            "child.example.com",
+            ".EXAMPLE.COM:443"
+        ));
+        assert!(super::no_proxy_match_value(
+            "[::1]",
+            "[0:0:0:0:0:0:0:1]:8443"
+        ));
+        assert!(super::no_proxy_match_value("example.com.", "EXAMPLE.COM"));
+        for (host, bypass) in [
+            ("otherexample.com", "example.com"),
+            ("[::2]", "[::1]"),
+            ("example.com.", "."),
+        ] {
+            assert!(
+                !super::no_proxy_match_value(host, bypass),
+                "{host} must not bypass {bypass}"
+            );
+        }
+    }
+    #[test]
+    fn stealth_v3_proxy_endpoint_validation_rejects_invalid_hosts_and_zero_port() {
+        for raw in [
+            "http://:8080",
+            "http://proxy:0",
+            "http://proxy/path:8080",
+            "http://proxy\r\nInjected:8080",
+            "http://[not-ip]:8080",
+            "http://proxy:8080/",
+            "socks5://two words:1080",
+        ] {
+            assert!(
+                super::Proxy::parse(raw).is_err(),
+                "invalid proxy endpoint accepted: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stealth_v3_proxy_scheme_case_does_not_become_part_of_the_host() {
+        for (raw, expected) in [
+            ("HTTP://proxy:8080", super::ProxyScheme::Http),
+            ("SoCkS5H://[::1]:1080", super::ProxyScheme::Socks5),
+        ] {
+            let proxy = super::Proxy::parse(raw).unwrap();
+            assert_eq!(proxy.scheme, expected);
+            assert_eq!(
+                proxy.host,
+                if expected == super::ProxyScheme::Http {
+                    "proxy"
+                } else {
+                    "::1"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn stealth_v3_proxy_connection_identity_covers_protocol_and_each_credential_field() {
+        let original = super::Proxy::parse("http://alice:owned-secret@proxy.example:8080").unwrap();
+        let key = original.connection_key();
+        assert_eq!(key, original.clone().connection_key());
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for variant in [
+            "socks5://alice:owned-secret@proxy.example:8080",
+            "http://bob:owned-secret@proxy.example:8080",
+            "http://alice:changed-secret@proxy.example:8080",
+            "http://alice:owned-secret@other.example:8080",
+            "http://alice:owned-secret@proxy.example:8081",
+        ] {
+            assert_ne!(key, super::Proxy::parse(variant).unwrap().connection_key());
+        }
+        let left = super::Proxy::parse("http://a:bc@proxy.example:8080").unwrap();
+        let right = super::Proxy::parse("http://ab:c@proxy.example:8080").unwrap();
+        assert_ne!(
+            left.connection_key(),
+            right.connection_key(),
+            "field boundaries are part of identity"
+        );
+    }
+
+    // E1: IPv6 literals (bracketed and bare), CIDR networks and
+    // host:port entries in NO_PROXY.
+    #[test]
+    fn no_proxy_matches_ipv6_cidr_and_port_entries() {
+        unsafe {
+            std::env::set_var(
+                "NO_PROXY",
+                "[::1],192.168.0.0/16,example.com:8443,.internal.local",
+            )
+        };
+        assert!(no_proxy_match("::1"), "bare IPv6 host vs bracketed entry");
+        assert!(no_proxy_match("192.168.5.5"), "CIDR /16");
+        assert!(!no_proxy_match("192.169.0.1"), "outside the CIDR");
+        assert!(
+            no_proxy_match("example.com"),
+            "host:port entry matches the host"
+        );
+        assert!(!no_proxy_match("example.org"), "other hosts unaffected");
+        assert!(
+            no_proxy_match("api.internal.local"),
+            "dot-prefixed entry still matches"
+        );
+        unsafe { std::env::remove_var("NO_PROXY") };
+    }
+
+    #[test]
+    fn no_proxy_cidr_v6() {
+        unsafe { std::env::set_var("NO_PROXY", "fc00::/7") };
+        assert!(no_proxy_match("fc00:1::2"), "inside fc00::/7");
+        assert!(!no_proxy_match("fe80::1"), "outside");
+        unsafe { std::env::remove_var("NO_PROXY") };
+    }
+
+    // E5: an unsupported scheme line is a loud parse error, not a
+    // proxy that pretends to be HTTP and dies at dial time.
+    #[test]
+    fn proxy_parse_rejects_unsupported_schemes() {
+        assert!(Proxy::parse("socks4://127.0.0.1:1080").is_err());
+        // The Debug impl redacts the password; the parse errors used
+        // to echo the whole string, password included, into a
+        // FetchError that can surface in a tool result. The port token
+        // is dropped too: without an `@`, or with the order swapped,
+        // the last colon segment is the password.
+        for bad in [
+            "http://user:s3cret@host:notaport",
+            "http://user:s3cret@hostonly",
+            "http://users3cret@host:1080",
+            "http://user:s3cret",
+            "http://host:1080@user:s3cret",
+        ] {
+            let e = Proxy::parse(bad).unwrap_err().to_string();
+            assert!(!e.contains("s3cret"), "{bad} -> {e}");
+        }
+        assert!(Proxy::parse("https://127.0.0.1:3128").is_err());
+        assert!(Proxy::parse("ftp://127.0.0.1:21").is_err());
+        // supported schemes still parse
+        assert!(Proxy::parse("http://127.0.0.1:3128").is_ok());
+        assert!(Proxy::parse("socks5://127.0.0.1:1080").is_ok());
+        assert!(Proxy::parse("socks5h://127.0.0.1:1080").is_ok());
+        // scheme-less lines keep their legacy meaning (http by default)
+        assert!(Proxy::parse("127.0.0.1:3128").is_ok());
+    }
+
+    // Q1: unparseable proxy lines are counted, not silently dropped.
+    #[test]
+    fn parse_lines_verbose_counts_skipped() {
+        let (proxies, skipped) = parse_lines_verbose(
+            "http://127.0.0.1:3128\n\n# comment\nsocks4://127.0.0.1:1080\ngarbage-no-colon\n",
+        );
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(skipped, 2, "socks4 line + garbage line counted");
+    }
+    use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let p = Proxy {
+            host: "proxy.example.com".into(),
+            port: 8080,
+            user: "alice".into(),
+            pass: "s3cret-password".into(),
+            scheme: ProxyScheme::Http,
+        };
+        let out = format!("{p:?}");
+        assert!(!out.contains("s3cret-password"), "leaked password: {out}");
+        assert!(out.contains("proxy.example.com"));
+        assert!(out.contains("alice"));
+        assert!(out.contains("***"));
+    }
+
+    #[test]
+    fn base64_rfc4648_vectors() {
+        // RFC 4648 §10 : covers every input-length remainder.
+        assert_eq!(base64(""), "");
+        assert_eq!(base64("f"), "Zg==");
+        assert_eq!(base64("fo"), "Zm8=");
+        assert_eq!(base64("foo"), "Zm9v");
+        assert_eq!(base64("foob"), "Zm9vYg==");
+        assert_eq!(base64("fooba"), "Zm9vYmE=");
+        assert_eq!(base64("foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_credentials_pad_at_the_end() {
+        // Regression: the final partial group was emitted as padding
+        // first, data after : "dXNlcjpwYXNz==QA" instead of
+        // "dXNlcjpwYXNzd2Q=". Only credentials whose length was an exact
+        // multiple of 3 survived, so most basic-auth and proxy-auth
+        // headers went out corrupted.
+        assert_eq!(base64("user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64("user:passw"), "dXNlcjpwYXNzdw==");
+        assert_eq!(base64("user:passwd"), "dXNlcjpwYXNzd2Q=");
+    }
+
+    #[test]
+    fn parse_bare_http() {
+        let p = Proxy::parse("user:pass@1.2.3.4:8080").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Http);
+        assert_eq!(p.host, "1.2.3.4");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.user, "user");
+        assert_eq!(p.pass, "pass");
+    }
+
+    #[test]
+    fn parse_explicit_http() {
+        let p = Proxy::parse("http://u:p@host:3128").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Http);
+        assert_eq!(p.host, "host");
+        assert_eq!(p.port, 3128);
+    }
+
+    #[test]
+    fn parse_socks5() {
+        let p = Proxy::parse("socks5://u:p@5.6.7.8:1080").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Socks5);
+        assert_eq!(p.host, "5.6.7.8");
+        assert_eq!(p.port, 1080);
+        assert_eq!(p.user, "u");
+        assert_eq!(p.pass, "p");
+    }
+
+    #[test]
+    fn parse_socks5h_alias() {
+        let p = Proxy::parse("socks5h://u:p@host:1080").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Socks5);
+    }
+
+    #[test]
+    fn parse_socks5_no_auth() {
+        let p = Proxy::parse("socks5://host:1080").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Socks5);
+        assert_eq!(p.user, "");
+        assert_eq!(p.pass, "");
+    }
+
+    #[test]
+    fn parse_http_no_auth() {
+        let p = Proxy::parse("host:8080").unwrap();
+        assert_eq!(p.scheme, ProxyScheme::Http);
+        assert_eq!(p.host, "host");
+        assert_eq!(p.user, "");
+    }
+
+    #[test]
+    fn parse_ipv6_brackets() {
+        let p = Proxy::parse("socks5://u:p@[::1]:1080").unwrap();
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 1080);
+    }
+
+    #[test]
+    fn id_stable() {
+        let p = Proxy::parse("socks5://u:p@host:1080").unwrap();
+        assert_eq!(p.id(), "host:1080");
+    }
+
+    #[test]
+    fn parse_bad() {
+        assert!(Proxy::parse("garbage").is_err());
+        assert!(Proxy::parse("u:p@bad").is_err());
+        assert!(Proxy::parse("u:p@host:99999").is_err());
+    }
+
+    // Auth was split from the address at the FIRST '@', so a
+    // password containing one ("p@ss") ended up as pass="p" and
+    // host="ss@1.2.3.4": accepted by `proxy add`, stored, and then
+    // unreachable. The address can never contain '@' (host:port),
+    // so the LAST '@' is the only correct split point.
+    #[test]
+    fn parse_password_containing_at() {
+        let p = Proxy::parse("socks5://alice:p@ss@1.2.3.4:1080").unwrap();
+        assert_eq!(p.user, "alice");
+        assert_eq!(p.pass, "p@ss");
+        assert_eq!(p.host, "1.2.3.4");
+        assert_eq!(p.port, 1080);
+        // Round trip through to_url keeps the password whole.
+        let p2 = Proxy::parse(&p.to_url()).unwrap();
+        assert_eq!(p2.pass, "p@ss");
+        assert_eq!(p2.host, "1.2.3.4");
+    }
+
+    #[test]
+    fn parse_user_and_password_containing_at_with_ipv6() {
+        let p = Proxy::parse("http://me@corp:p@ss:w0rd@[::1]:3128").unwrap();
+        assert_eq!(p.user, "me@corp");
+        assert_eq!(p.pass, "p@ss:w0rd");
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 3128);
+        let p2 = Proxy::parse(&p.to_url()).unwrap();
+        assert_eq!(p2.user, "me@corp");
+        assert_eq!(p2.pass, "p@ss:w0rd");
+        assert_eq!(p2.host, "::1");
+    }
+
+    #[test]
+    fn to_url_roundtrip() {
+        let urls = [
+            "socks5://user:pass@host:1080",
+            "http://u:p@1.2.3.4:8080",
+            "socks5://host:1080",
+            "http://host:8080",
+            "user:pass@host:8080",
+            "host:8080",
+        ];
+        for url in urls {
+            let p = Proxy::parse(url).unwrap();
+            let reconstructed = p.to_url();
+            let p2 = Proxy::parse(&reconstructed).unwrap();
+            assert_eq!(p.scheme, p2.scheme, "scheme mismatch for {url}");
+            assert_eq!(p.host, p2.host, "host mismatch for {url}");
+            assert_eq!(p.port, p2.port, "port mismatch for {url}");
+            assert_eq!(p.user, p2.user, "user mismatch for {url}");
+            assert_eq!(p.pass, p2.pass, "pass mismatch for {url}");
+        }
+    }
+
+    #[test]
+    fn to_url_ipv6_brackets() {
+        let p = Proxy::parse("socks5://u:p@[::1]:1080").unwrap();
+        let url = p.to_url();
+        assert!(
+            url.contains("[::1]"),
+            "IPv6 host should be bracketed: {url}"
+        );
+        let p2 = Proxy::parse(&url).unwrap();
+        assert_eq!(p.host, p2.host);
+        assert_eq!(p.port, p2.port);
+    }
+
+    #[test]
+    fn wire_url_hands_socks5_names_to_the_proxy() {
+        // The engine URL keeps SOCKS5 remote-DNS (`socks5h`): the lane
+        // resolves the target, the host never leaks to the local resolver —
+        // exactly what the old transport sent (ATYP=3 domain).
+        let p = Proxy::parse("socks5://u:p@5.6.7.8:1080").unwrap();
+        assert_eq!(p.wire_url(), "socks5h://u:p@5.6.7.8:1080");
+        assert_eq!(
+            p.to_url(),
+            "socks5://u:p@5.6.7.8:1080",
+            "the config/display form stays socks5"
+        );
+        let h = Proxy::parse("http://1.2.3.4:8080").unwrap();
+        assert_eq!(h.wire_url(), "http://1.2.3.4:8080");
+        let v6 = Proxy::parse("socks5://[::1]:1080").unwrap();
+        assert_eq!(v6.wire_url(), "socks5h://[::1]:1080");
+    }
+
+    #[test]
+    fn parse_lines_ignores_comments_and_blanks() {
+        let content = "\
+# This is a comment
+socks5://u:p@host:1080
+
+  # Indented comment
+http://host:8080
+
+# Empty line above
+";
+        let proxies = parse_lines_verbose(content).0;
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].id(), "host:1080");
+        assert_eq!(proxies[1].id(), "host:8080");
+    }
+
+    #[test]
+    fn parse_lines_skips_invalid() {
+        let content = "\
+socks5://valid:1080
+garbage_line
+u:p@also_valid:8080
+:99999
+";
+        let proxies = parse_lines_verbose(content).0;
+        assert_eq!(proxies.len(), 2);
+    }
+
+    #[test]
+    fn parse_lines_empty() {
+        assert!(parse_lines_verbose("").0.is_empty());
+        assert!(
+            parse_lines_verbose("# only comments\n# more comments")
+                .0
+                .is_empty()
+        );
+        assert!(parse_lines_verbose("\n\n\n").0.is_empty());
+    }
+
+    // ── from_env_for tests ──
+    // These tests use std::env::set_var which is not thread-safe,
+    // so each test sets and cleans up its own vars. Rust's test runner
+    // runs tests in parallel by default, but these tests use unique
+    // var names to avoid collisions. The standard proxy vars
+    // (HTTP_PROXY etc.) are cleaned up after each test.
+    //
+    // SAFETY: set_var/remove_var are unsafe in Rust 2024 edition because
+    // they're not thread-safe. We guard all env var tests with a mutex to
+    // serialize them, so only one test touches env vars at a time.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn env_https_proxy() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
+        }
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
+        assert_eq!(p.host, "proxy");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.scheme, ProxyScheme::Http);
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+        }
+    }
+
+    #[test]
+    fn env_http_proxy() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            std::env::set_var("HTTP_PROXY", "http://proxy:3128");
+        }
+        let p = from_env_for("http://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
+        assert_eq!(p.host, "proxy");
+        assert_eq!(p.port, 3128);
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+        }
+    }
+
+    #[test]
+    fn env_all_proxy_fallback() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::set_var("ALL_PROXY", "socks5://proxy:1080");
+        }
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
+        assert_eq!(p.host, "proxy");
+        assert_eq!(p.port, 1080);
+        assert_eq!(p.scheme, ProxyScheme::Socks5);
+        unsafe {
+            std::env::remove_var("ALL_PROXY");
+        }
+    }
+
+    #[test]
+    fn env_lowercase_proxy() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::set_var("https_proxy", "http://proxy:8080");
+        }
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect lowercase proxy");
+        assert_eq!(p.host, "proxy");
+        unsafe {
+            std::env::remove_var("https_proxy");
+        }
+    }
+
+    #[test]
+    fn env_no_proxy_bypass() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
+            std::env::set_var("NO_PROXY", "example.com");
+        }
+        assert!(
+            from_env_for("https://example.com/").unwrap().is_none(),
+            "NO_PROXY should bypass"
+        );
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("NO_PROXY");
+        }
+    }
+
+    #[test]
+    fn env_no_proxy_wildcard() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
+            std::env::set_var("NO_PROXY", "*");
+        }
+        assert!(
+            from_env_for("https://example.com/").unwrap().is_none(),
+            "NO_PROXY=* should bypass all"
+        );
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("NO_PROXY");
+        }
+    }
+
+    #[test]
+    fn env_no_proxy_subdomain() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
+            std::env::set_var("NO_PROXY", ".example.com");
+        }
+        assert!(
+            from_env_for("https://foo.example.com/").unwrap().is_none(),
+            "NO_PROXY=.example.com should match subdomain"
+        );
+        assert!(
+            from_env_for("https://example.com/").unwrap().is_none(),
+            "NO_PROXY=.example.com should match root"
+        );
+        assert!(
+            from_env_for("https://other.com/").unwrap().is_some(),
+            "NO_PROXY should not match unrelated domain"
+        );
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("NO_PROXY");
+        }
+    }
+
+    #[test]
+    fn env_no_proxy_returns_none_without_env() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("ALL_PROXY");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("http_proxy");
+            std::env::remove_var("all_proxy");
+        }
+        assert!(
+            from_env_for("https://example.com/").unwrap().is_none(),
+            "no env vars = no proxy"
+        );
+    }
+
+    #[test]
+    fn chrome_proxy_arg_format() {
+        let p = Proxy::parse("socks5://u:p@host:1080").unwrap();
+        let arg = p.chrome_proxy_arg();
+        assert_eq!(arg, "socks5://host:1080");
+        assert!(!arg.contains("u:p"));
+    }
+
+    // The bracketed-IPv6 + port combination ("[::1]:8443") used to
+    // match nothing: the port split refused any host part containing
+    // ':' and the bracket strip ran after it, so the entry survived
+    // both passes broken. Brackets are stripped first now.
+    #[test]
+    fn no_proxy_matches_bracketed_ipv6_with_port() {
+        unsafe {
+            std::env::set_var("NO_PROXY", "[::1]:8443, [2001:db8::1]:443, [fe80::1]");
+        }
+        assert!(no_proxy_match("::1"), "bracketed entry + port vs bare host");
+        assert!(no_proxy_match("[::1]"), "bracketed entry vs bracketed host");
+        assert!(
+            no_proxy_match("2001:db8::1"),
+            "other bracketed entry + port"
+        );
+        assert!(no_proxy_match("fe80::1"), "bracketed entry without port");
+        assert!(!no_proxy_match("::2"), "other host must not match");
+        assert!(!no_proxy_match("2001:db8::2"), "other host must not match");
+        unsafe { std::env::remove_var("NO_PROXY") };
+    }
+
+    // A literal target goes on the SOCKS5 wire with its native address
+    // type (RFC 1928 §5); as a "domain" it could never resolve.
+    #[tokio::test]
+    async fn socks5_sends_ip_literals_with_native_address_types() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn run_case(target: &str, port: u16) -> Vec<u8> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listen_port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 3]; // ver, nmethods, method
+                s.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [0x05, 0x01, 0x00]);
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let mut head = [0u8; 4];
+                s.read_exact(&mut head).await.unwrap();
+                let mut rest = Vec::new();
+                match head[3] {
+                    0x01 => {
+                        let mut b = [0u8; 4 + 2];
+                        s.read_exact(&mut b).await.unwrap();
+                        rest.extend_from_slice(&b);
+                    }
+                    0x04 => {
+                        let mut b = [0u8; 16 + 2];
+                        s.read_exact(&mut b).await.unwrap();
+                        rest.extend_from_slice(&b);
+                    }
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        s.read_exact(&mut len).await.unwrap();
+                        let mut b = vec![0u8; len[0] as usize + 2];
+                        s.read_exact(&mut b).await.unwrap();
+                        rest.push(len[0]);
+                        rest.extend_from_slice(&b);
+                    }
+                    other => panic!("unexpected ATYP {other:#04x}"),
+                }
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+                let mut out = head.to_vec();
+                out.extend_from_slice(&rest);
+                out
+            });
+            let p = Proxy {
+                host: "127.0.0.1".into(),
+                port: listen_port,
+                user: String::new(),
+                pass: String::new(),
+                scheme: ProxyScheme::Socks5,
+            };
+            p.connect(target, port).await.expect("handshake ok");
+            server.await.unwrap()
+        }
+
+        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut want = vec![0x05, 0x01, 0x00, 0x04];
+        want.extend_from_slice(&v6.octets());
+        want.extend_from_slice(&8443u16.to_be_bytes());
+        assert_eq!(run_case("2001:db8::1", 8443).await, want, "bare IPv6");
+        assert_eq!(
+            run_case("[2001:db8::1]", 8443).await,
+            want,
+            "bracketed IPv6"
+        );
+
+        let v4: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        let mut want4 = vec![0x05, 0x01, 0x00, 0x01];
+        want4.extend_from_slice(&v4.octets());
+        want4.extend_from_slice(&80u16.to_be_bytes());
+        assert_eq!(run_case("1.2.3.4", 80).await, want4, "IPv4 literal");
+
+        let mut want_dom = vec![0x05, 0x01, 0x00, 0x03, 11];
+        want_dom.extend_from_slice(b"example.com");
+        want_dom.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(
+            run_case("example.com", 443).await,
+            want_dom,
+            "hostname stays a domain (proxy resolves DNS)"
+        );
+    }
+
+    // A bare IPv6 literal must bracket on the CONNECT line and the
+    // Host header; already-bracketed input must not double-bracket.
+    #[tokio::test]
+    async fn http_connect_brackets_bare_ipv6_targets() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn run_case(target: &str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listen_port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut byte).await.unwrap() == 0 {
+                        break;
+                    }
+                    buf.push(byte[0]);
+                }
+                s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+            let p = Proxy {
+                host: "127.0.0.1".into(),
+                port: listen_port,
+                user: String::new(),
+                pass: String::new(),
+                scheme: ProxyScheme::Http,
+            };
+            p.connect(target, 8443).await.expect("CONNECT ok");
+            server.await.unwrap()
+        }
+
+        for target in ["2001:db8::1", "[2001:db8::1]"] {
+            let head = run_case(target).await;
+            assert!(
+                head.starts_with("CONNECT [2001:db8::1]:8443 HTTP/1.1\r\n"),
+                "{target} => {head}"
+            );
+            assert!(
+                head.contains("Host: [2001:db8::1]:8443\r\n"),
+                "{target} => {head}"
+            );
+        }
+        let head = run_case("example.com").await;
+        assert!(
+            head.starts_with("CONNECT example.com:8443 HTTP/1.1\r\n"),
+            "a hostname passes through untouched: {head}"
+        );
+    }
+
+    // S3: the per-step timeouts must not stack. On the old code this
+    // test hung for the 12s per-step timeout and failed the elapsed
+    // bound; the outer budget ends a stalled handshake instead.
+    #[tokio::test]
+    async fn a_stalled_handshake_is_cut_by_the_outer_budget() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Accept, then stall silently: the half-dead-lane shape.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = s.shutdown().await;
+        });
+        let p = Proxy {
+            host: "127.0.0.1".into(),
+            port: listen_port,
+            user: String::new(),
+            pass: String::new(),
+            scheme: ProxyScheme::Socks5,
+        };
+        let started = std::time::Instant::now();
+        let err = p
+            .connect_within("example.com", 443, Duration::from_millis(250))
+            .await
+            .expect_err("stalled handshake must fail");
+        assert!(matches!(err, FetchError::Timeout), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "outer budget must fire long before the 12s per-step timeout: {:?}",
+            started.elapsed()
+        );
+        server.abort();
+    }
+
+    // RFC 1929 wants both ULEN and PLEN in 1..255, so a credential
+    // shape with an empty field (":token@host", "user@host") has no
+    // valid SOCKS5 sub-negotiation: the greeting must offer no-auth
+    // alone, never 0x02 with a zero-length field (a strict server
+    // rejects the frame; the old code sent ULEN=0 for a token). The
+    // token still rides the HTTP-side headers and the save round trip
+    // (`password_only_credentials_are_carried`).
+    #[tokio::test]
+    async fn socks5_offers_no_auth_alone_when_a_field_is_empty() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn run_case(user: &str, pass: &str) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listen_port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 3];
+                s.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(
+                    greeting,
+                    [0x05, 0x01, 0x00],
+                    "no valid sub-negotiation exists: offer no-auth alone"
+                );
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let mut head = [0u8; 4];
+                s.read_exact(&mut head).await.unwrap();
+                assert_eq!(head[3], 0x03, "domain name target");
+                let mut len = [0u8; 1];
+                s.read_exact(&mut len).await.unwrap();
+                let mut rest = vec![0u8; len[0] as usize + 2];
+                s.read_exact(&mut rest).await.unwrap();
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+            });
+            let p = Proxy {
+                host: "127.0.0.1".into(),
+                port: listen_port,
+                user: user.into(),
+                pass: pass.into(),
+                scheme: ProxyScheme::Socks5,
+            };
+            p.connect("example.com", 443)
+                .await
+                .expect("no-auth handshake completes");
+            server.await.unwrap();
+        }
+
+        run_case("", "tok3n").await;
+        run_case("alice", "").await;
+    }
+
+    // A full credential still negotiates RFC 1929: both methods are
+    // offered, the sub-negotiation carries user then password, and
+    // the handshake completes on the server's 0x00.
+    #[tokio::test]
+    async fn socks5_negotiates_auth_when_both_fields_are_present() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 4];
+            s.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+            s.write_all(&[0x05, 0x02]).await.unwrap();
+            let mut auth = [0u8; 2 + 5 + 1 + 6];
+            s.read_exact(&mut auth).await.unwrap();
+            let mut want = vec![0x01, 5];
+            want.extend_from_slice(b"alice");
+            want.push(6);
+            want.extend_from_slice(b"s3cr3t");
+            assert_eq!(auth.to_vec(), want, "RFC 1929: user then password");
+            s.write_all(&[0x01, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            s.read_exact(&mut head).await.unwrap();
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.unwrap();
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut rest).await.unwrap();
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+        });
+        let p = Proxy {
+            host: "127.0.0.1".into(),
+            port: listen_port,
+            user: "alice".into(),
+            pass: "s3cr3t".into(),
+            scheme: ProxyScheme::Socks5,
+        };
+        p.connect("example.com", 443)
+            .await
+            .expect("auth handshake completes");
+        server.await.unwrap();
+    }
+
+    // An empty proxy env value counts as unset (curl parity): it must
+    // not short-circuit the fallback chain. On the old code this test
+    // read None (the whole chain starved by the empty value).
+    #[test]
+    fn empty_env_value_falls_through_to_all_proxy() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("all_proxy");
+            std::env::set_var("HTTPS_PROXY", "");
+            std::env::set_var("ALL_PROXY", "socks5://proxy:1080");
+        }
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("an empty HTTPS_PROXY must not starve ALL_PROXY");
+        assert_eq!(p.scheme, ProxyScheme::Socks5);
+        assert_eq!(p.host, "proxy");
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("ALL_PROXY");
+        }
+    }
+
+    // A token-only password (":token@host") is a real provider shape:
+    // it must not be dropped from auth headers or the save round trip.
+    #[test]
+    fn password_only_credentials_are_carried() {
+        let p = Proxy::parse("http://:tok3n@proxy:8080").unwrap();
+        assert_eq!(p.user, "");
+        assert_eq!(p.pass, "tok3n");
+        assert_eq!(
+            p.proxy_authorization(),
+            Some(format!("Basic {}", base64(":tok3n"))),
+            "the CONNECT and raw-hop headers must carry the token"
+        );
+        let url = p.to_url();
+        assert!(url.contains(":tok3n@"), "save must not drop it: {url}");
+        let p2 = Proxy::parse(&url).unwrap();
+        assert_eq!(p2.pass, "tok3n");
+        // No credentials at all stays credential-free.
+        assert!(
+            Proxy::parse("http://proxy:8080")
+                .unwrap()
+                .proxy_authorization()
+                .is_none()
+        );
+    }
+
+    // ── Credentials on the wire ──
+    //
+    // The fetching tests below install their own config and dial loopback
+    // fixtures; they rely on nextest's one process per test (`just t`).
+
+    #[test]
+    fn percent_encoded_credentials_parse_decoded_in_every_form() {
+        for raw in [
+            "http://alice:p%40ss%3Aword@proxy:3128",
+            "socks5://alice:p%40ss%3Aword@proxy:1080",
+            "socks5h://alice:p%40ss%3Aword@proxy:1080",
+            "alice:p%40ss%3Aword@proxy:3128",
+        ] {
+            let p = Proxy::parse(raw).unwrap();
+            assert_eq!((p.user.as_str(), p.pass.as_str()), ("alice", "p@ss:word"));
+        }
+        // An escaped ':' is the only way to put one in the user name.
+        let p = Proxy::parse("http://me%3Acorp:pw@proxy:3128").unwrap();
+        assert_eq!((p.user.as_str(), p.pass.as_str()), ("me:corp", "pw"));
+    }
+
+    #[test]
+    fn a_percent_that_starts_no_escape_stays_literal() {
+        for (raw, pass) in [
+            ("http://alice:100%@proxy:3128", "100%"),
+            ("http://alice:50%off@proxy:3128", "50%off"),
+            ("http://alice:ab%4@proxy:3128", "ab%4"),
+            ("http://alice:ab%+f@proxy:3128", "ab%+f"),
+            ("http://alice:s3cret@proxy:3128", "s3cret"),
+        ] {
+            assert_eq!(Proxy::parse(raw).unwrap().pass, pass, "{raw}");
+        }
+    }
+
+    // A v4 config may hold a password whose escape is not UTF-8 ("x%FFy",
+    // which v4 sent literally): it must still load and survive the save
+    // round trip, never be skipped by load_config and dropped on save.
+    #[test]
+    fn an_escape_that_does_not_decode_to_utf8_stays_as_written() {
+        for (raw, user, pass) in [
+            ("http://bob:x%FFy@proxy:3129", "bob", "x%FFy"),
+            ("alice:s3cret%C3@proxy:3128", "alice", "s3cret%C3"),
+            ("socks5://b%FFb:pw@proxy:1080", "b%FFb", "pw"),
+        ] {
+            let p = Proxy::parse(raw).unwrap();
+            assert_eq!((p.user.as_str(), p.pass.as_str()), (user, pass), "{raw}");
+            assert_eq!(Proxy::parse(&p.to_url()).unwrap(), p, "{raw}");
+        }
+        let (loaded, skipped) = parse_lines_verbose("http://bob:x%FFy@127.0.0.1:3129\n");
+        assert_eq!((loaded.len(), skipped), (1, 0));
+    }
+
+    // Credentials made only of characters userinfo allows raw are written
+    // back byte for byte: no churn in proxies.txt, `proxy export` or the
+    // engine URL the page cache keys on.
+    #[test]
+    fn credentials_that_need_no_escape_are_written_unchanged() {
+        for raw in [
+            "http://alice:s3cret@127.0.0.1:3128",
+            "socks5://dave:a+b=c!@127.0.0.1:1080",
+            "http://user-zone-us:tok~en_1.2@proxy.example:8080",
+            "http://alice:a!$&'()*+,;=:b@127.0.0.1:3128",
+            "http://:tok3n@proxy:8080",
+        ] {
+            assert_eq!(Proxy::parse(raw).unwrap().to_url(), raw);
+        }
+    }
+
+    // Every byte of a credential must come back from the URL the engine
+    // and the config file get: the authority must still end at the proxy.
+    #[test]
+    fn proxy_urls_carry_every_credential_byte() {
+        for (user, pass) in [
+            ("alice", "pa/ss"),
+            ("alice", "pa#ss"),
+            ("alice", "pa?ss"),
+            ("me@corp", "p@ss:w%rd"),
+            ("me:corp", "100%41 é"),
+            ("", "tok/en"),
+            ("a!$&'()*+,;=b", "c!$&'()*+,;=:d"),
+        ] {
+            for scheme in [ProxyScheme::Http, ProxyScheme::Socks5] {
+                let p = Proxy {
+                    host: "127.0.0.1".into(),
+                    port: 3128,
+                    user: user.into(),
+                    pass: pass.into(),
+                    scheme,
+                };
+                for url in [p.wire_url(), p.to_url()] {
+                    let parsed = url::Url::parse(&url).unwrap_or_else(|e| panic!("{url}: {e}"));
+                    assert_eq!(parsed.host_str(), Some("127.0.0.1"), "{url}");
+                    assert_eq!(parsed.port(), Some(3128), "{url}");
+                    assert_eq!(Proxy::parse(&url).unwrap(), p, "{url}");
+                }
+            }
+        }
+    }
+
+    async fn read_request_head<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            if bytes.len() > 16384 {
+                return None;
+            }
+            bytes.push(stream.read_u8().await.ok()?);
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The decoded `user:pass` of a request head's `Proxy-Authorization: Basic`.
+    fn basic_credentials(head: &str) -> Option<String> {
+        use base64::Engine as _;
+        let value = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("proxy-authorization")
+                .then(|| value.trim().to_string())
+        })?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(value.strip_prefix("Basic ")?)
+            .ok()?;
+        String::from_utf8(decoded).ok()
+    }
+
+    fn page_reply() -> Vec<u8> {
+        const PAGE: &[u8] = b"<!doctype html><html><head><title>Final page</title></head><body><article><h1>Final page</h1><p>The request reached the page it asked for, and this paragraph is that page's content.</p></article></body></html>";
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            PAGE.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(PAGE);
+        reply
+    }
+
+    type Heads = std::sync::Arc<Mutex<Vec<String>>>;
+
+    /// An HTTP proxy on 127.0.0.1 that records every request head, grants
+    /// CONNECT and answers any other request as the origin.
+    async fn http_proxy_fixture() -> (u16, Heads, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heads: Heads = Default::default();
+        let log = std::sync::Arc::clone(&heads);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let Some(head) = read_request_head(&mut stream).await else {
+                        return;
+                    };
+                    log.lock().unwrap().push(head.clone());
+                    let reply = if head.starts_with("CONNECT ") {
+                        b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec()
+                    } else {
+                        page_reply()
+                    };
+                    let _ = stream.write_all(&reply).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (port, heads, task)
+    }
+
+    fn loopback_fetch_config() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+    }
+
+    /// One plaintext read of `url` through `proxy`: the status, or the
+    /// error text.
+    async fn fetch_through(proxy: &Proxy, url: &str) -> Result<u16, String> {
+        let fetcher =
+            crate::fetch::client::Fetcher::new(crate::profile::BrowserProfile::host_default())
+                .unwrap();
+        fetcher
+            .fetch_once_via(url, &[], Some(proxy), false, None)
+            .await
+            .map(|out| out.status)
+            .map_err(|e| e.to_string())
+    }
+
+    /// What an HTTP proxy configured as `http://{userinfo}@…` receives from
+    /// the CONNECT probe behind `proxy add` / `proxy test` and from a fetch:
+    /// `(parsed user:pass, CONNECT credential, GET credential, report)`.
+    async fn sent_by_probe_and_fetch(
+        userinfo: &str,
+    ) -> (String, Option<String>, Option<String>, String) {
+        let (port, heads, server) = http_proxy_fixture().await;
+        let proxy = Proxy::parse(&format!("http://{userinfo}@127.0.0.1:{port}")).unwrap();
+        let parsed = format!("{}:{}", proxy.user, proxy.pass);
+        let tunnel = proxy.connect("example.test", 80).await.map(drop);
+        let fetch = fetch_through(&proxy, "http://127.0.0.1:9/page").await;
+        server.abort();
+        let heads = heads.lock().unwrap().clone();
+        let sent = |verb: &str| {
+            heads
+                .iter()
+                .find(|head| head.starts_with(verb))
+                .and_then(|head| basic_credentials(head))
+        };
+        let (connect, get) = (sent("CONNECT "), sent("GET "));
+        let report = format!(
+            "{userinfo}: parsed {parsed:?}; CONNECT probe ({tunnel:?}) sent {connect:?}; fetch ({fetch:?}) sent {get:?}"
+        );
+        (parsed, connect, get, report)
+    }
+
+    /// Credentials `Proxy::parse` accepts with a raw '/', '#' or '?', in the
+    /// password or the user name, must reach the proxy on the fetch path.
+    #[tokio::test]
+    async fn a_raw_reserved_character_in_proxy_credentials_reaches_the_proxy() {
+        loopback_fetch_config();
+        for userinfo in [
+            "alice:pa/ss",
+            "alice:pa#ss",
+            "alice:pa?ss",
+            "al/ice:pw",
+            "us#er:p?w",
+        ] {
+            let (port, heads, server) = http_proxy_fixture().await;
+            let proxy = Proxy::parse(&format!("http://{userinfo}@127.0.0.1:{port}")).unwrap();
+            assert_eq!(format!("{}:{}", proxy.user, proxy.pass), userinfo);
+            let fetch = fetch_through(&proxy, "http://127.0.0.1:9/page").await;
+            server.abort();
+            let sent: Vec<Option<String>> = heads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|head| basic_credentials(head))
+                .collect();
+            assert!(
+                matches!(fetch, Ok(200))
+                    && sent.first().cloned().flatten().as_deref() == Some(userinfo),
+                "{userinfo}: fetch: {fetch:?}; proxy received credentials {sent:?}"
+            );
+        }
+    }
+
+    /// Userinfo in a proxy URL is percent-encoded (RFC 3986 §3.2.1). The
+    /// CONNECT probe and the fetch must send the same decoded credential.
+    #[tokio::test]
+    async fn proxy_credentials_are_percent_decoded() {
+        loopback_fetch_config();
+        let (parsed, connect, get, report) = sent_by_probe_and_fetch("alice:p%40ss%3Aword").await;
+        assert_eq!(parsed, "alice:p@ss:word", "{report}");
+        assert_eq!(connect.as_deref(), Some("alice:p@ss:word"), "{report}");
+        assert_eq!(get.as_deref(), Some("alice:p@ss:word"), "{report}");
+    }
+
+    /// An escape that does not decode to UTF-8 ("x%FFy", a password v4 sent
+    /// literally) goes out as written on both paths.
+    #[tokio::test]
+    async fn an_escape_that_is_not_utf8_goes_out_as_written_on_every_path() {
+        loopback_fetch_config();
+        let (parsed, connect, get, report) = sent_by_probe_and_fetch("bob:x%FFy").await;
+        assert_eq!(parsed, "bob:x%FFy", "{report}");
+        assert_eq!(connect.as_deref(), Some("bob:x%FFy"), "{report}");
+        assert_eq!(get.as_deref(), Some("bob:x%FFy"), "{report}");
+    }
+
+    // Negative: what the fetch path sent for a plain password, an encoded
+    // one, a '%' that starts no escape and raw sub-delims stays what it was.
+    #[tokio::test]
+    async fn the_fetch_path_keeps_sending_plain_and_encoded_passwords_as_before() {
+        loopback_fetch_config();
+        for (userinfo, expected) in [
+            ("alice:s3cret", "alice:s3cret"),
+            ("alice:p%40ss%3Aword", "alice:p@ss:word"),
+            ("alice:100%", "alice:100%"),
+            ("alice:a!$&'()*+,;=:b", "alice:a!$&'()*+,;=:b"),
+        ] {
+            let (port, heads, server) = http_proxy_fixture().await;
+            let proxy = Proxy::parse(&format!("http://{userinfo}@127.0.0.1:{port}")).unwrap();
+            let fetch = fetch_through(&proxy, "http://127.0.0.1:9/page").await;
+            server.abort();
+            let sent = heads
+                .lock()
+                .unwrap()
+                .first()
+                .and_then(|h| basic_credentials(h));
+            assert!(
+                matches!(fetch, Ok(200)) && sent.as_deref() == Some(expected),
+                "{userinfo}: fetch: {fetch:?}; proxy received {sent:?}"
+            );
+        }
+    }
+
+    /// A SOCKS5 proxy on 127.0.0.1 that records each RFC 1929 `user:pass`,
+    /// grants the CONNECT and answers the tunnelled request itself.
+    async fn socks5_fixture() -> (u16, Heads, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // One RFC 1929 field: a length byte, then that many bytes.
+        async fn read_field(s: &mut tokio::net::TcpStream) -> Option<String> {
+            let len = s.read_u8().await.ok()?;
+            let mut bytes = vec![0u8; usize::from(len)];
+            s.read_exact(&mut bytes).await.ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Heads = Default::default();
+        let log = std::sync::Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    s.read_exact(&mut greeting).await.ok()?;
+                    let mut methods = vec![0u8; usize::from(greeting[1])];
+                    s.read_exact(&mut methods).await.ok()?;
+                    if !methods.contains(&0x02) {
+                        log.lock()
+                            .unwrap()
+                            .push("no username/password offer".into());
+                        s.write_all(&[0x05, 0xFF]).await.ok()?;
+                        return None;
+                    }
+                    s.write_all(&[0x05, 0x02]).await.ok()?;
+                    let _version = s.read_u8().await.ok()?;
+                    let user = read_field(&mut s).await?;
+                    let pass = read_field(&mut s).await?;
+                    log.lock().unwrap().push(format!("{user}:{pass}"));
+                    s.write_all(&[0x01, 0x00]).await.ok()?;
+                    let mut head = [0u8; 4];
+                    s.read_exact(&mut head).await.ok()?;
+                    let skip = match head[3] {
+                        0x01 => 4,
+                        0x04 => 16,
+                        _ => usize::from(s.read_u8().await.ok()?),
+                    };
+                    let mut rest = vec![0u8; skip + 2];
+                    s.read_exact(&mut rest).await.ok()?;
+                    s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                        .await
+                        .ok()?;
+                    read_request_head(&mut s).await?;
+                    s.write_all(&page_reply()).await.ok()?;
+                    s.shutdown().await.ok()
+                });
+            }
+        });
+        (port, seen, task)
+    }
+
+    /// The SOCKS5 lane takes the same URL: its RFC 1929 sub-negotiation must
+    /// carry the stored credential, and the read must never leave on a
+    /// direct connection to the origin.
+    #[tokio::test]
+    async fn a_socks5_lane_authenticates_with_the_stored_credential() {
+        loopback_fetch_config();
+        for (userinfo, expected) in [
+            ("alice:pa#ss", "alice:pa#ss"),
+            ("alice:pa/ss%40x", "alice:pa/ss@x"),
+        ] {
+            let (origin_port, direct, origin) = http_proxy_fixture().await;
+            let (port, seen, server) = socks5_fixture().await;
+            let proxy = Proxy::parse(&format!("socks5://{userinfo}@127.0.0.1:{port}")).unwrap();
+            let fetch =
+                fetch_through(&proxy, &format!("http://127.0.0.1:{origin_port}/page")).await;
+            server.abort();
+            origin.abort();
+            let seen = seen.lock().unwrap().clone();
+            let direct = direct.lock().unwrap().len();
+            assert!(
+                matches!(fetch, Ok(200))
+                    && seen.first().map(String::as_str) == Some(expected)
+                    && direct == 0,
+                "{userinfo}: fetch: {fetch:?}; proxy received {seen:?}; direct connections to the origin: {direct}"
+            );
+        }
+    }
+}

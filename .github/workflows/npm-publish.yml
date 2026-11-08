@@ -1,5 +1,8 @@
-# Publish the npm wrapper package automatically when a GitHub
-# release is published (draft -> published included).
+# Publish the npm wrapper package. The CI pipeline calls this as its last job
+# (workflow_call) once it has published the GitHub release; it also runs when a
+# release is published by hand in the GitHub UI, and manually (workflow_dispatch)
+# to retry or to prove the credential. A release created by the pipeline's own
+# token raises no `release` event, which is why the pipeline calls this directly.
 #
 # History (2026-09-15): v4.0.0 and v4.1.0 shipped to GitHub releases
 # but npm stayed on 3.6.7 because publishing was a manual step nobody
@@ -14,21 +17,38 @@
 # - If the version is already on the registry the publish is skipped
 #   (re-publishing the same version is an npm error).
 #
-# Requires the NPM_TOKEN repo secret (an npm automation token for
-# the dondai1234 account, no 2FA prompt on CI).
+# Auth: the NPM_TOKEN secret, a granular write token for `donsetch` (it
+# expires; renew it on npmjs.com and `gh secret set NPM_TOKEN`). npm prefers
+# trusted publishing (OIDC) when npmjs.com trusts this workflow, which is why
+# the job keeps `id-token: write` and npm >= 11.5.1.
 
 name: npm publish
 
 permissions:
   contents: read
+  id-token: write
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
   release:
-    types: [released]
-  # Manual run: proves the NPM_TOKEN secret and the guards without
-  # minting a release. Resolves the repo's latest release as the
-  # tag under test.
+    # `released` is a normal release; publishing a beta or rc draft fires
+    # `prereleased` instead, so without this line no prerelease ever reached
+    # npm (the `beta` dist-tag still pointed at 0.5.0-beta.1).
+    types: [released, prereleased]
+  # Manual run: proves the trusted-publisher setup and the guards without minting a
+  # release. Publishes the newest published release - prereleases included,
+  # which `releases/latest` skips - or the tag given.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (default: the newest published release)'
+        required: false
+        type: string
 
 jobs:
   publish:
@@ -36,22 +56,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The tag under test, so npm/package.json is the one being published.
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref }}
 
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
           registry-url: https://registry.npmjs.org/
 
+      # Trusted publishing needs npm 11.5.1+; Node 22 ships npm 10.
+      - name: Upgrade npm
+        run: npm install -g npm@11
+
       - name: Assert npm version matches the release tag
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_VERSION: ${{ github.event.release.tag_name }}
+          TAG_VERSION: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
-          # Manual runs carry no release context: test against the
-          # repo's latest published release instead.
+          # Manual runs carry no release context: the newest published release,
+          # prereleases included, or the tag given.
           if [ -z "$TAG_VERSION" ]; then
-            TAG_VERSION=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
-            echo "manual run: testing against latest release $TAG_VERSION"
+            TAG_VERSION=$(gh api repos/${{ github.repository }}/releases \
+              --jq '[.[] | select(.draft == false)][0].tag_name')
+            echo "manual run: testing against the newest published release $TAG_VERSION"
           fi
           TAGVER="${TAG_VERSION#v}"
           PKGVER=$(node -p "require('./npm/package.json').version")
@@ -92,17 +120,32 @@ jobs:
       - name: Copy LICENSE into npm package
         run: cp LICENSE npm/LICENSE
 
-      - name: Publish (skip if already on the registry)
+      # Proves the credential on every run, including a manual one for a
+      # version already published (which skips the publish itself).
+      - name: Check npm auth
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: Publish (skip if already on the registry)
         working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION=$(node -p "require('./package.json').version")
           if npm view "donsetch@$VERSION" version >/dev/null 2>&1; then
             echo "donsetch@$VERSION already published, skipping"
             exit 0
           fi
-          npm publish --access public
+          # A prerelease must never take the `latest` dist-tag: 5.0.0-beta.1
+          # would become what every `npm i donsetch` installs. `-beta.1`
+          # publishes under `beta`, `-rc.2` under `rc`.
+          DIST_TAG=latest
+          case "$VERSION" in
+            *-*) DIST_TAG=$(printf '%s' "${VERSION#*-}" | cut -d. -f1) ;;
+          esac
+          echo "publishing donsetch@$VERSION under dist-tag $DIST_TAG"
+          npm publish --access public --tag "$DIST_TAG"
 
   notify-downstream:
     name: notify downstream repositories
@@ -112,7 +155,7 @@ jobs:
       - name: Dispatch release notifications
         env:
           DOWNSTREAM_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           # Token for the latest-release lookup on manual runs (the
           # dispatch PAT below only holds the two downstream repos and
           # cannot read this one). The dispatches re-export the PAT
@@ -125,7 +168,8 @@ jobs:
           fi
           TAG="$RELEASE_TAG"
           if [ -z "$TAG" ]; then
-            TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
+            TAG=$(gh api repos/${{ github.repository }}/releases \
+              --jq '[.[] | select(.draft == false)][0].tag_name')
           fi
           export GH_TOKEN="$DOWNSTREAM_TOKEN"
           gh api repos/dondai44423/homebrew-donsetch/dispatches \

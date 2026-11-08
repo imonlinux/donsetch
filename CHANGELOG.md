@@ -5,6 +5,418 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.1] - 2026-11-08
+
+A release that takes minutes of waiting instead of hours, and an updater that no
+longer crawls.
+
+### Fixed
+
+- **"Unsupported Browser" pages are reported as walls, not content.** A page that
+  only tells the client its browser is not served (Microsoft Teams was the witness)
+  used to come back as a successful read. It is now classified as an identity wall,
+  and a page made only of scripts is classified as an empty shell instead of an
+  incomplete document, because script and style text no longer counts as page text.
+- **PDF headings.** A row of figure or diagram labels (very short words, or words
+  separated by wide gaps) is no longer promoted to a heading.
+- **`donsetch update` no longer crawls on a throttled route.** The download watches
+  its own speed; a route that stays slow is abandoned and the next route (GitHub
+  release URL, GitHub API asset, configured proxies) continues from the bytes
+  already received, with SHA-256 verified at the end. A server that ignores resume
+  requests restarts cleanly instead of appending.
+
+### Changed
+
+- **One pipeline from push to npm.** A push to `master` whose version has no tag is
+  a release: one workflow tests on Linux, macOS and Windows, builds and gates the
+  five binaries in parallel, tags the tested commit, publishes the GitHub release
+  from those same gated binaries and publishes npm. Nothing is rebuilt between
+  "tested" and "shipped". `just ship <version>` is a single command that bumps the
+  manifests and pushes.
+- **Smaller, faster builds.** Three Cargo profiles remain (`fast` for the edit loop
+  and every CI test lane, `dist-thin` for shipped binaries, `release` for local
+  use); the `ci` and `dist` profiles are gone. Payload checks live in one script,
+  `scripts/gates.sh`, used by CI and `just gates`.
+- **A test budget with a ratchet.** The budget guard reports the slowest five tests,
+  warns when the ceilings carry unused slack, and `just ratchet` fails when a
+  ceiling could be lowered, so the suite cannot quietly grow.
+
+## [5.1.0] - 2026-11-08
+
+The repository is one structure: the product is `src/`, the fetch core is
+`core/` (crate `donsetch-core`), and the private design set is `design/`.
+v4-era material has left the checkout.
+
+### Changed
+
+- **One structure.** `v5core/` is now `core/` and the crate is `donsetch-core`;
+  the product's fetch module is `src/fetch/core.rs`; the private docs are
+  `design/brief.md` and `design/mechanism.md`. CI, `Justfile`, `guard.sh` and every
+  document follow. Frozen v4 evidence (Persona Engine, doncore, proof, the v4
+  design notes) moved out of the repository to `~/Projects/donsetch-evidence/`.
+- **A faster development and release loop.** The `fast`/`ci`/`dist` profile split,
+  a default suite of ~2,000 tests with a budget guard, and `just ship <version>`
+  (CI gate through npm) are the workflow from here on. Contributor detail is in
+  `CONTRIBUTING.md`.
+- **A major update asks first.** `donsetch update` now prints what a major version
+  changes and refuses to install one without confirmation; an unattended run needs
+  `--yes`. The text names the v5 fetch-engine change when the jump is 4.x → 5.x.
+  A v4 install that already updated in place sees a one-time notice on its first
+  interactive run, on stderr only.
+
+### Removed
+
+- **`donsetch login` and the session vault.** The vault was written and never spent:
+  v5 keeps its own per-(host, identity) jars, the tier-1 echo that used to bridge
+  them had no caller, and `web_screenshot` uses a throwaway profile. A login wall
+  stays a declared `wall_state`; authenticated browsing belongs to a browser driver
+  (bladebro). Removed with it: `src/auth.rs`, the `--import`/`--logout`/`--status`
+  paths, `auth-state.json`, the vault fields in `ghost-state.json`, the `reqwest`
+  login probe, and the headful browser path.
+- **The `state.cookie_vault` knob and `DONSETCH_NO_COOKIE_VAULT`**, which gated that
+  vault and nothing else.
+
+## [5.0.0] - 2026-11-08
+
+The stable release of v5: one fetch path (`v5core`: carried identity and state,
+the site's own interfaces, and a V8 engine for challenge programs only, with no
+browser in the path). The betas below describe that change; this release adds
+the fixes and the hardening found since.
+
+### Changed
+
+- **`links: true` keeps the real link addresses.** `[text](https://...)`, to
+  cite a source, check where a link goes or follow it. Short handles are still
+  there as `links: "handles"` (`--links=handles`), about half the tokens of the
+  address; a handle passed as `url` follows it. Off stays the default: link
+  text only. Callers that relied on `true` giving handles should send
+  `"handles"`.
+- **Content is judged by the document's substance, not its size.** A page is
+  content when its main region holds prose, a listing, a table or code; an
+  empty app shell, a sign-in gate, a loading screen or a notice is called what
+  it is, whatever its length. A thin JavaScript shell is no longer reported as
+  content, and a short real page (a card grid, a page-wide header holding the
+  article) is no longer called a shell. Text recovered from a page's app state is judged
+  the same way.
+
+### Added
+
+- **SiteGround's proof-of-work challenge is answered natively.** The page's
+  own work is solved in process and the origin accepts the answer; no browser.
+- **NCBI's proof of work is answered natively.** PubMed (and NCBI's other
+  hosts) answer a new client with an HTTP 203 page whose program hashes for a
+  nonce and posts it to `/_pow/solve`; v5 states the same work in code, posts
+  the answer as the page's own request, and reads the article with the
+  clearance it earns. PubMed articles were reported as an empty app frame.
+- **`focus` and `must_contain` find a figure in the page's spelling.** "15M"
+  finds "EUR 15 000 000", "7.5M" finds "EUR 7 500 000", "2B" finds "2 billion"
+  and "15k" finds "15,000". A capital magnitude that is never a unit (K, M, B,
+  and k) counts without a currency; `15m` (metres), `5b` (bits) and `3T`
+  (tesla) are matched as written. Focus ranks the passage that states the
+  figure first and names a figure absent only when the page never states it.
+
+- **Every Stack Exchange site reads through the public API.** Questions on
+  Super User, Server Fault, Ask Ubuntu, MathOverflow, the `*.stackexchange.com`
+  sites, the meta sites and the localized Stack Overflows come back with their
+  answers and comments, as Stack Overflow's already did, instead of meeting
+  the Cloudflare wall in front of the page.
+
+- **YouTube videos read as their card.** A watch, Shorts, live or `youtu.be`
+  URL gives the title, channel, date, length, views, category, chapters and
+  the full description, links included, from the data the page carries for
+  its own player. It came back as player component names and interface
+  strings, with the description dropped for its links.
+
+### Fixed
+
+- **Links.** `--links=handles` on the command line sent `true` and returned
+  addresses; it returns handles now. A Wikipedia article carried link markup
+  with links off; it is text only now (GitHub, Stack Exchange and reddit
+  threads keep their links, where a link is often the content). Card grids
+  link their headlines, and an empty anchor renders nothing instead of
+  `[](url)`.
+- **Sections and tables.** Tables inside tab panels and inside indenting
+  blockquotes are kept, cells stay under their headers across `rowspan` and
+  `colspan`, and tables, code and quotes wrapped in `<figure>` are kept. The
+  outline indents headings by nesting, not by level number, and a linked
+  heading is listed by its words.
+- **GitHub.** Issue, pull request and release bodies keep their paragraphs,
+  lists and code blocks (an issue's reproduction came back as one line), with
+  their headings nested under the thread or release; release notes are clipped
+  between blocks, never inside a code fence. Pull request pages render as
+  threads again, with their state (open, closed, merged), instead of the
+  generic page and its UI chrome.
+- **Paging.** With no paragraph break near the cut, a page ended mid-row or
+  inside a link address; it now ends on a line or a word outside any link, and
+  the next page resumes exactly there.
+- **Focus.** A query word on the page in another form (an inflection the
+  stemmer does not know, `-ies` plurals) is no longer called absent.
+- **Reading.** A hover definition or glossary popup is not read into its
+  sentence; a badge is not glued to the word after it; bold that leaked into
+  text stays bold; bare numeric and letter superscripts are kept; a relative
+  `<base href>` is resolved against the page; text and feeds decode by the
+  charset they declare.
+- **A page refusing the browser is a notice.** Slack's "Please change browsers"
+  and Teams' "Your browser version isn't supported" were reported as content
+  because the apology and the list of browsers under the headline read as
+  prose. A headline that refuses the reader's browser now makes what stands
+  under it the notice; a page about supported browsers, or an article with
+  sections under such a headline, stays content. An age gate is the same
+  notice: a headline that is only the ask ("Please tell us: When were you
+  born?", "Are you of legal drinking age?") makes heineken.com a notice
+  quoting it, while "Are you over 50? Here's what to know" heads an article.
+  A headline that is a bot check or an access refusal ("Verifying your
+  browser" on OpenReview, "Request Access" on the Federal Register, "Just a
+  moment...") is not content either, and a heading straight under such a
+  headline is its subtitle, not a section.
+  A page whose only text is a Korean statutory business footer is not content
+  either.
+- **Missing pages.** A page with no `h1` that leads with a "404" or "Page not
+  found" `h2` is reported as not found (Medium's missing post came back as the
+  app's membership plans), and the embedded-data rescue skips the app's own
+  settings in the page state (`config`, feature flags, experiments,
+  environment, analytics, translations) and long identifier names
+  (`expandableMetadataRenderer`, `engagement-panel-comments-section`).
+- **Page chrome is not read as the page.** When a page's visible text is thin,
+  the rescue that reads its embedded app data took any JSON script: a job
+  site's homepage came back as its navigation bar's prompt strings. A JSON
+  script whose id names chrome (navigation, header, footer, banners, sign-up
+  prompts, configuration, flags, analytics, translations, bundler chunks) is
+  left out, so the page's own text is read instead.
+- **`since_last`** compares pages by their words, so a read with links and one
+  without are the same page.
+- **Slow transfers.** A body still arriving is bounded by the caller's deadline,
+  not the per-request ceiling, and a transfer cut by the deadline says how far
+  it got and that a larger `deadline_ms` (up to 600000) lets it finish.
+- **A site's interface answers only the page asked for.** A missing or walled
+  New York Times or WSJ article, a Stack Exchange question and a 4chan thread
+  were answered with the front page's feed or listing; they are now read as
+  their own document, and a wall or a 404 there is reported as such. Fronts,
+  sections, question listings and board pages still use the feed, and a Stack
+  Exchange tag page (`/questions/tagged/c%2B%2B+async`) lists that tag's
+  questions instead of the site's newest. A front's feed whose newest story is
+  over 30 days old has been abandoned (WSJ's stopped in January 2025) and
+  answers nothing, so the front is read as its own document.
+- **Walls.** A wall heading no longer overrides a substantive page.
+- **Proxy.** v5 reads no proxy environment of its own; a proxy URL the engine
+  cannot read fails the request instead of going direct; credentials with
+  reserved characters are encoded; a proxied read leaves the target's name to
+  the proxy.
+- **Search.** Persisted cache entries and quarantines age by wall clock;
+  exclusions, phrases, `#` and `OR` stay apart in the cache key; `site:` honours
+  a path or scheme.
+- **Crawl.** Sitemaps that start with a BOM are read and an empty one is not
+  complete; `robots.txt` `*` rules apply in multi-agent groups; a crawl cut by
+  `max_depth` stops `DepthLimit`; a `ThrottledOut` stop keeps the URL it popped
+  for resume; locale dedup keys on the URL; a crawl that asks for progress is
+  answered when it ends, and a cancelled one sends no more progress and stores
+  no resume token.
+- **PDF.** Pages are rendered for OCR one at a time and only when OCR can run;
+  the OCR'd page is found by its index; the outline walk stops at a bookmark
+  cycle; furniture removal keeps titles and body lines; notes are kept when an
+  untitled document yields no blocks.
+- **Screenshot and browser.** `web_screenshot` guards the page's redirects and
+  subresources again, and a browser that dies at start is reported at once with
+  its stderr.
+- **Runtime.** ONNX loads the runtime's libstdc++ and a bad load fails at once
+  instead of waiting 15 s; the HTTP MCP server stops with a `GET /mcp` stream
+  open; npm downloads ride the `HTTPS_PROXY` tunnel with its credentials;
+  `donsetch version` and `status` give the same update verdict `update` acts
+  on.
+
+## [5.0.0-beta.3] - 2026-11-07
+
+### Fixed
+
+- **Vendor priors learn again.** A wall that was passed never taught the vendor
+  which identity got through: the success was recorded before the wall's vendor
+  was known, so the prior stayed empty (seen live on Product Hunt, which okhttp
+  passes cold). The passing identity is now credited when a walled origin first
+  answers with content, and a wall decays a vendor's prior for the identity it
+  stopped instead of leaving it untouched.
+- **A new host starts from its site.** A host with no scores of its own orders
+  identities from a sibling host on the same site (`www.` and `api.` of one
+  domain) before falling back to the global order.
+- **The caller's `deadline_ms` bounds the whole encounter.** The budget was
+  applied to the document fetch only; challenge rounds and retries could run
+  past it. The fetch now gets the caller's remaining time, and every wait in the
+  encounter (attempt spacing, a `Retry-After`, Akamai's verify delay) is
+  cancel-aware and fits the deadline. A `Retry-After` past one hour is ignored.
+  A deadline under about 1.6 s no longer fails before sending anything: the
+  first request goes out with whatever time is left (Wikipedia now answers
+  inside `deadline_ms: 600`). A slow body no longer runs past its budget: the
+  HTTP client started the timeout again when headers arrived, so a page whose
+  headers took 0.6 s could take 3.6 s on a 3 s budget; the whole exchange is
+  bounded now.
+- **Akamai's bm-verify hand-off follows the page as served.** The refresh target
+  is read in any quoting and with HTML entities, resolved against the page,
+  kept on the same host, and its cookies are kept for the next request.
+- **An exhausted fetch reports the last URL it reached**, not the one asked.
+- **Learning is cheaper and still merges.** Carried state shares unchanged
+  origins and jars between workers instead of copying them, and a save skips
+  re-reading the state file when no other process wrote it. At the 4096-origin
+  cap, the cost a learning fetch pays fell from about 60 ms to about 24 ms.
+- **`must_contain` matches amounts in the page's own notation.** `$1.5bn`
+  matches `US$1,500 million` and `1.5 billion dollars`, `£3k` matches `£3,000`,
+  `12000` matches `12 000`, and `15%` matches `15 percent`; decimal commas and
+  dot thousands are read. A number matches only whole: `15%` does not match
+  `115%` or `1.5%`, and `$1.5bn` does not match `$1.6 billion`.
+- **Private CAs.** `[tls] cert_file` and `cert_dir` add PEM roots to the fetch
+  path's trust store; a bundle that does not parse is reported and left out.
+
+### Removed
+
+- The shadow asset fetch and its counters (`shadowed_assets_total`). v5 makes one
+  request per read; `fetch.shadow_fetch`, `shadow_deadline_ms`, `h3` and
+  `alt_svc` are still accepted so older configs load, and have no effect.
+- Dead code paths in the challenge engine (an unused page hand-back) and the PDF
+  reader.
+
+## [5.0.0-beta.2] - 2026-11-07
+
+### Fixed
+
+- **Linux ARM64 starts, and ships again.** The beta.1 product binary died before
+  `main` on aarch64. PDFium's and libc++'s objects use CREL (compact
+  relocation) sections; GNU ld before 2.44 and any lld before LLVM 20 skip them
+  without an error, so their relocations stay unapplied and one constructor
+  slot in `.init_array` is null (`SIGSEGV` at address 0 in `call_init`).
+  Measured on real arm64 hardware: Ubuntu's lld 18 applied one of six
+  `.init_array` relocations and the binary crashed; the Rust toolchain's own
+  `rust-lld` (LLVM 22.1.8) started it and passed the suite. `build.rs` now links
+  with the toolchain's `rust-lld`, or an `ld.lld` of LLVM 20 or later on `PATH`,
+  and warns when neither exists; the system lld is no longer installed or
+  needed, and a build must not force an older one through `RUSTFLAGS`. CI builds
+  the shipped arm64 shape on an arm64 runner and gates on the binary starting.
+  The `donsetch-linux-arm64` asset is core-only (fetch, search, crawl, PDF): the
+  aarch64 ONNX Runtime deadlocks in its loader, so OCR and rerank stay off there.
+- **Windows reads a browser's version from the file.** `chrome.exe --version`
+  never exits (a GUI subsystem binary), so every process spent the whole probe
+  timeout asking. The version now comes from the executable's own version
+  resource (a pure-Rust PE reader), and a launch remains only as the fallback
+  for a file without one. On the Windows runner the seconds that beta.1 listed as
+  first-fetch setup are gone: a version-reporting CLI test fell from 12.3 s to
+  0.09 s and the crawl governor's lane-health tests from 6-8 s to 0.14 s. What
+  is left on that platform is the OS itself: refusing a loopback connection
+  takes about 2.2 s there, which is what the two lane tests that dial a closed
+  port still pay.
+- **A challenge program's timer errors say where they came from.** An exception
+  thrown from a timer callback is logged with its stack.
+- **`section` and `focus` keep tables.** A small table of figures (a pricing or
+  results grid) was dropped as page furniture; it is kept now, and only a tiny
+  table of links is still removed. Series sidebars and navboxes on wiki pages no
+  longer count as article content. `focus` ranks passages with synonyms, boosts
+  passages that carry figures when the question asks for them, completes a table
+  it matched into whole rows, and says when only weaker matches exist instead of
+  returning a confident-looking excerpt. `section` accepts a `§sN` id as printed
+  in `toc`.
+- **`offset` past the end says so.** It returns `end_of_document` rather than a
+  short body labelled partial, and a continuation chunk no longer repeats the
+  title and canonical URL.
+- **`links` can return URLs.** `links: "urls"` resolves every link handle to its
+  address in the text (`links: true` still gives handles). On the CLI,
+  `--links=urls`.
+- **`since_last` works on pages read without the block extractor.** A page
+  served through the text fallback, a feed or a data rescue had no fingerprint,
+  so every `since_last` read answered `no_baseline` at full price (seen on a news
+  front page). Those reads are now fingerprinted from their text. An unchanged
+  page collapses to a short change report with `read_status: "change_report"`
+  and no `next_offset`.
+
+## [5.0.0-beta.1] - 2026-11-07
+
+### Known limitations in this beta
+
+- **No linux-arm64 asset.** The product binary that links the v5 core stops
+  before `main` on aarch64: an ELF constructor is called through a null
+  `.init_array` entry (`call_init`, address 0). The core's own suite passes there
+  (182/182) and CI now captures the fault on real arm64 hardware on every push.
+  This beta ships x86_64 Linux, macOS arm64 and x64, and Windows x64; 4.10.5
+  remains installable on arm64.
+- **Windows pays its setup on the first fetch of a process.** Measured on a CI
+  runner: one proxied request took 2.5 s and a crawl's first read 9.0 s, where a
+  Linux process pays tens of milliseconds. The lane accounting and wall
+  classification this used to leave unverified are covered by the suite on
+  Windows now; why that setup costs seconds there is open.
+
+### Changed
+
+- **v5core is the only fetch engine.** Every document and one-shot read goes
+  through its session. The doncore crate, the browser fetch lane, the
+  cookie-vault replay into fetch and the per-domain route and warm state they
+  fed are removed. Bot walls are v5core's call: a page it verified as content
+  is never relabelled a challenge by passive vendor markers. A cached read
+  inside a declared lifetime is served only after one checked read found the
+  page unchanged. Responses that vary on Referer, Sec-Fetch-Site or Origin
+  are cached per navigation. A fetch the caller stops waiting for is
+  cancelled, and a proxy that refuses credentials reports its 407.
+- **Breaking:** `web_fetch` no longer sends sessions stored by
+  `donsetch login`. A page behind a login is a declared auth wall; session
+  support for fetch is a future feature. The `DONSETCH_V5` switch is gone.
+- **Breaking: `web_fetch` options are rebuilt around views of the whole
+  page.** Every view works on every source (HTML, PDF, site adapters, feeds,
+  text), reads the full document (up to 8 MiB) and returns only the view:
+  - `must_contain` takes one term or up to 8. Each term is a phrase
+    (case-insensitive, tolerant of markdown markup, quote and dash variants)
+    or a `/regex/`. Each term gets a count, the sections (`sN`) it occurs in
+    and excerpts; a phrase whose words all occur but not together says
+    where. The verdict is match, partial, no_match, or unverified when part
+    of the page was not read. With `section`, the probe stays inside it.
+  - `focus` returns the passages that answer the query, best first, under
+    their section paths, and names query words absent from the page. A miss
+    returns the outline, never the full page.
+  - `toc` lists sections with `sN` ids and sizes; `section` takes an id or a
+    heading. A missing section returns the outline.
+  - `max_chars` is the total for a URL array (default 48,000; 16,000 for one
+    URL). Results name the next part of a paginated page as `next_page`.
+  - Conflicting options (`must_contain` with `focus`, `toc` or `offset`;
+    `toc` with `focus`; `since_last` with another view) are refused before
+    anything is fetched.
+
+### Removed
+
+- `web_fetch` options, each refused with a note naming the replacement:
+  `budget_tokens` (use `max_chars`, the batch total), `mode` (set
+  `max_chars`), `stitch` (fetch the URL in `next_page`), `selector` (use
+  `section` or `focus`), `media` (use `image_text`).
+- The browser fetch tier. `web_fetch` loses `tier`, `actions` and `shot`
+  (use `web_screenshot`), each refused with a note; the browser stays only
+  for `donsetch login` and `web_screenshot`.
+- The browser backends, the browser search lane and rule tier pins. Login
+  and screenshots drive the installed Chromium-family browser
+  (`browser.chromium_path`, or the one discovery finds); CloakBrowser and its
+  download are gone, search no longer falls back to a browser-rendered
+  Google page, and a rule no longer pins a fetch tier.
+  **Breaking:** a `donsetch.toml` that still sets one of these keys fails to
+  load, and every command except `help`, `version` and
+  `config show --legacy` exits 1 naming it:
+  `[browser]` `backend`, `no_sandbox`, `cloak_auto_download`, `cloak_path`,
+  `cloak_version`, `cloak_cache_dir`, `pool_slots` and `xvfb_display`;
+  `[search]` `ghost_lane`; `tier` and `tier_enforce` in a
+  `[rules.url."<pattern>"]` rule. Delete those lines. The environment
+  variables that set them are ignored.
+
+### Fixed
+
+- `state.no_disk_state` (`DONSEEK_NO_DISK_STATE`) now also keeps the fetch
+  engine's learned state and page cache in memory.
+- **Reddit.** Its JS gate — a form whose one field the page's own inline
+  program computes and submits — now runs in the in-process engine and is
+  spent as the same client: a thread is content in under a second, and the
+  anonymous session the solve opens makes every later read one request. A
+  subreddit listing is answered by the endpoint the page's own feed reloads
+  with, not by the three posts its document server-renders: 23–24 posts per
+  request, each with title, domain, score, author, comment count and a
+  followable permalink, and no session or rate limit to negotiate. A human
+  check served to the learned client class now sends the encounter to the class
+  that is asked for a program instead of ending the fetch. The `old.reddit.com`
+  session hop and the `.json` rewrite are gone; both were what put the fetcher
+  behind Reddit's interactive humanity check.
+
+### Security
+
+- Lockfile: tokio 1.54.1 and zstd-sys 2.1.2 for RUSTSEC-2026-0386, -0391,
+  -0398, -0403 and -0410.
 ## [4.10.5] - 2026-11-03
 
 ### Fixed

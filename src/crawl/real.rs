@@ -18,7 +18,6 @@ use futures_util::FutureExt;
 
 use crate::detect::walls::Verdict;
 use crate::fetch::client::{CacheState, Fetcher};
-use crate::ghost::cache::GhostState;
 use crate::search::egress::EgressPool;
 
 use super::governor::{Governor, Lane, LaneKind};
@@ -28,7 +27,7 @@ use super::{Crawler, FetchedPage, PageFetcher};
 /// lanes only while crawl pool use is on (`proxy.crawl_rotate`,
 /// default true; `donsetch proxy crawl off` opts out, leaving every
 /// crawl request on the home IP).
-fn pool_lanes(proxies: &[crate::transport::proxy::Proxy], rotate: bool) -> Vec<Lane> {
+fn pool_lanes(proxies: &[crate::egress::proxy::Proxy], rotate: bool) -> Vec<Lane> {
     let mut lanes = vec![Lane {
         id: "direct".into(),
         kind: LaneKind::Direct,
@@ -48,11 +47,7 @@ fn pool_lanes(proxies: &[crate::transport::proxy::Proxy], rotate: bool) -> Vec<L
 /// jar/pool/cache as everything else in the process); `pool` is
 /// the process-wide egress fabric (health + dead benches shared
 /// with search and fetch).
-pub fn build(
-    fetcher: Arc<Fetcher>,
-    pool: Arc<EgressPool>,
-    state: Option<Arc<tokio::sync::Mutex<GhostState>>>,
-) -> (Crawler, Arc<Governor>) {
+pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Governor>) {
     let proxies = Arc::new(pool.proxies());
     let rotate = crate::config::cfg().proxy.crawl_rotate;
     let governor = Arc::new(Governor::new(pool_lanes(&proxies, rotate)));
@@ -69,8 +64,7 @@ pub fn build(
                 let fetcher = Arc::clone(&fetcher);
                 let pool = Arc::clone(&pool);
                 let proxies = Arc::clone(&proxies);
-                let state = state.clone();
-                // v4 phase 3: the same adapter registry web_fetch uses
+                // the same adapter registry web_fetch uses
                 // shapes crawl fetches, so a reddit/npm class URL rides
                 // the cheap .json/registry path instead of the HTML app.
                 // The candidate URL stays canonical: dedup, history and
@@ -86,10 +80,6 @@ pub fn build(
                 let host = parsed
                     .as_ref()
                     .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-                    .unwrap_or_default();
-                let path = parsed
-                    .as_ref()
-                    .map(|u| u.path().to_string())
                     .unwrap_or_default();
                 async move {
                     let started = Instant::now();
@@ -132,33 +122,14 @@ pub fn build(
                     // cached body made every delta recrawl compare the
                     // previous crawl's own content and report zero
                     // changes forever).
-                    // v4 E2 coherence: a host with a persona presents
-                    // the persona's language on crawl pages exactly as
-                    // web_fetch and the ghost do; a host without one
-                    // keeps the TLD/script heuristic.
-                    let persona_al = match &state {
-                        Some(state) => {
-                            let st = state.lock().await;
-                            st.personas
-                                .get(&host)
-                                .filter(|p| p.quarantine_reason.is_none())
-                                .map(|p| {
-                                    crate::profile::accept_language_with_persona(
-                                        &host, &path, &p.locale,
-                                    )
-                                })
-                        }
-                        None => None,
-                    };
                     match fetcher
-                        .fetch_via_jar_language(
+                        .fetch_via_jar_opts(
                             &fetch_url,
                             proxy.as_ref(),
                             use_jar,
                             referer.as_deref(),
                             true,
                             false,
-                            persona_al.as_deref(),
                             redirect_gate,
                         )
                         .await
@@ -255,7 +226,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::proxy::Proxy;
+    use crate::egress::proxy::Proxy;
 
     #[tokio::test]
     async fn stealth_v3_buffered_seed_feedback_charges_the_actual_lane() {
@@ -281,11 +252,7 @@ mod tests {
         });
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
-        let (crawler, governor) = build(
-            fetcher,
-            Arc::new(EgressPool::new(vec![proxy.clone()])),
-            None,
-        );
+        let (crawler, governor) = build(fetcher, Arc::new(EgressPool::new(vec![proxy.clone()])));
         let result = crawler
             .crawl(
                 &url,
@@ -341,7 +308,7 @@ mod tests {
         });
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
-        let (crawler, _governor) = build(fetcher, Arc::new(EgressPool::new(Vec::new())), None);
+        let (crawler, _governor) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
         let result = crawler
             .crawl(
                 &url,
@@ -402,7 +369,7 @@ mod tests {
         });
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
-        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())), None);
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
         let page = (crawler.fetch)(url, "missing-owned-proxy".into(), None, None).await;
         let reached_origin = origin.await.unwrap();
         assert!(
@@ -440,7 +407,7 @@ mod tests {
         });
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
-        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())), None);
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
         let page = (crawler.fetch)(url, "direct".into(), None, None).await;
         assert!(!origin.await.unwrap(), "a denied URL must not be dialed");
         assert_eq!(page.status, 0, "robots and sitemap readers keep status 0");
@@ -453,6 +420,106 @@ mod tests {
                 "policy.denied.local_only: excluded by the operator's local DonSeTch rules `127.0.0.1`"
             ),
             "never labelled a network failure"
+        );
+    }
+
+    // Installs the process config: depends on nextest's process-per-test.
+    #[tokio::test]
+    async fn a_finished_crawl_holds_no_sender_of_its_progress_sink() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc::error::TryRecvError;
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") && head.len() < 16384 {
+                        match socket.read_u8().await {
+                            Ok(byte) => head.push(byte),
+                            Err(_) => return,
+                        }
+                    }
+                    // The seed is read before any worker starts, without
+                    // the crawl's redirect gate; `/next` is a worker's
+                    // fetch and carries it.
+                    let page = if head.starts_with(b"GET / ") {
+                        Some((
+                            "Field notes",
+                            "A sentence a reader came to this page for. ",
+                            "<ul><li><a href=\"/next\">The next field notes page</a></li></ul>",
+                        ))
+                    } else if head.starts_with(b"GET /next ") {
+                        Some((
+                            "More field notes",
+                            "Another observation recorded on the second page. ",
+                            "",
+                        ))
+                    } else {
+                        None
+                    };
+                    let reply = if let Some((title, sentence, links)) = page {
+                        let body = format!(
+                            "<html><head><title>{title}</title></head><body><article>\
+                             <h1>{title}</h1><p>{}</p>{links}</article></body></html>",
+                            sentence.repeat(40)
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let fetcher =
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
+        // The MCP server answers a call that asked for progress once every
+        // sender of the call's progress channel is gone; this sink is that
+        // channel.
+        let (sink, mut beats) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let result = crawler
+            .crawl(
+                &url,
+                super::super::CrawlOptions {
+                    mode: super::super::CrawlMode::Content,
+                    respect_robots: false,
+                    max_pages: 2,
+                    max_depth: 1,
+                    deadline: std::time::Duration::from_secs(10),
+                    progress: Some(Arc::new(move |done, _queued| {
+                        let _ = sink.send(done);
+                    })),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.pages.len(), 2, "{:?}", result.skipped);
+        let mut done = Vec::new();
+        let end = loop {
+            match beats.try_recv() {
+                Ok(beat) => done.push(beat),
+                Err(end) => break end,
+            }
+        };
+        // The sink was live while the crawl ran: every page's beat arrived.
+        assert_eq!(done, vec![1, 2]);
+        assert_eq!(
+            end,
+            TryRecvError::Disconnected,
+            "the crawl returned, yet something still holds its progress sink"
         );
     }
 
