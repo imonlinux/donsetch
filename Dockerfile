@@ -74,6 +74,7 @@ COPY Cargo.toml Cargo.lock README.md LICENSE ./
 COPY build.rs ./
 COPY src/ ./src/
 COPY tests/ ./tests/
+COPY core/ ./core/
 
 # Pre-fetch PDFium before cargo build. build.rs vendors the library
 # under vendor/pdfium and skips its own download once lib/libpdfium.a
