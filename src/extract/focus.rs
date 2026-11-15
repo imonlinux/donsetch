@@ -12,17 +12,6 @@ use super::language::{self, LanguageInfo};
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
-/// Max blocks for semantic rescue when the lexical query has no hits.
-/// Larger pages keep the honest full-content fallback instead of paying
-/// cross-encoder inference over a reference manual.
-const SEMANTIC_MAX_BLOCKS: usize = 8;
-
-/// Cross-encoder relevance threshold (sigmoid output [0,1]).
-/// Blocks scoring above this are kept even if BM25 missed them.
-/// 0.3 catches semantically relevant blocks while filtering
-/// out navigation, boilerplate, and unrelated sections.
-const XENC_THRESHOLD: f64 = 0.3;
-
 // ── Stopwords ────────────────────────────────────────────────
 
 const STOP_EN: &[&str] = &[
@@ -838,8 +827,7 @@ pub(crate) fn passage_tokens(text: &str, lang: &LanguageInfo) -> Vec<String> {
 
 /// Compute BM25 scores for each block against the query.
 /// Returns a vector of scores (one per block, 0.0 = no match).
-/// Used by both `filter` (BM25-only) and `filter_semantic`
-/// (BM25 + cross-encoder union).
+/// Shared by the baseline and section-aware lexical filters.
 fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
     let qterms = passage_tokens(query, lang);
     let docs: Vec<Vec<String>> = blocks
@@ -916,9 +904,8 @@ pub(crate) fn bm25_rank(docs: &[Vec<String>], mut qterms: Vec<String>) -> Vec<f6
 /// returned the full page : the CALLER must signal this,
 /// or the agent mistakes full content for focus matches.
 ///
-/// BM25-only version. Production code uses `filter_semantic`
-/// (BM25 + cross-encoder union). This function is kept for
-/// tests and as a pure-BM25 baseline.
+/// Production uses the section-aware lexical `filter_semantic`. This simpler
+/// version remains a baseline for tests.
 #[allow(dead_code)]
 pub fn filter<'a>(blocks: &'a [Block], query: &str, lang: &LanguageInfo) -> (Vec<&'a Block>, bool) {
     let qterms = tokenize(query, lang);
@@ -1095,7 +1082,9 @@ fn expand_breadcrumbs(blocks: &[Block], kept: &mut Vec<usize>, kept_set: &mut Ha
     }
 }
 
-/// Keep CPU-heavy optional inference off multi-thread Tokio workers.
+/// Keep CPU-heavy optional inference off multi-thread Tokio workers. Used by
+/// tests only now: search has no inference to offload (5.3.0 §8).
+#[cfg(test)]
 fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static) -> R {
     use tokio::runtime::RuntimeFlavor;
     if let Ok(handle) = tokio::runtime::Handle::try_current()
@@ -1106,14 +1095,9 @@ fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'stati
     work()
 }
 
-fn xenc_scores(query: &str, docs: Vec<(String, String)>) -> Option<Vec<f64>> {
-    let q = query.to_string();
-    offload_inference(move || crate::search::rerank::cross_encoder_scores(&q, &docs))
-}
-
 /// Select lexical evidence with real heading ancestry and source order.
-/// A cached cross-encoder may rescue a lexical miss on a small page; inference
-/// never downloads a model. The boolean signals a full-content miss fallback.
+/// No model is loaded or downloaded. The boolean signals a full-content miss
+/// fallback.
 pub fn filter_semantic<'a>(
     blocks: &'a [Block],
     query: &str,
@@ -1129,25 +1113,9 @@ pub fn filter_semantic<'a>(
     let max_bm25 = scores.iter().cloned().fold(0.0f64, f64::max);
 
     if max_bm25 <= 0.0 {
-        // BM25 found nothing. Try cross-encoder rescue.
-        if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
-            let docs: Vec<(String, String)> = blocks
-                .iter()
-                .map(|b| (b.body_text(), String::new()))
-                .collect();
-            if let Some(xenc_scores) = xenc_scores(query, docs) {
-                let xenc_max = xenc_scores.iter().cloned().fold(0.0f64, f64::max);
-                if xenc_max >= XENC_THRESHOLD {
-                    let mut kept = select_sections_core(blocks, &xenc_scores, XENC_THRESHOLD);
-                    if !kept.is_empty() {
-                        let mut kept_set: HashSet<usize> = kept.iter().copied().collect();
-                        expand_breadcrumbs(blocks, &mut kept, &mut kept_set);
-                        kept.sort_unstable();
-                        return (kept.into_iter().map(|i| &blocks[i]).collect(), false);
-                    }
-                }
-            }
-        }
+        // Nothing lexical matched. There is no semantic rescue any more:
+        // search carries no model and no ONNX (5.3.0 §8), so the honest answer
+        // is the whole page and the caller's own fetch.
         return (blocks.iter().collect(), true); // fell_back
     }
 
@@ -1752,10 +1720,7 @@ mod tests {
     }
 
     // ── filter_semantic tests ──
-    // These tests assert properties that hold regardless of
-    // whether the cross-encoder model is cached. filter_semantic
-    // is a union (BM25 ∪ cross-encoder), so it always keeps at
-    // least the BM25 matches.
+    // The section-aware lexical filter retains direct matches and their context.
 
     #[test]
     fn filter_semantic_empty_query() {
@@ -1780,8 +1745,8 @@ mod tests {
 
     #[test]
     fn filter_semantic_union_property() {
-        // filter_semantic is a union: it keeps at least every
-        // block that filter (BM25-only) keeps.
+        // On these unsectioned paragraphs, section selection retains the
+        // baseline lexical matches.
         let blocks = vec![
             para("Machine learning is a subset of artificial intelligence"),
             para("The weather is nice today"),

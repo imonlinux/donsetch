@@ -25,6 +25,23 @@ pub struct InstantAnswer {
     pub engine: String,
 }
 
+impl InstantAnswer {
+    /// Apply the same URL, title and exclusion rules as organic evidence.
+    pub(crate) fn permitted(&self, facts: &super::query::QueryFacts) -> bool {
+        super::contract::veto_lane(
+            facts,
+            &Hit {
+                title: self.title.clone(),
+                url: self.url.clone(),
+                snippet: self.text.clone(),
+                rank: 0,
+                published: None,
+            },
+        )
+        .is_none()
+    }
+}
+
 fn sel(css: &str) -> Selector {
     Selector::parse(css).expect("static selector")
 }
@@ -75,9 +92,6 @@ fn finish(
 /// Extract an instant answer from a SERP body. `None` when the page
 /// has none (the common case for most queries).
 pub fn parse_instant(engine: &str, html: &str) -> Option<InstantAnswer> {
-    if !crate::config::cfg().search.serp_instant {
-        return None;
-    }
     let doc = Html::parse_document(html);
     parse_instant_doc(engine, &doc)
 }
@@ -86,9 +100,6 @@ pub fn parse_instant(engine: &str, html: &str) -> Option<InstantAnswer> {
 /// engine fan-out parses the SERP once and feeds hits + instant
 /// from the same DOM (html5ever is not free on a 3MB page).
 pub fn parse_instant_doc(engine: &str, doc: &Html) -> Option<InstantAnswer> {
-    if !crate::config::cfg().search.serp_instant {
-        return None;
-    }
     match engine {
         "bing" => parse_bing_instant(doc, engine),
         "brave" => parse_brave_instant(doc, engine),
@@ -317,6 +328,17 @@ mod tests {
             "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html"
         );
         assert_eq!(a.engine, "bing");
+        let query = super::super::query::QueryFacts::new;
+        assert!(a.permitted(&query(
+            "rust ownership site:doc.rust-lang.org intitle:ownership"
+        )));
+        assert!(!a.permitted(&query("rust ownership site:example.com")));
+        assert!(!a.permitted(&query("rust ownership intitle:borrowing")));
+        assert!(!a.permitted(&query("rust ownership -collector")));
+        assert!(!a.permitted(&query("rust ownership filetype:pdf")));
+        let mut reference = a.clone();
+        reference.url = "https://en.wikipedia.org/wiki/Tokio".into();
+        assert!(!reference.permitted(&query("tokio::spawn")));
     }
 
     #[test]

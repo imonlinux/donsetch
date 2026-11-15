@@ -19,11 +19,19 @@ cargo build --release         # local release: thin LTO, parallel codegen
 The ladder: climb only as far as the question needs.
 
 ```bash
-just check              # types + cfg on the full feature set   ~1 s warm
-just t crawl::frontier  # the touched scope, fast profile       ~6 s warm
-just test               # the default suite                     ~35 s warm
+just check              # types + cfg, no optional features      ~1 s warm
+just t crawl::frontier  # the touched scope, no features         ~2 s warm
+just test               # the default suite (full features)      ~36 s warm
+just check-all          # every target, full features (the old check)
+just tf crawl::frontier # the touched scope, full features
 just all                # pre-push: guard + fmt + check + lockgate + lint + budget-static
 ```
+
+`just check` and `just t` leave `ocr,http` off on purpose: the featureless
+graph is 386 crates against 572, and OCR/HTTP code is not what a fetch or
+search edit is about. `just check-all` and `just tf` are their full-feature
+twins; `just all` checks the full set, so nothing feature-gated reaches a
+push unchecked.
 
 `just check` and `just t` run the **`fast` profile** (this crate at opt-level 0,
 deps at opt-level 1, no debuginfo, codegen-units 16), and so does every CI test
@@ -58,7 +66,7 @@ One workflow, `.github/workflows/ci.yml`, with one required check, `gate`:
 |---|---|
 | Docs-only push or PR | nothing (the gate passes) |
 | Any other push or PR | `lint` (fmt, deny, budget, clippy on both feature sets) and the full suite on Linux, about 5 minutes warm |
-| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `core/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
+| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `crates/fetch/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
 | A release commit, and the nightly | everything: all three test lanes, and the five shipped binaries built and gated |
 
 A newer push to master cancels the unfinished run of an older one; a release
@@ -88,17 +96,20 @@ release to the pipeline: it runs the suite on Linux, Windows and macOS, builds
 the five binaries and runs `scripts/gates.sh` on each (size, ONNX payload,
 version, glibc 2.35 baseline, non-AVX CPU) while that happens, and only when
 everything is green creates the tag and the GitHub release from those exact
-binaries and publishes npm. A red run publishes nothing and leaves nothing to
-undo: fix forward and push, and the same version is tried again. One failed job
-(the npm step, say) re-runs alone with `gh run rerun <id> --failed`. Progress:
-`just runs`.
+binaries. A red run publishes nothing and leaves nothing to undo: fix forward and
+push, and the same version is tried again. One failed job re-runs alone with
+`gh run rerun <id> --failed`. Progress: `just runs`.
+
+npm is dispatched as its own workflow run once the release exists, so a registry
+or credential failure there never reddens the release; retry it with
+`gh workflow run npm-publish.yml -f tag=v<version>`.
 
 ### Verifying Windows compilation from Linux
 
 Linux-only changes regularly broke Windows CI in `cfg`-gated code that never
 compiled locally. `just win-check` type-checks the whole crate for
 `x86_64-pc-windows-gnu` without linking — both ends of the feature matrix
-(full `ocr,rerank,http` and `--no-default-features`), all targets,
+(full `ocr,http` and `--no-default-features`), all targets,
 `-Dwarnings` — so those breaks surface before the push. It is not part of
 `just all` because it needs a cross toolchain on top of the normal build
 prerequisites (NASM, CMake and libclang are already required above). On
@@ -120,7 +131,7 @@ Per recipe:
   gcc/g++), `nasm` + `cmake` (BoringSSL build), `libclang-dev`
   (bindgen for boring-sys), and the `x86_64-pc-windows-gnu` rustup
   target. Run this one first; it is the cheaper half.
-- **`win-check-full`** (`ocr,rerank,http`): all of the above plus
+- **`win-check-full`** (`ocr,http`): all of the above plus
   `pkg-config` — the ort binary downloader builds a host-side
   `openssl-sys`, which needs pkg-config to find the system OpenSSL
   headers (`libssl-dev`, usually already present).
@@ -192,7 +203,7 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-The fetch layer is `core/` (repo root, its own crate and CI job): carried client
+The fetch layer is `crates/fetch/` (its own crate and CI job): carried client
 identity, carried state, a page cache, wall classification, the site's own interfaces,
 and an in-process V8 engine that runs a challenge page's own program. No browser is in
 the fetch path — Chromium serves `web_screenshot` and doctor's parity capture only. The

@@ -8,26 +8,29 @@ most often: turning an issue into a change.
 
 ## Local project context
 
-When local `status.md` and `project.md` files exist, read `status.md` completely,
-then `project.md` and the governing brief they name before planning project
-work. They may be private and git-ignored; keep them that way. Current decisions
+When local `docs/status.md` and `docs/project.md` exist, read `status.md` completely, then
+`project.md` and the docs they name (`docs/search.md`, `crates/fetch/README.md`) before planning
+project work. They are private and git-ignored; keep them that way. Current decisions
 and approval gates take precedence over historical plans and experimental
 artifacts. A branch or a dirty implementation is not an approved roadmap.
 
 ## The fetch path has a shape
 
-`src/` is the product; `core/` (repo root, its own crate and CI job) is the whole
-fetching layer: carried client identity, carried state, a page cache, wall
+`src/` is the product; `crates/fetch/` (its own crate and CI job) is the fetching
+layer: carried client identity, carried state, a page cache, wall
 classification, the site's own interfaces, and an in-process V8 engine that runs a
-challenge page's own program. No browser is in the path. `design/` is the private
-working set (the brief, the mechanism, the core README); frozen v4 evidence lives
-outside the checkout, in `~/Projects/donsetch-evidence/`.
+challenge page's own program — or an application page's own program for content (the
+content lane: a data-plane DOM, never a rendering one). No browser is in the path. A first
+content run that passes the contract mines the app's own content request; later encounters replay
+it as plain HTTP on the identity that mined it, before any JS, and re-mine on a break. Private
+working docs live in `docs/`; frozen v4 evidence lives outside the checkout, in
+`~/Projects/donsetch-evidence/`.
 
 Fetch work is one of exactly four contract classes — **identity, state, request
 contract, egress**. Anything else is drift, however plausible. Before code:
 
 - **Classify first.** A wall is one of nine outcome classes with a vendor and an ask.
-  Reproduce it (`donsetch-core probe` / `bench`), name the class, then say what would
+  Reproduce it (`donsetch-fetch probe` / `bench`), name the class, then say what would
   answer it. A wall a clean reference client also receives on the same egress is not
   ours to fix.
 - **Only two asks are declared: human interaction and a login.** Identity, state,
@@ -160,8 +163,9 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 - The version is bumped by the maintainer at release time. Do not touch it
   in a PR. A release is `just ship <version>`: it bumps the manifests and
   pushes the release commit, and the CI pipeline (`.github/workflows/ci.yml`)
-  tests it, builds and gates the five binaries, tags, publishes the GitHub
-  release and runs npm, stopping at the first red. Do not hand-run those steps,
-  and do not tag by hand: the pipeline tags the commit it tested.
+  tests it, builds and gates the five binaries, tags and publishes the GitHub
+  release, stopping at the first red. npm is dispatched afterwards as its own
+  workflow run, so a registry failure cannot fail a release. Do not hand-run
+  those steps, and do not tag by hand: the pipeline tags the commit it tested.
 - Commit messages follow Conventional Commits. Do not append tool or
   session trailers.

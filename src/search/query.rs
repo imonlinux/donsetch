@@ -30,7 +30,7 @@ impl CompiledQuery {
 /// DDG lite is the known liar: it treats `site:` as a search term.
 pub fn engine_honors(engine: &str) -> (bool, bool, bool) {
     match engine {
-        "ddg" | "ddg_lite" => (false, false, false),
+        "ddg" | "ddg_lite" | "yandex" => (false, false, false),
         "ddg_html" => (true, false, false),
         _ => (true, true, true),
     }
@@ -171,8 +171,7 @@ pub(crate) fn intitle_filter(query: &str, results: &mut Vec<super::rank::Merged>
     let Some(needle) = c.intitle else {
         return;
     };
-    let needle_l = needle.to_lowercase();
-    results.retain(|r| r.title.to_lowercase().contains(&needle_l));
+    results.retain(|r| phrase_matches(&needle, &r.title));
 }
 
 /// `filetype:` soft filter: keep URLs that look like the type or
@@ -184,17 +183,26 @@ pub(crate) fn filetype_filter(query: &str, results: &mut Vec<super::rank::Merged
         return;
     };
     let ft = ft.to_lowercase();
-    results.retain(|r| {
-        let path = url::Url::parse(&r.url)
-            .map(|u| u.path().to_ascii_lowercase())
-            .unwrap_or_else(|_| r.url.to_ascii_lowercase());
-        // Explicit other extension → drop. No extension or matching
-        // extension → keep.
-        match path.rsplit_once('.') {
-            Some((_, ext)) if !ext.contains('/') && ext.len() <= 5 => ext == ft,
-            _ => true,
-        }
-    });
+    results.retain(|r| url_filetype(&r.url).is_none_or(|ext| ext == ft));
+}
+
+/// An explicit filename extension or arXiv's declared PDF view. Dotted numeric
+/// identifiers do not themselves name a format.
+pub(crate) fn url_filetype(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    if url.host_str().map(|h| h.trim_start_matches("www.")) == Some("arxiv.org")
+        && url
+            .path()
+            .strip_prefix("/pdf/")
+            .is_some_and(|id| !id.is_empty())
+    {
+        return Some("pdf".into());
+    }
+    let (_, ext) = url.path().rsplit_once('.')?;
+    (ext.len() <= 5
+        && ext.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && ext.bytes().all(|c| c.is_ascii_alphanumeric()))
+    .then(|| ext.to_ascii_lowercase())
 }
 
 /// Split a `site:` value into the host to match and an optional path
@@ -219,6 +227,38 @@ pub(crate) fn site_scope(site: &str) -> (&str, Option<&str>) {
 /// the path is compared ASCII case-insensitively.
 pub(crate) fn site_path_matches(url: &url::Url, prefix: Option<&str>) -> bool {
     prefix.is_none_or(|prefix| url.path().to_ascii_lowercase().starts_with(prefix))
+}
+
+/// Constraints that can be checked from a candidate's URL and title, before
+/// consensus or ranking. Extensionless URLs retain the filetype filter's
+/// existing contract: their content type is unknown until fetched.
+pub(crate) fn permits(c: &CompiledQuery, title: &str, raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if let Some(site) = &c.site {
+        let (host, path) = site_scope(site);
+        let want = host.trim_start_matches("www.");
+        if !url.host_str().is_some_and(|h| {
+            let h = h.trim_start_matches("www.");
+            h == want || h.ends_with(&format!(".{want}"))
+        }) || !site_path_matches(&url, path)
+        {
+            return false;
+        }
+    }
+    if let Some(needle) = &c.intitle
+        && !phrase_matches(needle, title)
+    {
+        return false;
+    }
+    if let Some(ft) = &c.filetype
+        && let Some(ext) = url_filetype(raw)
+        && ext != *ft
+    {
+        return false;
+    }
+    true
 }
 
 /// site: routes to a matching vertical so a scoped search gets the
@@ -252,6 +292,743 @@ pub(crate) fn site_vertical(site: &str) -> Option<&'static str> {
     None
 }
 
+/// The query as the sources should receive it.
+///
+/// A pasted URL is a question about that page and its site: it becomes
+/// `site:<host>` plus the path's words, because engines read a raw URL as
+/// noise (`https://docs.rs/tokio` ranked Kubernetes pages first). Emoji carry
+/// no searchable meaning and are dropped when words remain ("🦀 rust" left two
+/// results); a query that is only symbols is left as typed.
+pub fn normalize(query: &str) -> String {
+    let t = query.trim();
+    if !t.contains(char::is_whitespace)
+        && let Ok(u) = url::Url::parse(t)
+        && matches!(u.scheme(), "http" | "https")
+        && let Some(host) = u.host_str()
+    {
+        let mut q = format!("site:{}", host.trim_start_matches("www."));
+        let mut seen: Vec<String> = Vec::new();
+        for word in u.path().split(|c: char| !c.is_alphanumeric()) {
+            let w = word.to_lowercase();
+            if w.chars().count() < 2
+                || matches!(
+                    w.as_str(),
+                    "html" | "htm" | "php" | "aspx" | "index" | "www"
+                )
+                || seen.contains(&w)
+            {
+                continue;
+            }
+            q.push(' ');
+            q.push_str(&w);
+            seen.push(w);
+        }
+        return q;
+    }
+    let is_pictograph = |c: char| {
+        matches!(c as u32,
+            0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE0F | 0x200D | 0x20E3)
+    };
+    let stripped = t
+        .chars()
+        .map(|c| if is_pictograph(c) { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if stripped.chars().any(char::is_alphanumeric) {
+        stripped
+    } else {
+        t.to_string()
+    }
+}
+
+/// The scripts this matcher distinguishes. Only the CJK family changes the
+/// matching rule; the rest are recorded so a locale or language decision can
+/// read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Script {
+    Latin,
+    Kana,
+    Han,
+    Hangul,
+    Cyrillic,
+    Arabic,
+    Devanagari,
+    Other,
+}
+
+fn is_kana(c: char) -> bool {
+    ('\u{3040}'..='\u{30ff}').contains(&c)
+}
+
+fn is_han(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+        || ('\u{3400}'..='\u{4dbf}').contains(&c)
+        || ('\u{f900}'..='\u{faff}').contains(&c)
+}
+
+fn is_hangul(c: char) -> bool {
+    ('\u{ac00}'..='\u{d7af}').contains(&c)
+}
+
+pub(crate) fn is_cjk(c: char) -> bool {
+    is_kana(c) || is_han(c) || is_hangul(c)
+}
+
+/// The script a text is written in, by its first character that has one. A query
+/// is judged by what it is written in, and a hit by whether it shares that.
+pub fn script_of(text: &str) -> Script {
+    for c in text.chars() {
+        if is_kana(c) {
+            return Script::Kana;
+        }
+        if is_hangul(c) {
+            return Script::Hangul;
+        }
+        if is_han(c) {
+            return Script::Han;
+        }
+        if ('\u{0400}'..='\u{04ff}').contains(&c) {
+            return Script::Cyrillic;
+        }
+        if ('\u{0600}'..='\u{06ff}').contains(&c) {
+            return Script::Arabic;
+        }
+        if ('\u{0900}'..='\u{097f}').contains(&c) {
+            return Script::Devanagari;
+        }
+        if ('\u{0370}'..='\u{03ff}').contains(&c) {
+            return Script::Other;
+        }
+    }
+    Script::Latin
+}
+
+/// Words that carry no topic: function words and the temporal vocabulary of a
+/// news query. A title containing "this week" is not about the query because
+/// the query also said "week".
+const STOP: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "how",
+    "what",
+    "who",
+    "why",
+    "when",
+    "where",
+    "which",
+    "does",
+    "did",
+    "can",
+    "could",
+    "should",
+    "would",
+    "with",
+    "without",
+    "from",
+    "into",
+    "about",
+    "best",
+    "vs",
+    "versus",
+    "you",
+    "your",
+    "are",
+    "was",
+    "were",
+    "is",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "there",
+    "of",
+    "to",
+    "in",
+    "on",
+    "or",
+    "a",
+    "an",
+    "latest",
+    "today",
+    "tonight",
+    "yesterday",
+    "week",
+    "breaking",
+    "recent",
+    "update",
+    "updates",
+    "news",
+    "live",
+];
+
+/// Capitalised words that are sentence furniture, never a named entity.
+const ANCHOR_STOP: &[&str] = &[
+    "the", "a", "an", "how", "what", "who", "why", "when", "where", "which", "is", "are", "was",
+    "were", "do", "does", "did", "can", "could", "should", "would", "this", "that", "these",
+    "those", "it", "its", "of", "to", "in", "on", "for", "and", "or", "with", "without", "from",
+    "into", "about",
+];
+
+/// What kind of question the query asks. Fixed, small and exhaustive: every
+/// query gets exactly one, and it decides the program (which steps run), the
+/// lanes allowed to contribute, and the kinds of result the ranker expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// One name — `select!`, `itertools::izip`, `@types/node`. Answered by the
+    /// record and the documentation, never by a page about the word.
+    Identifier,
+    /// Code help: an error, an API, a language, a build.
+    Code,
+    /// A dated event: the wire, the feeds, the publisher's own page.
+    News,
+    /// A paper or a study.
+    Paper,
+    /// A procedure: "how to…".
+    HowTo,
+    /// A price, a model number, a buying decision.
+    Shopping,
+    /// A named thing: what/who/when.
+    Entity,
+    /// Everything else.
+    Web,
+}
+
+impl Shape {
+    /// The word the census, `--explain` and the bench use for it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Shape::Identifier => "identifier",
+            Shape::Code => "code",
+            Shape::News => "news",
+            Shape::Paper => "paper",
+            Shape::HowTo => "howto",
+            Shape::Shopping => "shopping",
+            Shape::Entity => "entity",
+            Shape::Web => "web",
+        }
+    }
+
+    /// The kinds of result that answer it, strongest first. `kind` is the
+    /// result-kind classifier's vocabulary in [`super::rank`].
+    pub fn expected_kinds(self) -> &'static [&'static str] {
+        match self {
+            // A name is answered by its record or its docs; a paper's abstract
+            // page answers a paper query; the rest is the open web.
+            Shape::Identifier => &["record"],
+            Shape::Paper => &["record", "publisher"],
+            Shape::News => &["publisher", "record"],
+            Shape::Code => &["record", "community"],
+            Shape::HowTo => &["publisher", "community"],
+            Shape::Shopping => &["publisher", "community"],
+            Shape::Entity => &["record", "publisher"],
+            // The residual shape expects no kind: listing three of five made
+            // "matches the shape" mean "is not an ordinary site", and lifted a
+            // tangential encyclopedia article over the weather service a
+            // `東京の天気予報` query asked for (a bench gold row).
+            Shape::Web => &[],
+        }
+    }
+}
+
+/// Openings that make a query a procedure, whatever the words after them are.
+const HOWTO_LEADS: &[&str] = &["how to ", "how do ", "how does ", "how can ", "how should "];
+
+/// Words that make a query a purchase rather than a topic.
+const SHOPPING_WORDS: &[&str] = &[
+    "price",
+    "prices",
+    "pricing",
+    "buy",
+    "cheap",
+    "cheapest",
+    "deal",
+    "deals",
+    "coupon",
+    "review",
+    "reviews",
+    "specs",
+    "specifications",
+    "refurbished",
+    "cost",
+];
+
+/// One weighted query term. CJK terms are character bigrams; a Latin term is a
+/// word. The weight is 2 for a quoted phrase, 1 otherwise.
+#[derive(Debug, Clone)]
+struct Term {
+    text: String,
+    weight: f64,
+}
+
+/// The query, compiled once into the facts every later judgement reads.
+///
+/// This replaces the contract's `Profile`, which was the same machine wearing a
+/// filter's name: it judged hits one at a time and threw away what it did not
+/// recognise. The facts here are *about the query* — its terms and their
+/// weights, its named anchors, its negations, its operators, its script — and
+/// the judgement lives where it belongs: a veto list per hit and a set-level
+/// class in [`super::quality`].
+#[derive(Debug, Clone)]
+pub struct QueryFacts {
+    raw: String,
+    compiled: CompiledQuery,
+    terms: Vec<Term>,
+    /// Named entities: capitalised runs (an internal capital counts even in the
+    /// first word, so "SpaceX" is one and a sentence-start "Latest" is not) and
+    /// quoted spans.
+    anchors: Vec<String>,
+    /// `-word` exclusions.
+    negated: Vec<String>,
+    script: Script,
+}
+
+impl QueryFacts {
+    pub fn new(query: &str) -> Self {
+        let compiled = compile(query);
+        let mut terms: Vec<Term> = Vec::new();
+        let mut anchors: Vec<String> = Vec::new();
+        let mut negated: Vec<String> = Vec::new();
+
+        // An operator's own name is never a term. `site:` names a host (and,
+        // with a path, some content), `filetype:` names a format, `intitle:`
+        // names a title; all three are read once, from `compile` — the same
+        // parse the post-merge filters enforce. Reading the raw tokens instead
+        // ranked the literal word "intitle": measured, `intitle:"Attention Is
+        // All You Need" arxiv` returned nothing while three lanes answered,
+        // because no result could contain the operator's own name.
+        if let Some(site) = &compiled.site
+            && let Some((_host, path)) = site.split_once('/')
+        {
+            for word in path.split(|c: char| !c.is_alphanumeric()) {
+                let word = word.to_lowercase();
+                if word.chars().count() >= 2 && !STOP.contains(&word.as_str()) {
+                    push_term(&mut terms, word, 1.0);
+                }
+            }
+        }
+        if let Some(title) = &compiled.intitle {
+            anchors.push(title.to_lowercase());
+        }
+
+        let tokens: Vec<&str> = compiled.text.split_whitespace().collect();
+        let mut first_word = true;
+        let mut i = 0;
+        while i < tokens.len() {
+            let raw = tokens[i];
+            i += 1;
+            let excluded = raw.starts_with('-') && raw.len() > 1;
+            let raw = if excluded { &raw[1..] } else { raw };
+            // A quoted span is one unit, however many words it spans: it names
+            // an anchor and enters the terms as a phrase, so `"the quick brown
+            // fox"` cannot be satisfied by a page carrying three of its words
+            // in any order.
+            if let Some(head) = raw.strip_prefix('"') {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(inner) = head.strip_suffix('"') {
+                    parts.push(inner.to_string());
+                } else {
+                    parts.push(head.to_string());
+                    while i < tokens.len() {
+                        let next = tokens[i];
+                        i += 1;
+                        if let Some(inner) = next.strip_suffix('"') {
+                            parts.push(inner.to_string());
+                            break;
+                        }
+                        parts.push(next.to_string());
+                    }
+                }
+                let phrase = parts.join(" ").trim().to_lowercase();
+                if excluded {
+                    if !phrase.is_empty() {
+                        negated.push(phrase);
+                    }
+                    continue;
+                }
+                if !phrase.is_empty() {
+                    anchors.push(phrase.clone());
+                    push_term(&mut terms, phrase.clone(), 2.0);
+                    for word in phrase.split_whitespace() {
+                        if word.chars().count() >= 2 && !STOP.contains(&word) {
+                            push_term(&mut terms, word.to_string(), 1.0);
+                        }
+                    }
+                }
+                first_word = false;
+                continue;
+            }
+            if excluded {
+                negated.push(raw.to_lowercase());
+                continue;
+            }
+            let quoted = raw.ends_with('"');
+            let bare = raw.trim_matches('"');
+            if quoted && !bare.is_empty() && bare.chars().any(char::is_whitespace) {
+                anchors.push(bare.to_lowercase());
+            }
+            // A CJK run is one unit: bigrams, never whitespace words.
+            if script_of(bare) != Script::Latin {
+                for run in cjk_runs(bare) {
+                    for term in bigrams(&run) {
+                        push_term(&mut terms, term, 1.0);
+                    }
+                }
+                first_word = false;
+                continue;
+            }
+            let capitalised = bare.chars().next().is_some_and(char::is_uppercase);
+            let internal_capital = bare.chars().skip(1).any(char::is_uppercase);
+            let anchor_ok = capitalised
+                && (internal_capital || !first_word)
+                && !ANCHOR_STOP.contains(&bare.to_lowercase().as_str())
+                && bare.chars().count() >= 2;
+            if anchor_ok {
+                anchors.push(bare.to_lowercase());
+            }
+            for word in bare.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#') {
+                let lower = word.to_lowercase();
+                if lower.is_empty() || STOP.contains(&lower.as_str()) {
+                    continue;
+                }
+                if lower.chars().count() < 2 && !lower.chars().any(|c| c.is_numeric()) {
+                    continue;
+                }
+                push_term(&mut terms, lower, if quoted { 2.0 } else { 1.0 });
+            }
+            first_word = false;
+        }
+        anchors.sort();
+        anchors.dedup();
+        negated.sort();
+        negated.dedup();
+        Self {
+            raw: query.to_string(),
+            compiled,
+            terms,
+            anchors,
+            negated,
+            script: script_of(query),
+        }
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// The operators the query states, and its free text without them.
+    pub fn compiled(&self) -> &CompiledQuery {
+        &self.compiled
+    }
+
+    /// The query's content terms, lowercased and stripped of operators — what
+    /// the resolver reads to decide whether the query names one thing.
+    pub fn terms(&self) -> impl Iterator<Item = &str> {
+        self.terms.iter().map(|t| t.text.as_str())
+    }
+
+    /// The terms with their weights: a quoted phrase counts for more than a
+    /// word. BM25+ and RM3 read this, so the query's own emphasis survives into
+    /// the score instead of being flattened into a bag of words.
+    pub fn weighted_terms(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.terms.iter().map(|t| (t.text.as_str(), t.weight))
+    }
+
+    pub fn anchors(&self) -> &[String] {
+        &self.anchors
+    }
+
+    pub fn negated(&self) -> &[String] {
+        &self.negated
+    }
+
+    /// The script the query is written in: the language it asked for, when it
+    /// asks for one by writing in it.
+    pub fn script(&self) -> Script {
+        self.script
+    }
+
+    /// Whether the query is **one identifier and nothing else**: a macro
+    /// (`select!`), a path (`std::mem::take`), an attribute (`#[tokio::main]`),
+    /// a scoped package (`@types/node`), a version (`v1.2.3`) or a name with a
+    /// code signal in it (`serde_json::Value`, `camelCase`).
+    ///
+    /// The shape decides what can answer: the name's own record or documentation,
+    /// never a general encyclopedia or a video. `tokio::spawn` returning
+    /// Wikipedia's Japanese article on the band TOKIO is the measured failure
+    /// this exists to stop (5.3.0 A baseline, rows i2/i6/i7/i8).
+    pub fn is_identifier(&self) -> bool {
+        let text = self.compiled.text.trim();
+        if text.is_empty() || text.contains(char::is_whitespace) {
+            return false;
+        }
+        if text.contains("::") || text.starts_with('#') || text.starts_with('@') {
+            return true;
+        }
+        if text.ends_with('!') || text.contains('_') {
+            return true;
+        }
+        // `v1.2.3`, and only that: a bare number is not an identifier.
+        let version = text.strip_prefix('v').unwrap_or(text);
+        if version.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && version.split('.').count() >= 2
+            && version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        {
+            return true;
+        }
+        // camelCase: a capital after the first character, lowercase around it.
+        let chars: Vec<char> = text.chars().collect();
+        chars.len() > 2
+            && chars[0].is_lowercase()
+            && chars.iter().skip(1).any(|c| c.is_uppercase())
+            && chars.iter().any(|c| c.is_lowercase())
+    }
+
+    /// A path identifier split into the name that owns it and the item it
+    /// names: `itertools::izip` → `("itertools", ["izip"])`, `#[tokio::main]` →
+    /// `("tokio", ["main"])`, `serde_json::Value` → `("serde_json", ["Value"])`,
+    /// `std::mem::take` → `("std", ["mem", "take"])`.
+    ///
+    /// `None` for a bare name: `select!` may be a macro of any crate, so the
+    /// registry is not the thing to ask, and a scoped package is one name
+    /// (`@types/node`), not an owner and an item.
+    pub fn identifier_parts(&self) -> Option<(String, Vec<String>)> {
+        if !self.is_identifier() {
+            return None;
+        }
+        let text = self.compiled.text.trim();
+        if text.starts_with('@') {
+            return None;
+        }
+        let cleaned = text
+            .trim_start_matches('#')
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('!')
+            .trim();
+        let segments: Vec<&str> = if cleaned.contains("::") {
+            cleaned.split("::").filter(|s| !s.is_empty()).collect()
+        } else if cleaned.contains('.') && !cleaned.starts_with('v') {
+            // `serde_json::Value` is a path; `v1.2.3` is a version, and its
+            // dots are separators of a number, not of a namespace.
+            cleaned.split('.').filter(|s| !s.is_empty()).collect()
+        } else {
+            return None;
+        };
+        if segments.len() < 2 {
+            return None;
+        }
+        let root = segments[0].trim().to_string();
+        let rest: Vec<String> = segments[1..]
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if root.is_empty() || rest.is_empty() {
+            return None;
+        }
+        Some((root, rest))
+    }
+
+    /// What kind of question this is. The routing vocabulary: which program
+    /// answers it, which lanes may contribute, and which kinds of result are
+    /// expected. Explicit user markers beat the lexicon — "how to…" is a
+    /// procedure and "…price" is a purchase even when the words inside them
+    /// look technical.
+    pub fn shape(&self) -> Shape {
+        if self.is_identifier() {
+            return Shape::Identifier;
+        }
+        let q = self.compiled.text.to_lowercase();
+        if HOWTO_LEADS.iter().any(|lead| q.starts_with(lead)) {
+            return Shape::HowTo;
+        }
+        if self
+            .terms
+            .iter()
+            .any(|t| SHOPPING_WORDS.contains(&t.text.as_str()))
+        {
+            return Shape::Shopping;
+        }
+        match super::intent::detect(&self.raw) {
+            super::intent::Intent::Code => Shape::Code,
+            super::intent::Intent::News => Shape::News,
+            super::intent::Intent::Paper => Shape::Paper,
+            super::intent::Intent::Entity => Shape::Entity,
+            super::intent::Intent::Web => Shape::Web,
+        }
+    }
+
+    /// The query's rarest terms: long Latin words and CJK bigrams. A set that
+    /// shares none of them is not about this query, whatever its numbers say.
+    pub fn rare_terms(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .terms
+            .iter()
+            .filter(|t| t.text.chars().any(is_cjk) || t.text.chars().count() >= 6)
+            .map(|t| t.text.as_str())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out.truncate(6);
+        out
+    }
+
+    /// Does `root` name one of the query's terms? `_` and `-` are the same in a
+    /// package name.
+    pub(crate) fn names(&self, root: &str) -> bool {
+        let root = root.replace('_', "-").to_lowercase();
+        self.terms.iter().any(|t| {
+            t.text.replace('_', "-").to_lowercase() == root
+                || t.text.eq_ignore_ascii_case(root.as_str())
+        })
+    }
+
+    /// How much of the query's weight a text carries, in 0..=1.
+    pub fn coverage(&self, text: &str) -> f64 {
+        let total: f64 = self.terms.iter().map(|t| t.weight).sum();
+        if total == 0.0 {
+            return 1.0;
+        }
+        let matched: f64 = self
+            .terms
+            .iter()
+            .filter(|t| matches(&t.text, text))
+            .map(|t| t.weight)
+            .sum();
+        matched / total
+    }
+
+    /// `(any anchor present, all anchors present)`. Both are true when the query
+    /// names nothing.
+    pub fn anchor_state(&self, text: &str) -> (bool, bool) {
+        if self.anchors.is_empty() {
+            return (true, true);
+        }
+        let hit: Vec<bool> = self.anchors.iter().map(|a| matches(a, text)).collect();
+        (hit.iter().any(|b| *b), hit.iter().all(|b| *b))
+    }
+
+    /// Whether this text is *the* record the query asked for: it covers the
+    /// query at 0.6 or more and carries every anchor. This is the old contract's
+    /// `Verdict::Exact`, kept as a predicate because two callers (the news wire
+    /// and the record-admission tier) need exactly that strength, while the
+    /// ranking score uses the gradient in `contract::relevance`.
+    pub fn is_exact(&self, title: &str, snippet: &str, url: &str) -> bool {
+        let text = format!("{title} {snippet} {url}");
+        if self
+            .negated
+            .iter()
+            .any(|n| matches(n, &text) || text.to_lowercase().contains(n))
+        {
+            return false;
+        }
+        if self.terms.is_empty() {
+            return true;
+        }
+        let (_, all) = self.anchor_state(&text);
+        self.coverage(&text) >= 0.6 && all
+    }
+}
+
+fn push_term(terms: &mut Vec<Term>, text: String, weight: f64) {
+    if let Some(existing) = terms.iter_mut().find(|t| t.text == text) {
+        existing.weight = existing.weight.max(weight);
+    } else {
+        terms.push(Term { text, weight });
+    }
+}
+
+/// Runs of CJK characters inside one token, e.g. "地震速報" or "東京の".
+fn cjk_runs(token: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for c in token.chars() {
+        if is_cjk(c) {
+            current.push(c);
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+/// Character bigrams of a run; a one-character run is its own term.
+fn bigrams(run: &str) -> Vec<String> {
+    let chars: Vec<char> = run.chars().collect();
+    if chars.len() <= 1 {
+        return vec![run.to_string()];
+    }
+    chars
+        .windows(2)
+        .map(|w| w.iter().collect())
+        .collect::<Vec<String>>()
+}
+
+/// Whether a word is English sentence furniture: never a term on its own, and
+/// never an RM3 expansion term either.
+pub(crate) fn is_stop_word(word: &str) -> bool {
+    STOP.contains(&word)
+}
+
+/// Does `term` occur in `text`? Latin terms are whole words, with a prefix
+/// match for long ones ("dataclass" finds "dataclasses"); a quoted span (a
+/// term containing whitespace) is that run of words in order; CJK terms are
+/// substrings, because a Japanese title has no spaces to split on.
+pub(crate) fn matches(term: &str, text: &str) -> bool {
+    if term.chars().any(is_cjk) {
+        return text.contains(term);
+    }
+    // A quoted span is one term: it matches a run of words, in order, with any
+    // amount of whitespace or punctuation between them.
+    if term.contains(char::is_whitespace) {
+        return phrase_matches(term, text);
+    }
+    let lower = text.to_lowercase();
+    let words = lower.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#');
+    words
+        .into_iter()
+        .any(|w| w == term || (term.chars().count() >= 5 && w.starts_with(term)))
+}
+
+/// Whole phrase words in order, across punctuation and URL separators. Code
+/// punctuation written in the query remains literal: `operator<<` is not `>>`.
+fn phrase_matches(term: &str, text: &str) -> bool {
+    let term = term.to_lowercase();
+    let text = text.to_lowercase();
+    if term.chars().any(is_cjk) {
+        return text.contains(&term);
+    }
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '+' | '#');
+    if term.contains(['+', '#', '<', '>', ':', '!', '&']) {
+        let needle = term.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hay = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        return !needle.is_empty()
+            && hay.match_indices(&needle).any(|(at, _)| {
+                !hay[..at].chars().next_back().is_some_and(word)
+                    && !hay[at + needle.len()..].chars().next().is_some_and(word)
+            });
+    }
+    let words = |s: &str| {
+        s.split(|c| !word(c))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let needle = words(&term);
+    let hay = words(&text);
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +1042,9 @@ mod tests {
             sources: vec![],
             score: 0.0,
             published: None,
+            families: 0,
+            from_page: false,
+            tier: 0,
         }
     }
 
@@ -332,6 +1112,14 @@ mod tests {
         let ddg = for_engine(&c, "ddg");
         assert!(!ddg.contains("site:"), "ddg must strip: {ddg}");
         assert!(ddg.contains("tokio"));
+        assert_eq!(
+            QueryFacts::new("site:example.com how to replace a tire").shape(),
+            Shape::HowTo
+        );
+        assert_ne!(
+            QueryFacts::new("intitle:\"how to repair\" bicycle specifications").shape(),
+            Shape::HowTo
+        );
     }
 
     #[test]
@@ -399,10 +1187,41 @@ mod tests {
         let mut rs = vec![
             m("https://a.example/1", "Rust Book chapter"),
             m("https://b.example/2", "Unrelated page"),
+            m("https://c.example/3", "Bookkeeping for beginners"),
         ];
         intitle_filter("rust intitle:book", &mut rs);
         assert_eq!(rs.len(), 1);
         assert!(rs[0].title.contains("Book"));
+        for (title, expected) in [
+            ("A car review", true),
+            ("A car-review", true),
+            ("A scar review", false),
+        ] {
+            let compiled = compile("intitle:\"car review\"");
+            assert_eq!(permits(&compiled, title, "https://example.com/p"), expected);
+        }
+        assert!(matches("C++ operator<<", "How C++ operator<< works"));
+        assert!(!matches("C++ operator<<", "How C++ operator>> works"));
+        assert!(!matches("C++ operator<<", "How C# operator<< works"));
+    }
+
+    #[test]
+    fn a_quoted_intitle_keeps_its_item_after_the_filter() {
+        let mut rs = vec![m(
+            "https://arxiv.org/abs/1706.03762",
+            "Attention Is All You Need - arXiv.org",
+        )];
+        intitle_filter("intitle:\"Attention Is All You Need\" arxiv", &mut rs);
+        assert_eq!(rs.len(), 1, "kept: {rs:?}");
+    }
+
+    #[test]
+    fn an_operator_is_never_a_search_term() {
+        let f = QueryFacts::new("intitle:\"Attention Is All You Need\" arxiv filetype:pdf");
+        let terms: Vec<&str> = f.terms().collect();
+        assert!(!terms.contains(&"intitle"), "terms: {terms:?}");
+        assert!(!terms.contains(&"filetype"), "terms: {terms:?}");
+        assert!(!terms.contains(&"pdf"), "terms: {terms:?}");
     }
 
     #[test]
@@ -411,8 +1230,54 @@ mod tests {
             m("https://a.example/paper.pdf", "Paper"),
             m("https://b.example/page.html", "HTML"),
             m("https://c.example/download?id=1", "Download"),
+            m("https://arxiv.org/pdf/1706.03762", "Paper"),
+            m("https://arxiv.org/pdf/1706.03762v2", "Paper version"),
+            m("https://a.example/releases/1.2", "Numeric identifier"),
         ];
+        let compiled = compile("paper filetype:pdf");
+        for r in &rs {
+            assert_eq!(
+                permits(&compiled, &r.title, &r.url),
+                !r.url.ends_with(".html")
+            );
+        }
         filetype_filter("paper filetype:pdf", &mut rs);
-        assert_eq!(rs.len(), 2, "pdf + extensionless kept: {rs:?}");
+        assert_eq!(rs.len(), 5, "PDFs and unknown types kept: {rs:?}");
+        assert_eq!(
+            url_filetype("https://a.example/REPORT.PDF?x=.html"),
+            Some("pdf".into())
+        );
+        assert_eq!(url_filetype("https://a.example/page.html/chapter"), None);
+        assert_eq!(
+            url_filetype("https://arxiv.org/pdf/1706.03762v2"),
+            Some("pdf".into())
+        );
+        assert_eq!(url_filetype("https://arxiv.org/abs/1706.03762"), None);
+        assert_eq!(url_filetype("https://a.example/pdf/1706.03762"), None);
+        assert_eq!(url_filetype("https://arxiv.org/pdf/"), None);
+    }
+
+    #[test]
+    fn a_pasted_url_searches_its_site_for_its_path() {
+        assert_eq!(normalize("https://docs.rs/tokio"), "site:docs.rs tokio");
+        assert_eq!(
+            normalize(" https://www.github.com/tokio-rs/tokio/index.html "),
+            "site:github.com tokio rs"
+        );
+        assert_eq!(normalize("https://example.com/"), "site:example.com");
+        // A URL inside a sentence is part of the question, not the question.
+        assert_eq!(
+            normalize("what is https://docs.rs/tokio"),
+            "what is https://docs.rs/tokio"
+        );
+    }
+
+    #[test]
+    fn emoji_are_dropped_when_words_remain() {
+        assert_eq!(normalize("🦀 rust"), "rust");
+        assert_eq!(normalize("best ☕️ in berlin"), "best in berlin");
+        assert_eq!(normalize("🦀"), "🦀");
+        assert_eq!(normalize("C++ std::optional"), "C++ std::optional");
+        assert_eq!(normalize("地震速報"), "地震速報");
     }
 }

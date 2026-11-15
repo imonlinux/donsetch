@@ -164,6 +164,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "rollback",
     "version",
     "config",
+    "search-bench",
     "help",
 ];
 
@@ -248,9 +249,25 @@ async fn run() {
 
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
+        // `search --sources` / `search --doctor`: source health, not a search.
+        "search" if donsetch::search::doctor::wants(&args[2..]) => {
+            let code = donsetch::search::doctor::run(&args[2..]).await;
+            std::process::exit(code);
+        }
+        // `search --explain <query>`: each result's features and weights.
+        "search" if donsetch::search::explain::wants(&args[2..]) => {
+            let code = donsetch::search::explain::run(&args[2..]).await;
+            std::process::exit(code);
+        }
         "fetch" | "search" | "crawl" | "screenshot" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);
+        }
+
+        // ── Developer: the search gold-set bench (live web, paced) ──
+        "search-bench" => {
+            let code = donsetch::search::bench::run(&args[2..]).await;
+            std::process::exit(code);
         }
 
         // ── Discovery ──
@@ -381,6 +398,7 @@ async fn route_help(cmd: &str) {
         "adapters" => cli::adapters::help(),
         "rules" => cli::rules::help(),
         "status" => cli::status::help(),
+        "search-bench" => println!("{}", donsetch::search::bench::USAGE),
         // `proxy`, `keys` and `adapters` carry their own text; routing here
         // means `donsetch help proxy` and `donsetch proxy --help` cannot
         // drift apart again (the copy that used to live here had gone
@@ -403,7 +421,7 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]");
             println!();
             println!("  Health checks: binary, network, TLS, browser, browser launch,");
-            println!("  auth profile, cache, permissions, PDFium, OCR models, rerank model,");
+            println!("  auth profile, cache, permissions, PDFium, OCR models,");
             println!("  egress lanes, local rules.");
             println!("  Auto-fixes what it can. Reports issues with instructions.");
             println!("  --deep     live egress-lane and provider probes");

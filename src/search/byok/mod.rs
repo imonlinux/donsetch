@@ -2,7 +2,7 @@
 //!
 //! When the user configures API keys for external search providers
 //! (Tavily, Exa, Serper.dev, SerpApi, Brave Search API, TinyFish,
-//! Parallel AI, Bright Data), the entire local 5-engine
+//! Parallel AI, Bright Data), the entire local keyless
 //! search system is bypassed. The provider handles everything:
 //! search, IP, rate limiting. DonSeTch just sends the query and
 //! normalizes the results.
@@ -400,18 +400,21 @@ impl ByokSearcher {
                             crate::diag!("[byok] {provider} returned 0 results, trying next");
                         }
                         walk.push(EngineReport {
+                            cache_age_ms: None,
                             engine: provider.clone(),
                             profile: None,
                             status: "empty".into(),
                             hits: 0,
                             ms: attempt_ms,
                             egress: "byok".into(),
+                            requests: 0,
                         });
                         continue;
                     }
                     let results = to_merged(outcome.hits, &provider, max);
                     let mut report = std::mem::take(&mut walk);
                     report.push(EngineReport {
+                        cache_age_ms: None,
                         engine: provider.clone(),
                         profile: None,
                         status: if outcome.degraded {
@@ -422,13 +425,17 @@ impl ByokSearcher {
                         hits: results.len(),
                         ms: outcome.ms,
                         egress: "byok".into(),
+                        requests: 0,
                     });
+                    let quality =
+                        super::quality::assess(query, &results, &report, &Default::default());
                     return Ok(SearchOutcome {
                         results,
-                        weak: false,
                         intent,
                         report,
                         cached: false,
+                        quality,
+                        cache_age: None,
                         elapsed: started.elapsed(),
                         provider: Some(provider),
                         // Provider-ranked, not cross-encoder-ranked.
@@ -436,6 +443,7 @@ impl ByokSearcher {
                         // Providers do not expose a byte-derived
                         // SERP instant layer.
                         instant: None,
+                        requests: None,
                         stage_ms: Vec::new(),
                     });
                 }
@@ -456,6 +464,7 @@ impl ByokSearcher {
                     // the transient case, everything else here is an
                     // error the caller can see in `_meta`.
                     walk.push(EngineReport {
+                        cache_age_ms: None,
                         engine: provider.clone(),
                         profile: None,
                         status: match failure.key.to_key_state() {
@@ -466,6 +475,7 @@ impl ByokSearcher {
                         hits: 0,
                         ms: attempt_ms,
                         egress: "byok".into(),
+                        requests: 0,
                     });
 
                     // Update key state if this is a key-level error.
@@ -575,6 +585,9 @@ fn to_merged(hits: Vec<SearchHit>, provider: &str, max: usize) -> Vec<Merged> {
             score: h.score as f64,
             sources: vec![(provider.to_string(), i + 1)],
             published: None,
+            families: 0,
+            from_page: false,
+            tier: 3,
         })
         .collect()
 }

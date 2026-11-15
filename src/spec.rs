@@ -295,12 +295,23 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         ),
     },
     ParamSpec {
+        name: "lang",
+        flag: "lang",
+        kind: ParamKind::Str,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Optional language tag for the answer (en, uk, ne, pt-BR). It selects the language; a region subtag (uk-UA) is the only way to select a market. Omit for the English default on Latin-script queries; non-Latin queries send no language unless set.",
+        mcp_help: Some(
+            "Optional BCP-47 language tag (en, uk, ne, pt-BR). It selects the answer language; a region subtag is the only way to select a market. Omit for the English default on Latin-script queries; no language or country is inferred from the query's script. An explicit lang uses the local language-aware sources; configured providers are bypassed for that call.",
+        ),
+    },
+    ParamSpec {
         name: "max_results",
         flag: "max-results",
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Max results (default 7, max 12). The most relevant results almost always live in the top 7. Increase only when results are weak.",
+        help: "Max results (default 7, max 12). The answer is usually in the top 7; raise this only when the top results miss what you need.",
         mcp_help: Some(
             "Maximum ranked candidates to return (default 7, max 12). Increase only when the returned candidate set is insufficient.",
         ),
@@ -317,14 +328,25 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         ),
     },
     ParamSpec {
+        name: "read",
+        flag: "read",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Read the top N results (max 3, default 0) inside the same deadline: each snippet becomes the passage of that page which answers the query, marked `page:`, and the page is warm for a follow-up fetch. A page that cannot be read keeps its snippet.",
+        mcp_help: Some(
+            "Read the top N results (max 3, default 0) within the call's deadline: their snippets become the page's own passage for the query (`page:`), and a follow-up web_fetch of them is served warm. Use when snippets are not enough to choose.",
+        ),
+    },
+    ParamSpec {
         name: "intent",
         flag: "intent",
         kind: ParamKind::Enum(&["auto", "web", "code", "paper", "news", "entity"]),
         cli: CliKind::Flag,
         required: false,
-        help: "auto (default) detects from query signals (code/tech tokens, paper terms, news words, who/what-is). Keyless mode adds that intent's keyless verticals: code: GitHub, HN, StackExchange, MDN; paper: Scholar, arXiv; news: Google News, HN; entity: Wikipedia; web: general only. With a configured provider (donsetch keys) the provider replaces the fan-out: intent maps to its own filters and the keyless verticals do not join.",
+        help: "auto (default) detects from query signals (code/tech tokens, paper terms, news words, who/what-is). Keyless mode adds that intent's first-party sources: code: GitHub, HN, StackExchange, MDN, and the crates.io, npm or PyPI record for a package name (`npm zod`, `cargo serde_json`); paper: OpenAlex, arXiv, Europe PMC for biomedical terms; news, or any query with a recent window (`this week`, `yesterday`): the Bing News wire, publisher feeds, GDELT, HN; entity: Wikipedia; web: general only. With a configured provider (donsetch keys) the provider replaces the fan-out: intent maps to its own filters and the keyless verticals do not join.",
         mcp_help: Some(
-            "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN; paper: + Scholar, arXiv; news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
+            "auto (default) detects from the query. Keyless mode adds first-party sources: code: + GitHub, HN, StackExchange, MDN, crates.io/npm/PyPI for a package name; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news or a recent window ('this week'): + news wire, publisher feeds, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
         ),
     },
 ];
@@ -552,8 +574,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_search",
         cli_cmd: "search",
         summary: "Web search : keyless aggregation or optional configured providers",
-        description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. Weak or degraded retrieval remains explicitly labeled. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nDefault: keyless backends fused by cross-engine consensus + local semantic reranking. Configured BYOK providers are preferred; keyless search remains the fallback. Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically (one provider; intent maps to its filters, and the keyless verticals do not join).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content contains leading [meta] JSON and the ranked evidence list. State includes provider, degraded/failed_engines, weak plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Engine health, score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant.",
-        mcp_description: "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. Weak or degraded results are incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
+        description: "Web search: returns ranked URLs, titles and bounded evidence excerpts. Use it to choose sources; web_fetch reads their full content. read=1..3 reads excerpts from the leading pages inside the same call budget; unreadable pages keep their source snippets.\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nLanguage is explicit: `lang` (en, uk, ne, pt-BR) selects the answer language; a region subtag is the only way to select a market. No language or country is inferred from the query's script. Omit it for the English default on Latin-script queries; a non-Latin query sends no language unless you set one.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. A source census line names who answered and what every other source said (403, timeout, off-query): retrieval state, not a verdict on the list. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nDefault: keyless sources fused by cross-source consensus. Configured BYOK providers are preferred; keyless search remains the fallback. First-party interfaces join by answer shape: GitHub, Wikipedia, HN, OpenAlex, arXiv, Europe PMC, crates.io, npm, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically (one provider; intent maps to its filters, and the keyless verticals do not join).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content contains leading [meta] JSON and the ranked evidence list. State includes provider, a per-source census (id, items, status), plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle.",
+        mcp_description: "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. A sources census names who answered and what every other source said, so an incomplete set reads as incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
         params: SEARCH_PARAMS,
         examples: &[
             "donsetch search rust async trait objects",
@@ -787,8 +809,9 @@ MCP search handles belong to their server session and cannot be reused \
 in a separate CLI invocation."
         }
         "search" => {
-            "Search the web across 10+ keyless engines, merged with \
-consensus ranking (no API keys needed). \
+            "Search the web without API keys: general engines, first-party \
+sources (package registries, papers, encyclopedias, a dated news wire) and \
+publisher feeds, merged by agreement between independent sources. \
 Results include reusable URLs: pass one to donsetch fetch <url>. \
 Session-local search handles are used only by the persistent MCP server. \
 Use --max-results to cap the list and --intent to pick a vertical \

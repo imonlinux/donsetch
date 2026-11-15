@@ -48,7 +48,7 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 | 🧠 **Self-improving fetch** | Remembers which identity each site accepts, what each bot-wall vendor lets through, which route answered, and how far each site's cache headers can be trusted. Measured: first-try content on a hard corpus went from 13/28 to 26/28 once learned, with 40% fewer requests. |
 | 🎯 **Read only what you need** | `must_contain` answers "is X on this page?" per term with counts, sections and excerpts, in a few hundred characters. `focus` returns the passages that answer a question, best first. `toc` then `section` reads one part. Every view searches the whole page, PDFs and site adapters included. |
 | 🧾 **Honest outcomes** | Every read says what it is: content, or a wall with its vendor and what it asks for (a login, a human, a program). A probe on a partly read page says `unverified`, never a false "not found". |
-| 🔑 **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus plus local semantic reranking. No keys, $0 forever. BYOK optional. |
+| 🔑 **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus and lexical evidence over the answer set. No keys, $0 forever. BYOK optional. |
 | 📄 **Pixel-fusion PDF** | Glyphs and rendered pixels come from the same content stream and are fused deterministically, with a per-region trust audit. Scanned PDFs auto-OCR. |
 | 🧬 **Built from scratch** | Own fetch engine, extraction engine, PDF parser, search aggregator and crawl engine. |
 | 🪶 **~2k tool schema** | All four tools: 2,042 tokens (`o200k_base`, compact `tools/list` JSON). |
@@ -147,7 +147,7 @@ donsetch doctor --mcp    # detects clients and prints absolute-path registration
 <details>
 <summary><b>Install notes and troubleshooting</b></summary>
 
-- **Linux prebuilts:** glibc >= 2.35 (Ubuntu 22.04 LTS and newer). The bundled ONNX lib keeps its own 2.27 floor, so OCR and rerank work on all of those.
+- **Linux prebuilts:** glibc >= 2.35 (Ubuntu 22.04 LTS and newer). The bundled ONNX lib keeps its own 2.27 floor, so OCR works on all of those.
 - **pnpm or bun:** approve the build script (`pnpm approve-builds`, or the bun equivalent), then reinstall. If scripts were blocked, `npx donsetch` invokes the self-healing shim.
 - **`--ignore-scripts`:** postinstall is intentionally skipped. Run `node node_modules/donsetch/install.js`, or `npx donsetch` to download the binary when network is available.
 - **System-wide npm installs:** a root-owned npm prefix (`/usr/local/lib/node_modules`) cannot receive the binary when you run as a normal user. donsetch falls back to an existing binary on `PATH` or in `~/.cargo/bin`; `DONSETCH_BINARY=/path/to/donsetch` points at one explicitly. Keep the package copy with `npm config set prefix ~/.npm-global && npm install -g donsetch`.
@@ -156,7 +156,7 @@ donsetch doctor --mcp    # detects clients and prints absolute-path registration
 - **Windows:** the installer needs `tar`, included since Windows 10 1803.
 - **Windows ARM64:** the x64 build runs under emulation, no native asset needed.
 - **musl/Alpine:** published Linux binaries are glibc. Build from source on musl.
-- **First OCR/search run downloads models** (~24MB reranker, ~37MB OCR), cached forever. Pre-seed offline boxes by copying the `ocr`/`rerank` cache dirs.
+- **First OCR run downloads a model** (~37MB, cached forever). Search downloads nothing: it carries no model, no embeddings and no ONNX; its ranking is BM25+, RM3 and a linear ranker with compiled-in weights.
 
 </details>
 
@@ -177,7 +177,7 @@ The challenge engine embeds V8 through `deno_core`. The build downloads a prebui
 ```bash
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
-cargo build --release --features ocr,rerank,http
+cargo build --release --features ocr,http
 ```
 
 First build compiles BoringSSL and links V8 (a few minutes), cached after. Chromium is optional and never fetches pages: it serves `web_screenshot` only. DonSeTch auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows.
@@ -191,7 +191,7 @@ cargo build --release
 
 The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built on Ubuntu 22.04 and runs there directly.
 
-**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64; linux-arm64 is core-only, because the aarch64 ONNX runtime deadlocks in its loader. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary).
+**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship both on linux-x64, macOS-arm64, macOS-x64 and Windows-x64; linux-arm64 is core-only, because the aarch64 ONNX runtime deadlocks in its loader. On macOS, OCR needs macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary).
 
 </details>
 
@@ -280,7 +280,7 @@ require compatibility folding after their MCP handshake.
 | Tool | What it does |
 |---|---|
 | 🌐 **`web_fetch`** | Any URL as clean markdown, or only the part that answers: `must_contain` probes, `focus` passages, `toc` → `section`. Walls answered in-process, never by a browser. PDFs with OCR and per-page confidence, site adapters, page memory, batches of up to 12. |
-| 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
+| 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus plus lexical evidence over the answer set, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 | 📸 **`web_screenshot`** | Rendered PNG of any URL through DonSeTch's browser. URL goes through the usual safety guards. CLI twin: `donsetch screenshot URL [--out PATH]`. |
 
@@ -410,24 +410,30 @@ Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
 
 ## 🔎 Keyless search
 
-No API key, no account. Six keyless engines across four independent index families, plus eight official verticals, run in parallel on your machine, then merge, dedupe and rank.
+No API key, no account. Keyless engines and first-party interfaces run in parallel on your machine inside one time budget, then merge, dedupe and rank. A source's answer is classified before it can rank: a page that is off the query, a bot wall or an empty result earns nothing.
 
-- **Backends**: Bing family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google, plus keyless verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv, StackExchange, MDN, Google News).
-- **Native Google, browser-free**: HTTP through the legacy mobile endpoint on the existing Rust transport, with seven experimentally verified Nokia profiles (`6230-03.15` by default). A profile that succeeds stays preferred per egress, CAPTCHA advances the cursor circularly, rate limits do not. Retry, pacing and quarantine use the same policy as every other engine. Availability depends on Google and your network; see [configuration and limits](docs/google-wml.md).
-- **Semantic reranking**: a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, 23MB) reads query + title + snippet through full attention, blended 60/40 with RRF + BM25 + consensus. A post-enrichment top-up re-scores close calls using the destination page's real title and description instead of SERP fragments.
-- **Consensus**: a URL several independent indexes return gets a boost. Every result carries `score`, `consensus` (independent index families) and `engines`, and the compact surface shows `· N sources`.
-- **Learned engine health**: per-engine trust EWMAs and chronic-failure quarantine survive restarts, so dead engines get benched instead of burning fan-out slots on every query.
-- **Entity coverage**: anchor entities (B-tree, version numbers, years) are checked against results. Wrong entity, 0.3x.
-- **Honest reporting**: `weak=true` means low consensus, per-engine status is always visible, and there is no fake "no results".
-- **Warm handoff**: search pre-fetches the top results, so the next MCP fetch serves from cache in ~3ms.
+- **Backends**: Google search elements, Bing, DuckDuckGo, Yahoo and Brave, plus first-party sources (GitHub, Wikipedia in the query's own language, HN, OpenAlex, arXiv, Europe PMC, StackExchange, MDN) and a news program for news queries or a recent window ("this week", "yesterday"): the Bing News wire, a mesh of publisher feeds and GDELT, every item dated and inside the window.
+- **Package names answered by their registry**: `npm zod`, `cargo serde_json`, `pip scikit-learn` ask crates.io, npm or PyPI directly (one request, no engine fan-out) and return the registry record with the project's own documentation, homepage and source repository. A bare name (`tokio`) or a language word with a name (`rust serde`) is answered by the registry only when the package is widely used, because `rust ownership` or `python decorators` is a question about the language, not about a small package that happens to share the word. A code query that names a package (`rust reqwest http client`) asks the registry too, so the official documentation leads instead of a tutorial.
+- **Native Google, browser-free**: the default Google source reads the public search-element bootstrap and structured results through the existing Rust transport. It uses its own short-lived token on the same network route, without executing scripts or downloading a model. A refusal rests the source. The legacy mobile adapter remains a research helper; see [request and refusal handling](docs/google-wml.md). Availability depends on Google and your network.
+- **No model in the search path.** Ranking is BM25+ over the answer set, RM3 expansion from the results themselves, and a linear ranker whose weights are trained offline and compiled in. It orders code, how-to and shopping queries, the kinds where it beat the engines' vote on bench queries it never trained on; every other query keeps the vote (`donsetch search --explain <query>` prints each result's features and what each one added). A first search downloads nothing, and no ONNX session is opened: OCR is the only ONNX consumer.
+- **Consensus**: a URL several independent indexes return gets a boost. Independence is measured, not assumed: sources whose top results overlap are counted as one index, and the graph is learned and persisted, so a source that changes supplier is re-measured. The compact surface shows `· N indexes` when more than one index returned a result.
+- **Learned engine health**: per-engine trust and chronic-failure quarantine survive restarts, so dead engines get benched instead of burning fan-out slots on every query. A source that publishes a rate limit (Stack Exchange's daily quota, any `429`) is rested until it lapses, not marked as failing.
+- **Source health you can read**: `donsetch search --sources` shows every source as verified, suspect or benched until a time, with its measured index family. `donsetch search doctor` (also `--doctor`) runs eight canary queries whose answers are owned by first-party interfaces (arXiv, crates.io, npm, Wikipedia, GitHub, Europe PMC) through the real search path, and judges each general source on whether it returns what the owner returned. A canary whose owner does not confirm that run is dropped, so a broken oracle never convicts a source.
+- **Query evidence**: named entities, versions, years and exact identifiers contribute to ranking. Search constraints are enforced before the vote; a non-Latin query prefers evidence in its script, and Han-only text receives no guessed English market. A foreign-script fallback carries low confidence.
+- **Honest reporting**: `confidence` reports high, medium or low retrieval confidence from source independence, agreement, query coverage and junk; it does not certify the pages' claims. `degraded` marks limited independence or a high junk ratio. Only high-confidence merged answers are cached, and replay reports `cache_age_ms`. A census line names every source that answered and what each other source said (`403`, `late`, `off-query`, `rate-limited:N`), so an empty or thin result says why.
+- **Answer text from Stack Overflow**: the native API returns question records and their answers in one request. Snippets quote an accepted answer when available, otherwise a non-negative-scored answer; unanswered questions retain their metadata. Source-published waits apply even when the current response succeeds.
+- **Evidence, not teasers**: each result's snippet is the sentence, across all sources that returned it, that best covers your query, cut at a sentence boundary: up to 320 characters for the top three, 180 for the rest, sharing a 1,600-byte snippet budget across the answer. Readable Unicode paths avoid spending context on percent-encoded letters; destinations and reserved URL escapes are preserved. Actual token use also depends on URLs, titles and language. `read: N` (max 3) fetches the top N pages inside the same deadline and shows the passage of each page that answers the query, marked `page:`; automatic repair reads top-three stubs and a procedural result or excerpt promising instructions, with one independent publisher as a fallback when needed. One procedural read can overlap the remaining index requests when an unreserved request slot is available; its excerpt is used only if that URL survives the final ranking. All automatic reads use the remaining time inside a 2.2-second native-call envelope and the existing three-page/request allowance. Page passages preserve code line breaks, list steps and table column headers, and source dates stay attached to evidence. Read pages are warm for the follow-up fetch when prewarming is enabled.
 - **Query compiler**: `site:`, `filetype:` and `intitle:` are sent only to engines that honor them, and SERP instant answers are extracted with their source URLs.
 
-Keyless quality, 110 questions across 11 niches with no keys: **95.5%** answer-in-snippet against Tavily's published 93.3% (LLM-graded). Reproduce with `python3 bench/search_quality.py --verbose`; methodology and per-niche numbers live in the script. Search-quality caching for the bench lives in `~/.cache/donsetch/bench-search/`, delete it when comparing binaries.
+Measure keyless quality with `donsetch search-bench --set all --cold --out run.json`.
+The corpus separates tuning from held-out queries and reports answering-page rank, whether
+expected phrases appear in snippets, empty answers, forbidden matches, and latency by query
+shape. Actual answer accuracy requires the separate blinded evidence review.
+`python3 bench/headtohead.py --help` runs the same fixed queries against provider APIs;
+results from different corpora or judging methods are not directly comparable.
 
 Search reports `requested_results`, `returned_results`, and `underfilled`
-when engines cannot supply the requested count. `weak` considers lexical
-query coverage as well as engine agreement; it is a retrieval warning, not a
-fact-check. `source_type` identifies video, community, paper, reference,
+when engines cannot supply the requested count. `source_type` identifies video, community, paper, reference,
 publisher, official, institutional, and general web sources from known hosts.
 It does not certify a page's claims or assign trust to lookalike domains.
 
@@ -524,7 +530,7 @@ A site decides before it serves content on two things: **who is asking** (TLS an
 |---|---|
 | `plain` | A plain HTTP client: the cheapest first ask |
 | `chrome-local` | Chrome 156 on Linux, captured from a real browser |
-| `chrome` | Chrome 149 on Linux |
+| `chrome` | Chrome 156 on Linux (wire measured against the reference browser) |
 | `chrome-win` | Chrome on Windows |
 | `chrome-android` | Chrome on Android |
 | `firefox` | Firefox 151 |
@@ -586,15 +592,15 @@ Every layer in Rust.
 
 | Component | What | Where |
 |---|---|---|
-| 🛡️ **Fetch core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `core/` |
+| 🛡️ **Fetch core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `crates/fetch/` |
 | 📝 **DonSift** | HTML → markdown, block model, 12-language BM25, the page views (`must_contain`, `focus`, `toc`, `section`) | `src/extract/` |
-| 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25 + consensus + semantic reranking | `src/search/` |
+| 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25+ + consensus + a compiled linear ranker | `src/search/` |
 | 🕷️ **DonTread** | Crawl engine, sitemap, focus frontier, Governor pacing, resume tokens | `src/crawl/` |
 | 📄 **DonSheet** | PDF extraction, PDFium FFI, pixel-truth fusion, OCR cascade, forms | `src/pdf/` |
 | 📸 **Browser** | Screenshots only, headless and throwaway; never a page read | `src/browser/` |
 | 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, four tools, crash-only supervisor | `src/mcp/` |
 
-1,900+ tests. Zero clippy warnings: `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law, and CI runs the full matrix on Linux, macOS and Windows.
+1,900+ tests. Zero clippy warnings: `cargo clippy --all-targets --features ocr -- -Dwarnings` is the law, and CI runs the full matrix on Linux, macOS and Windows.
 
 ## ⚙️ Configuration
 
@@ -647,7 +653,7 @@ Thin adapter over the same engine the MCP server uses.
 | Command | What it does |
 |---|---|
 | `donsetch fetch <url>` | Fetch as clean markdown (`--must-contain`, `--focus`, `--toc`, `--section`, `--max-chars`, `--since-last`, `--json`) |
-| `donsetch search <query>` | Search, keyless + BYOK (`--intent`, `--max-results`) |
+| `donsetch search <query>` | Search, keyless + BYOK (`--intent`, `--max-results`; `--explain` shows why each result ranks where it does) |
 | `donsetch crawl <url>` | Crawl (`--mode map\|full\|content`, `--topic`, `--max-pages`) |
 | `donsetch screenshot <url>` | Render to PNG (`--out`) |
 | `donsetch mcp` | MCP server (stdio, or `--http --port N`) |
@@ -751,8 +757,8 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | First build takes a few minutes | BoringSSL compiles from source and V8 is downloaded and linked, cached after. Go is a build dependency too: BoringSSL's build system is Go-based. |
 | v5 is a new engine | Every push runs the full suite on Linux and the core suite on Windows; macOS arm64 and x64 run the smoke set, and linux-arm64 runs the fetch engine's suite and the smoke set. Report anything that regressed from v4. |
 | A login wall is an answer | `web_fetch` carries no session in v5: a signed-in page returns `wall.auth`. |
-| OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
-| First OCR/rerank use downloads models | ~24MB reranker, ~37MB OCR, cached forever. |
+| OCR is not in the default build | ONNX Runtime is heavy and optional: `--features ocr`. Prebuilts ship it on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
+| First OCR use downloads a model | ~37MB, cached forever. Search downloads nothing. |
 | Captchas need an unlocker key | hCaptcha, reCAPTCHA, Turnstile and press-and-hold walls ask a human; they are not solved locally, by design. With `donsetch keys add unlocker <key>[::zone]` they come through rendered; without one you get a clear honest error, never a hang. |
 | robots.txt is ON for crawl | `respect_robots=true` for crawl. `fetch` does not check robots. |
 | Keyless search rate-limits without a proxy | It hits engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
@@ -774,7 +780,7 @@ The honest summary: nothing else in this space combines browser-free challenge h
 | Language | **Rust, one binary** | Python | Python | Python (API) | TypeScript |
 | TLS fingerprint | **8 whole client profiles, chosen per site** | curl-impersonate | requests | their servers | their servers |
 | JS challenges | **site's own program in embedded V8, no browser** | browser fetches all | browser fetches all | their servers | their servers |
-| Search | **keyless, 10+ engines, local rerank** | keyed | no | yes | no |
+| Search | **keyless, 10+ engines, local ranking** | keyed | no | yes | no |
 | Crawl | **yes, resume tokens** | yes | yes | no | cloud only |
 | PDF + OCR | **pixel-fusion + PP-OCR** | yes | partial | yes | cloud, paid |
 | Self-improving routing | **yes, local state** | no | no | no | no |

@@ -310,6 +310,22 @@ fn walk<'a>(
                 );
             }
         }
+        // A tabbed layout keeps each tab's whole content in a `<ul>` of
+        // `<li role="tabpanel">`, and an accordion keeps each section's in an
+        // `<li>` with its tables: sections of the page, not list lines. Read
+        // as lines they would flatten the tables and headings inside (an AWS
+        // pricing accordion printed "db.t4g.micro$0.016db.t4g.small$0.032").
+        "ul" | "ol" if holds_sections(el) => {
+            for child in el.children() {
+                let Some(child_el) = ElementRef::wrap(child) else {
+                    continue;
+                };
+                if crate::extract::junk::skip(child_el) {
+                    continue;
+                }
+                walk(child_el, base, opts, headings, out, depth + 1, card);
+            }
+        }
         "ul" | "ol" => {
             let (items, ld) = list_items(el, base, opts, 0);
             if !items.is_empty() {
@@ -572,6 +588,24 @@ fn holds_structure(el: ElementRef<'_>) -> bool {
             "table" | "ul" | "ol" | "pre" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
         )
     })
+}
+
+/// True when a list's items are page sections: any direct `<li>` is a tab
+/// panel (`role="tabpanel"`), or carries a heading and a table the way an
+/// accordion section does. An item with a table and no heading stays a list
+/// line.
+fn holds_sections(list: ElementRef<'_>) -> bool {
+    list.children()
+        .filter_map(ElementRef::wrap)
+        .filter(|li| li.value().name() == "li")
+        .any(|li| {
+            li.value().attr("role") == Some("tabpanel")
+                || (has_heading(li)
+                    && li
+                        .descendants()
+                        .filter_map(ElementRef::wrap)
+                        .any(|d| d.value().name() == "table"))
+        })
 }
 
 /// True when an element holds a heading.

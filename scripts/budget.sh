@@ -2,9 +2,9 @@
 # The resource budget wrapper. Every build/test/fuzz command in this repo
 # goes through it (Justfile recipes, .githooks/pre-push, scripts/gates.sh).
 #
-# status.md mechanic 5: this box is Dondai's live desktop (16 threads /
-# 7.6 GB), not a build farm. The ceiling is a quarter of the cores AND a
-# bounded share of RAM, because a `-j` flag bounds neither:
+# status.md mechanic 5: this box is Dondai's live desktop (8 threads /
+# 31 GB), not a build farm. The ceiling is all the cores AND a bounded
+# share of RAM, because a `-j` flag bounds neither:
 #
 #   * rustc runs its own codegen threads (the ci profile asks for 256
 #     codegen units), so one rustc process can use every core;
@@ -15,20 +15,21 @@
 #
 # So the cap is MECHANICAL, not aspirational: the whole command tree is
 # pinned to a core subset with taskset (however many threads the tools
-# spawn, they share a quarter of the machine), niced and ionice-idle so
-# the live session wins every contention, and the job-count variables are
-# exported so nested build systems stay in the same budget.
+# spawn, they share that set), niced and ionice-idle so the live session
+# wins every contention, and the job-count variables are exported so nested
+# build systems stay in the same budget.
 #
 # MEMORY is the half that actually lags a desktop. Measured 2026-09-19:
 # three concurrent rustc held ~2.4 GB and pushed the box to 3.6 GB of
 # swap with the browser running at 10 fps. A memory-shaped box does not
 # stall, it swaps. So the job count is also bounded by what RAM is
-# available RIGHT NOW: one job per ~1.2 GB, after reserving 1.5 GB for
+# available RIGHT NOW: one job per ~700 MB, after reserving 1 GB for
 # the session and the OS.
 #
 #   BG_JOBS=<n>    job count for cargo/cmake/make (default: the min of
-#                  the core quarter and the RAM budget)
-#   BG_CORES=<set> cores to pin to, taskset syntax (default: first quarter)
+#                  all cores and the RAM budget)
+#   BG_CORES=<set> cores to pin to, taskset syntax (default: every core)
+#                  (give it 0-5 when you want the desktop kept quiet)
 #
 # Both are escapes for a known-idle box, not the default.
 set -eu
@@ -47,10 +48,11 @@ if [ -f "$root/scripts/guard.sh" ]; then
 fi
 
 nproc_now=$(nproc 2>/dev/null || echo 4)
-# Half the threads, not a quarter: profile.codegen-units caps each rustc's own
-# LLVM fan-out (16 instead of 256), so one process no longer claims the whole
-# box. `nice`/`ionice` still put the live session first.
-core_jobs=$(( (nproc_now + 1) / 2 ))
+# Every thread: 32 GB no longer needs the 7.6 GB-era half-core cap, and
+# profile.codegen-units still caps each rustc's own LLVM fan-out. `nice` and
+# `ionice` put the live session first, so an interactive task preempts the
+# build instead of waiting behind it.
+core_jobs=$nproc_now
 [ "$core_jobs" -lt 1 ] && core_jobs=1
 
 # MemAvailable is the kernel's own estimate of what we can take without

@@ -21,6 +21,14 @@ pub(super) async fn search_tool(
         Err(message) => return tool_error(message),
     };
     let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(7) as usize;
+    let read = args.get("read").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let lang = match args.get("lang").and_then(Value::as_str) {
+        Some(raw) => match crate::search::Lang::parse(raw) {
+            Ok(lang) => Some(lang),
+            Err(error) => return tool_error(format!("search: {error}")),
+        },
+        None => None,
+    };
     let intent = match args.get("intent").and_then(Value::as_str) {
         Some("web") => Some(Intent::Web),
         Some("code") => Some(Intent::Code),
@@ -35,7 +43,7 @@ pub(super) async fn search_tool(
             if queries.len() == 1 {
                 let query = &queries[0];
                 run_with_budget(
-                    search_inner(daemon, query, max, intent),
+                    search_inner(daemon, query, max, intent, read, lang.as_ref()),
                     deadline,
                     ctx.as_mut(),
                     || search_deadline_error(query),
@@ -44,7 +52,7 @@ pub(super) async fn search_tool(
             } else {
                 let deadline_queries = queries.clone();
                 run_with_budget(
-                    search_batch_inner(daemon, &queries, max, intent),
+                    search_batch_inner(daemon, &queries, max, intent, read, lang.as_ref()),
                     deadline,
                     ctx.as_mut(),
                     move || search_batch_deadline_error(&deadline_queries),
@@ -113,8 +121,10 @@ pub(super) async fn search_inner(
     query: &str,
     max: usize,
     intent: Option<Intent>,
+    read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Value {
-    match search_outcome(daemon, query, max, intent).await {
+    match search_read(daemon, query, max, intent, read, lang).await {
         Ok(out) => render_search_outcome(daemon, &out, max).await,
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
@@ -128,12 +138,7 @@ pub(super) async fn render_search_outcome(
     let hs = bind_search_handles(daemon, out).await;
     let hints = route_hints(daemon, out).await;
     let md = search::render_compact_markdown(out, "# Search results", Some(&hs), &hints);
-    let mut model = search_model_meta(out, &hs);
-    model["requested_results"] = json!(requested.clamp(1, 12));
-    model["returned_results"] = json!(out.results.len());
-    if out.results.len() < requested.clamp(1, 12) {
-        model["underfilled"] = json!(true);
-    }
+    let model = search_model_meta(out, &hs, requested);
     let debug = search_debug_meta(out);
     json!({
         "content": [{ "type": "text", "text": md }],
@@ -145,7 +150,12 @@ pub(super) async fn render_search_outcome(
 /// Machine state needed to route a subsequent fetch. Titles and snippets are
 /// already present on the linear evidence surface; ranking and engine
 /// telemetry remain in client-only metadata.
-pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[String]) -> Value {
+pub(super) fn search_model_meta(
+    out: &crate::search::SearchOutcome,
+    handles: &[String],
+    requested: usize,
+) -> Value {
+    let requested = requested.clamp(1, 12);
     let results = out
         .results
         .iter()
@@ -162,7 +172,7 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             // finds a mirror.
             let mut item = json!({
                 "rank": index + 1,
-                "url": result.url,
+                "url": crate::search::evidence_url(&result.url),
                 "source_type": crate::search::rank::source_type(&result.url),
             });
             if let Some(handle) = handles.get(index) {
@@ -171,22 +181,57 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             item
         })
         .collect::<Vec<_>>();
+    // The retrieval state, as facts: who answered, with how many items, and
+    // what every source that did not answer said. There is no verdict flag to
+    // read and no degraded ratio to interpret -- the census is the state.
+    let sources = crate::search::source_states(&out.report)
+        .into_iter()
+        .map(|s| {
+            let age = out
+                .report
+                .iter()
+                .filter(|report| report.engine == s.id)
+                .filter_map(|report| report.cache_age_ms)
+                .max();
+            let mut source =
+                json!({"id": s.id, "items": s.items, "status": s.status, "state": s.state});
+            if let Some(age) = age {
+                source["cache_age_ms"] = json!(age);
+            }
+            source
+        })
+        .collect::<Vec<_>>();
     let mut item = json!({
         "ok": true,
-        "weak": out.weak,
         "results": results,
+        "sources": sources,
         "provider": out.provider.as_deref().unwrap_or("keyless"),
     });
-    let (failed, _) = out.engine_health();
-    let failed = failed.len();
-    if failed > 0 {
-        item["degraded"] = json!(true);
-        item["failed_engines"] = json!(failed);
-        if out.results.is_empty() {
-            item["next_action"] = json!(
-                "retrieval was incomplete; check provider/engine health with doctor --deep or retry another source before concluding that no answer exists"
-            );
-        }
+    // The answer's standing, as fields a caller can branch on without reading
+    // the census: a list to choose from, a thin list, or nothing.
+    let answered = out
+        .report
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "ok" | "cached" | "thin"))
+        .count();
+    item["filled"] = json!(!out.results.is_empty());
+    item["requested_results"] = json!(requested);
+    item["returned_results"] = json!(out.results.len());
+    item["underfilled"] = json!(out.results.len() < requested);
+    item["degraded"] = json!(out.quality.degraded());
+    item["confidence"] = json!(out.quality.confidence);
+    if let Some(age) = out.cache_age {
+        item["cache_age_ms"] = json!(age.as_millis() as u64);
+    }
+    item["answered_sources"] = json!(answered);
+    if out.results.is_empty() && !out.report.is_empty() {
+        item["next_action"] = json!(
+            "no source returned matching items; rephrase or retry another source before concluding that no answer exists"
+        );
+    } else if out.results.len() < requested.min(3) {
+        item["next_action"] = json!("thin answer: a retry usually adds the sources that were late");
+    } else if out.quality.degraded() {
+        item["next_action"] = json!("limited independent evidence; retry for confirmation");
     }
     // Instant answers are decision aids, not ranked evidence: they
     // ride structuredContent (not the organic list) with their source.
@@ -223,11 +268,13 @@ pub(super) async fn search_batch_inner(
     queries: &[String],
     max: usize,
     intent: Option<Intent>,
+    read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Value {
     let started = std::time::Instant::now();
     let futures = queries
         .iter()
-        .map(|query| search_outcome(daemon, query, max, intent));
+        .map(|query| search_read(daemon, query, max, intent, read, lang));
     let outcomes = futures_util::future::join_all(futures).await;
     let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
     if ok == 0 {
@@ -297,12 +344,7 @@ pub(super) async fn search_batch_inner(
                     query_handles,
                     &hints,
                 ));
-                let mut model = search_model_meta(out, query_handles.unwrap_or(&[]));
-                model["requested_results"] = json!(max.clamp(1, 12));
-                model["returned_results"] = json!(out.results.len());
-                if out.results.len() < max.clamp(1, 12) {
-                    model["underfilled"] = json!(true);
-                }
+                let mut model = search_model_meta(out, query_handles.unwrap_or(&[]), max);
                 model["query"] = json!(query);
                 searches.push(model);
                 let mut debug = search_debug_meta(out);
@@ -338,14 +380,46 @@ pub(super) async fn search_batch_inner(
     })
 }
 
-/// The search pipeline without presentation. Keeping acquisition separate lets
-/// multi-query mode share one deadline and one final handle table while the
-/// single-query response stays byte-for-byte compatible.
+/// The search pipeline, then `read`: the top `read` results' pages are fetched
+/// inside the same deadline and their passages replace the teasers, and a stub
+/// snippet in the top three is repaired the same way. Applies to a provider's
+/// results as much as to the local fan-out.
+async fn search_read(
+    daemon: &Arc<Daemon>,
+    query: &str,
+    max: usize,
+    intent: Option<Intent>,
+    read: usize,
+    lang: Option<&crate::search::Lang>,
+) -> Result<crate::search::SearchOutcome, SearchFailure> {
+    let mut out = search_outcome(daemon, query, max, intent, read, lang).await?;
+    if out.provider.is_none() {
+        return Ok(out);
+    }
+    if read > 0 {
+        daemon
+            .searcher
+            .read_results(&mut out.results, query, read)
+            .await;
+    }
+    // A stub snippet in the top three is read from its page, inside what
+    // `read` left of the same budget.
+    daemon
+        .searcher
+        .repair_snippets(&mut out.results, query, read)
+        .await;
+    Ok(out)
+}
+
+/// Acquisition and bounded evidence reads without presentation, so multi-query
+/// mode can share one deadline and one final handle table.
 pub(super) async fn search_outcome(
     daemon: &Arc<Daemon>,
     query: &str,
     max: usize,
     intent: Option<Intent>,
+    read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Result<crate::search::SearchOutcome, SearchFailure> {
     // Input hygiene first: a bad query is a permanent-shaped failure
     // whether the fanout would have been BYOK or local.
@@ -362,9 +436,11 @@ pub(super) async fn search_outcome(
     let byok_configured = daemon.byok.is_configured();
     let local_first = daemon.byok.is_local_default();
 
-    // BYOK-first mode: try providers, fall back to local.
+    // BYOK-first mode: try providers, fall back to local. An explicit `lang`
+    // keeps the local language-aware path: a provider that does not accept the
+    // tag must not silently answer in its own locale.
     let mut byok_fail: Option<String> = None;
-    if byok_configured && !local_first {
+    if byok_configured && !local_first && lang.is_none() {
         match byok_search_cached(daemon, query, max, intent).await {
             Ok(out) => return Ok(out),
             Err(e) => {
@@ -381,21 +457,27 @@ pub(super) async fn search_outcome(
     }
 
     // Local search (primary in local-first mode, fallback in BYOK-first).
-    match daemon.searcher.search(query, max, intent).await {
+    match daemon
+        .searcher
+        .search_with_read(query, max, intent, read, lang)
+        .await
+    {
         Ok(mut out) => {
-            // #285: fold the BYOK failure into the visible engines
-            // trail (the same `degraded:` field local engine
-            // failures use).
+            // #285: fold the BYOK failure into the source census, so a
+            // provider that was configured and did not answer is named
+            // beside the local sources instead of vanishing.
             if let Some(e) = byok_fail {
                 out.report.insert(
                     0,
                     crate::search::EngineReport {
+                        cache_age_ms: None,
                         engine: "byok".into(),
                         profile: None,
                         status: crate::search::byok::compact_failure(&e),
                         hits: 0,
                         ms: 0,
                         egress: "byok".into(),
+                        requests: 0,
                     },
                 );
             }
@@ -470,7 +552,6 @@ async fn byok_search_cached(
             // zero added latency).
             crate::search::site_filter(query, &mut out.results);
             out.results.truncate(max.clamp(1, 12));
-            out.weak |= crate::search::rank::relevance_is_weak(&out.results, query);
             daemon.searcher.spawn_prewarm(&out.results);
             Ok(out)
         })
@@ -554,15 +635,20 @@ mod search_output_contract_tests {
                 sources: vec![("bing".into(), 0)],
                 score: 0.9,
                 published: None,
+                families: 0,
+                from_page: false,
+                tier: 0,
             }],
-            weak: false,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
+            quality: Default::default(),
+            cache_age: None,
             elapsed: Duration::ZERO,
             provider: None,
             reranked: false,
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         };
         let result = render_search_outcome(&cli, &output, 1).await;
@@ -609,23 +695,27 @@ mod search_output_contract_tests {
         use crate::search::{EngineReport, render_compact_markdown, render_markdown};
         let mut output = SearchOutcome {
             results: Vec::new(),
-            weak: true,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
+            quality: Default::default(),
+            cache_age: None,
             elapsed: Duration::ZERO,
             provider: None,
             reranked: false,
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         };
         let report = |engine: &str, status: &str| EngineReport {
+            cache_age_ms: None,
             engine: engine.into(),
             status: status.into(),
             profile: None,
             hits: 0,
             ms: 0,
             egress: "direct".into(),
+            requests: 0,
         };
         output.report = vec![
             report("bing", "ok"),
@@ -633,25 +723,56 @@ mod search_output_contract_tests {
             report("bing", "pacing-timeout"),
             report("ddg", "blocked:403"),
         ];
-        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
+        // One state per source, whatever its retries: bing answered (a
+        // successful attempt outlives its retries), ddg did not.
+        // `status` is the raw outcome a 5.1 parser reads; `state` is the
+        // census word beside it.
+        let sources = search_model_meta(&output, &[], 5)["sources"].clone();
+        assert_eq!(sources[0]["id"], "bing");
+        assert_eq!(sources[0]["status"], "ok");
+        assert_eq!(sources[0]["state"], "answered");
+        assert_eq!(sources[1]["id"], "ddg");
+        assert_eq!(sources[1]["status"], "403");
+        assert_eq!(sources[1]["state"], "failed");
         let compact = render_compact_markdown(&output, "Results", None, &[]);
-        assert!(compact.contains("1/2 backends available"), "{compact}");
+        assert!(
+            compact.contains("sources: bing 0 · ddg — failed"),
+            "{compact}"
+        );
         let full = render_markdown(&output, "query", None, &[]);
-        assert!(full.contains("1/2 engines ok (ddg: blocked:403)"), "{full}");
-        // A successful recovery or a cached provider remains available.
+        assert!(full.contains("sources: bing 0 · ddg — failed"), "{full}");
+        // A cached provider answer is still an answer, not a failure.
         output.report = vec![report("bing", "blocked:429"), report("bing", "cached")];
-        assert!(search_model_meta(&output, &[]).get("degraded").is_none());
-        assert!(!render_compact_markdown(&output, "Results", None, &[]).contains("Degraded"));
-        assert!(!render_markdown(&output, "query", None, &[]).contains("degraded"));
+        let cached = search_model_meta(&output, &[], 5)["sources"][0].clone();
+        assert_eq!(cached["status"], "cached", "a cached answer is an answer");
+        assert_eq!(cached["state"], "answered", "a cached answer is an answer");
         output.report = vec![
             report("bing", "blocked:429"),
             report("bing", "pacing-timeout"),
         ];
-        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
-        assert!(
-            render_compact_markdown(&output, "Results", None, &[])
-                .contains("0/1 backends available")
-        );
+        let refused = search_model_meta(&output, &[], 5)["sources"][0].clone();
+        assert_eq!(refused["status"], "429");
+        assert_eq!(refused["state"], "failed");
+        // A published rate limit rests the source; it did not fail.
+        output.report = vec![report("stackexchange", "rate-limited:3219")];
+        let rested = search_model_meta(&output, &[], 5)["sources"][0].clone();
+        assert_eq!(rested["status"], "rate-limited:3219");
+        assert_eq!(rested["state"], "rested");
+        // A source the plan never asked is in the machine census but not in the
+        // footer the model reads; resting sources are counted there, not named.
+        output.report = vec![
+            report("bing", "ok"),
+            report("google", "not-asked"),
+            report("mojeek", "rested:120"),
+            report("yahoo", "rested"),
+        ];
+        let sources = search_model_meta(&output, &[], 5)["sources"].clone();
+        assert_eq!(sources[1]["state"], "not asked");
+        assert_eq!(sources[2]["state"], "rested");
+        let compact = render_compact_markdown(&output, "Results", None, &[]);
+        assert!(compact.contains("sources: bing 0 · 2 resting"), "{compact}");
+        assert!(!compact.contains("google"), "{compact}");
+        assert!(!compact.contains("mojeek"), "{compact}");
     }
 
     #[test]
@@ -664,18 +785,33 @@ mod search_output_contract_tests {
                 sources: vec![("bing".into(), 0)],
                 score: 0.9,
                 published: None,
+                families: 0,
+                from_page: false,
+                tier: 0,
             }],
-            weak: false,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
+            quality: Default::default(),
+            cache_age: None,
             elapsed: Duration::from_millis(10),
             provider: None,
             reranked: true,
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         };
-        let state = search_model_meta(&output, &["S1".into()]);
+        let state = search_model_meta(&output, &["S1".into()], 5);
+        assert_eq!(state["underfilled"], true);
+        let single = search_model_meta(&output, &[], 1);
+        assert_eq!(single["underfilled"], false);
+        assert_eq!(single["requested_results"], 1);
+        assert!(
+            !single["next_action"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("thin answer")
+        );
         assert_eq!(state["results"][0]["rank"], 1);
         assert_eq!(state["results"][0]["handle"], "S1");
         // The markdown shows title, host and the S-handle : never the

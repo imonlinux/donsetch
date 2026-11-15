@@ -3429,3 +3429,59 @@ fn a_tiny_window_still_advances() {
     let pages = pages_of(text, 2);
     assert_eq!(pages.concat(), text);
 }
+
+#[test]
+fn a_tabs_panels_keep_their_tables_and_headings() {
+    // The layout AWS's pricing pages use: each tab's content is an
+    // `<li role="tabpanel">` in a `<ul>`; the tab labels are a list of their own.
+    let html = r#"<html><body><main>
+        <ul role="tablist"><li role="tab">Event Functions</li><li role="tab">MicroVMs</li></ul>
+        <ul class="tabs-content">
+          <li role="tabpanel"><h2>Event Functions Pricing</h2>
+            <p>Event functions are priced per request and per unit of duration, as shown below.</p>
+            <table><thead><tr><th>Tier</th><th>Price</th></tr></thead>
+              <tbody><tr><td>First 6 billion</td><td>$0.0000166667</td></tr>
+              <tr><td>Next 9 billion</td><td>$0.000015</td></tr></tbody></table></li>
+          <li role="tabpanel"><h2>MicroVMs Pricing</h2>
+            <p>MicroVMs are priced per instance-second of provisioned capacity in a region.</p></li>
+        </ul></main></body></html>"#;
+    let out = extract_html(html).markdown;
+    assert!(
+        out.contains("| Tier | Price |") && out.contains("| First 6 billion | $0.0000166667 |"),
+        "the table stays a table: {out}"
+    );
+    assert!(out.contains("## Event Functions Pricing"), "{out}");
+    assert!(out.contains("## MicroVMs Pricing"), "{out}");
+}
+
+#[test]
+fn an_accordions_sections_keep_their_tables() {
+    // AWS's RDS pricing accordion: each `<li>` is a section with a heading and
+    // its tables. Read as list lines, a table printed as one run of text.
+    let html = r#"<html><body><main><p>Pricing for every engine, by deployment option, below.</p>
+        <ul data-lb-comp="accordion">
+          <li><a role="button"><h3>RDS for MySQL</h3><div>Select to see details</div></a>
+            <div><p>The pricing below applies to a DB instance in one Availability Zone.</p>
+            <table><thead><tr><th>Instance</th><th>Price Per Hour</th></tr></thead>
+              <tbody><tr><td>db.t4g.micro</td><td>$0.016</td></tr>
+              <tr><td>db.t4g.small</td><td>$0.032</td></tr></tbody></table></div></li>
+          <li><a role="button"><h3>Storage</h3></a><div><p>Storage is billed per GB-month as below.</p></div></li>
+        </ul></main></body></html>"#;
+    let out = extract_html(html).markdown;
+    assert!(
+        out.contains("| db.t4g.micro | $0.016 |") && out.contains("| db.t4g.small | $0.032 |"),
+        "the table stays a table: {out}"
+    );
+    assert!(out.contains("### RDS for MySQL"), "{out}");
+    assert!(!out.contains("db.t4g.micro$0.016"), "{out}");
+}
+
+#[test]
+fn an_ordinary_list_with_a_table_in_an_item_is_still_a_list() {
+    let html = r#"<html><body><main><p>Steps for the procedure, written out in full below.</p>
+        <ul><li>First step, then read the table here<table><tr><td>a</td><td>b</td></tr></table></li>
+        <li>Second step is to continue with the work</li></ul></main></body></html>"#;
+    let out = extract_html(html).markdown;
+    assert!(out.contains("- First step"), "{out}");
+    assert!(out.contains("- Second step"), "{out}");
+}

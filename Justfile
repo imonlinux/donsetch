@@ -3,11 +3,17 @@
 # THE LADDER (each rung is a different question; climb only as far as the
 # question needs):
 #
-#   1. just check       types + cfg, full feature set        ~1 s warm
-#   2. just t <expr>    the touched scope                    ~6 s warm
-#   3. just test        the whole default suite              ~35 s warm
+#   1. just check       types + cfg, no optional features        ~1 s warm
+#   2. just t <expr>    the touched scope, no optional features  ~6 s warm
+#   3. just test        the whole default suite                  ~35 s warm
 #   4. CI               Linux gate on every push, ~5 min; Windows and macOS on
 #                       platform-touching pushes, nightly and every release
+#
+# The quick rungs run WITHOUT `ocr,http`: the featureless graph is 386 crates
+# against 572 with them, and OCR/HTTP code is not what a fetch/search edit is
+# about. Feature work uses the full-feature twins: `just check-all`, `just tf`,
+# `just test` (full by default, the suite is the gate). `just all` runs the
+# full-feature check, so nothing feature-gated reaches a push unchecked.
 #
 # `just all` is the pre-push net: guard + fmt + check + lockgate + lint + the
 # static test budget. It does NOT run the suite: CI already does.
@@ -20,11 +26,14 @@
 #
 # SHIPPING IS ONE COMMAND. `just ship <version>` bumps the manifests and pushes
 # the release commit; the CI pipeline then tests it on five platforms, builds
-# and gates the shipped binaries, tags, publishes the GitHub release and npm,
-# and stops on the first red. Nothing runs on this machine, nothing waits here.
+# and gates the shipped binaries, tags and publishes the GitHub release, then
+# dispatches npm as its own run. It stops on the first red. Nothing runs on this
+# machine, nothing waits here.
 #
-#   just check        compile-check, full feature set, fast profile
+#   just check        compile-check, no optional features, fast profile
+#   just check-all    compile-check, full feature set, all targets
 #   just t <expr>     scoped tests, fast profile (`just t crawl::frontier`)
+#   just tf <expr>    scoped tests, full feature set
 #   just th <expr>    scoped heavy test, default-filter lifted
 #   just test         the default suite, fast profile
 #   just heavy        the heavy set (soak / corpus / PDF corpus / timing)
@@ -37,6 +46,8 @@
 #   just bin-dist     target/dist-thin/donsetch (the shipped shape)
 #   just gates        bin-dist + the payload gates the release pipeline runs
 #   just smoke        bin + doctor + fetch + search
+#   just bench        the live search bench, each shape cold (bench-smoke: 3 min)
+#   just rank-train   retrain the search ranker from saved bench artifacts
 #   just ship <ver>   bump + push the release commit; CI does the rest
 #   just runs         what CI, the release and npm are doing right now
 #   just loop-report  measure this ladder on this box, right now
@@ -46,15 +57,14 @@
 # A hung test is caught by nextest's own per-test slow-timeout; a long
 # COLD build is caught by the CI step timeout.
 #
-# CPU + MEMORY citizenship: this box is the operator's desktop (16 threads,
-# 7.6 GB RAM, a live session next to every compile). Every cargo/build/fuzz
-# command below runs through scripts/budget.sh, which pins the whole process
-# TREE to half the cores with taskset, exports the job caps into nested build
-# systems (cmake, make, nasm), and bounds the job count by MemAvailable right
-# now: ~700 MB per rustc at codegen-units 16, after reserving 1 GB.
-#   BG_JOBS=<n>     job count (default: min of half the cores and the RAM
-#                   budget; 3-4 with a browser open, 8 on an idle box)
-#   BG_CORES=<set>  taskset core set (default: the first half)
+# CPU + MEMORY citizenship: this box is the operator's desktop (8 threads,
+# 31 GB RAM, a live session next to every compile). Every cargo/build/fuzz
+# command below runs through scripts/budget.sh, which exports the job caps into
+# nested build systems (cmake, make, nasm) and bounds the job count by
+# MemAvailable right now: ~700 MB per rustc at codegen-units 16, after
+# reserving 1 GB.
+#   BG_JOBS=<n>     job count (default: min of all cores and the RAM budget)
+#   BG_CORES=<set>  taskset core set (default: every core; use 0-5 for quiet)
 # With sccache installed (rust-sccache), budget.sh wires RUSTC_WRAPPER and the
 # C/C++ compilers through it, so recompiles across profiles and branches are
 # cache hits instead of work.
@@ -65,7 +75,9 @@
 #   RELEASE_MIRROR=http://127.0.0.1:18777/v8 just bin
 # Absolute, so a recipe that cd's first (fuzz) can still use it.
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
-feat := "--features ocr,rerank,http"
+feat := "--features ocr,http"
+# The quick rungs run featureless: 386 crates instead of 572.
+lite := ""
 
 # Storage guard: one implementation, four entry points (scripts/guard.sh):
 # `just guard`/`just all`/pre-push measure and reclaim at the ceiling,
@@ -173,7 +185,11 @@ test:
 
 # Scoped run: `just t crawl::frontier` runs only what matches. The heavy
 # default-filter still applies; `just th` is the escape for a heavy test.
+# Featureless by default; `just tf` is the full-feature twin.
 t expression:
+    {{budget}} cargo nextest run --cargo-profile fast {{lite}} -E 'test({{expression}})'
+
+tf expression:
     {{budget}} cargo nextest run --cargo-profile fast {{feat}} -E 'test({{expression}})'
 
 # Scoped heavy run: `just th pdf::tests::progit_book` (one test, on purpose).
@@ -225,10 +241,14 @@ bin:
 bin-dist:
     {{budget}} cargo build --profile dist-thin {{feat}}
 
-# Compile-only full-feature check: the whole-crate structural signal.
-# Fast when the check graph is warm; ~2.5 min when only the test graph is
-# (check and test build different artifacts for the deps).
+# Compile-only check for the edit loop: this crate and the core, no optional
+# features, libs and bins only. Feature work uses `check-all`.
 check:
+    {{budget}} cargo check --profile fast --workspace {{lite}}
+
+# The full structural signal: every target, both feature sets' worth of code
+# (`ocr,http` here; `just all` also runs the no-feature clippy).
+check-all:
     {{budget}} cargo check --profile fast --workspace --all-targets {{feat}}
 
 # What the ladder actually costs on THIS box, right now: warm check,
@@ -244,7 +264,7 @@ loop-report:
     echo "== just t mcp::supervisor (warm)"
     s=$(date +%s); just t mcp::supervisor >/dev/null 2>&1; echo "   $(( $(date +%s) - s ))s"
     echo "== sccache"
-    sccache --show-stats 2>/dev/null | grep -E 'cache hits|compile requests|Cache size' || echo "   (sccache not installed: rust-sccache in the Void repos)"
+    sccache --show-stats 2>/dev/null | grep -E 'cache hits|compile requests|Cache size' || echo "   (sccache not installed: pacman -S sccache, or rust-sccache on Void)"
 
 # Live smoke: payload, normal site, walled site, search.
 smoke: bin
@@ -253,6 +273,36 @@ smoke: bin
     echo
     target/fast/donsetch search "linux kernel" --json 2>/dev/null | head -c 120
     echo
+
+# The search bench on the shipped shape: live, cold, every shape from its own
+# fresh state (the fair measurement; `--one-ledger` measures the roster's rest
+# instead). Pass any `search-bench` flag: `just bench --set held --runs 3
+# --gap-min 60 --out bench/results/x.json`. `bench-smoke` is one row per shape
+# in ~3 minutes, for iteration; a release never quotes it.
+bench *args: bin-dist
+    target/dist-thin/donsetch search-bench --set all {{args}}
+
+bench-smoke *args: bin-dist
+    target/dist-thin/donsetch search-bench --set all --smoke {{args}}
+
+# Same fixed 100-query comparison against a local JSON endpoint.
+bench-against provider endpoint: bin-dist
+    python3 bench/headtohead.py --include donsetch {{provider}} --endpoint {{endpoint}} --out bench/results/local-{{provider}}.json
+
+# Retrain the ranker from saved bench artifacts: their candidate pools are
+# replayed through this build, dumped with their features, and trained on the
+# gold rows; scripts/train_rank.py writes src/search/rank_weights.rs only when
+# held-out MRR beats the fusion and no shape falls.
+#   just rank-train bench/results/5.3.0-*.json
+rank-train +artifacts: bin
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dump=target/rank-features.jsonl
+    rm -f "$dump"
+    for a in {{artifacts}}; do
+        target/fast/donsetch search-bench --set all --replay "$a" --features-out "$dump" >/dev/null
+    done
+    python3 scripts/train_rank.py --features "$dump"
 
 # 30-second fuzz burst on one target: just fuzz extract
 # Fuzzing is the one thing that can escape a job cap entirely (the
@@ -267,9 +317,9 @@ fuzz target:
 # Cargo.toml version has no tag yet). The pipeline then runs the suite on
 # Linux, Windows and macOS, builds and gates the five shipped binaries in
 # parallel with it, and only when every one is green creates the tag and the
-# GitHub release and publishes npm. A red run publishes nothing: fix forward
-# and push again, the same version is simply tried again. Nothing to wait on
-# here and no state to roll back; `just runs` shows how far it got, and a
+# GitHub release and dispatches npm as its own run. A red run publishes nothing:
+# fix forward and push again, the same version is simply tried again. Nothing to
+# wait on here and no state to roll back; `just runs` shows how far it got, and a
 # single failed job is re-run with `gh run rerun <id> --failed`.
 ship version:
     #!/usr/bin/env bash
@@ -297,7 +347,7 @@ ship version:
         git commit -q -m "chore(release): {{version}}"
     fi
     git push -q origin HEAD
-    echo "ship: v{{version}} pushed. CI tests, builds, tags, publishes and runs npm."
+    echo "ship: v{{version}} pushed. CI tests, builds, tags and publishes the release; npm follows."
     echo "      progress: just runs      watch live: gh run watch"
 
 # One status call: the pipeline's latest runs, the newest release and the npm

@@ -309,6 +309,9 @@ mod tests {
             sources: vec![],
             score,
             published: None,
+            families: 0,
+            from_page: false,
+            tier: 0,
         }
     }
 

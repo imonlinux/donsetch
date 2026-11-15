@@ -92,7 +92,7 @@
     },
     {
       "name": "web_search",
-      "description": "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. Weak or degraded results are incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
+      "description": "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. A sources census names who answered and what every other source said, so an incomplete set reads as incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -108,6 +108,10 @@
             "maxItems": 2,
             "description": "Optional array; maximum 2 alternate formulations for the same unmet requirement. Preserve entities and hard constraints; vary vocabulary, terminology, language or answer-bearing phrasing. Omit when no distinct retrieval angle exists."
           },
+          "lang": {
+            "type": "string",
+            "description": "Optional BCP-47 language tag (en, uk, ne, pt-BR). It selects the answer language; a region subtag is the only way to select a market. Omit for the English default on Latin-script queries; no language or country is inferred from the query's script. An explicit lang uses the local language-aware sources; configured providers are bypassed for that call."
+          },
           "max_results": {
             "type": "integer",
             "description": "Maximum ranked candidates to return (default 7, max 12). Increase only when the returned candidate set is insufficient."
@@ -115,6 +119,10 @@
           "deadline_ms": {
             "type": "integer",
             "description": "Hard time budget in ms (500-600000) for the whole call; per-backend timeouts stay below it. On expiry: an honest deadline error."
+          },
+          "read": {
+            "type": "integer",
+            "description": "Read the top N results (max 3, default 0) within the call's deadline: their snippets become the page's own passage for the query (`page:`), and a follow-up web_fetch of them is served warm. Use when snippets are not enough to choose."
           },
           "intent": {
             "type": "string",
@@ -126,7 +134,7 @@
               "news",
               "entity"
             ],
-            "description": "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN; paper: + Scholar, arXiv; news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join)."
+            "description": "auto (default) detects from the query. Keyless mode adds first-party sources: code: + GitHub, HN, StackExchange, MDN, crates.io/npm/PyPI for a package name; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news or a recent window ('this week'): + news wire, publisher feeds, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join)."
           }
         },
         "required": [

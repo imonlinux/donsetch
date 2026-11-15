@@ -138,25 +138,60 @@ section!(BypassSection {
 });
 
 section!(SearchSection {
+    /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
+    /// Deprecated no-op, kept so a config file that carries it still loads:
+    /// search has no cross-encoder (5.3.0 §8). Removed in 6.0.
     rerank_topup: bool = true,
+    /// Deprecated no-op: search runs no ONNX session and has no threads to set.
+    /// Removed in 6.0.
     rerank_threads: u32 = 0,
     brightdata_zone: String = String::new(),
-    /// B3: learned host quality from enrich/prefetch success density.
+    /// Deprecated no-op: ranking no longer applies host-quality priors.
+    /// Accepted for configuration compatibility; removed in 6.0.
     quality_prior: bool = true,
     /// B4: agent-outcome feedback (must_contain miss / content_ok=false).
     /// DEFAULT OFF until the 24h soak proves it. Never triggers
     /// extra fetches; only soft-demotes (class, host) for ranking.
     outcome_feedback: bool = false,
-    /// C4: cancel stragglers once ≥3 independent families agree
+    /// D5: the most lanes one search may ask. A lane past the budget is
+    /// reported `not-asked`, never silently dropped.
+    request_budget: usize = 6,
+    /// How much of the top family vote the lexical evidence may move a result
+    /// by, 0..=1. **0 ships**: a hand-set share was measured against the vote and
+    /// lost (`entity` −0.12, `paper` −0.12 hit@1 over 86 rows), because BM25
+    /// rewards a page for repeating the query and the vote carries what three
+    /// indexes already learned. The evidence reaches the ranking through the
+    /// trained model instead, whose weights are fitted on the bench and gated on
+    /// held-out rows; this window applies wherever the model does not rank.
+    tie_window: f64 = 0.0,
+    /// Rank with the compiled-in linear model (`search/rank_weights.rs`) on the
+    /// query shapes it was shipped for. Off ranks by the fusion alone: the switch that measures
+    /// one against the other on the same candidates (`search-bench --replay`).
+    learned_rank: bool = true,
+    /// C4: cancel stragglers once ≥2 distinct ranking families agree
     /// on a top-3 URL. Kill: DONSETCH_NO_SEARCH_EARLY.
     search_early: bool = true,
     /// C2: compile site:/filetype:/intitle: per-engine (strip from
     /// engines that ignore them). Kill: DONSETCH_NO_QUERY_COMPILE.
     query_compile: bool = true,
-    /// C5: extract byte-derived featured/instant/knowledge answers
-    /// from SERP HTML. Kill: DONSETCH_NO_SERP_INSTANT.
-    serp_instant: bool = true,
+    /// C5: extract byte-derived featured/instant/knowledge answers from SERP
+    /// HTML. Default OFF: the block is page content, and search's place is the
+    /// URL plus a short snippet — the fetch tool reads the page. A SERP's
+    /// "featured snippet" also arrives with the wrapper URL attached.
+    /// Kill: DONSETCH_NO_SERP_INSTANT.
+    serp_instant: bool = false,
+    /// Deprecated no-op, kept so an old config or environment still loads:
+    /// search carries no model, no ONNX and no cross-encoder (5.3.0 §8). The
+    /// ranking is BM25+ over the answer set, RM3 and a linear model with
+    /// compiled-in weights. Setting it warns once and changes nothing.
+    /// Removed in 6.0.
+    rerank: bool = false,
+    /// Fetch the top results to replace SERP snippets with the pages' own
+    /// title and description, and park the bodies for the next fetch.
+    /// OFF by default: it is one page fetch per result (five per search), which
+    /// is an agent's traffic to spend only when it asks. Default off since 5.2.
+    enrich: bool = false,
 });
 
 section!(BrowserSection {
@@ -1667,14 +1702,14 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "rerank_topup",
             FieldKind::Bool,
             "true",
-            "rerank top-up pass",
+            "deprecated no-op (search carries no model)",
         ),
         (
             "search",
             "rerank_threads",
             FieldKind::Int,
             "0 (auto)",
-            "rerank thread count; 0 = auto, max 64",
+            "deprecated no-op (search carries no model)",
         ),
         (
             "search",
@@ -1689,6 +1724,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Bool,
             "true",
             "learned host quality from enrich success; small rank nudge",
+        ),
+        (
+            "search",
+            "learned_rank",
+            FieldKind::Bool,
+            "true",
+            "rank code, how-to and shopping queries with the compiled-in linear model; false ranks every query by the family vote",
         ),
         (
             "search",
@@ -2132,9 +2174,6 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     if c.browser.probe_stale_secs < 60 || c.browser.probe_stale_secs > 604_800 {
         return err("browser.probe_stale_secs must be 60..=604800".into());
     }
-    if c.search.rerank_threads > 64 {
-        return err("search.rerank_threads must be 0 (auto) or 1..=64".into());
-    }
     if c.rules.crawl_denied_urls_per_rule > 200 {
         return err("rules.crawl_denied_urls_per_rule must be 0..=200".into());
     }
@@ -2451,6 +2490,17 @@ static CONFIG: OnceLock<Loaded> = OnceLock::new();
 
 fn install_loaded_inner(loaded: Loaded) -> Result<(), ConfigError> {
     validate(&loaded.config)?;
+    // One warning for the search.rerank* keys, which are accepted no-ops for one
+    // release: a user who set them must not silently believe a model is
+    // running, and a config file from 5.2 must still load.
+    if loaded.config.search.rerank
+        || loaded.config.search.rerank_threads != 0
+        || !loaded.config.search.rerank_topup
+    {
+        crate::diag!(
+            "donsetch: search.rerank* is deprecated and has no effect: search runs no model (BM25+, RM3 and a compiled linear ranker instead)"
+        );
+    }
     CONFIG
         .set(loaded)
         .map_err(|_| ConfigError::Env("config is already installed in this process".into()))
@@ -3484,20 +3534,16 @@ mod tests {
     }
 
     #[test]
-    fn serp_instant_defaults_on_and_honors_kill_switch() {
+    fn serp_instant_defaults_off_and_can_be_turned_on() {
         let guard = clean_env();
         set_env("DONSETCH_NO_CONFIG_FILE", "1");
         let loaded = load().expect("defaults");
         assert!(
-            loaded.config.search.serp_instant,
-            "search.serp_instant must default true"
-        );
-        set_env("DONSETCH_NO_SERP_INSTANT", "1");
-        let loaded = load().expect("kill switch");
-        assert!(
             !loaded.config.search.serp_instant,
-            "DONSETCH_NO_SERP_INSTANT must map to search.serp_instant=false"
+            "the instant block is page content: search returns the URL and a snippet"
         );
+        // Enabling it is a config-file decision ([search] serp_instant = true),
+        // not a default.
         assert_eq!(
             legacy_target_of("DONSETCH_NO_SERP_INSTANT"),
             ("search", "serp_instant")

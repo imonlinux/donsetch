@@ -1,7 +1,7 @@
 //! Intent detection : routes the query to the right
 //! engines + verticals, and feeds domain priors to rank.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Intent {
     Web,
     Code,
@@ -115,6 +115,47 @@ const TECH: &[&str] = &[
     "terminal",
     "vec",
 ];
+/// TECH words that are also everyday nouns: rust on iron, a python in a
+/// zoo, java the island, a node on a bus map. They open the tech gate only
+/// when nothing in the query names the everyday sense.
+const TECH_HOMONYMS: &[&str] = &[
+    "rust", "python", "java", "ruby", "swift", "kernel", "shell", "node", "terminal", "script",
+    "code", "package", "library", "function",
+];
+/// Words that pin a homonym to its everyday sense. A false hit here only
+/// drops the code verticals for a query that also names, say, a car; a
+/// real code query almost always carries an unambiguous TECH word or a
+/// strong code signal, which still open the gate.
+const EVERYDAY_CONTEXT: &[&str] = &[
+    "iron",
+    "steel",
+    "metal",
+    "car",
+    "truck",
+    "bike",
+    "bicycle",
+    "boat",
+    "paint",
+    "snake",
+    "snakes",
+    "zoo",
+    "pet",
+    "coffee",
+    "island",
+    "indonesia",
+    "bird",
+    "birds",
+    "taylor",
+    "popcorn",
+    "corn",
+    "nut",
+    "beach",
+    "airport",
+    "parcel",
+    "delivery",
+    "postal",
+    "gemstone",
+];
 const PAPER_SIGNALS: &[&str] = &[
     "paper", "arxiv", "doi", "journal", "citation", "preprint", "ablation",
 ];
@@ -127,6 +168,9 @@ const NEWS_SIGNALS: &[&str] = &[
     "election",
     "war",
     "stock",
+    "новости",
+    "ニュース",
+    "뉴스",
 ];
 const ENTITY_SIGNALS: &[&str] = &["what is", "who is", "who was", "define", "meaning of"];
 
@@ -174,10 +218,16 @@ fn has_phrase(toks: &[&str], signal: &str) -> bool {
 }
 
 pub fn detect(query: &str) -> Intent {
+    if super::query::QueryFacts::new(query).is_identifier() {
+        return Intent::Code;
+    }
     let q = query.to_lowercase();
     let toks = tokens(&q);
     let score = |signals: &[&str]| signals.iter().filter(|s| has_phrase(&toks, s)).count();
-    let tech = toks.iter().any(|w| TECH.contains(w));
+    let everyday = toks.iter().any(|w| EVERYDAY_CONTEXT.contains(w));
+    let tech = toks
+        .iter()
+        .any(|w| TECH.contains(w) && !(everyday && TECH_HOMONYMS.contains(w)));
     // Ambiguous utility words need tech context; strong
     // signals never do.
     // Asymmetric by design: a false Code label on
@@ -217,17 +267,20 @@ pub fn detect(query: &str) -> Intent {
 }
 
 /// Engines to fan out per intent. Order = trust prior.
-/// Bing family (bing/ddg/yahoo) + independent indexes
-/// (mojeek/brave/google) for consensus diversity.
+/// Supplier independence is measured from matching query results, not assigned
+/// from the number of named endpoints.
 /// DDG and Brave are PROXY_AVERSE : they prefer the direct
 /// lane because proxy IPs get CAPTCHA'd/429'd.
 pub fn engines_for(intent: Intent) -> &'static [&'static str] {
     match intent {
-        // 6 engines, 4 index families (bing, mojeek, brave, google).
+        // Native accepted contracts. Healthy plans still ask at most four;
+        // Yahoo's scoped documentation recall retains a slot beside Yandex.
+        // mojeek is not one of them: it answers our identity with an HTTP 200
+        // captcha page, so a slot spent on it is a slot not spent on an answer.
         Intent::Web | Intent::Code | Intent::News | Intent::Entity => {
-            &["bing", "ddg", "mojeek", "yahoo", "brave", "google"]
+            &["google-cse", "bing", "ddg", "yahoo", "brave", "yandex"]
         }
-        Intent::Paper => &["bing", "ddg", "mojeek", "google"],
+        Intent::Paper => &["google-cse", "bing", "ddg", "yandex"],
     }
 }
 
@@ -235,6 +288,10 @@ pub fn engines_for(intent: Intent) -> &'static [&'static str] {
 /// Returns a Vec: code verticals are now query-gated (C6), so the
 /// set is no longer a static slice.
 pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
+    let facts = super::query::QueryFacts::new(query);
+    if facts.is_identifier() || super::resolve::item(&facts).is_some() {
+        return Vec::new();
+    }
     match intent {
         // Official keyless APIs first: near-100% reliable,
         // zero egress budget spent on engines for code.
@@ -246,6 +303,18 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             let q = query.to_lowercase();
             let toks = tokens(&q);
             let mut v = Vec::new();
+            // A package registry answers "which package is this, and what does
+            // its own documentation say" better than any page about it, and the
+            // vertical cap is two: a package-named query asks the registry
+            // before the general code verticals, not after them.
+            if registry_words(&toks, CRATE_WORDS) {
+                v.push("crates");
+            }
+            // `node` is a Node.js query word, but `node_modules` is a path: the
+            // tokenizer cannot tell them apart once it splits on `_`.
+            if registry_words(&toks, NPM_WORDS) && !q.contains("node_modules") {
+                v.push("npm");
+            }
             if so_qaish(&q, &toks) {
                 v.push("stackexchange");
             }
@@ -259,13 +328,23 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             }
             v
         }
-        Intent::Paper => vec!["scholar", "arxiv"],
-        Intent::News => vec!["news", "hn"],
+        Intent::Paper => {
+            let lower = query.to_lowercase();
+            let toks = tokens(&lower);
+            let mut v = vec!["openalex", "arxiv"];
+            if biomedical(&toks) {
+                v.push("europepmc");
+            }
+            v
+        }
+        Intent::News => vec!["hn"],
         Intent::Entity => vec!["wikipedia"],
         // Wiki safety net only on CONCEPTUAL web queries :
         // firing it everywhere flooded merges and crowded
         // out real canonicals (bench round 2 regression).
-        Intent::Web if is_conceptual(query) => vec!["wikipedia"],
+        Intent::Web if is_conceptual(query) => {
+            vec!["wikipedia"]
+        }
         Intent::Web => vec![],
     }
 }
@@ -278,6 +357,71 @@ pub fn trim_verticals_for_stress(verticals: Vec<&'static str>, stress: f64) -> V
         return verticals;
     }
     verticals.into_iter().filter(|v| *v != "hn").collect()
+}
+
+const CRATE_WORDS: &[&str] = &["rust", "crate", "crates", "cargo"];
+const NPM_WORDS: &[&str] = &[
+    "npm",
+    "node",
+    "nodejs",
+    "javascript",
+    "typescript",
+    "js",
+    "yarn",
+    "pnpm",
+    "package",
+];
+
+/// A registry is asked only when the query names its ecosystem: "rust" for
+/// crates, "npm" or "node" for npm. The word "package" alone names no
+/// ecosystem, so a Python or Go package question spends no request.
+fn registry_words(toks: &[&str], words: &[&str]) -> bool {
+    toks.iter().any(|t| *t != "package" && words.contains(t))
+}
+
+/// Europe PMC holds the life-science literature; asking it about transformers
+/// would only spend a request. Fires on vocabulary that names that literature.
+fn biomedical(toks: &[&str]) -> bool {
+    const BIO: &[&str] = &[
+        "pubmed",
+        "clinical",
+        "trial",
+        "trials",
+        "patients",
+        "patient",
+        "disease",
+        "cancer",
+        "tumor",
+        "protein",
+        "proteins",
+        "gene",
+        "genes",
+        "genome",
+        "genomic",
+        "covid",
+        "sars",
+        "vaccine",
+        "mrna",
+        "crispr",
+        "therapy",
+        "cell",
+        "cells",
+        "drug",
+        "syndrome",
+        "randomized",
+        "randomised",
+        "biology",
+        "medical",
+        "medicine",
+        "neuron",
+        "neurons",
+        "virus",
+        "bacteria",
+        "antibody",
+        "diabetes",
+        "mice",
+    ];
+    toks.iter().any(|t| BIO.contains(t))
 }
 
 /// StackExchange: question language, error strings, or how-to +
@@ -364,123 +508,6 @@ fn hnish(q: &str, toks: &[&str]) -> bool {
     NEWSY.iter().any(|s| q.contains(s)) || toks.len() <= 3 && toks.iter().any(|t| TECH.contains(t))
 }
 
-/// Domain quality prior per intent: 0.0..1.0 bonus mass.
-/// Curated seed; the consensus signal usually dominates,
-/// this just breaks ties toward known-good sources.
-pub fn domain_prior(intent: Intent, host: &str, query: &str) -> f64 {
-    let h = host.strip_prefix("www.").unwrap_or(host);
-    let table: &[&str] = match intent {
-        Intent::Code => &[
-            "stackoverflow.com",
-            "github.com",
-            "docs.rs",
-            "developer.mozilla.org",
-            "learn.microsoft.com",
-            "doc.rust-lang.org",
-            "pkg.go.dev",
-            "pypi.org",
-            "crates.io",
-            "npmjs.com",
-            "readthedocs.io",
-            "superuser.com",
-            "serverfault.com",
-            "news.ycombinator.com",
-            "git-scm.com",
-        ],
-        Intent::Paper => &[
-            "arxiv.org",
-            "semanticscholar.org",
-            "scholar.google.com",
-            "nature.com",
-            "science.org",
-            "acm.org",
-            "ieee.org",
-            "openreview.net",
-            "pubmed.ncbi.nlm.nih.gov",
-            "doi.org",
-        ],
-        Intent::News => &[
-            "reuters.com",
-            "apnews.com",
-            "bbc.com",
-            "bbc.co.uk",
-            "nytimes.com",
-            "theguardian.com",
-            "arstechnica.com",
-            "techcrunch.com",
-            "news.ycombinator.com",
-            "bloomberg.com",
-            "wsj.com",
-        ],
-        Intent::Entity => &[
-            "wikipedia.org",
-            "britannica.com",
-            "wikidata.org",
-            "imdb.com",
-        ],
-        Intent::Web => &[
-            // Authoritative explainers : SEO-gamed titles
-            // win BM25 otherwise.
-            "cloudflare.com",
-            "developer.mozilla.org",
-            "wikipedia.org",
-            "learn.microsoft.com",
-            "aws.amazon.com",
-            "kubernetes.io",
-            "ietf.org",
-            "rfc-editor.org",
-        ],
-    };
-    let intent_prior: f64 = if table
-        .iter()
-        .any(|d| h == *d || h.ends_with(&format!(".{d}")))
-    {
-        1.0
-    } else {
-        0.0
-    };
-    intent_prior.max(utility_prior(query, h))
-}
-
-/// Cross-intent utility prior: DIY/how-to queries get
-/// their canonical cluster regardless of Web/Code label.
-/// Farms keyword-stuff titles (exact-match "How to Fix a
-/// Leaking Kitchen Faucet") to win BM25 + consensus :
-/// measured in bench/headtohead.py: engines returned
-/// thisoldhouse/wikihow but exact-match farms outranked
-/// them. This bonus is the only layer that knows humans
-/// trust these domains. Advisory: it can only LIFT a
-/// canonical result, never hide anything.
-const UTILITY_WORDS: &[&str] = &[
-    "how to", "fix", "repair", "install", "replace", "clean", "build", "make", "remove",
-];
-const DIY: &[&str] = &[
-    "ifixit.com",
-    "wikihow.com",
-    "thisoldhouse.com",
-    "familyhandyman.com",
-    "homedepot.com",
-    "lowes.com",
-    "thespruce.com",
-    "hgtv.com",
-    "instructables.com",
-];
-
-pub fn utility_prior(query: &str, host: &str) -> f64 {
-    let q = query.to_lowercase();
-    if !UTILITY_WORDS.iter().any(|w| q.contains(w)) {
-        return 0.0;
-    }
-    if DIY
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
-    {
-        1.0
-    } else {
-        0.0
-    }
-}
-
 /// A normalized recall variant of the query (strip
 /// question scaffolding). Goes only to top-trust engines.
 pub fn variant(query: &str) -> Option<String> {
@@ -524,6 +551,16 @@ mod tests {
             Intent::Web
         );
         assert_eq!(detect("how to repair drywall hole"), Intent::Web);
+        // A homonym in its everyday sense is not a tech token.
+        assert_eq!(detect("how to remove rust from cast iron"), Intent::Web);
+        assert_eq!(detect("how to fix rust on a car"), Intent::Web);
+        assert_eq!(
+            detect("how to install a python snake enclosure"),
+            Intent::Web
+        );
+        // An unambiguous tech word or code signal still opens the gate.
+        assert_eq!(detect("rust iron crate install"), Intent::Code);
+        assert_eq!(detect("python car simulation error"), Intent::Code);
         assert_eq!(detect("best budget mechanical keyboard 2026"), Intent::Web);
         // Real code queries MUST stay Code.
         assert_eq!(detect("rust vec vs hashmap performance"), Intent::Code);
@@ -569,6 +606,10 @@ mod tests {
         // The real signals still fire as whole words / phrases.
         assert_eq!(detect("breaking news ukraine war"), Intent::News);
         assert_eq!(detect("stock market crash today"), Intent::News);
+        for q in ["новости москвы", "東京 ニュース", "서울 뉴스"] {
+            assert_eq!(detect(q), Intent::News, "{q}");
+        }
+        assert_eq!(detect("новостройки москвы"), Intent::Web);
         assert_eq!(detect("arxiv paper on attention"), Intent::Paper);
         assert_eq!(detect("null pointer in c"), Intent::Code);
         assert_eq!(detect("what is a monad"), Intent::Entity);
@@ -576,6 +617,27 @@ mod tests {
         // substring across a word boundary ("show tools" is not
         // "how to").
         assert_ne!(detect("show tools for woodworking"), Intent::Code);
+    }
+
+    #[test]
+    fn registries_and_the_medical_index_fire_only_on_their_own_vocabulary() {
+        let v = |i, q| verticals_for(i, q);
+        assert!(v(Intent::Code, "rust tokio crate").contains(&"crates"));
+        assert_eq!(
+            v(Intent::Code, "rust reqwest http client").first(),
+            Some(&"crates"),
+            "a package-named code query asks its registry before MDN/GitHub"
+        );
+        assert!(!v(Intent::Code, "python requests package").contains(&"crates"));
+        assert!(!v(Intent::Code, "python requests package").contains(&"npm"));
+        assert!(v(Intent::Code, "npm express middleware").contains(&"npm"));
+        assert!(v(Intent::Code, "node fetch timeout").contains(&"npm"));
+        assert_eq!(
+            v(Intent::Paper, "attention is all you need"),
+            ["openalex", "arxiv"]
+        );
+        assert!(v(Intent::Paper, "crispr cas9 therapy trial").contains(&"europepmc"));
+        assert!(!v(Intent::Paper, "scaling laws language models").contains(&"europepmc"));
     }
 
     #[test]

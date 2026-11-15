@@ -5,6 +5,461 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **The document and engine connections pin their DNS answers.** A public name that
+  rebinds to loopback, a LAN address or cloud metadata is refused before the socket,
+  redirect hops included. The engine no longer trusts the page's own host at any
+  private address; the explicit private-egress opt-out is the only exception.
+- **Compromised CA chains are refused.** The eight eMudhra keys are checked against
+  the peer chain, so a trust store that still carries the cross-sign cannot deliver
+  content through them.
+- **The search lane ledger reserves a token before a request.** A concurrent burst
+  can no longer spend the same token twice and leave the next search with no engine.
+
+### Fixed
+
+- **The Bright Data unlocker applies the caller's views.** `must_contain`, `focus`,
+  `section`, `toc` and `offset` are no longer bypassed on an unlocked page.
+- **Auth words in titles are not sign-in gates.** “The Best Password Managers” and
+  “Processor register” are articles; only a bare sign-in call to action opens a gate.
+- **Sub-cent amounts keep their digits.** `$0.0116` no longer matches `$0.012`.
+- **Registry names no longer replace the fan-out.** `node path` still gets the Node
+  docs; the npm record is one source, not the whole answer.
+- **The Docker image copies the fetch crate and builds `ocr,http`** instead of the
+  deleted `rerank` feature.
+
+### Changed
+
+- **Search never infers a language or a market from a query's script.** `lang` is an explicit
+  optional tool parameter (BCP-47: `en`, `uk`, `ne`, `pt-BR`); a region is used only when the tag
+  carries one. Latin-script queries default to English as a language, not a country; non-Latin
+  queries send no language unless `lang` is set. The script-level native/foreign filter, the
+  Wikipedia-edition guess and the per-provider `setlang`/`cc`/`kl`/`vl` inference are removed.
+- **Fetch: the content lane mines and replays the app's own request (M3).** The wire tap records
+  the request; a first content run mines a request contract per host/identity/URL shape, and the
+  next encounter replays it as plain HTTP before any JS, with a structural check and a re-mine on
+  break.
+
+## [5.3.0] - 2026-11-12
+
+Search as the fetch layer's sibling: a query is classified before anything runs, results are
+admitted by veto rather than by a coverage test, and the ranking is fused per index family, with a
+learned order for code, how-to and shopping queries. No model, no download and no browser in the
+search path.
+
+Measured here against the shipped 5.2.1 build on the same 220-row corpus (109 held rows, runs an
+hour apart): **held hit@3 76.15% → 82.6%** on a clean run, 78.0% pooled over two runs (the first had
+two sources rested out), p50 1.74 s, first-call zero-rate 0.46%, junk@5 0%. A 20-query live set
+answered 20 of 20 (cold p50 1.81 s, warm 0.80 s), and on a head-to-head set the first-party page now
+outranks aggregators and vendor blogs for reference queries where 5.2.1 returned them —
+`postgres vacuum full vs analyze` gives postgresql.org three times out of three, `anthropic claude api
+pricing` gives Anthropic's own pages, `typescript satisfies operator` puts the handbook first.
+
+**Not measured:** the Exa fast and TinyFish comparisons, their blinded fact reviews, and the
+SearXNG/4get local comparison. There is no peer key and no local instance on the build machine, so
+this release claims no cloud number and no peer table.
+
+### Changed
+
+- **Results are admitted by veto, not by a coverage test.** A hit is refused only when no answer
+  can be it — a redirector, a search page, a negated term, a bare front door, an encyclopedia or
+  video for a one-identifier query — and everything else enters with a graded score. The old test
+  dropped a whole engine when half its top ten scored low: a long query returned nothing while
+  two engines had delivered thirty real results. The answer *set* is judged once (answered, thin
+  or junk), and junk never benches a source.
+- **A learned ranker orders code, how-to and shopping results.** A linear model over 22
+  features — the engines' vote, BM25+ per field, whether the site is the thing the query names,
+  agreement, rank, result kind, freshness, RM3 feedback, n-grams, coverage and more — trained
+  offline on the bench's `gold` rows. It ranks the query shapes where it beat the engines' vote in
+  training; on the frozen held-out Phase B run, the right page came first in
+  61.8% of final answers against 58.2%, with no shape lower. Every other query keeps the vote.
+  The weights are compiled in: no download, no runtime, microseconds per search.
+  `search.learned_rank = false` ranks every query by the vote.
+- **The top results carry more evidence.** The first three results keep up to 320 characters of
+  the sources' own text, the rest 180, sharing a 1,600-byte snippet envelope. Readable Unicode URL paths preserve
+  destinations and reserved escapes while reducing encoded URL overhead. Actual token use
+  is measured separately. Automatic keyless repair reads top-three stubs and a procedural result or
+  description promising instructions, with one independent publisher as a fallback. One procedural
+  page read can overlap the remaining index requests; only a retained final URL receives its
+  excerpt. All automatic reads use the remaining time inside a 2.2-second native-call
+  envelope, the three-page budget and the call’s physical-request allowance.
+  Page excerpts retain code line breaks, list actions and table column headers; source dates
+  stay attached to the evidence. Selection examines deeper page content before clipping the
+  reply, rather than stopping at the first 2,000 extracted bytes. Structured instructions can
+  replace keyword-heavy introductions while retaining the relevance floor and all query
+  constraints. Overlapping reads keep one source date.
+- **Search carries no model.** The `rerank` feature is gone: no cross-encoder, no 23 MB download
+  and no ONNX in the search path (`ort` stays for OCR alone). `search.rerank*` config keys are
+  accepted as deprecated no-ops for one release, and the envelope's `reranked` is always `false`.
+  The legacy `search.quality_prior` switch is also a deprecated no-op: historical host
+  quality no longer changes the evidence-ranked order.
+- **Operators are read once.** `intitle:`/`filetype:`/`site:` come from the query's operator parse
+  and never enter the text as terms — `intitle:"Attention Is All You Need" arxiv` returned nothing
+  because no page contains the word "intitle". A quoted span is one phrase, matched as a run of
+  words.
+
+### Added
+
+- **Stack Overflow answer text in one request.** A fixed native API filter returns question
+  records and nested answers together. Snippets quote an accepted answer when present, otherwise
+  a non-negative-scored answer; a question merely marked answered is not called accepted.
+  Successful JSON responses can publish backoff or quota exhaustion without losing their
+  current records. Code passes through the existing HTML extractor, and answer excerpts keep
+  their line breaks through merging. Canary requests honor the same origin waits.
+- **Wikipedia evidence from its own pages.** One structured request returns ranked
+  records, canonical article URLs and introductory text. API errors remain errors,
+  so a broken response is not presented as an empty search.
+- **Search confidence and cache age.** Answers carry high/medium/low retrieval confidence
+  from independent sources, agreement and query evidence. Merged answers are cached only at
+  high confidence; per-source caches retain judged answers with source-specific TTLs.
+- **A query that names its answer language is routed to it.** `React 中国語 ドキュメント` asks for
+  Chinese documentation even though the sentence is Japanese; a small script-bound language-name
+  signal (中国語/中文, 日本語, 한국어, русский, …) sets the locale ahead of the kana/hangul guess.
+  A Latin query that mentions a language as a topic keeps the Latin default.
+- **Reproducible comparisons and a release gate.** `bench/headtohead.py` compares equal
+  top-five evidence from DonSeTch, Exa fast, TinyFish and local JSON endpoints. Failed calls
+  stay in the denominator; `bench/release_gate.py` rejects missing or failing evidence. The
+  local-only gate enforces every local clause and records the peer clauses as not measured,
+  never as passed, when no keys or local peer exist.
+- **A name is answered by its documentation.** `itertools::izip`, `#[tokio::main]`,
+  `std::mem::take` and `serde_json::Value` ask the module index page of the crate that owns them
+  and read the item's own href — `izip` is a macro, `Value` a struct, `take` a function, and a
+  guessed URL is a 404 returned as an answer. One request, cached for a week.
+- **A package-named code query asks its own registry before the general code verticals.**
+  `rust reqwest http client` returns `docs.rs/reqwest` and its `Client` page instead of a
+  tutorial, because the registry vertical is scheduled ahead of MDN and GitHub rather than
+  behind them. The record carries the project's own documentation, homepage and source.
+- **`donsetch search --explain <query>`** prints why each result sits where it does: its score
+  and the features that moved it, each weight's share of the score, and whether those scores
+  reproduce the order the search returned (`--json` for the whole vector).
+- **A search bench that can fail.** `donsetch search-bench` runs a corpus over 14 shapes, half
+  held out, cold, against any build (`--bin`); each shape starts in its own process with
+  fresh answers and learning, while active source refusals survive (`--one-ledger` for one
+  process). `--replay` re-ranks saved
+  candidate pools offline and `--features-out` dumps them for `just rank-train`, which retrains
+  the ranker and writes the weights only when the held-out gate passes.
+
+### Fixed
+
+- A request for one result no longer reports an underfilled list when one result is returned.
+- Cold Google bootstrap and query costs are planned separately. Initial requests are reserved
+  per source, so optional retries cannot consume the pending hedge’s slot; unused reservations
+  return when a source finishes. Cached engine answers reserve no outgoing requests.
+- Rank-training validation learns feature scales from each training fold alone; validation
+  queries cannot influence that preprocessing. Repeated runs of one query cannot satisfy
+  the minimum training or validation corpus size.
+- GitHub routing classifies the original question before URL encoding. An inapplicable
+  first-party interface reserves no request slot. Overlapping page reads use only unreserved
+  search allowance.
+- Search counts and bounds actual HTTP exchanges, including redirects and default snippet
+  repair. Per-response totals include explicit evidence reads. Source waits keep
+  their full published duration, cover owned APIs, and survive cold benchmark groups.
+- Concurrent identical searches share the complete fresh answer, including page reads,
+  even when low confidence prevents caching. Cancelled calls release their shared state. Cached namespace results retain their owner and age; no-disk mode keeps search
+  learning in memory. Cached or differently scoped lists do not teach source independence.
+- Concurrent ledger saves preserve explicit refusal waits against late successes, refill
+  pacing balances before merging and discard expired origin records.
+- Evidence matching shares the query compiler’s operators and CJK handling; news detection
+  recognizes Russian, Japanese and Korean news markers. Chinese and Japanese sentence
+  endings split excerpts correctly, and words beyond the displayed cut cannot improve its score.
+  Benchmark help prints its usage.
+- PDF filters retain dotted numeric identifiers as unknown formats; canonical merging
+  preserves a matching format URL actually returned by a source, including extensionless arXiv PDFs.
+- URL deduplication preserves path case and non-default ports. Yahoo fallback containers
+  no longer duplicate results, and native Google results use the same zero-based ranks.
+- The Yahoo search fallback no longer treats the page's own navigation as results. A restyled
+  Yahoo page that yields fewer than three parsed records used to hand the generic shape reader
+  its menu (`Gift ideas`, `My portfolio`, `College football`); the reader rejects
+  `nav`/`footer`/`role=navigation|banner|contentinfo`/hidden/inert/aria-hidden subtrees, and six
+  bench rows carry the furniture as `must_not`.
+- Thin result lists and unmeasured source names do not cancel the reserved hedge for another
+  independent answer. Early agreement uses the same measured independence rule as confidence.
+- Preserve pending search requests between wait marks instead of starting duplicates;
+  share pacing between scoped queries and sibling endpoints, and honor 403/429 refusals.
+- Quoted phrases match whole words across punctuation and URL separators. Phrase exclusions
+  include the final word’s simple English plural without arbitrary prefix matches. Title
+  constraints use the same phrase boundaries, retaining literal code punctuation.
+- Enforce URL/title constraints before consensus, preserve quoted exclusions and word
+  boundaries, and keep web operators out of first-party API requests. Page repairs and
+  featured answers enforce the query constraints too.
+- Preserve code-identifier syntax in cache keys; age persisted egress cooldowns across
+  restarts; calculate the calendar year correctly outside January and February.
+- **An engine's answer is judged by the lane veto.** The encyclopedia/video and bare-front-door
+  vetoes were never called, so a dictionary page could answer `select!`.
+- **An operator query merges deeper** (40 candidates, not 12), so a title or type filter has
+  something to keep after it runs.
+
+## [5.2.1] - 2026-11-10
+
+Search that answers on the first call, an EC2 instance price list, and a scorecard that
+measures the identities that actually ship.
+
+### Added
+
+- **The EC2 on-demand instance list.** `aws.amazon.com/ec2/pricing/on-demand/` fills
+  every template it carries, but its instance grid is a separate app in an iframe that
+  builds its table at run time; a reader without scripts saw no instance price at all.
+  The grid's own price file is read and its rows are placed beside the widget: instance
+  name and On-Demand hourly rate for the app's default selection (Linux, US East (Ohio)),
+  with the publication date, 1,228 instances. Ask for a larger `max_chars` to read past
+  the default projection of a long page.
+- **`donsetch-core scorecard`.** Every browser identity's live wire — JA4, peetprint, the
+  Akamai HTTP/2 fingerprint and the user agent — is measured against
+  `core/scorecard-baseline.json`, so an identity that rots is caught instead of claimed;
+  `--record` rewrites the baseline deliberately. The weekly stealth workflow now runs it
+  and reads the persona's Chrome version for its drift alarm.
+- **Search results say how they stand.** The search envelope carries `filled`,
+  `underfilled`, `degraded` and `answered_sources`, with a `next_action` when the list is
+  empty, thin, or confirmed by a single source, so a caller does not have to read the
+  census to know whether to retry.
+
+### Fixed
+
+- **A search answers on the first call.** A lane whose own pace (a token bucket) is
+  waiting is now waited out and asked instead of being skipped as if it were walled, the
+  fan-out keeps three lanes even under stress, and a call with nothing yet gives the
+  lanes it cut one more ask inside its budget. Back-to-back searches no longer degrade to
+  two lanes and an empty answer.
+- **A source is judged by what it answered, not by where the caller runs.** Google, DDG
+  and Yahoo were asked without a locale when a query named none, so Bing answered this
+  egress's own market — a Nepali result page for an English query — and the items were
+  scored off-query against the source. The default market is now stated (en-US).
+- **Bing's wire answers when its layout page does not.** When the layout page wears a
+  challenge, Bing's own RSS interface is asked once before the lane is reported walled.
+- **A wall is named.** A 2xx that is not content reports what it is (`blocked:challenge`,
+  `blocked:login`, `blocked:paywall`) instead of `blocked:200`, and a source that keeps
+  answering with a captcha no longer holds a roster slot (mojeek, HTTP 200 captcha page).
+- **A deleted Stack Exchange question is not a wall.** The API's own `not_found` is
+  reported as a missing item rather than falling through to the page's Cloudflare wall.
+- **A reCAPTCHA is an interaction wall, not a login gate.** A page whose copy says "sign
+  in" and which carries a human-verification widget (federalregister.gov) no longer reads
+  as an auth gate.
+- **An inline script has a parent.** `document.currentScript.parentNode` is the element
+  the script tag hangs from, as a browser's is, so an inline integration (GTM) can place
+  its own element.
+
+## [5.2.0] - 2026-11-09
+
+Local search that checks every result against the question, answers package names
+from the registry that owns them and news from dated sources; AWS instance price
+tables in every language aws.amazon.com serves; and a Windows Chrome identity
+measured against Chrome on Windows.
+
+### Added
+
+- **Every result must answer the query it came from.** A candidate is judged
+  against the query that fetched it: the scope it asked for, its weighted terms
+  (with two-character runs for Chinese and Japanese text), the date window, and
+  whether the address is a real page. A source is judged by what its own results
+  earned. Every returned URL is the publisher's own: tracking parameters and
+  fragments are stripped, and a redirect wrapper (Google's `/url?q=`, DDG's
+  `uddg=`, Bing's `apiclick`, Yahoo's `/RU=`) is decoded to its target.
+- **A package name is answered by the registry that owns it.** A query that
+  names its ecosystem (`rust tokio`, `npm react`, `pip scikit-learn`,
+  `cargo serde_json`) asks that one registry and nothing else: one to three
+  requests, exact records. A bare name asks crates.io, npm and PyPI together and
+  is settled only when all three have answered; a rate limit or a timeout counts
+  as "unknown", never as "no". A record answers a bare name, or a language word
+  plus a name ("rust ownership"), only when the package is widely used (about
+  100k crate downloads, or 5k npm downloads a week); otherwise the query goes to
+  the ordinary search. The answer carries the project's documentation, homepage
+  and repository from the record itself.
+- **News is dated and inside the query's window.** A news query, or any query
+  with a window ("this week", "today", "since Monday"), reads three news lanes
+  beside the general search: Bing News, eleven publisher feeds read with
+  conditional requests (a warm cache costs nothing), and GDELT. Every item is
+  dated and falls inside the window. The Google News lane is gone: every link it
+  returned was a redirect.
+- **A query's script picks its market.** Japanese, Korean, Russian and other
+  scripts send their locale to every source that accepts one and to Wikipedia's
+  own edition, so a Korean query gets Korean results. Han characters alone are
+  not guessed into a market.
+- **A source that failed once does not fail ten times.** One standing per
+  source and lane, in a locked file every process shares: a request budget,
+  the source's own `Retry-After`, and a rest after a refusal (a captcha, a 403)
+  or after a second transient failure. A search spends at most six requests,
+  chosen so the answer is the last thing cut, and every lane it did not ask is
+  reported as not asked, never as a failure.
+- **Each source reports what happened in two words.** The search meta part's
+  `sources[]` gains `state` (answered, empty, off, failed, late, rested, not
+  asked) beside `status`, which stays the raw outcome it was in 5.1.2 (`ok`,
+  `403`, `captcha`, and now also `late`, `rested`, `not-asked`). The plain
+  footer counts resting and unasked sources instead of listing them.
+- **AWS instance price tables.** An aws.amazon.com pricing page's instance
+  tables (RDS, ElastiCache, DocumentDB, SageMaker, OpenSearch, MemoryDB, Neptune,
+  EC2's data transfer) are templates its own script fills with one row per
+  instance type. The fetch now fills them the same way: the records of the sets
+  the page names, joined on the instance type where the page joins them, sorted
+  in the page's order. Measured live: RDS MySQL 726 rows in about 2 s,
+  SageMaker 2,646 rows from 22 price files in 6.6 s.
+- **AWS pricing pages in every language aws.amazon.com serves.** A page in any
+  of its fourteen languages is written as that page writes it: `0,017 USD` on
+  the German page, `USD 0.016` on the Japanese one, with its labels translated
+  through the page's own dictionaries.
+
+### Changed
+
+- **The Windows Chrome identity is Chrome 156, measured on Windows.**
+  `chrome-win` printed Chrome 149. Google Chrome 156 on Windows, captured on its
+  first request, has exactly the identity's TLS fingerprint (JA4, peetprint),
+  HTTP/2 fingerprint and header order; only the user agent, the client-hint
+  brands and the `accept` list were older. `chrome-win` now sends that browser's
+  own strings, and measured again, every layer and every header value matches.
+  `chrome-android` is unchanged: Chromium 156 and 157 on Android send a TLS
+  extension that no available profile sends, so no current Android browser
+  matches that identity's wire, and it is not relabelled as one.
+- **"Nothing found" is an answer.** A search whose sources all answered with
+  nothing returns an empty success with the census, not `ok: false`.
+- **Search waits for stragglers 600 ms past the point where sources agree**, not
+  to the hard deadline. `--max-results` is held to 1–12. The instant-answer
+  block is off by default; when asked for, its link passes the same checks.
+- **Measured on all 109 bench rows, live:** hit@1 0.73, hit@3 0.94, hit@5 0.97,
+  MRR 0.833, p50 1.05 s, p95 1.91 s; median 3 requests per search (at most 6);
+  0 redirect links, 0 undated or out-of-window news items, and no
+  foreign-language result in the top three of the Japanese, Korean and Russian
+  rows. News is the weakest shape: the right story is in the top three every
+  time, first 45% of the time.
+
+### Fixed
+
+- **A pasted URL searches its own site.** A query that is a URL becomes a
+  search of that site for its path's words; emoji are dropped when words
+  remain; "rust" next to cast iron or "python" next to a snake is not a code
+  query.
+- **Snippets read as written.** Engines bold the query's words; joining the
+  bold runs with spaces printed "select ! macro" and "proxy _ pass".
+- **DuckDuckGo's bot check is a wall, not an empty answer.** It answers a
+  suspected bot with an HTTP 200 anomaly page, which read as "empty-parse", a
+  fault of the parser. It is now `captcha`, and the lane rests instead of being
+  asked again.
+- **A source's state follows its most informative attempt.** A source asked,
+  skipped and asked again could read "not asked" after it had answered.
+- **An accordion's sections keep their tables.** A list item holding a heading
+  and a table (the AWS pricing pages' sections) was flattened into one line of
+  text; it is now read as a section with its table.
+- **A wall no vendor names is not called a captcha.** A site that refuses every
+  client (Microsoft Teams' "unsupported browser" page) was reported as
+  "protected by Generic" with advice about captchas. The message now says the
+  site does not serve its content to this client.
+
+## [5.1.2] - 2026-11-09
+
+Local search that ranks by agreement and answers from first-party records, price
+tables on AWS pricing pages that are tables again, and a Chrome identity that
+prints the version it really is.
+
+### Added
+
+- **Papers and packages are asked at their own front door.** A query that reads as
+  a paper ("... paper", "arxiv ...") asks OpenAlex and arXiv, plus Europe PMC when
+  it is biomedical; one that reads as a library asks crates.io and npm. Each is
+  read through its published interface, so an answer is a record, not a scraped
+  page, and a result's title has to cover what was asked before it ranks. A
+  source's published rate limit (Stack Exchange's daily quota) rests it for the
+  time it states (`rate-limited:3600` in the census); that is not a fault and does
+  not change its trust. A bare paper title still goes through the general sources,
+  which rank it well.
+- **Results carry the sentence that answers.** Each result's snippet is the
+  best-covering window across every source's snippet, cut at a sentence and never
+  padded; `read: N` (at most 3) replaces it with the best-covering passage of the
+  page itself, fetched for the occasion. Lexical, no model. On the recorded gold
+  traces a snippet now covers 0.69 of the query's words (0.64 before) and ends at a
+  sentence 69% of the time (19% before), in 145 characters instead of 168.
+- **Source health you can read.** `donsetch search --sources` shows each source's
+  standing (verified, suspect, benched until when), trust, independence family and
+  last canary. `donsetch search --doctor` asks eight canary queries whose right
+  answer is a first-party record ("attention is all you need", "rust tokio crate",
+  and six more) and judges every source against them, so a source that decays is
+  benched within three calls and one that recovers returns without anyone
+  noticing. A source is convicted only by a live answer: a cached one proves
+  nothing and is never read as a failure.
+- **AWS pricing pages come out as price tables.** An `aws.amazon.com` pricing page
+  holds templates (`{priceOf!lambda/lambda!Lambda!Duration!Tier2}`), not prices;
+  its own script fills them from a public price file. The fetch now reads that
+  file the way the script does (same token grammar, exact decimal arithmetic, the
+  region the page shows by default) and puts the filled tables in the page.
+  Witnessed on Lambda, S3, SQS, EKS and DynamoDB: S3 Standard reads $0.023,
+  $0.022 and $0.021 per GB, SQS $0.40 per million requests, EKS $0.10 per cluster
+  hour, each as AWS publishes it. A row whose price is not published for the
+  region is dropped, as the page drops it. Tables of one row per instance type
+  (RDS, EC2 instances), other partitions and non-English locales are left as
+  served, and so is any table whose price file did not arrive in time.
+
+### Changed
+
+- **Ranking is by measured agreement, not by text match.** Results are fused by
+  reciprocal rank per *independent* family of sources (which sources return the
+  same pages is measured, not declared), and the merge is deterministic. The text
+  match, trust prior and authority multiplier that used to reorder the answer are
+  gone. On the 44-row gold set, live and paced: hit@1 0.68, hit@3 0.86,
+  hit@5 0.89, p50 0.99 s, p95 2.30 s (5.1.1 scored hit@1 0.25 and hit@3 0.47 on
+  the 40 rows the set had then; it grew to 44 while this was built, and it is the
+  set the ranking was tuned on). On 50 held-out rows it was not tuned on: hit@1 0.76, hit@3 0.90, hit@5 0.96. The weakest shape is
+  general web questions (hit@1 0.33 on six rows).
+- **The Linux Chrome identity sends Chrome 156, not 149.** Measured against
+  Chromium 156 on the same host, its TLS and HTTP/2 fingerprints, header order and
+  every header value except the headless token are identical to the real
+  browser's; only the version it printed was old, and it now sends the reference
+  browser's own. `chrome-win` and `chrome-android` still print their profile's 149:
+  no reference browser of those platforms was available to measure them against,
+  so they are not relabelled.
+
+- **Search answers in about a second, not five.** The fan-out runs under one
+  budget: a soft mark that ends the wait once independent sources already agree,
+  and a hard mark that always ends it. A source still running at the mark is
+  reported `late` and cancelled, never waited on. Measured against the previous
+  build on the same 40 queries: p50 3.4 s → 1.2 s, p95 9.0 s → 2.7 s, with the
+  answer page in the top three unchanged.
+- **The unbounded retry wave is gone.** A thin merge (fewer than three sources or
+  fifteen items) gets exactly one second ask, through a different lane, inside the
+  same budget. Recovery across calls is the learned state's job.
+- **Two per-search costs are opt-in.** Result enrichment fetched five pages on
+  every search; it is now `search.enrich`, off by default. The cross-encoder moved
+  no metric on two paired 40-query runs while costing 7–12 CPU-seconds per search,
+  so it is `search.rerank`, off by default.
+- **No source can inflate a snippet.** Feed descriptions arrive as whole articles;
+  the merge now bounds every snippet, because the cross-encoder's batch is padded
+  to its longest pair — one 10 KB description turned a 40 ms re-rank into 40
+  CPU-seconds.
+
+- **Search reports what answered, and refuses what did not.** Every source's
+  answer is classified before it can influence ranking: `content`, `thin`,
+  `off-query` (a 200 carrying a result list that never mentions the query — a
+  bot-page wearing a success shape), `empty`, or a request-level failure
+  (`403`, `timeout`). Only real answers earn rank mass or health credit.
+  Measured on this network: one general source answered 38 of 40 queries with
+  ten items, and 24 of those answers engaged no query term at all, which a
+  status-code health model read as 95% healthy.
+- **The `weak` flag is gone, and so is the `degraded: N/M` line.** One census
+  line replaces both: `sources: bing 10 · ddg 10 · brave 19 · mojeek — 403`.
+  The result's `[meta]` part carries `sources: [{id, items, status}]`; the `weak` and
+  `failed_engines` fields are removed.
+- **A source that stops answering stops holding a slot.** A source at the trust
+  floor benches for ten minutes, then is probed once; a failure re-benches it
+  and a success returns it to the roster. `google` and `mojeek` were failing on
+  every search here, spending a third of the fan-out on nothing.
+- **Result extraction falls back to the document's shape** when a source's known
+  selectors find fewer than three results, so a restyle costs results instead of
+  the source. bing's HTML answer also falls back to its RSS interface (the same
+  index, 5 KB, no parser) when the page answer does not credit the source.
+
+### Fixed
+
+- **Tabbed pages kept their tables.** A tab's whole content, tables and headings
+  included, sits in an `<li role="tabpanel">`; read as a list item it flattened
+  into one line of running text. A list of tab panels is now read as the sections
+  it is.
+- **A figure's labels no longer enter a PDF's outline.** A caption or a row of
+  labels set large and bold used to be promoted to a heading. A line now counts as
+  a heading only when its typeface or its size also introduces running text at
+  least twice in the document; a figure's labels introduce only more labels. The
+  price is stated: a real heading set in a face and size used nowhere else, after
+  the first page and followed by a table or a list, reads as a paragraph (no text
+  is lost). Checked on all eight PDFs of the corpus.
+
 ## [5.1.1] - 2026-11-08
 
 A release that takes minutes of waiting instead of hours, and an updater that no
