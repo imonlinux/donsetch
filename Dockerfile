@@ -75,6 +75,9 @@ COPY build.rs ./
 COPY src/ ./src/
 COPY crates/ ./crates/
 COPY tests/ ./tests/
+# src/search/bench.rs compiles the root bench module into the crate:
+# `#[path = "../../bench/live.rs"] pub mod live;` resolves to ./bench/live.rs.
+COPY bench/live.rs ./bench/live.rs
 
 # Pre-fetch PDFium before cargo build. build.rs vendors the library
 # under vendor/pdfium and skips its own download once lib/libpdfium.a

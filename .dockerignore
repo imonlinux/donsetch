@@ -15,8 +15,12 @@ target/
 # Fuzzing (development-only)
 fuzz/
 
-# Benchmarks (development-only)
+# Benchmarks (development-only), except bench/live.rs: the search bench
+# module is compiled into the crate itself (src/search/bench.rs declares
+# `#[path = "../../bench/live.rs"] pub mod live;`), so the release build
+# cannot read it from the context if it is stripped here.
 bench/
+!bench/live.rs
 
 # Scripts (development-only)
 scripts/
