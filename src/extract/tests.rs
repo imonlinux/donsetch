@@ -1130,6 +1130,205 @@ fn edge_div_soup() {
     assert!(r.markdown.contains("main content paragraph"));
 }
 
+/// Mintlify docs (code.claude.com/docs/en/hooks) write every paragraph as
+/// `<span data-as="p">`, a direct child of the content div beside its
+/// headings, lists and tables. Read as inline spans, all of them fused into
+/// one loose paragraph ahead of the first heading.
+const PARA_SPAN_PAGE: &str = r#"<html><body><main>
+<div id="content" class="mdx-content">
+<span data-as="p">Intro paragraph that explains what the hooks reference page covers in some detail.</span>
+<h2>Lifecycle</h2>
+<span data-as="p">Events fall into three cadences that the following list describes one by one.</span>
+<ul><li>per session events</li><li>per turn events</li></ul>
+<span data-as="p">First paragraph after the list, about how matchers select the events.</span>
+<span data-as="p">Second paragraph after the list, about how handlers receive their input.</span>
+<h2>Configuration</h2>
+<span data-as="p">Hooks are defined in JSON settings files with three levels of nesting.</span>
+</div>
+</main></body></html>"#;
+
+#[test]
+fn para_spans_keep_source_order() {
+    let md = extract_html(PARA_SPAN_PAGE).markdown;
+    let order = [
+        "Intro paragraph",
+        "## Lifecycle",
+        "Events fall into three cadences",
+        "per session events",
+        "First paragraph after the list",
+        "Second paragraph after the list",
+        "## Configuration",
+        "Hooks are defined in JSON",
+    ];
+    let pos: Vec<usize> = order
+        .iter()
+        .map(|s| {
+            md.find(s)
+                .unwrap_or_else(|| panic!("missing {s:?} in:\n{md}"))
+        })
+        .collect();
+    assert!(pos.windows(2).all(|w| w[0] < w[1]), "out of order:\n{md}");
+}
+
+#[test]
+fn para_spans_are_separate_paragraphs() {
+    let md = extract_html(PARA_SPAN_PAGE).markdown;
+    assert!(
+        md.contains("matchers select the events.\n\nSecond paragraph"),
+        "adjacent paragraph spans fused:\n{md}"
+    );
+}
+
+#[test]
+fn para_spans_inside_a_list_item_do_not_fuse() {
+    let html = r#"<html><body><main><div id="content">
+<span data-as="p">A list of steps follows, each with two paragraphs of explanation text.</span>
+<ul><li><span data-as="p">Step one ends here.</span><span data-as="p">Then step one continues.</span></li></ul>
+</div></main></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("ends here. Then"), "words fused:\n{md}");
+}
+
+#[test]
+fn plain_spans_stay_inline() {
+    // Negative: a span without data-as="p" (or with another value) is still
+    // phrasing content of its container's loose paragraph.
+    let html = r#"<html><body><main><div id="content">
+<span>Loose text in a plain span,</span> <span data-as="label">joined with a labelled span,</span> and bare text that closes the same paragraph.
+</div></main></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(
+        md.contains("plain span, joined with a labelled span, and bare text"),
+        "plain spans split:\n{md}"
+    );
+}
+
+#[test]
+fn empty_content_type_preserves_markdown_and_plain_text() {
+    let md_body = b"# Overview\n\nIntro with generic Vec<T> syntax.\n\n## Install\n\n- step one\n- step two\n\n```rust\nlet x: Option<usize> = Some(1);\n```\n";
+    let ex = extract(
+        md_body,
+        "",
+        "https://bucket.example/README.md",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(ex.via, Some("format:text"));
+    assert!(
+        ex.markdown.contains("# Overview\n\nIntro"),
+        "{}",
+        ex.markdown
+    );
+    assert!(
+        ex.markdown.contains("## Install\n\n- step one"),
+        "{}",
+        ex.markdown
+    );
+    assert!(
+        ex.markdown.contains("Vec<T>") && ex.markdown.contains("Option<usize>"),
+        "angle-bracket generics must survive:\n{}",
+        ex.markdown
+    );
+    let toc = view::render(
+        &ex.markdown,
+        &view::View {
+            toc: true,
+            max_chars: 16_000,
+            ..Default::default()
+        },
+        None,
+    );
+    assert_eq!(toc.status, "outline");
+    assert!(
+        toc.text.contains("Overview") && toc.text.contains("Install"),
+        "{}",
+        toc.text
+    );
+    let sec = view::render(
+        &ex.markdown,
+        &view::View {
+            section: Some("Install".into()),
+            max_chars: 16_000,
+            ..Default::default()
+        },
+        None,
+    );
+    assert!(
+        sec.text.contains("step one") && !sec.text.contains("Vec<T>"),
+        "{}",
+        sec.text
+    );
+
+    // Whitespace-only Content-Type behaves the same as empty.
+    let ex_ws = extract(
+        md_body,
+        "   ",
+        "https://bucket.example/README.md",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(ex_ws.via, Some("format:text"));
+
+    // Markdown opening with an HTML badge/comment still stays text, not HTML.
+    let badge_md = b"<!-- lint-disable -->\n# Guide\n\nBody paragraph.\n";
+    let ex_badge = extract(
+        badge_md,
+        "",
+        "https://bucket.example/guide.md",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(ex_badge.via, Some("format:text"));
+    assert!(ex_badge.markdown.contains("# Guide\n\nBody paragraph."));
+}
+
+#[test]
+fn empty_content_type_html_still_parses_as_html() {
+    let html = b"<!DOCTYPE html><html><head><title>Doc</title></head><body><main><h1>Hello World</h1><p>This is a real HTML page served without a Content-Type header, with enough prose for extraction.</p></main></body></html>";
+    let ex = extract(
+        html,
+        "",
+        "https://example.com/page",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_ne!(ex.via, Some("format:text"));
+    assert!(ex.markdown.contains("Hello World"), "{}", ex.markdown);
+    assert!(
+        ex.markdown
+            .contains("real HTML page served without a Content-Type header"),
+        "{}",
+        ex.markdown
+    );
+    assert!(
+        !ex.markdown.contains("<h1>"),
+        "raw HTML leaked:\n{}",
+        ex.markdown
+    );
+
+    // Leading HTML comment before <!DOCTYPE html> still sniffs as HTML.
+    let commented = b"<!-- cached -->\n<!DOCTYPE html><html><body><article><h1>Cached</h1><p>Content inside an HTML page with a leading comment and no Content-Type header.</p></article></body></html>";
+    let ex_comment = extract(
+        commented,
+        "",
+        "https://example.com/cached",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_ne!(ex_comment.via, Some("format:text"));
+    assert!(
+        !ex_comment.markdown.contains("<article>"),
+        "{}",
+        ex_comment.markdown
+    );
+
+    // Binary body with empty Content-Type is still rejected by is_binary.
+    assert!(crate::fetch::guards::is_binary(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+        ""
+    ));
+}
+
 #[test]
 fn edge_whitespace_only() {
     let html = "<html><body>   \n\n\n   </body></html>";

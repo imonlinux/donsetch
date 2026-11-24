@@ -22,10 +22,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlueprintKind {
+    #[default]
+    Collection,
+    EntityJson,
+    HtmlFragment,
+}
+
+pub struct ReplayPayload {
+    pub html: String,
+    pub title: String,
+    pub text_chars: usize,
+    pub items: usize,
+    pub sample: Vec<String>,
+    pub sample_urls: Vec<String>,
+}
+
 /// One mined request contract. The field paths are relative to an item object
 /// in the response array, never to values: values change, shapes do not.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MinedContract {
+    /// What kind of structured answer the mined endpoint returns.
+    #[serde(default)]
+    pub kind: BlueprintKind,
     /// The document host this was mined on.
     pub host: String,
     /// The identity whose wire made the request; a contract is bound to it.
@@ -103,24 +124,34 @@ impl MinedContract {
     /// in, or `None` when the URL does not match the contract's shape.
     pub fn materialize(&self, url: &str, document_url: &str) -> Option<RequestParts> {
         let values = self.fill(url)?;
-        let fill = |text: &str| -> String {
-            let mut out = text.replace("{{doc}}", document_url);
-            for (index, value) in values.iter().enumerate() {
-                out = out.replace(&format!("{{{{{index}}}}}"), value);
-            }
-            out
-        };
-        let request_url = fill(&self.url);
-        let headers = self
+        let request_url = fill_url(&self.url, document_url, &values);
+        let safe_doc: String = document_url
+            .chars()
+            .filter(|c| *c != '\r' && *c != '\n')
+            .collect();
+        let headers: Vec<(String, String)> = self
             .headers
             .iter()
-            .map(|(name, value)| (name.clone(), fill(value)))
+            .map(|(name, value)| {
+                let mut out = value.replace("{{doc}}", &safe_doc);
+                for (index, slot) in values.iter().enumerate() {
+                    let clean: String = slot.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                    out = out.replace(&format!("{{{{{index}}}}}"), &clean);
+                }
+                (name.clone(), out)
+            })
             .collect();
+        let is_form = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value
+                    .to_ascii_lowercase()
+                    .contains("application/x-www-form-urlencoded")
+        });
         let body = self.body.as_ref().map(|body| {
             if self.body_b64 {
                 crate::http::unbase64(body).unwrap_or_default()
             } else {
-                fill(body).into_bytes()
+                fill_body(body, document_url, &values, is_form).into_bytes()
             }
         });
         Some((request_url, headers, body))
@@ -172,6 +203,101 @@ impl MinedContract {
             }
         }
         (items.len() >= self.min_items).then_some(items)
+    }
+
+    /// Extract a full replay payload (`Collection`, `EntityJson`, or `HtmlFragment`)
+    /// from a replayed HTTP response body. Returns `None` on any structural break.
+    pub fn extract_payload(
+        &self,
+        body: &str,
+        request_url: &str,
+        document_url: &str,
+        host: &str,
+    ) -> Option<ReplayPayload> {
+        match self.kind {
+            BlueprintKind::Collection => {
+                let items = self.extract(body, request_url)?;
+                let text_chars: usize = items
+                    .iter()
+                    .map(|item| item.title.chars().count() + item.detail.chars().count())
+                    .sum();
+                let title = items
+                    .first()
+                    .map(|item| item.title.clone())
+                    .unwrap_or_else(|| format!("replay {host}"));
+                let sample = items
+                    .iter()
+                    .take(5)
+                    .map(|item| item.title.clone())
+                    .collect();
+                let sample_urls = items
+                    .iter()
+                    .filter_map(|item| item.url.clone())
+                    .take(5)
+                    .collect();
+                let html = render_html(host, &items);
+                Some(ReplayPayload {
+                    html,
+                    title,
+                    text_chars: text_chars.max(1),
+                    items: items.len(),
+                    sample,
+                    sample_urls,
+                })
+            }
+            BlueprintKind::EntityJson => {
+                let value: Value = serde_json::from_str(body).ok()?;
+                let obj = crate::synthesize::unwrap_entity_object(&value)?;
+                if !shares_shape(obj, &self.item_keys) {
+                    return None;
+                }
+                let (html, title, text_chars) =
+                    crate::synthesize::render_entity_replay_html(&value, document_url)?;
+                Some(ReplayPayload {
+                    html,
+                    sample: vec![title.clone()],
+                    sample_urls: Vec::new(),
+                    title,
+                    text_chars,
+                    items: 1,
+                })
+            }
+            BlueprintKind::HtmlFragment => {
+                let trimmed = body.trim();
+                if !trimmed.starts_with('<') {
+                    return None;
+                }
+                let stripped = crate::contract::strip_noise(trimmed);
+                let parsed = scraper::Html::parse_fragment(&stripped);
+                let plain_text = crate::contract::normalize(
+                    &parsed.root_element().text().collect::<Vec<_>>().join(" "),
+                );
+                let text_chars = plain_text.chars().count();
+                if text_chars < 120 {
+                    return None;
+                }
+                let heading_sel = scraper::Selector::parse("h1, h2, title").ok();
+                let title = heading_sel
+                    .as_ref()
+                    .and_then(|sel| parsed.select(sel).next())
+                    .map(|el| crate::contract::normalize(&el.text().collect::<Vec<_>>().join(" ")))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("replay {host}"));
+                let html = format!(
+                    "<!DOCTYPE html><html><head><title>{}</title></head><body><main>{}</main></body></html>",
+                    escape_html_text(&title),
+                    trimmed
+                );
+                Some(ReplayPayload {
+                    html,
+                    sample: vec![title.clone()],
+                    sample_urls: Vec::new(),
+                    title,
+                    text_chars,
+                    items: 1,
+                })
+            }
+        }
     }
 
     /// The array the contract names, or one elsewhere in the JSON that still
@@ -261,10 +387,87 @@ impl UrlParts {
 }
 
 fn percent_decode(text: &str) -> String {
-    url::form_urlencoded::parse(format!("v={text}").as_bytes())
-        .next()
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_else(|| text.to_string())
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2])) {
+                out.push((hi << 4) | lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_decode(text: &str) -> String {
+    percent_decode(&text.replace('+', " "))
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn encode_uri_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn escape_json_str(text: &str) -> String {
+    match serde_json::to_string(text) {
+        Ok(quoted) if quoted.len() >= 2 => quoted[1..quoted.len() - 1].to_string(),
+        _ => text.to_string(),
+    }
+}
+
+fn fill_url(template_url: &str, document_url: &str, values: &[String]) -> String {
+    let mut out = if let Some(rest) = template_url.strip_prefix("{{doc}}") {
+        format!("{document_url}{rest}")
+    } else {
+        template_url.to_string()
+    };
+    if out.contains("{{doc}}") {
+        out = out.replace("{{doc}}", &encode_uri_component(document_url));
+    }
+    for (index, value) in values.iter().enumerate() {
+        out = out.replace(&format!("{{{{{index}}}}}"), &encode_uri_component(value));
+    }
+    out
+}
+
+fn fill_body(template_body: &str, document_url: &str, values: &[String], is_form: bool) -> String {
+    let trimmed = template_body.trim_start();
+    let is_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let encode = |raw: &str| -> String {
+        if is_json {
+            escape_json_str(raw)
+        } else if is_form {
+            encode_uri_component(raw)
+        } else {
+            raw.to_string()
+        }
+    };
+    let mut out = template_body.replace("{{doc}}", &encode(document_url));
+    for (index, value) in values.iter().enumerate() {
+        out = out.replace(&format!("{{{{{index}}}}}"), &encode(value));
+    }
+    out
 }
 
 /// The document's shape, with the components that appear in the app's request
@@ -285,27 +488,22 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
         .as_ref()
         .and_then(|body| crate::http::unbase64(body))
         .unwrap_or_default();
-    let body_text = String::from_utf8(request_body.clone()).ok();
-    let header_text: String = entry
-        .request_headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\n"))
-        .collect();
+    let body_text = String::from_utf8(request_body).ok();
 
-    // Which document components are variable? A query value is the caller's
-    // question; a path segment has to look like an identifier (a digit, a
-    // separator or a long token) so a word like `about` stays a literal.
+    // Which document components actually parameterize the app's request? Only
+    // components whose substitution changes the request URL, kept headers, or
+    // UTF-8 body become `*` wildcards in `shape`; otherwise static endpoints on
+    // parameterized pages (e.g. `GET /api/featured` on `/products/12345`) would
+    // wildcard `12345` with zero `{{n}}` slots and poison `/products/99999`.
     let mut values: Vec<String> = Vec::new();
     let mut path_shape: Vec<String> = Vec::new();
-    for segment in &doc.path {
-        let seen = appears(
-            entry,
-            &request_body,
-            body_text.as_deref(),
-            &header_text,
-            segment,
-        );
-        if seen && distinctive(segment) {
+    for (index, segment) in doc.path.iter().enumerate() {
+        let candidate = if index == 0 {
+            parameter_segment(segment) && distinctive(segment)
+        } else {
+            distinctive(segment) || parameter_segment(segment)
+        };
+        if candidate && component_substitutes(entry, document_url, body_text.as_deref(), segment) {
             path_shape.push("*".into());
             if !values.contains(segment) {
                 values.push(segment.clone());
@@ -316,14 +514,9 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
     }
     let mut query_shape: Vec<(String, String)> = Vec::new();
     for (key, value) in &doc.query {
-        let seen = appears(
-            entry,
-            &request_body,
-            body_text.as_deref(),
-            &header_text,
-            value,
-        );
-        if seen && value.chars().count() >= 2 {
+        if value.chars().count() >= 2
+            && component_substitutes(entry, document_url, body_text.as_deref(), value)
+        {
             query_shape.push((key.clone(), "*".into()));
             if !values.contains(value) {
                 values.push(value.clone());
@@ -357,9 +550,20 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
             continue;
         }
         let mut value = value.replace(document_url, "{{doc}}");
-        for (index, component) in values.iter().enumerate() {
-            if component.chars().count() >= 3 {
-                value = value.replace(component, &format!("{{{{{index}}}}}"));
+        if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "origin"
+                | "referer"
+                | "accept"
+                | "content-type"
+                | "sec-fetch-site"
+                | "sec-fetch-mode"
+                | "sec-fetch-dest"
+        ) {
+            for (index, component) in values.iter().enumerate() {
+                if component.chars().count() >= 3 {
+                    value = value.replace(component, &format!("{{{{{index}}}}}"));
+                }
             }
         }
         if let Some(existing) = headers
@@ -376,7 +580,12 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
             text = text.replace(document_url, "{{doc}}");
             for (index, component) in values.iter().enumerate() {
                 if component.chars().count() >= 3 {
-                    text = text.replace(component, &format!("{{{{{index}}}}}"));
+                    let slot = format!("{{{{{index}}}}}");
+                    text = text.replace(component, &slot);
+                    let escaped = escape_json_str(component);
+                    if escaped != *component {
+                        text = text.replace(&escaped, &slot);
+                    }
                 }
             }
             (Some(text), false)
@@ -395,27 +604,48 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
     })
 }
 
-fn appears(
+fn component_substitutes(
     entry: &TranscriptEntry,
-    request_body: &[u8],
+    document_url: &str,
     body_text: Option<&str>,
-    header_text: &str,
     value: &str,
 ) -> bool {
     if value.chars().count() < 2 {
         return false;
     }
-    if entry.url.contains(value) {
+    let base_url = entry.url.replace(document_url, "{{doc}}");
+    if replace_component(&base_url, value, "\x00SLOT\x00") != base_url {
         return true;
     }
-    if header_text.contains(value) {
-        return true;
+    if value.chars().count() >= 3 {
+        if entry.request_headers.iter().any(|(name, header_val)| {
+            keep_header(name)
+                && !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "origin"
+                        | "referer"
+                        | "accept"
+                        | "content-type"
+                        | "sec-fetch-site"
+                        | "sec-fetch-mode"
+                        | "sec-fetch-dest"
+                )
+                && header_val.replace(document_url, "{{doc}}").contains(value)
+        }) {
+            return true;
+        }
+        if let Some(text) = body_text {
+            let scrubbed = text.replace(document_url, "{{doc}}");
+            if scrubbed.contains(value) {
+                return true;
+            }
+            let escaped = escape_json_str(value);
+            if escaped != value && scrubbed.contains(&escaped) {
+                return true;
+            }
+        }
     }
-    body_text.is_some_and(|text| text.contains(value)) || {
-        // A binary body is not searched; it cannot carry a document component
-        // in a form this contract can fill.
-        request_body.is_empty()
-    }
+    false
 }
 
 fn distinctive(value: &str) -> bool {
@@ -425,8 +655,63 @@ fn distinctive(value: &str) -> bool {
         || value.chars().any(|c| !c.is_alphanumeric())
 }
 
-/// Replace a whole path segment or query value, not a substring of a longer
-/// one; the rest of the URL is left exactly as the app sent it.
+fn parameter_segment(value: &str) -> bool {
+    if value.chars().count() < 2 {
+        return false;
+    }
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "docs"
+            | "latest"
+            | "overview"
+            | "api"
+            | "examples"
+            | "styling"
+            | "helm"
+            | "npm"
+            | "search"
+            | "items"
+            | "reviews"
+            | "settings"
+            | "packages"
+            | "package"
+            | "providers"
+            | "components"
+            | "profile"
+            | "users"
+    )
+}
+
+fn replace_affix_token(segment: &str, value: &str, placeholder: &str) -> Option<String> {
+    if value.chars().count() < 3 {
+        return None;
+    }
+    let decoded = percent_decode(segment);
+    let mut start = 0usize;
+    while let Some(rel) = decoded[start..].find(value) {
+        let idx = start + rel;
+        let end = idx + value.len();
+        let prev_delim = idx == 0
+            || matches!(
+                decoded.as_bytes()[idx - 1],
+                b'-' | b'_' | b'.' | b':' | b'@'
+            );
+        let next_delim = end == decoded.len()
+            || matches!(decoded.as_bytes()[end], b'-' | b'_' | b'.' | b':' | b'@');
+        if prev_delim && next_delim && (idx > 0 || end < decoded.len()) {
+            let mut out = String::with_capacity(decoded.len() + placeholder.len());
+            out.push_str(&decoded[..idx]);
+            out.push_str(placeholder);
+            out.push_str(&decoded[end..]);
+            return Some(out);
+        }
+        start = idx + value.chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// Replace a whole path segment, query value, or token-bounded segment affix
+/// (such as `material-button.html` -> `material-{{0}}.html`).
 fn replace_component(url: &str, value: &str, placeholder: &str) -> String {
     let Some((head, rest)) = url.split_once("://") else {
         return url.to_string();
@@ -449,6 +734,8 @@ fn replace_component(url: &str, value: &str, placeholder: &str) -> String {
         .map(|segment| {
             if percent_decode(segment) == value {
                 placeholder.to_string()
+            } else if let Some(affixed) = replace_affix_token(segment, value, placeholder) {
+                affixed
             } else {
                 segment.to_string()
             }
@@ -462,7 +749,7 @@ fn replace_component(url: &str, value: &str, placeholder: &str) -> String {
             &query
                 .split('&')
                 .map(|pair| match pair.split_once('=') {
-                    Some((key, raw)) if percent_decode(raw) == value => {
+                    Some((key, raw)) if query_decode(raw) == value => {
                         format!("{key}={placeholder}")
                     }
                     _ => pair.to_string(),
@@ -605,6 +892,7 @@ pub fn mine(
     let text = lower_text;
 
     let mut best: Option<(usize, usize, MinedContract)> = None;
+    let mut best_singular: Option<(usize, MinedContract)> = None;
     for entry in transcript {
         if !(200..300).contains(&entry.status) {
             continue;
@@ -612,6 +900,13 @@ pub fn mine(
         let Some(body) = entry.body.as_deref() else {
             continue;
         };
+        if let Some((score, singular)) =
+            mine_entity_or_fragment(document_url, identity, entry, body, &text)
+        {
+            if best_singular.as_ref().is_none_or(|(prev, _)| score > *prev) {
+                best_singular = Some((score, singular));
+            }
+        }
         let Ok(value) = serde_json::from_str::<Value>(body) else {
             continue;
         };
@@ -634,16 +929,6 @@ pub fn mine(
             if matched == 0 {
                 continue;
             }
-            let score = (matched, elements.len());
-            let better = best
-                .as_ref()
-                .map(|(best_matched, best_len, _)| {
-                    score.0 > *best_matched || (score.0 == *best_matched && score.1 > *best_len)
-                })
-                .unwrap_or(true);
-            if !better {
-                continue;
-            }
             let Some(contract) = contract_from(
                 document_url,
                 identity,
@@ -655,10 +940,180 @@ pub fn mine(
             ) else {
                 continue;
             };
-            best = Some((score.0, score.1, contract));
+            let is_param = contract.shape.contains('*');
+            let score = (usize::from(is_param), matched, elements.len());
+            let better = best
+                .as_ref()
+                .map(|(best_matched, best_len, best_contract)| {
+                    let prev = (
+                        usize::from(best_contract.shape.contains('*')),
+                        *best_matched,
+                        *best_len,
+                    );
+                    score > prev
+                })
+                .unwrap_or(true);
+            if better {
+                best = Some((matched, elements.len(), contract));
+            }
         }
     }
-    best.map(|(_, _, contract)| contract)
+    match (best, best_singular) {
+        (Some((matched, _, collection)), Some((singular_score, singular))) => {
+            let singular_param = singular.shape.contains('*');
+            let collection_param = collection.shape.contains('*');
+            let sub_array_on_entity = singular_param
+                && !collection.array_path.is_empty()
+                && !matches!(
+                    collection
+                        .array_path
+                        .last()
+                        .map(|s| s.to_ascii_lowercase())
+                        .as_deref(),
+                    Some(
+                        "items"
+                            | "results"
+                            | "hits"
+                            | "nodes"
+                            | "edges"
+                            | "records"
+                            | "entries"
+                            | "feed"
+                            | "posts"
+                            | "statuses"
+                            | "jobs"
+                            | "packages"
+                            | "articles"
+                            | "threads"
+                    )
+                );
+            if singular_param
+                && (!collection_param
+                    || matched <= 2
+                    || singular_score >= 1_200
+                    || sub_array_on_entity)
+            {
+                Some(singular)
+            } else {
+                Some(collection)
+            }
+        }
+        (Some((_, _, collection)), None) => Some(collection),
+        (None, Some((_, singular))) => Some(singular),
+        (None, None) => None,
+    }
+}
+
+fn mine_entity_or_fragment(
+    document_url: &str,
+    identity: &str,
+    entry: &TranscriptEntry,
+    body: &str,
+    lower_doc_text: &str,
+) -> Option<(usize, MinedContract)> {
+    let templated = template(document_url, entry)?;
+    if !templated.shape.contains('*') {
+        return None;
+    }
+    let host = url::Url::parse(document_url).ok()?.host_str()?.to_string();
+    let trimmed = body.trim();
+    let now = crate::state::now_unix();
+
+    // Case 1: Parameterized HTML fragment endpoint (e.g. Angular Material docs).
+    if trimmed.starts_with('<') && !trimmed.to_ascii_lowercase().starts_with("<!doctype") {
+        let stripped = crate::contract::strip_noise(trimmed);
+        let parsed = scraper::Html::parse_fragment(&stripped);
+        let frag_text =
+            crate::contract::normalize(&parsed.root_element().text().collect::<Vec<_>>().join(" "));
+        let chars = frag_text.chars().count();
+        if chars >= 180 {
+            let probe: String = frag_text.to_lowercase().chars().take(48).collect();
+            if probe.len() >= 20 && lower_doc_text.contains(probe.trim()) {
+                return Some((
+                    chars.min(6_000) + 1_500,
+                    MinedContract {
+                        kind: BlueprintKind::HtmlFragment,
+                        host,
+                        identity: identity.to_string(),
+                        shape: templated.shape,
+                        method: entry.method.clone(),
+                        url: templated.url,
+                        headers: templated.headers,
+                        body: templated.body,
+                        body_b64: templated.body_b64,
+                        min_items: 1,
+                        mined_unix: now,
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
+
+    // Case 2: Parameterized single-entity JSON endpoint (e.g. Bundlephobia, ArtifactHub).
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return None;
+    };
+    let obj = crate::synthesize::unwrap_entity_object(&value)?;
+    let scalar_count = obj
+        .values()
+        .filter(|v| v.is_string() || v.is_number() || v.is_boolean())
+        .count();
+    if scalar_count < 3 {
+        return None;
+    }
+    let (_html, title, text_chars) =
+        crate::synthesize::render_entity_replay_html(&value, document_url)?;
+    let has_rich_prose = [
+        "readme",
+        "content",
+        "markdown",
+        "descriptionHtml",
+        "overview",
+    ]
+    .iter()
+    .any(|k| {
+        obj.get(*k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.len() >= 200)
+    });
+    let has_metrics = (obj.contains_key("size") && obj.contains_key("gzip"))
+        || (obj.contains_key("version") && obj.contains_key("description"))
+        || (obj.contains_key("description") && scalar_count >= 4 && text_chars >= 120);
+    if !has_rich_prose && !has_metrics {
+        return None;
+    }
+    let matched_doc = (!title.is_empty()
+        && title.chars().count() >= 2
+        && lower_doc_text.contains(&title.to_lowercase()))
+        || obj.values().filter_map(Value::as_str).any(|s| {
+            let s = s.trim();
+            s.chars().count() >= 8 && lower_doc_text.contains(&s.to_lowercase())
+        });
+    if !matched_doc {
+        return None;
+    }
+    let item_keys: Vec<String> = obj.keys().take(32).cloned().collect();
+    let score = text_chars.min(8_000) + usize::from(has_rich_prose) * 1_500 + scalar_count * 80;
+    Some((
+        score,
+        MinedContract {
+            kind: BlueprintKind::EntityJson,
+            host,
+            identity: identity.to_string(),
+            shape: templated.shape,
+            method: entry.method.clone(),
+            url: templated.url,
+            headers: templated.headers,
+            body: templated.body,
+            body_b64: templated.body_b64,
+            item_keys,
+            min_items: 1,
+            sample: vec![title],
+            mined_unix: now,
+            ..Default::default()
+        },
+    ))
 }
 
 fn contract_from(
@@ -862,6 +1317,7 @@ fn contract_from(
         .collect();
     let now = crate::state::now_unix();
     Some(MinedContract {
+        kind: BlueprintKind::Collection,
         host,
         identity: identity.to_string(),
         shape: templated.shape,
@@ -944,8 +1400,49 @@ fn string_at(value: &Value, path: &[String]) -> Option<String> {
 
 /// The records as the caller reads them: the same markdown the hand-written
 /// data paths render, under the contract's own name.
+#[allow(dead_code)]
 pub fn render(host: &str, items: &[Item]) -> String {
     crate::datapath::render_items(&format!("replay {host}"), items)
+}
+
+/// Render replayed items as semantic HTML with `<a href="...">` links so
+/// downstream readability and crawl link discovery work seamlessly.
+pub fn render_html(host: &str, items: &[Item]) -> String {
+    let heading = format!("replay {host}");
+    let mut out = format!(
+        "<!DOCTYPE html><html><head><title>{}</title></head><body><main><h1>{}</h1><ul>",
+        escape_html_text(&heading),
+        escape_html_text(&heading)
+    );
+    for item in items {
+        out.push_str("<li><article><h2>");
+        if let Some(url) = &item.url {
+            out.push_str(&format!(
+                "<a href=\"{}\">{}</a>",
+                escape_html_attr(url),
+                escape_html_text(&item.title)
+            ));
+        } else {
+            out.push_str(&escape_html_text(&item.title));
+        }
+        out.push_str("</h2>");
+        if !item.detail.is_empty() {
+            out.push_str(&format!("<p>{}</p>", escape_html_text(&item.detail)));
+        }
+        out.push_str("</article></li>");
+    }
+    out.push_str("</ul></main></body></html>");
+    out
+}
+
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_html_attr(s: &str) -> String {
+    escape_html_text(s).replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -1051,5 +1548,138 @@ mod tests {
             contract.fill("https://bsky.app/profile/alice/replies"),
             None
         );
+    }
+
+    #[test]
+    fn get_request_without_component_keeps_literal_shape_instead_of_wildcarding() {
+        let body = r#"{"items":[{"title":"Featured item shown on every page","url":"https://shop.example/f1"},{"title":"Second featured item on every page","url":"https://shop.example/f2"}]}"#;
+        let document = r#"<html><body><a href="https://shop.example/f1">Featured item shown on every page</a><a href="https://shop.example/f2">Second featured item on every page</a></body></html>"#;
+        let transcript = vec![entry(
+            "GET",
+            "https://shop.example/api/featured.json",
+            body,
+            None,
+        )];
+        let contract = mine(
+            document,
+            "https://shop.example/products/12345?tab=reviews",
+            "chrome",
+            &transcript,
+        )
+        .expect("mined");
+        assert_eq!(
+            contract.shape, "/products/12345?tab=reviews",
+            "unrelated GET must not wildcard path or query components"
+        );
+        assert!(
+            contract
+                .fill("https://shop.example/products/99999?tab=specs")
+                .is_none(),
+            "distinct product URL must not match a static endpoint contract"
+        );
+    }
+
+    #[test]
+    fn path_plus_and_ampersand_round_trip_and_materialize_escapes_url_and_json() {
+        let body = r#"{"hits":[{"title":"C++ R&D reference guide","url":"https://example.com/cpp"},{"title":"Async Rust systems guide","url":"https://example.com/rust"}]}"#;
+        let document = r#"<html><body><a href="https://example.com/cpp">C++ R&D reference guide</a><a href="https://example.com/rust">Async Rust systems guide</a></body></html>"#;
+        let transcript = vec![entry(
+            "POST",
+            "https://api.example.com/lang/c++/r%26d?q=rust%20async",
+            body,
+            Some(r#"{"topic":"c++","sub":"r&d","query":"rust async"}"#),
+        )];
+        let contract = mine(
+            document,
+            "https://site.example/lang/c++/r%26d?q=rust+async",
+            "chrome",
+            &transcript,
+        )
+        .expect("mined");
+        assert_eq!(contract.shape, "/lang/*/*?q=*");
+        let (req_url, _headers, req_body) = contract
+            .materialize(
+                "https://site.example/lang/f%23/a%2Fb?q=hello+world%26admin%3D1%23frag",
+                "https://site.example/lang/f%23/a%2Fb?q=hello+world%26admin%3D1%23frag",
+            )
+            .expect("materialized");
+        assert_eq!(
+            req_url,
+            "https://api.example.com/lang/f%23/a%2Fb?q=hello%20world%26admin%3D1%23frag"
+        );
+        let parsed: Value =
+            serde_json::from_slice(&req_body.expect("json body")).expect("valid json");
+        assert_eq!(parsed["topic"], "f#");
+        assert_eq!(parsed["sub"], "a/b");
+        assert_eq!(parsed["query"], "hello world&admin=1#frag");
+
+        // Quotes and newlines in filled values keep JSON body valid.
+        let (_, _, quoted_body) = contract
+            .materialize(
+                "https://site.example/lang/c++/r%26d?q=say+%22hi%22%0Anow",
+                "https://site.example/lang/c++/r%26d?q=say+%22hi%22%0Anow",
+            )
+            .expect("materialized quoted");
+        let parsed_q: Value = serde_json::from_slice(&quoted_body.expect("json body"))
+            .expect("valid json with quotes");
+        assert_eq!(parsed_q["query"], "say \"hi\"\nnow");
+    }
+
+    #[test]
+    fn mines_affix_html_fragment_and_ignores_origin_header_domain_collision() {
+        let frag = format!(
+            "<div class=\"docs-markdown\"><h2>Button overview</h2><p>{}</p></div>",
+            "Angular Material buttons are native button or anchor elements enhanced with styling. "
+                .repeat(4)
+        );
+        let doc = format!("<html><body><main>{frag}</main></body></html>");
+        let transcript = vec![entry(
+            "GET",
+            "https://material.angular.dev/docs-content/overviews/material/button/material-button.html",
+            &frag,
+            None,
+        )];
+        let mined = mine(
+            &doc,
+            "https://material.angular.dev/components/button/overview",
+            "plain",
+            &transcript,
+        )
+        .expect("mined html fragment");
+        assert_eq!(mined.kind, BlueprintKind::HtmlFragment);
+        assert_eq!(mined.shape, "/components/*/overview");
+        let (sib_url, _, _) = mined
+            .materialize(
+                "https://material.angular.dev/components/dialog/overview",
+                "https://material.angular.dev/components/dialog/overview",
+            )
+            .expect("sibling materialized");
+        assert_eq!(
+            sib_url,
+            "https://material.angular.dev/docs-content/overviews/material/dialog/material-dialog.html"
+        );
+
+        // Negative: when a profile handle equals the host name (`bsky.app`),
+        // `origin: https://bsky.app` must NOT wildcard `/profile/*` on an opaque DID URL.
+        let mut did_entry = entry(
+            "GET",
+            "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=did:plc:12345",
+            r#"{"feed":[{"post":{"text":"Official announcement post from our engineering team"}}]}"#,
+            None,
+        );
+        did_entry.request_headers = vec![
+            ("origin".into(), "https://bsky.app".into()),
+            ("referer".into(), "https://bsky.app/".into()),
+        ];
+        let bsky_doc =
+            "<html><body><p>Official announcement post from our engineering team</p></body></html>";
+        let bsky_mined = mine(
+            bsky_doc,
+            "https://bsky.app/profile/bsky.app",
+            "plain",
+            &[did_entry],
+        )
+        .expect("mined literal");
+        assert_eq!(bsky_mined.shape, "/profile/bsky.app");
     }
 }

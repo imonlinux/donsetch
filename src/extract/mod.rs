@@ -29,6 +29,39 @@ pub mod render;
 pub mod score;
 pub mod view;
 
+/// Rows of identifiers and numbers with almost no prose: a metrics/config
+/// table (a WAF quota reply), not a document. A page of records carries names,
+/// sentences or repeated prose; this does not.
+pub(crate) fn metric_table(markdown: &str) -> bool {
+    let mut prose_chars = 0usize;
+    let mut keys = 0usize;
+    for line in markdown.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('|') {
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            // A vertical key/value table: `| user_id | <uuid> |`, one snake_case
+            // metric per row. A record table has a header row and more columns.
+            if cells.len() == 2
+                && cells[0]
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && cells[0].chars().any(|c| c == '_')
+            {
+                keys += 1;
+            }
+        } else if !line.starts_with('-') {
+            // A blockquote (`>`) is prose too; it just is not a list item.
+            prose_chars += line.chars().count();
+        }
+    }
+    // A page may carry a metrics table beside its prose (a profile's stats next
+    // to a WAF quota blob); only a table that is the document is refused.
+    keys >= 4 && prose_chars < 120 && markdown.chars().count() < 1_200
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -131,7 +164,7 @@ pub struct Extracted {
     pub partial: Option<PartialContent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentKind {
     Article,
     Listing,
@@ -357,7 +390,7 @@ pub fn extract(
     let max_chars = opts.max_chars.unwrap_or(16_000).max(200);
 
     // Non-HTML passthrough (json/text/xml): no extraction lies.
-    let ct = content_type.to_lowercase();
+    let ct = content_type.trim().to_lowercase();
     let is_pdf = body.len() >= 5 && body.starts_with(b"%PDF-") || ct.contains("pdf");
 
     if !is_pdf
@@ -404,13 +437,14 @@ pub fn extract(
         return Ok(ex);
     }
 
-    // A "text/plain" body that is actually HTML (misconfigured
-    // servers, raw git URLs): parse it as HTML, not as literal
-    // text full of angle brackets.
-    let plain_is_html =
-        !ct.is_empty() && !ct.contains("html") && !is_pdf && body_starts_with_html(body);
+    // A non-HTML or missing Content-Type body that actually starts with HTML
+    // (misconfigured servers, raw git URLs, S3 buckets omitting Content-Type):
+    // parse it as HTML; otherwise preserve plain text / markdown structure
+    // rather than flattening lines through the HTML pipeline (#466).
+    let is_html_ct = ct.contains("html");
+    let sniffed_html = !is_html_ct && !is_pdf && body_starts_with_html(body);
 
-    if !ct.is_empty() && !ct.contains("html") && !is_pdf && !plain_is_html {
+    if !is_html_ct && !is_pdf && !sniffed_html {
         let text = charset::decode_declared(body, content_type);
         if let Some(v) = crate::detect::walls::text_wall(&text)
             && !(opts.verified && bot_wall(v))
@@ -636,7 +670,9 @@ pub fn extract(
                 _ => page.verdict,
             }
         };
-        js.thin = !verdict.is_content();
+        // A table of ids and counters is not prose, whatever its line count:
+        // a WAF quota/config blob mined out of a page is not the page.
+        js.thin = !verdict.is_content() || metric_table(&js.markdown);
         js.page = Some(verdict);
         return Ok(js);
     }
@@ -669,17 +705,38 @@ pub fn extract(
     Ok(extracted)
 }
 
-/// Does the body start (after BOM/whitespace) with an HTML
-/// doctype or `<html` tag? Used to catch HTML served as
-/// text/plain.
+/// Does the body start (after BOM, whitespace, and any leading HTML comments)
+/// with an HTML document root (`<!doctype html`, `<html`, `<head`, or `<body`)?
+/// Used to detect HTML served as `text/plain` or with no `Content-Type` header
+/// without misclassifying Markdown files that open with inline/block HTML tags
+/// like `<p align="center">` or `<details>`.
 fn body_starts_with_html(body: &[u8]) -> bool {
     let mut s = body;
     if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
         s = &s[3..];
     }
-    let s = String::from_utf8_lossy(&s[..s.len().min(256)]);
-    let t = s.trim_start().to_lowercase();
-    t.starts_with("<!doctype html") || t.starts_with("<html")
+    let decoded = String::from_utf8_lossy(&s[..s.len().min(1024)]);
+    let lower = decoded.to_ascii_lowercase();
+    let mut rest = lower.trim_start();
+    while let Some(after) = rest.strip_prefix("<!--") {
+        let Some(end) = after.find("-->") else {
+            return false;
+        };
+        rest = after[end + 3..].trim_start();
+    }
+    fn has_tag(s: &str, prefix: &str) -> bool {
+        s.strip_prefix(prefix).is_some_and(|tail| {
+            tail.is_empty()
+                || tail
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'))
+        })
+    }
+    has_tag(rest, "<!doctype html")
+        || has_tag(rest, "<html")
+        || has_tag(rest, "<head")
+        || has_tag(rest, "<body")
 }
 
 /// Honest stub for PDFs that could not be parsed.

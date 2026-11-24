@@ -2,28 +2,26 @@
 'use strict';
 
 // Binary resolution for the npm package, shared by every consumer:
-// bin/donsetch.js (the CLI / MCP wrapper, in-process), install.js
-// (install-time acknowledgement), and pi-extension.ts (spawned as
-// `node resolve-binary.js --print-file <path>`).
+// bin/donsetch.js (the CLI / MCP wrapper), install.js (failure-path
+// acknowledgement), and pi-extension.ts.
 //
 // Order:
 //   1. DONSETCH_BINARY            explicit override, wins over everything
-//   2. <pkg>/binaries/<name>      the pinned copy this package installs
-//   3. install.js                 fetch the pinned copy when it can run
-//   4. an existing binary         PATH, $CARGO_HOME/bin, ~/.cargo/bin
-//   5. hard failure               curated, names every way out
+//   2. <pkg>/binaries/<name>      the pinned copy (upgraded if stamp < package.json)
+//   3. versioned user cache       read-only global packages need no sudo
+//   4. install.js                 fetch the pinned copy on first use / upgrade
+//   5. an existing binary         stale local copy or PATH, $CARGO_HOME/bin, ~/.cargo/bin
+//   6. hard failure               curated, names every way out
 //
-// The fallback exists because the pinned copy is not always obtainable
-// (issue #361): a system-wide npm package under a root-owned prefix
-// cannot be written by the user running it, and an install that cannot
-// succeed must not take a working donsetch down with it. The wrapper
-// itself is never a candidate: on a global npm install the PATH entry
-// named `donsetch` is a symlink back into this package, so candidates
-// are compared by their real path and anything resolving into the
-// package is skipped.
+// The installer runs IN THIS PROCESS (`install()` from install.js),
+// never as `process.execPath install.js`: under a compiled host —
+// Pi-Bolt is a Bun-compiled pi — process.execPath is that host, not a
+// JS runtime, and it rejects install.js's arguments as its own
+// (issue #450). A host that can run this file can run install.js.
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execFileSync } = require('child_process');
 
 const BINARY_NAME = process.platform === 'win32' ? 'donsetch.exe' : 'donsetch';
@@ -50,6 +48,64 @@ function packageBinary(pkgDir) {
   return path.join(pkgDir, 'binaries', BINARY_NAME);
 }
 
+// A system-wide npm package can be read-only to its caller. First-run
+// installation still works without sudo, in a versioned per-user cache.
+function cachedBinary(pkgDir) {
+  const version = require(path.join(pkgDir, 'package.json')).version;
+  const home = os.homedir();
+  let root = process.env.DONSETCH_CACHE_DIR;
+  if (!root) {
+    const base = process.platform === 'win32'
+      ? (process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'))
+      : process.platform === 'darwin'
+        ? path.join(home, 'Library', 'Caches')
+        : (process.env.XDG_CACHE_HOME || path.join(home, '.cache'));
+    root = path.join(base, 'donsetch');
+  }
+  return path.join(root, 'npm', version, `${process.platform}-${process.arch}`, BINARY_NAME);
+}
+
+// Parse basic semver `major.minor.patch[-prerelease]`.
+function parseSemver(ver) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(ver || '').trim());
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    pre: m[4] || null,
+  };
+}
+
+function compareSemver(a, b) {
+  const va = parseSemver(a);
+  const vb = parseSemver(b);
+  if (!va || !vb) return 0;
+  if (va.major !== vb.major) return va.major < vb.major ? -1 : 1;
+  if (va.minor !== vb.minor) return va.minor < vb.minor ? -1 : 1;
+  if (va.patch !== vb.patch) return va.patch < vb.patch ? -1 : 1;
+  if (va.pre && !vb.pre) return -1;
+  if (!va.pre && vb.pre) return 1;
+  if (va.pre && vb.pre && va.pre !== vb.pre) return va.pre < vb.pre ? -1 : 1;
+  return 0;
+}
+
+// True when `<binaryPath>.version` exists and records a version strictly
+// older than `pinned`. Unstamped binaries (dev builds, fixtures) and
+// newer binaries (`donsetch update`) are kept as-is.
+function needsStampedUpgrade(binaryPath, pinned) {
+  if (!pinned || process.env.DONSETCH_SKIP_DOWNLOAD === '1') return false;
+  const stampPath = `${binaryPath}.version`;
+  if (!fs.existsSync(stampPath)) return false;
+  try {
+    const stamp = fs.readFileSync(stampPath, 'utf8').trim();
+    if (!stamp) return false;
+    return compareSemver(stamp, pinned) < 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 // The package-local copy, with a chmod rescue: an executable bit lost
 // in transit (copied tree, artifact download) is repaired in place
 // rather than triggering a re-download.
@@ -65,9 +121,7 @@ function usableLocal(p) {
 }
 
 // True when install.js could write into <pkgDir>/binaries. A missing
-// directory is judged by its parent. Advisory only: the install itself
-// still handles a late failure, but a known-unwritable target skips a
-// doomed 19MB download first (#361).
+// directory is judged by its parent.
 function targetWritable(pkgDir) {
   const binDir = path.join(pkgDir, 'binaries');
   try {
@@ -150,73 +204,141 @@ function noBinaryMessage(why) {
   ].join('\n');
 }
 
-function runInstaller(pkgDir, onOutput) {
+async function runInstaller(pkgDir, onOutput, binDir, extraOpts = {}) {
   const installScript = path.join(pkgDir, 'install.js');
   if (!fs.existsSync(installScript)) {
     return { ok: false, error: `installer missing: ${installScript}` };
   }
+  let install;
   try {
-    const out = execFileSync(process.execPath, [installScript], {
-      cwd: pkgDir,
-      encoding: 'utf8',
-      timeout: 300_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    if (onOutput && out) onOutput(out);
-    return { ok: true };
+    ({ install } = require(installScript));
   } catch (err) {
-    if (onOutput) {
-      if (err.stdout) onOutput(String(err.stdout));
-      if (err.stderr) onOutput(String(err.stderr));
-    }
-    const lines = String(err.stderr || err.message || err).trim().split('\n');
+    return { ok: false, error: `installer unavailable: ${String(err.message || err).trim()}` };
+  }
+  if (typeof install !== 'function') {
+    return { ok: false, error: `installer exports no install() function: ${installScript}` };
+  }
+  const log = (line) => {
+    if (onOutput) onOutput(String(line) + '\n');
+  };
+  try {
+    const result = await install({ binDir, log, warn: log, ...extraOpts });
+    return { ok: true, result };
+  } catch (err) {
+    const lines = String(err.message || err).trim().split('\n');
     return { ok: false, error: (lines[0] || 'installer failed').trim() };
   }
 }
 
-// Resolve the binary for a run. `onOutput` receives installer output
-// chunks; callers point it at stderr (never stdout: an MCP stdio
-// session owns that channel).
-function resolveBinary(opts) {
+function binaryVersion(p) {
+  try {
+    const out = execFileSync(p, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    const m = /\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(String(out));
+    return m ? m[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resolveBinary(opts) {
   const pkgDir = opts.pkgDir;
   const onOutput = opts.onOutput;
+  const stream = opts.stream || null;
+  const isTty = Boolean(stream && stream.isTTY && process.env.TERM !== 'dumb');
+  const pinned = pinnedVersion(pkgDir);
 
   const over = overrideBinary();
   if (over) return over;
 
   const local = packageBinary(pkgDir);
-  if (usableLocal(local)) return { path: local, source: 'package' };
+  let staleLocal = null;
+  if (usableLocal(local)) {
+    if (!needsStampedUpgrade(local, pinned)) {
+      return { path: local, source: 'package' };
+    }
+    staleLocal = local;
+  }
+
+  const cached = cachedBinary(pkgDir);
+  if (usableLocal(cached)) return { path: cached, source: 'cache' };
 
   let why;
   if (process.env.DONSETCH_SKIP_DOWNLOAD === '1') {
     why = 'download skipped (DONSETCH_SKIP_DOWNLOAD=1)';
   } else if (!targetWritable(pkgDir)) {
     why = `${path.join(pkgDir, 'binaries')} is not writable`;
+    if (!isTty && onOutput) {
+      onOutput('donsetch: first run; installing the verified binary in your user cache...\n');
+    }
+    const result = await runInstaller(pkgDir, onOutput, path.dirname(cached), {
+      stream,
+      cacheInstall: true,
+    });
+    if (usableLocal(cached)) return { path: cached, source: 'cache' };
+    why = result.ok ? 'the installer did not produce the binary' : result.error;
   } else {
-    const result = runInstaller(pkgDir, onOutput);
-    if (usableLocal(local)) return { path: local, source: 'package' };
-    // The installer can also exit 0 without a local binary (its own
-    // existing-binary acknowledgement): name that, never "undefined".
+    if (!isTty && onOutput) {
+      onOutput(
+        staleLocal
+          ? `donsetch: upgrading package binary to ${pinned}...\n`
+          : 'donsetch: first run; downloading the verified binary...\n'
+      );
+    }
+    const result = await runInstaller(pkgDir, onOutput, path.dirname(local), {
+      stream,
+      cacheInstall: false,
+    });
+    if (usableLocal(local) && !needsStampedUpgrade(local, pinned)) {
+      return { path: local, source: 'package' };
+    }
     why = result.ok ? 'the installer did not produce the binary' : result.error;
   }
 
-  const existing = findExistingBinary({ pkgDir, self: opts.self });
-  if (existing) {
-    return {
-      path: existing.path,
-      source: existing.source,
-      notice: `donsetch: package binary unavailable (${why}); using existing binary: ${existing.path}`,
-    };
+  if (staleLocal && usableLocal(staleLocal)) {
+    return existingNotice({ path: staleLocal, source: 'package' }, why, pinned);
   }
+
+  const existing = findExistingBinary({ pkgDir, self: opts.self });
+  if (existing) return existingNotice(existing, why, pinned);
   throw new Error(noBinaryMessage(why));
 }
 
-module.exports = { resolveBinary, findExistingBinary, targetWritable, packageBinary };
+function pinnedVersion(pkgDir) {
+  try {
+    return require(path.join(pkgDir, 'package.json')).version || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function existingNotice(existing, why, pinned) {
+  const found = binaryVersion(existing.path);
+  const version = found ? `version ${found}` : 'version unknown';
+  const mismatch = found && pinned && found !== pinned
+    ? `; this package pins ${pinned}`
+    : '';
+  return {
+    ...existing,
+    notice: `donsetch: package binary unavailable (${why}); using existing binary: ${existing.path} (${version}${mismatch})`,
+  };
+}
+
+module.exports = {
+  resolveBinary,
+  findExistingBinary,
+  targetWritable,
+  packageBinary,
+  cachedBinary,
+  compareSemver,
+  needsStampedUpgrade,
+};
 
 // ── CLI mode ─────────────────────────────────────────────────────
-// Used by pi-extension.ts. `--print` writes the resolved path to
-// stdout; `--print-file <path>` writes it to a file and keeps stdout
-// free for an inheriting caller. Progress and failures go to stderr.
 if (require.main === module) {
   const args = process.argv.slice(2);
   const pkgIdx = args.indexOf('--pkg-dir');
@@ -227,21 +349,23 @@ if (require.main === module) {
   }
   const pkgDir = path.resolve(args[pkgIdx + 1] || '');
   const outFile = fileIdx >= 0 ? args[fileIdx + 1] : null;
-  try {
-    const resolved = resolveBinary({
-      pkgDir,
-      self: process.argv[1],
-      onOutput: (chunk) => process.stderr.write(chunk),
+  resolveBinary({
+    pkgDir,
+    self: process.argv[1],
+    stream: process.stderr.isTTY ? process.stderr : null,
+    onOutput: (chunk) => process.stderr.write(chunk),
+  })
+    .then((resolved) => {
+      if (resolved.notice) process.stderr.write(resolved.notice + '\n');
+      if (outFile) {
+        fs.writeFileSync(outFile, resolved.path + '\n');
+      } else {
+        process.stdout.write(resolved.path + '\n');
+      }
+      process.exit(0);
+    })
+    .catch((err) => {
+      process.stderr.write(String(err.message || err) + '\n');
+      process.exit(1);
     });
-    if (resolved.notice) process.stderr.write(resolved.notice + '\n');
-    if (outFile) {
-      fs.writeFileSync(outFile, resolved.path + '\n');
-    } else {
-      process.stdout.write(resolved.path + '\n');
-    }
-    process.exit(0);
-  } catch (err) {
-    process.stderr.write(String(err.message || err) + '\n');
-    process.exit(1);
-  }
 }

@@ -1281,7 +1281,12 @@ async fn fetch_single_inner(
         // Binary content guard: images, video, audio, etc.
         // Don't pass binary bytes to extract (mojibake).
         if crate::fetch::guards::is_binary(&o.body, &ct) {
-            let kind = ct.split(';').next().unwrap_or("unknown").trim();
+            let kind = ct
+                .split(';')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown");
             return tool_error_structured(
                 format!(
                     "binary content: {url} returned {kind} ({} bytes) : not text, cannot extract",
@@ -1299,7 +1304,12 @@ async fn fetch_single_inner(
             ..opts.clone()
         };
         match extract::extract_off_worker(&o.body, &ct, &o.url, &read_opts).await {
-            Ok(e) => {
+            Ok(mut e) => {
+                if not_the_page(&e.markdown, o) {
+                    e.thin = true;
+                } else {
+                    e.markdown = strip_metric_tables(&e.markdown);
+                }
                 final_url = o.url.clone();
                 final_ex = Some(e);
             }
@@ -1344,6 +1354,7 @@ async fn fetch_single_inner(
         lopts.include_links = true;
         if let Ok(e3) = extract::extract_off_worker(&o.body, &ct, &o.url, &lopts).await
             && !e3.thin
+            && !not_the_page(&e3.markdown, o)
         {
             final_ex = Some(e3);
             trace.step("local", "links-extract", "ok", 0);
@@ -2063,6 +2074,69 @@ fn looks_like_shell_text(markdown: &str) -> bool {
 /// content. Returns the honest failure for the extracted shape, or
 /// None when the text is real content. A `verified` body (the fetch layer's
 /// contract found content) is not failed on bot-wall words alone.
+/// The page a failed fetch class or a locale picker really is. The extractor
+/// can read data the visible page does not carry (a shell's server-rendered
+/// JSON), so a shell whose extraction is a real document stays content; a
+/// short shell or a failed contract is not the page, and neither is a
+/// country/currency picker the site served instead.
+/// Remove vertical key/value metric tables (a WAF quota blob fused beside a
+/// real page) from a document that is otherwise prose. The table is noise the
+/// page never showed a reader; the prose is what they came for.
+fn strip_metric_tables(markdown: &str) -> String {
+    if crate::extract::metric_table(markdown) {
+        return markdown.to_string();
+    }
+    fn flush<'a>(block: &mut Vec<&'a str>, out: &mut Vec<&'a str>) {
+        let metric = block
+            .iter()
+            .filter(|line| line.trim_start().starts_with('|'))
+            .filter(|line| {
+                let cells: Vec<&str> = line
+                    .trim()
+                    .trim_matches('|')
+                    .split('|')
+                    .map(str::trim)
+                    .collect();
+                cells.len() == 2
+                    && cells[0]
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && cells[0].chars().any(|c| c == '_')
+            })
+            .count()
+            >= 3;
+        if !metric {
+            out.append(block);
+        }
+        block.clear();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for line in markdown.lines() {
+        if line.trim_start().starts_with('|') {
+            block.push(line);
+        } else {
+            flush(&mut block, &mut out);
+            out.push(line);
+        }
+    }
+    flush(&mut block, &mut out);
+    out.join("\n")
+}
+
+fn not_the_page(markdown: &str, outcome: &crate::fetch::client::FetchOutcome) -> bool {
+    let chars = markdown.chars().count();
+    // A shell whose extraction carries a real document (server-rendered JSON)
+    // is content; a shell with a short extraction is not. A failed contract is
+    // only a gate when the contract named one, so a short ordinary page keeps
+    // its own (thin) verdict.
+    let short_shell = outcome.class == donsetch_fetch::Class::Shell && chars < 800;
+    outcome.gate
+        || short_shell
+        || crate::extract::metric_table(markdown)
+        || donsetch_fetch::contract::locale_picker_text(markdown)
+}
+
 fn content_fail(
     markdown: &str,
     url: &str,

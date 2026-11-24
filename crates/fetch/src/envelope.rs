@@ -11,9 +11,9 @@
 //! * memory — a V8 heap limit that terminates instead of aborting, and an
 //!   ArrayBuffer allocator that refuses past a live-bytes cap;
 //! * network — http(s) only, browser-unsafe ports refused, non-public addresses
-//!   refused (at the URL, at DNS resolution and at every redirect hop) unless the
-//!   host is the page's own, bounded op count, request size, response size, total
-//!   bytes and redirect chain;
+//!   refused (at the URL, at DNS resolution and at every redirect hop), including
+//!   the page's own host unless private egress is explicitly enabled; bounded op
+//!   count, request size, response size, total bytes and redirect chain;
 //! * one engine at a time per process.
 
 use std::ffi::c_void;
@@ -83,30 +83,29 @@ impl Limits {
 
     /// The content lane's envelope: the same enforcement, a lane-sized budget.
     /// The wall clock covers the app's own script fetches and data calls; the
-    /// default is the first-visit budget the upgrade doc names (+1–2 s over the
-    /// document fetch). One lane run per encounter, so the op count covers a
-    /// heavy app's boot without becoming a crawl.
+    /// default is a 5-second ceiling, clamped to the encounter's remaining deadline.
+    /// One lane run per encounter, so the op count covers a heavy app's boot
+    /// without becoming a crawl.
     pub fn content() -> Self {
         Self {
             // The measured friendly SPA (hn.algolia, a 2.6 MB bundle and one
             // API call) reaches content at 2.2–3.0 s across windows, so 2.5 s
-            // terminated runs inside the noise and 3 s sat on the edge. Four
-            // seconds is the ceiling for a heavy first boot, not a target: the
-            // stop rule is the contract, and the replay removes the cost after
-            // the first visit.
-            wall: Duration::from_millis(4_000),
-            ops_max: 64,
-            // A modern app bundle is the page's own program: the measured
-            // Bluesky Expo bundle is 9.7 MB in one response, over the mint's
-            // 8 MB ceiling. The lane's total stays the same; one response may
-            // be larger because a first boot pays for the program once.
+            // terminated runs inside the noise and 3 s sat on the edge. The heavy
+            // shell measured at the same time (TikTok, 427–455 KB, 70 requests)
+            // boots, runs its program and quiesces at 4.0–4.3 s end to end, so 5 s
+            // is the ceiling for a heavy first boot, not a target: the stop rule is
+            // the contract, and the replay removes the cost after the first visit.
+            wall: Duration::from_millis(5_000),
+            ops_max: 256,
             response_body_max: 16 * 1024 * 1024,
-            total_response_max: 48 * 1024 * 1024,
+            total_response_max: 64 * 1024 * 1024,
             ..Self::default()
         }
     }
 
-    /// `content()`, with the wall clock overridable by `V5_CONTENT_WALL_MS`.
+    /// `content()`, with the wall clock and the op budget overridable by
+    /// `V5_CONTENT_WALL_MS` and `V5_CONTENT_OPS`: a budget is a measured
+    /// quantity, so measuring it does not need a rebuild.
     pub fn content_from_env() -> Self {
         let mut limits = Self::content();
         if let Some(ms) = std::env::var("V5_CONTENT_WALL_MS")
@@ -115,6 +114,13 @@ impl Limits {
             .filter(|ms| *ms >= 500)
         {
             limits.wall = Duration::from_millis(ms);
+        }
+        if let Some(ops) = std::env::var("V5_CONTENT_OPS")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .filter(|ops| *ops >= 8)
+        {
+            limits.ops_max = ops;
         }
         limits
     }

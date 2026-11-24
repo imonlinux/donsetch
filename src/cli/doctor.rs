@@ -41,15 +41,69 @@ fn check_counts(checks: &[(String, String, String, String)]) -> (u32, u32, u32) 
         })
 }
 
+pub fn help() {
+    cli::init();
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Doctor"),
+        "health diagnostics & safe auto-repair",
+    );
+    println!();
+    println!(
+        "  {} {}",
+        cli::dim("Usage:"),
+        cli::bold("donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]")
+    );
+    println!();
+    println!("  Options");
+    cli::print_opt(
+        "--deep",
+        "Run live egress-lane, captive-portal, and provider zone probes",
+    );
+    cli::print_opt(
+        "--fix",
+        "Apply safe local repairs (directories, permissions, corrupt state)",
+    );
+    cli::print_opt(
+        "--mcp",
+        "Print ready-to-paste MCP client snippets with absolute binary path",
+    );
+    cli::print_opt(
+        "--improve",
+        "Explain local adaptive route/search learning and live receipts",
+    );
+    cli::print_opt(
+        "--json",
+        "Append structured JSON summary for scripts and agents",
+    );
+    println!();
+    cli::print_nav(&[
+        ("donsetch status", "quick overview"),
+        ("donsetch proxy check", "verify proxy pool"),
+    ]);
+}
+
 fn render_checks(checks: &[(String, String, String, String)]) {
-    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
-    let width = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|w| w.parse::<usize>().ok())
-        .unwrap_or(96)
-        .clamp(60, 140);
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Doctor"),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
+    );
+    let width = cli::term_width().clamp(60, 140);
     let (passed, warnings, failed) = check_counts(checks);
-    println!("  {passed} passed   {warnings} warnings   {failed} failed");
+    let bar = cli::meter_bar(passed, warnings, failed, 24);
+    println!(
+        "\n  {bar}  {} passed  \u{00B7}  {} warnings  \u{00B7}  {} failed",
+        cli::green(&passed.to_string()),
+        if warnings > 0 {
+            cli::yellow(&warnings.to_string())
+        } else {
+            cli::dim("0")
+        },
+        if failed > 0 {
+            cli::red(&failed.to_string())
+        } else {
+            cli::dim("0")
+        },
+    );
     let groups: &[(&str, &[&str])] = &[
         (
             "Runtime & browser",
@@ -62,7 +116,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "ONNX Runtime",
                 "PDFium",
                 "OCR models",
-                "Rerank model",
+                "Search model",
             ],
         ),
         (
@@ -90,6 +144,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "State permissions",
                 "State store",
                 "Config posture",
+                "MCP output",
                 "Local rules",
                 "Clearance stores",
                 "Crawl stores",
@@ -98,7 +153,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
         ),
     ];
     for (label, names) in groups {
-        println!("\n  {}", cli::bold(label));
+        cli::print_section(label);
         // Put failures and warnings first within each stable group.
         for severity in ["fail", "warn", "fixed", "pass"] {
             for (name, status, detail, hint) in checks
@@ -115,7 +170,9 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 } else {
                     detail.clone()
                 };
-                let lines = wrap_detail(&detail, width - 30);
+                // Keep ONNX Runtime's summary line intact on one line for payload gates.
+                let max_detail = (width.saturating_sub(30)).max(42);
+                let lines = wrap_detail(&detail, max_detail);
                 println!(
                     "  {icon} {name:<24}  {}",
                     cli::dim(lines.first().map(String::as_str).unwrap_or(""))
@@ -124,7 +181,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                     println!("{:30}{}", "", cli::dim(line));
                 }
                 if status == "fail" && !hint.is_empty() {
-                    for line in wrap_detail(hint, width - 6) {
+                    for line in wrap_detail(hint, width.saturating_sub(6)) {
                         println!("      {}", cli::yellow(&line));
                     }
                 }
@@ -135,14 +192,16 @@ fn render_checks(checks: &[(String, String, String, String)]) {
         println!(
             "\n  {}",
             cli::bold(
-                "Next: donsetch doctor --fix (safe repairs), then follow any remaining instructions."
+                "Repair: run `donsetch doctor --fix` for automatic fixes, then follow any hints above."
             )
         );
     }
-    println!(
-        "\n  {}",
-        cli::dim("More: --deep for live probes · --mcp for client setup · --json for agents")
-    );
+    println!();
+    cli::print_nav(&[
+        ("donsetch doctor --deep", "live probes"),
+        ("donsetch doctor --mcp", "client setup"),
+        ("donsetch doctor --json", "agent output"),
+    ]);
 }
 
 fn wrap_detail(text: &str, width: usize) -> Vec<String> {
@@ -283,9 +342,17 @@ pub async fn run(args: &[String]) {
 
     // (name, status, detail, hint) collected for --json and --fix.
     let mut collected: Vec<(String, String, String, String)> = Vec::new();
+    let progress = (!json && !only_mcp)
+        .then(|| cli::Spinner::new_tty_only("Diagnosing · Binary & installation\u{2026}"));
+    let step_msg = |label: &str, count: usize| {
+        if let Some(ref s) = progress {
+            s.set_message(&format!("Diagnosing [{}] · {label}\u{2026}", count + 1));
+        }
+    };
 
     macro_rules! report {
-        ($name:expr, $r:expr) => {
+        ($name:expr, $r:expr) => {{
+            step_msg($name, collected.len());
             match $r {
                 CheckResult::Pass(d) => {
                     collected.push(($name.to_string(), "pass".into(), d.clone(), String::new()));
@@ -300,7 +367,7 @@ pub async fn run(args: &[String]) {
                     collected.push(($name.to_string(), "fixed".into(), d.clone(), String::new()));
                 }
             }
-        };
+        }};
     }
 
     // 1. Binary integrity.
@@ -415,11 +482,6 @@ pub async fn run(args: &[String]) {
     // 20. Network reality: DNS + optional captive-portal probe.
     report!("DNS", check_dns());
 
-    // 21. MCP client registration (detect + print blocks).
-    if only_mcp {
-        print_mcp_section();
-    }
-
     // 22. Legacy env vars (the pre-v4 names): still honored, but
     // each one active in this shell gets ONE warning naming its
     // config key. Cut at the v4 release.
@@ -438,6 +500,15 @@ pub async fn run(args: &[String]) {
             "Legacy env vars",
             CheckResult::Warn(format!("{} (deprecated, cut at v4)", names.join(", ")))
         );
+    }
+
+    if let Some(s) = progress {
+        s.stop();
+    }
+
+    // 21. MCP client registration (detect + print blocks).
+    if only_mcp {
+        print_mcp_section();
     }
 
     // ── Self-healing pass (--fix) ───────────────────────────
@@ -593,7 +664,19 @@ fn check_fetch_egress() -> CheckResult {
         }
     };
     let (sys_roots, env_roots) = crate::egress::trust::trust_store_report();
-    let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
+    let cert_bundle = std::env::var_os("SSL_CERT_FILE")
+        .filter(|v| !v.is_empty())
+        .map(|p| p.to_string_lossy().into_owned());
+    let cert_dir_env = std::env::var_os("SSL_CERT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(|p| p.to_string_lossy().into_owned());
+    let tls = &crate::config::cfg().tls;
+    let tls_configured = !tls.cert_file.trim().is_empty() || !tls.cert_dir.trim().is_empty();
+    let tls_roots = if tls_configured {
+        crate::egress::trust::configured_root_count()
+    } else {
+        0
+    };
 
     let mut bits = Vec::new();
     if let Some(p) = resolved {
@@ -607,24 +690,55 @@ fn check_fetch_egress() -> CheckResult {
                 .into()
         });
     }
-    match cert_bundle {
-        Some(b) => {
+    let mut warn = false;
+    let mut trust = match (cert_bundle, cert_dir_env) {
+        (Some(b), Some(d)) => {
             if env_roots > 0 {
-                bits.push(format!(
-                    "trust: {sys_roots} system roots + {env_roots} from {b}"
-                ));
-                CheckResult::Pass(bits.join(" · "))
+                format!("trust: {sys_roots} system roots + {env_roots} from {b} / {d}")
             } else {
-                bits.push(format!("trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"));
-                CheckResult::Warn(bits.join(" · "))
+                warn = true;
+                format!(
+                    "trust: {sys_roots} system roots; {b} / {d} set but yielded no parseable certs (the interception CA will NOT be trusted)"
+                )
             }
         }
-        None => {
-            bits.push(format!(
-                "trust: {sys_roots} system roots; SSL_CERT_FILE unset"
-            ));
-            CheckResult::Pass(bits.join(" · "))
+        (Some(b), None) => {
+            if env_roots > 0 {
+                format!("trust: {sys_roots} system roots + {env_roots} from {b}")
+            } else {
+                warn = true;
+                format!(
+                    "trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"
+                )
+            }
         }
+        (None, Some(d)) => {
+            if env_roots > 0 {
+                format!("trust: {sys_roots} system roots + {env_roots} from {d}")
+            } else {
+                warn = true;
+                format!(
+                    "trust: {sys_roots} system roots; {d} set but yielded no parseable certs (the interception CA will NOT be trusted)"
+                )
+            }
+        }
+        (None, None) => format!("trust: {sys_roots} system roots; SSL_CERT_FILE unset"),
+    };
+    if tls_configured {
+        if tls_roots > 0 {
+            trust.push_str(&format!(" + {tls_roots} from [tls]"));
+        } else {
+            warn = true;
+            trust.push_str(
+                "; [tls] cert_file/cert_dir set but yielded no parseable certs (configured CA will NOT be trusted)",
+            );
+        }
+    }
+    bits.push(trust);
+    if warn {
+        CheckResult::Warn(bits.join(" · "))
+    } else {
+        CheckResult::Pass(bits.join(" · "))
     }
 }
 
@@ -921,6 +1035,9 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
 }
 
 async fn check_chrome() -> CheckResult {
+    if let Some(cdp_url) = crate::browser::configured_cdp_url() {
+        return CheckResult::Pass(format!("external CDP configured ({cdp_url})"));
+    }
     let result = tokio::task::spawn_blocking(crate::browser::resolve_browser).await;
     match result {
         Ok(Ok(browser)) => {
@@ -941,7 +1058,7 @@ async fn check_chrome() -> CheckResult {
         }
         Ok(Err(error)) => CheckResult::Fail(
             error.to_string(),
-            "Install Chromium or set DONGHOST_CHROME.".into(),
+            "Install Chromium, set DONGHOST_CHROME, or set browser.cdp_url for an external CDP browser.".into(),
         ),
         Err(error) => CheckResult::Fail(
             format!("browser resolution task failed: {error}"),
@@ -950,29 +1067,27 @@ async fn check_chrome() -> CheckResult {
     }
 }
 
-/// The REAL browser test: launch the resolved Chromium headless
-/// exactly as login and web_screenshot would, probe it over CDP,
-/// close. Bounded to 40s. This is what turns the 50-case report's
-/// "a feature that works only when the user guesses the hidden
-/// prerequisite is not finished".
+/// The REAL browser test: launch the resolved Chromium headless (or connect to
+/// the configured external CDP browser) exactly as web_screenshot would, probe
+/// it over CDP, close. Bounded to 40s.
 async fn check_browser_launch() -> CheckResult {
-    let resolved = match crate::browser::resolve_browser() {
-        Ok(r) => r,
-        Err(e) => {
-            return CheckResult::Fail(
-                format!("launch failed: {e}"),
-                "Browser-backed features (screenshot) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
-            );
-        }
-    };
+    let remote = crate::browser::configured_cdp_url();
+    if remote.is_none()
+        && let Err(e) = crate::browser::resolve_browser()
+    {
+        return CheckResult::Fail(
+            format!("launch failed: {e}"),
+            "Browser-backed features (screenshot) will not work. Install Chromium, set DONGHOST_CHROME, or set browser.cdp_url.".into(),
+        );
+    }
     let inner = async {
         let t0 = std::time::Instant::now();
-        let session = match crate::browser::launch_headless(&resolved.path).await {
+        let session = match crate::browser::open_capture_session().await {
             Ok(s) => s,
             Err(e) => {
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Browser-backed features (screenshot) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
+                    "Browser-backed features (screenshot) will not work. Install Chromium, set DONGHOST_CHROME, or verify browser.cdp_url.".into(),
                 );
             }
         };
@@ -982,7 +1097,7 @@ async fn check_browser_launch() -> CheckResult {
         let probe = session
             .cdp()
             .call(
-                None,
+                session.session_id(),
                 "Runtime.evaluate",
                 serde_json::json!({"expression": "1+1", "returnByValue": true}),
             )
@@ -1985,7 +2100,7 @@ async fn bright_zone_probe_async(
     zone: &str,
     product: &str,
 ) -> ZoneProbeOut {
-    let client = match reqwest::Client::builder()
+    let client = match crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(10))
         .build()
     {
@@ -2943,6 +3058,44 @@ mod bright_probe_tests {
     fn json_escape_handles_windows_paths() {
         let path = r#"C:\Users\A "B"\donsetch.exe"#;
         assert_eq!(json_escape(path), serde_json::to_string(path).unwrap());
+    }
+
+    #[test]
+    fn check_fetch_egress_reports_valid_tls_cert_file() {
+        let cert = rcgen::generate_simple_self_signed(vec!["corp.example".into()]).unwrap();
+        let bundle = crate::paths::cache_dir().join("doctor-tls-valid.pem");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, cert.cert.pem()).unwrap();
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.tls.cert_file = bundle.to_string_lossy().into_owned();
+        crate::config::install(config).unwrap();
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+        match super::check_fetch_egress() {
+            super::CheckResult::Pass(msg) => assert!(msg.contains("+ 1 from [tls]"), "{msg}"),
+            other => panic!("expected Pass with [tls] count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_fetch_egress_warns_on_unreadable_tls_cert_file() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.tls.cert_file = "/nonexistent/donsetch-missing-ca.pem".into();
+        crate::config::install(config).unwrap();
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+        match super::check_fetch_egress() {
+            super::CheckResult::Warn(msg) => {
+                assert!(msg.contains("[tls] cert_file/cert_dir set"), "{msg}")
+            }
+            other => panic!("expected Warn on unreadable [tls] cert_file, got {other:?}"),
+        }
     }
 }
 

@@ -5,7 +5,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { chmodSync, mkdirSync, readFileSync, symlinkSync } = require('fs');
+const { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } = require('fs');
 const { join } = require('path');
 const h = require('./helpers.js');
 
@@ -188,6 +188,24 @@ test('installer failure falls back to PATH with a named reason, never "undefined
   assert.doesNotMatch(r.stderr, /undefined/);
 });
 
+test('a fallback names its version, and says when it is not the pinned one', (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const root = h.scratch('fallback-version');
+  const pkg = h.stagePkg(join(root, 'pkg'));
+  const userbin = join(root, 'userbin');
+  mkdirSync(userbin, { recursive: true });
+  const other = join(userbin, 'donsetch');
+  writeFileSync(other, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "DonSeTch 9.9.9"; else echo STUB; fi\n');
+  chmodSync(other, 0o755);
+  const r = resolve(pkg, {
+    path: [userbin],
+    home: join(root, 'home'),
+    extra: { DONSETCH_SKIP_DOWNLOAD: '1' },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /using existing binary: .*\(version 9\.9\.9; this package pins \d+\.\d+\.\d+\)/);
+});
+
 test('--print-file keeps stdout empty and puts the path in the file', (t) => {
   if (!h.IS_POSIX) return t.skip('posix-only fixture');
   const root = h.scratch('printfile');
@@ -202,4 +220,39 @@ test('--print-file keeps stdout empty and puts the path in the file', (t) => {
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.stdout, '', 'stdout must stay free for an inheriting caller');
   assert.equal(readFileSync(outFile, 'utf8').trim(), join(pkg, 'binaries', 'donsetch'));
+});
+
+test('a stale stamped package binary upgrades to package.json version, while a newer self-updated binary stays untouched', async (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const root = h.scratch('stamp-upgrade');
+  const pkg = h.stagePkg(join(root, 'pkg'), {
+    binaries: {
+      donsetch: '#!/bin/sh\necho OLD-STAMPED\n',
+      'donsetch.version': '0.0.1\n',
+    },
+  });
+  const m = await h.firstRunMirror(root);
+  if (!m) return t.skip('unsupported test platform');
+  t.after(() => m.server.close());
+
+  const r1 = await h.spawnNode(
+    [join(pkg, 'resolve-binary.js'), '--print', '--pkg-dir', pkg],
+    { env: m.env }
+  );
+  assert.equal(r1.code, 0, r1.stderr);
+  assert.equal(readFileSync(join(pkg, 'binaries', 'donsetch'), 'utf8'), h.TARBALL_BINARY);
+
+  // Now simulate `donsetch update` advancing the local binary ahead of package.json:
+  // resolve-binary.js must keep the newer binary offline without downgrading it.
+  writeFileSync(join(pkg, 'binaries', 'donsetch'), '#!/bin/sh\necho NEWER-SELF-UPDATED\n');
+  chmodSync(join(pkg, 'binaries', 'donsetch'), 0o755);
+  writeFileSync(join(pkg, 'binaries', 'donsetch.version'), '99.0.0\n');
+  const hitsBefore = m.server.hits.length;
+  const r2 = await h.spawnNode(
+    [join(pkg, 'resolve-binary.js'), '--print', '--pkg-dir', pkg],
+    { env: m.env }
+  );
+  assert.equal(r2.code, 0, r2.stderr);
+  assert.equal(m.server.hits.length, hitsBefore, 'newer self-updated binary must not re-download');
+  assert.equal(readFileSync(join(pkg, 'binaries', 'donsetch'), 'utf8'), '#!/bin/sh\necho NEWER-SELF-UPDATED\n');
 });

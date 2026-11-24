@@ -92,6 +92,30 @@ tokio::task_local! {
 
 pub(crate) type OriginGuard = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
 
+/// Account for one outbound HTTP exchange performed outside `donsetch-fetch`
+/// (e.g. `parallel-mcp` and `keenable` reqwest calls) against the active
+/// search's total and per-source request counters. Returns `false` if the
+/// scoped `REQUEST_LIMIT` has already been reached.
+pub(crate) fn record_external_request() -> bool {
+    use std::sync::atomic::Ordering;
+    let total = REQUEST_COUNT.try_with(Arc::clone).ok();
+    let source = REQUEST_SOURCE_COUNT.try_with(Arc::clone).ok();
+    let limit = REQUEST_LIMIT.try_with(|limit| *limit).unwrap_or(usize::MAX);
+    if let Some(total) = &total
+        && total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < limit).then(|| used + 1)
+            })
+            .is_err()
+    {
+        return false;
+    }
+    if let Some(source) = &source {
+        source.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
 fn request_start(refusal: Arc<Mutex<Option<FetchError>>>) -> Option<donsetch_fetch::RequestStart> {
     let total = REQUEST_COUNT.try_with(Arc::clone).ok();
     let source = REQUEST_SOURCE_COUNT.try_with(Arc::clone).ok();
@@ -411,6 +435,8 @@ impl LayerFetcher {
             verdict,
             elapsed: started.elapsed(),
             verified: false,
+            class: donsetch_fetch::Class::Content,
+            gate: false,
         })
     }
 
@@ -439,26 +465,33 @@ fn add_configured_roots() {
     });
 }
 
-fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
+pub(crate) fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let file = file.trim();
     if !file.is_empty() {
         paths.push(file.into());
     }
-    if !dir.is_empty()
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        let mut found: Vec<std::path::PathBuf> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| {
-                        matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer")
+    let dir = dir.trim();
+    if !dir.is_empty() {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let mut found: Vec<std::path::PathBuf> = entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| {
+                                matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer")
+                            })
                     })
-            })
-            .collect();
-        found.sort();
-        paths.extend(found);
+                    .collect();
+                found.sort();
+                paths.extend(found);
+            }
+            Err(error) => {
+                crate::diag!("[tls] cannot read directory {dir}: {error}");
+            }
+        }
     }
     paths
         .into_iter()
@@ -703,14 +736,21 @@ fn into_outcome(
         ));
     }
     // A data-path or embedded answer is the records, not the document they came
-    // from (an API body, or a shell): hand over the rendered records as text.
+    // from (an API body, or a shell): hand over the rendered records as text,
+    // or as HTML when a replayed blueprint emitted semantic HTML.
     let records = outcome.transport != "document" && !outcome.body_text.is_empty();
     let (headers, body) = if records {
+        let trimmed = outcome.body_text.trim_start();
+        let content_type = if trimmed.starts_with("<!DOCTYPE html")
+            || trimmed.starts_with("<!doctype html")
+            || trimmed.starts_with("<html")
+        {
+            "text/html; charset=utf-8"
+        } else {
+            "text/plain; charset=utf-8"
+        };
         (
-            vec![(
-                "content-type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
+            vec![("content-type".to_string(), content_type.to_string())],
             outcome.body_text.into_bytes(),
         )
     } else {
@@ -718,7 +758,14 @@ fn into_outcome(
             Some(bytes) => bytes,
             None => outcome.body.unwrap_or_default().into_bytes(),
         };
-        (outcome.headers, body)
+        let mut headers = outcome.headers;
+        if headers.is_empty() && body.starts_with(b"<") {
+            headers.push((
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ));
+        }
+        (headers, body)
     };
     let verdict = verdict_for(
         outcome.class,
@@ -746,6 +793,11 @@ fn into_outcome(
         verdict,
         elapsed: Duration::from_secs_f64(outcome.ms_total.max(0.0) / 1000.0),
         verified: outcome.class == donsetch_fetch::Class::Content && verdict == Verdict::ContentOk,
+        class: outcome.class,
+        gate: outcome
+            .failures
+            .iter()
+            .any(|failure| failure.contains("gate page")),
     })
 }
 

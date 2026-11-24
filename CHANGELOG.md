@@ -1,11 +1,331 @@
 # Changelog
 
+## [5.5.10] - 2026-11-23
+
+### Security
+
+- **Patched `url` stack-overflow advisory (`RUSTSEC-2026-0592`).** Upgraded `url` from `2.5.8` to `2.5.9` (and `form_urlencoded` to `1.2.3`) to prevent stack overflow in `Url::origin()` on deeply nested `blob:` URLs.
+
+### Fixed
+
+- **OS trust store, `SSL_CERT_FILE`/`SSL_CERT_DIR`, and `[tls]` CA roots honored across every outbound client (#467, #468).** Added `egress::trust::with_trusted_roots` (plus a blocking counterpart and divide-and-conquer vetting for malformed OS/bundle certificates) and wired it into `keenable`, `exa-mcp`, `parallel-mcp`, BYOK search and `/goto` resolution, `donsetch update` downloads, Bright Data Web Unlocker, `donsetch doctor` zone probes, OCR model downloads, and HTTPS external `browser.cdp_url` discovery so DonSeTch works end-to-end behind TLS-inspecting corporate proxies.
+- **`donsetch doctor` reports `[tls]` and multi-directory `SSL_CERT_DIR` trust roots.** `doctor` now splits multi-path `SSL_CERT_DIR` entries cross-platform, surfaces `[tls] cert_file`/`cert_dir` certificate counts, and warns when a configured CA path yields no parseable certificates; unreadable `[tls] cert_dir` paths also emit diagnostics.
+- **Loopback Chromium DevTools discovery bypasses `HTTP_PROXY`.** `browser::page_ws` now sets `.no_proxy()` on `http://127.0.0.1:<port>/json/list` so `web_screenshot` no longer routes local DevTools polling through an ambient HTTP proxy when `NO_PROXY` omits `127.0.0.1`.
+- **Self-update range download resilience.** `cli/download.rs` now bounds `request.send()` with timeouts on ranged probes, range segments, and streaming fallbacks, retries transient socket resets and `5xx`/`429` responses within each segment instead of aborting on the first blip, and percent-encodes pool proxy credentials via `wire_url()`.
+- **Proactive Keenable low-quota benching and RFC 9110 `Retry-After` parsing.** When Keenable's `X-RateLimit-Remaining` triggers soft cooling, the search planner now benches `keenable` before wave selection so three healthy engines take the initial active slots immediately without stalling until the soft mark. `keenable`, `exa-mcp`, and `parallel-mcp` also share an RFC 9110 `Retry-After` parser supporting both delta-seconds and HTTP-date headers, and `exa-mcp` accepts BOM- and comment-prefixed SSE responses.
+
+## [5.5.9] - 2026-11-21
+
+### Added
+
+- **Keyless Exa MCP search enabled by default (`exa-mcp`).** Searches without an explicit `lang` now include Exa's public Streamable HTTP MCP endpoint (`https://mcp.exa.ai/mcp`) via a single stateless `web_search_exa` POST with zero keys, cookies, or session handshakes, adding an independent neural+web index with `Published` dates and rich highlights alongside `google-cse`, `keenable`, `parallel-mcp`, `bing`, `ddg`, `yahoo`, `brave`, and `yandex`. Disable anytime with `[search] exa_mcp = false` (`DONSETCH_SEARCH__EXA_MCP=false`) or a `[rules.url]` deny rule on `mcp.exa.ai`.
+- **Anti-rate-limit Tier-1 rotation and multi-reserve failover.** Healthy Tier-1 keyless engines (`google-cse`, `keenable`, `exa-mcp`, `parallel-mcp`) now rotate their 3-engine active wave across queries inside coarse trust bands (cutting per-engine query load ~25% while degraded engines drop behind automatically). `schedule.rs` upgrades from a single hedge to an ordered multi-reserve failover queue (3 active + up to 2 zero-upfront-cost reserves): reserves spend zero requests when healthy and promote immediately on any active failure, 429, or off-query result. Keenable also tracks `X-RateLimit-Remaining` and cools proactively before hitting hard 429s.
+
+### Fixed
+
+- **20–40× faster `donsetch update` downloads on throttled GitHub Fastly peering.** `cli/download.rs` now uses HTTP/1.1 with `TCP_NODELAY` so all 8 parallel range workers open independent TCP sockets instead of multiplexing onto one HTTP/2 stream window, peeks GitHub's 302 `Location` without touching Fastly first, races a 256 KiB slice against the signed `*.blob.core.windows.net` origin from the redirect JWT (keeping the winning bytes, still full SHA-256 verified), and uses 2–5 MiB work-stealing chunks (~4 MB/s / 9.9 s for a 39.4 MB tarball vs 100–300 KB/s before).
+- **Accurate search confidence when 1 of 3–4 lanes is off-query.** Widened `quality::Assessment`'s off-query tolerance from `0.20` to `0.34` so a single discarded off-query engine never falsely marks a 3-engine consensus answer degraded or bypasses the merged cache.
+- **Included from `v5.5.8` (master `fea94eb`):** default-on keyless Keenable (`keenable`, #463), Mintlify `<span data-as="p">` ordering (#465), CommonMark setext headings & YAML frontmatter (#464), empty `Content-Type` HTML sniffing (#466), `parallel-mcp`/`keenable` request telemetry accounting, offline search test isolation, cross-platform `scripts/budget.sh`, and `scraper` 0.29 / `getrandom` 0.4 upgrades.
+
+## [5.5.8] - 2026-11-20
+
+### Added
+
+- **Keyless Parallel MCP search enabled by default (`parallel-mcp`, based on #457).** Searches without an explicit `lang` now include Parallel's anonymous Streamable HTTP MCP endpoint (`https://mcp.parallel.ai/mcp`) as a first-class engine alongside `google-cse`, `bing`, `ddg`, `yahoo`, `brave`, and `yandex` with zero API keys or accounts required. Per-route sessions are cached (`search-parallel-mcp.json`, 25 min TTL) so warm searches take a single POST (~1.1–1.4 s), `publish_date` and rich excerpts feed into multi-engine fusion and freshness ranking, HTTP 429s rest cleanly in the ledger while the remaining engines answer, and requests carry DonSeTch's versioned `User-Agent`. Disable anytime with `[search] parallel_mcp = false` (`DONSETCH_SEARCH__PARALLEL_MCP=false`) or a `[rules.url]` deny rule on `mcp.parallel.ai`.
+- **External CDP browser endpoint for screenshots (`browser.cdp_url` / `DONSETCH_BROWSER__CDP_URL`).** Hosts that cannot install Chrome locally (such as NAS devices or slim containers) can point `web_screenshot` and `donsetch doctor` at an external Chromium DevTools Protocol endpoint (`http(s)://host:port` or `ws(s)://...`). DonSeTch rewrites container-local `127.0.0.1`/`localhost` debugger URLs onto the configured host, creates an isolated incognito browser context per capture, enforces the full `Fetch.requestPaused` SSRF/URL-rule guard on flattened target sessions, and disposes only its target and context without closing the external browser.
+
+### Fixed
+
+- **Bright Data and BYOK Google `/goto` links resolve to real publisher URLs (#456).** Opaque signed-out `google.*/goto?url=…` links returned by Google SERP providers are resolved concurrently via cookie-less, no-Referer, non-following `GET` 302 probes (bounded concurrency, tight deadline, batch-stop on 403/429/503, honors `[rules.url]`) before deduplication, so models, deny rules, and citations see the real destination host instead of `google.com`. Local redirect wrappers (`/url?q=`, `uddg=`) also unwrap before deduplication, keyless `contract::url_class` classifies Google `/goto` as a redirector, and `donsetch-fetch` suppresses stored Google cookies and cookie/state persistence if a `/goto` URL is ever fetched directly.
+- **Fetch wire pooling, cookie scope, and redirect header stealth.** `Worker` shares one public-only SSRF `Guard` wire per `(identity, proxy)` instead of allocating an unbounded Tokio runtime and client per unique host, evicts temporary `allow_private` wires, and clears `guard` on `release()` / `once()`. `State::store_cookies` normalizes pathless (`None`) and `Path=/` cookies into the same slot and orders `Cookie` headers by path length descending (RFC 6265 §5.4). Redirect chains now enforce RFC 6265 path boundaries and `Secure` flags on hop cookies, carry destination-host cookies across `http→https` and `apex→www` hops, monotonically downgrade `Sec-Fetch-Site` and `Referer` (`strict-origin-when-cross-origin`), and strip `Content-Type` when 301/302/303 downgrades `POST` to `GET`.
+- **Search latency and recall fixes.** `byok_flight` followers wake as soon as a failing leader exits `byok_inflight` instead of sleeping 12 s; `decode_bing` handles `?u=a1…` as the first query parameter; and `enrich_results` parses HTML once with cached selectors on `spawn_blocking` instead of twice synchronously on async workers.
+- **Crawl reliability and budget enforcement.** Zero-status transport errors (`status == 0`) now report to `governor.on_error` and skip the page instead of permanently aborting the crawl as `Walled`; `wait_lane` loops after pacing sleeps so `Crawl-delay` and 429 backoff apply on every page and stop cleanly at the deadline; and `diff_mode` respects `opts.max_pages` instead of promoting every reserve row into `plan.pages`.
+- **CDP request guard on flattened sessions.** `Cdp::spawn_request_guard_for_session` forwards `sessionId` on `Fetch.continueRequest`/`Fetch.failRequest` and detaches `guard_queue` on `RequestGuard::drop` so trailing events never kill a reused WebSocket.
+
+## [5.5.7] - 2026-11-18
+
+### Changed
+
+- **The content lane runs a page's own app, not a reduced copy of it.** Worker is real behaviour
+  inside the content lane (a signature SDK that builds one from a Blob URL and waits for its answer
+  no longer stalls the boot), `performance.getEntriesByType("navigation")` and the legacy
+  `performance.timing` carry the Navigation Timing fields apps read (`connectEnd`, `responseStart`),
+  `PerformanceObserver.supportedEntryTypes` lists the kinds a page tests before observing, and
+  `navigator.connection` exists where the identity has one. Together these let a protected,
+  client-rendered app finish its own boot and issue its data requests: TikTok now completes its WAF
+  proof, reloads into the served document, boots the React app, calls its item/user APIs, and yields
+  the profile's stated figures (469.2M Likes, 97M Followers) in about 11 s cold.
+- **A challenge reload carries the whole cookie jar.** The lane re-requests the same URL with the
+  document's `Set-Cookie` values, the caller's cookies, and the cookies the page program wrote, as an
+  arriving navigation (`Referer`, `Sec-Fetch-*`), instead of only the program's own two cookies.
+- **The content lane's wall clock is a ceiling, not a delay.** It may use up to 8 s when the
+  encounter has it (a heavy app's last request no longer dies at 5 s); a lane that settles stops at
+  once, and the encounter deadline still wins. LinkedIn's `999` is classified as an identity refusal,
+  so the encounter rotates identities and retries instead of recording a server error.
+
+### Fixed
+
+- **A gate is never content.** A page whose title or text is a script gate ("enable JavaScript",
+  "trouble accessing", "select your country") or a locale/currency picker fails the contract, and a
+  short shell, a named gate, a metrics table, or a picker makes the product's read thin/incomplete
+  rather than `content_ok`. This removes the false successes that five real sites reproduced:
+  Google's JS notice, Instagram's country list, Best Buy's country chooser, and TikTok's WAF quota
+  table.
+- **Synthesis and inline state only render pages.** A flat metrics/quota object, an array of ids, or
+  a vertical table of snake-case counters is no longer fused as the document; a wrapper array earns
+  a page through its fields, not its size. A metrics table appended beside real prose is stripped
+  from the returned text.
+- **The content host completes the standard surfaces a boot path tests.** Unpadded base64 decodes as
+  browsers decode it (a WAF payload's JSON no longer gains trailing bytes), the SVG interface names
+  exist (`SVGSVGElement` was fatal to TikTok's bundle), and `Location` is constructible.
+
+Recorded 18 November 2026, cold product binary, home IP, two rounds: TikTok content 2/2 (213 chars,
+11.1–11.4 s), LinkedIn 3/3 (6,251 chars, 1.4–1.9 s), Google and Best Buy honestly incomplete, the SPA
+set 17/17 cold. The five-site witness is in `docs/benchmarks.md`; the private captures are in
+`~/Projects/donsetch-evidence/five-2026-11-18/`. The 5.5.6 corpus was recorded before these lane
+surfaces and its TikTok/Instagram shells do not describe this build.
+
+## [5.5.6] - 2026-11-18
+
+### Changed
+
+- **Browserless causal hydration, native ES module runtime, and universal blueprint replay.**
+  `donsetch-fetch` separates `<main>`/`<article>` content from navigation chrome (`hydrate.rs`) so
+  partial-HTML app shells and null-prop SSR wrappers enter hydration with zero false triggers on
+  static or server-rendered pages. Before starting V8, a zero-JS inline state materializer renders
+  embedded `window.*`, `data-page`/`data-props`, `<script type="application/json">`, and normalized
+  Apollo/Relay entity caches in under a millisecond. When JavaScript execution is required, V8 now
+  loads ES module graphs, dynamic `import()` route chunks, `import.meta.resolve`, import maps, and
+  `<base href>` concurrently over multiplexed HTTP/2 (`WireHandle::call_async`, 256 content ops /
+  64 MB ceiling) against expanded data-plane DOM surfaces (`<template>`, comment hydration anchors,
+  SVG geometry, `DOMParser`, `NodeIterator`/`TreeWalker`, `customElements`, `CSSStyleSheet`,
+  `MessageChannel`, async `XMLHttpRequest`, the `Location` interface object, and CSP-style Worker
+  fallback). `synthesize.rs` fuses
+  verified `2xx` OpenAPI, npm dependency-graph, GraphQL Relay, Entity JSON, and HTML-fragment wire
+  responses when the live DOM is graphical or collapsed, and `mine.rs` extends zero-JS HTTP replay
+  from collections to single-entity JSON and HTML documentation fragments with middle-segment and
+  filename-affix `{{n}}` URL templating.
+- **SPA-aware `crawl` redirect scoping and sitemap-index seed fallback.** `crawl --mode map` and
+  inventory collection adopt canonical cross-domain redirect hosts (`material.angular.io` →
+  `material.angular.dev`) so hydrated links remain in scope, and execute the promised 1-request
+  hydrated seed fallback when a `<sitemapindex>` exhausts its probe budget with zero in-scope URLs.
+
+### Fixed
+
+- **Challenge mint bounded by the encounter deadline.** A Cloudflare or AWS WAF interstitial reached
+  on the last allowed attempt ran V8 to the envelope's 10 s ceiling even when the fetch held a 3 s
+  budget, so a wall could cost 10.3 s (Product Hunt, Indeed). The mint now receives
+  `min(envelope wall, max(remaining encounter time, 5 s measured floor))` and is skipped with a
+  declared attempt below 500 ms: the floor covers the measured 1-3 s AWS WAF mint, the envelope
+  still caps a hostile program, and a walled fetch no longer spends ten seconds.
+- **Bench standing is per target, not per row.** `bench` reports a `standing` block (each target's
+  last round) beside the raw row counts, so a first-round discovery miss that later rounds solved is
+  no longer read as a permanent wall.
+- **Passive Cloudflare beacon script on HTTP 200 app shells.** `classify.rs` no longer misclassifies
+  normal `200 OK` application shells carrying Cloudflare's passive `/cdn-cgi/challenge-platform/`
+  script as active challenge walls when no interstitial marker or `cf-mitigated` header is present.
+- **Origin/Referer domain collisions in mined contracts.** `mine.rs` excludes `origin`, `referer`,
+  and fetch-metadata headers from route-parameter wildcarding so handles matching the site hostname
+  do not corrupt replay headers.
+
+## [5.5.5] - 2026-11-18
+
+### Changed
+
+- **Crimson-Noir CLI design, live multi-lane telemetry, and navigation.** Management and
+  diagnostic commands (`help`, `update`, `rollback`, `status`, `doctor`, `version`, `proxy`,
+  `adapters`, `stop`, `config`, `mcp`, `tools`) and first-run `npm` bootstrap share a
+  cross-platform visual hierarchy with adaptive 24-bit TrueColor / 256-color / 16-color palettes,
+  Windows UTF-8 + Virtual Terminal setup, segmented health meters, and contextual next-command
+  hints. Interactive sessions show a live comet scanner during probes/tool runs and an 8-lane
+  parallel range conduit bar during `donsetch update`, degrading to zero-escape plain text when
+  piped or under `NO_COLOR` / `--json` / `-q` and restoring cursor visibility on `Ctrl+C`.
+- **Update and rollback inspection flags.** `donsetch update` adds `--check` (`-c`) to report
+  release availability without downloading and `--force` (`-f`) to refresh the current binary and
+  sibling runtime libraries in place; `donsetch rollback` adds `--check` (`-c`) to inspect the
+  saved backup before swapping.
+
+### Fixed
+
+- **Zero-tool in-process archive extraction and resilient first-run downloads.** `npm/install.js`
+  extracts `.tar.gz` archives directly through Node's built-in `zlib` and an in-process ustar /
+  PAX / GNU LongLink tar reader (with path-traversal guards), removing external `tar`/`gzip`
+  requirements on minimal containers and avoiding Windows GNU-tar drive-letter failures. First-run
+  downloads verify the `.sha256` manifest upfront, resume interrupted transfers via HTTP `Range`
+  requests, boost throttled multi-MB streams across parallel range connections, fall back to the
+  GitHub Releases API mirror, and fail immediately without retry backoff on malformed/non-HTTP
+  proxies (#455), HTTP 407 proxy auth errors, or invalid TLS certificates.
+- **Race-free runtime staging, Windows locked-binary upgrades, and version-stamp sync.** The npm
+  installer stages companion `.so`/`.dylib`/`.dll` libraries before exposing `donsetch(.exe)`,
+  replaces pre-existing subdirectories cleanly (#455), moves locked Windows binaries aside when
+  upgrading alongside a running MCP server, and closes `/proc/self/exe` reliably (#455).
+  `resolve-binary.js` upgrades stale stamped package binaries after `npm update` without
+  downgrading newer self-updated installs, while `donsetch update` and `donsetch rollback`
+  canonicalize symlinks, keep npm `.version` stamps in sync, and clear macOS quarantine attributes.
+- **Parallel range download throughput window and deadline enforcement.** `donsetch update`'s
+  8-lane range downloader monitors aggregate window throughput and overall deadlines while
+  segments are in flight instead of awaiting all eight tasks first, failing over promptly from
+  throttled routes while keeping the contiguous prefix for resume (#454).
+- **Mined request contract templating and replay fidelity.** `mine::template` only wildcards URL
+  path segments and query values that actually parameterize the mined request, preserves `+` and
+  `%26` when decoding paths, escapes filled URL and JSON body slots in `materialize`, and honors
+  caller `Contract` predicates, redirect `final_url`, and `capture_body` on replay (#451).
+- **Embedded V8 `TextEncoder.encodeInto` UTF-8 boundaries.** Truncated destination buffers stop
+  cleanly on codepoint boundaries and report exact consumed UTF-16 code units in `read` (#452).
+- **Crawl quality gating, seed host normalization, and multi-line code fences in digests.**
+  `crawl` checks `min_quality` before charging `max_total_chars` or recording duplicate signatures
+  and parses seed hosts via `url::Url` (#453). Digest card splitting, boilerplate deduplication,
+  and truncation keep fenced code blocks containing blank lines or shared imports intact instead
+  of splitting fences and flattening code onto one line.
+- **Fast offline `status` and complete `doctor` rows.** `donsetch status` bounds release-feed
+  checks to 1.8 s and honors `DONSETCH_NO_UPDATE_CHECK` / `CI`, and `donsetch doctor` renders
+  the `Search model` and `MCP output` rows in its human report so displayed checks match the
+  summary tally.
+- **Resilient ONNX Runtime build acquisition.** `build.rs` fetches the pinned Microsoft ONNX
+  Runtime shared libraries (`1.24.2` on Linux/Windows, Developer-ID-signed `1.23.2` on macOS) via
+  byte-range slices of Microsoft's immutable NuGet packages before falling back to full `.nupkg`
+  and GitHub Release archives, verifying the extracted shared library's SHA-256 on every path.
+
+## [5.5.4] - 2026-11-16
+
+### Fixed
+
+- **Pi installs its pinned binary under a compiled host.** The first run ran the installer as
+  `process.execPath install.js --bin-dir DIR`; in a Bun-compiled host (Pi-Bolt) that executable
+  is the host itself, which rejects the installer's arguments, so the pinned binary was never
+  installed and a different `donsetch` on PATH was used silently. The installer is now a library
+  that runs in the calling process, whatever started it; a fallback names its version and says
+  when it is not the version the package pins (issue #450).
+- **A first search answers from the web, not from a registry guess.** A bare proper noun
+  ("Calgary") spent three of the six request exchanges on a package-registry lookup before any
+  engine was asked, so on a fresh state one engine decided the whole call. The guess claims the
+  budget first only for a word written like a package name, and a first-party lookup that finds
+  no record no longer turns a fan-out where every engine failed into "no results": the call
+  reports the engine statuses instead.
+- **A half-started MCP server no longer blocks the next start.** The Pi extension kills a server
+  whose initialize never completed, so a later tool call retries the handshake instead of
+  failing with "still initializing".
+
+## [5.5.3] - 2026-11-16
+
+### Fixed
+
+- **Windows releases include their Visual C++ runtime.** The required DLLs ship beside
+  `donsetch.exe`, so a PC without a machine-wide redistributable can start the CLI, MCP and Pi.
+  Packaging checks the runtime dependencies; self-update and rollback carry the same DLLs.
+- **Pi uses the same binary resolver as the CLI.** `DONSETCH_BINARY` takes precedence even
+  when the package has a local binary, and a lost executable bit is repaired before startup.
+
+### Changed
+
+- **npm installation needs no script approval.** The postinstall hook is removed. The first
+  CLI command or Pi session downloads and verifies the matching release binary; npm, pnpm,
+  bun and `--ignore-scripts` installs follow the same path. A read-only global package can
+  install its binary into the user's versioned cache without sudo. Existing local binaries
+  and explicit overrides keep working offline.
+
+## [5.5.2] - 2026-11-16
+
+### Fixed
+
+- **A multi-topic focus plans every named topic.** `web_crawl`'s focus is the caller's words, and
+  the planner now answers each term before it spends a page on breadth: `focus "channels select
+  shared state"` returns the Tokio tutorial's channels, select and shared-state pages instead of
+  collapsing them into one family representative.
+- **A family is a set, not a page.** The deepening phase spends the remaining budget on a family's
+  inventory members instead of its first three samples, so a ten-page family can fill a ten-page
+  budget and a no-focus crawl stops padding.
+- **The site's own labels are scored.** Seed navigation, `llms.txt` titles and hub links are matched
+  beside the URL path: MDN's Flexbox guides (`/Guides/Flexible_box_layout`) and Python's "Errors
+  and Exceptions" (`errors.html`) are found by the name the site uses, not only its slug.
+- **Bounded link discovery on a site with no published inventory.** When there is no sitemap, page
+  list or feed, the map reads the focus's best-ranked seed link and inventories its links — a
+  category page's items become plannable, inside the inventory's request budget.
+- **Coverage and stop reasons tell the truth.** The digest reports topics answered (`4/4 topics`),
+  pages planned against the in-scope inventory, and names an unanswered term; `covered` is no
+  longer claimed while a named page sat unselected. The plan renderer never divides by zero.
+- **`resume` is in the crawl result.** The documented continuation token is the job id, now
+  returned beside `job`.
+
+### Changed
+
+- **Digest cards follow the page budget:** 500–3,200 characters per card and a 14k–60k character
+  envelope, so a 10-page crawl returns ten real cards instead of a fixed 900-character brief.
+- **The crawl dossier is v4**, adding the site's own labels for its inventory URLs. An older
+  dossier is discarded and rebuilt by the next map.
+
+## [5.5.1] - 2026-11-16
+
+### Fixed
+
+- **Crawl CLI help describes the shipped v6 crawl.** The `crawl --help` long text still named the
+  retired sitemap/content frontier path. It now names `full` (plan + execute), `map`, `plan`,
+  `run`, `diff`, `get`, `sites`, `forget`, job resume and `pN` handles.
+
+## [5.5.0] - 2026-11-15
+
+### Changed
+
+- **Crawl is rebuilt around a site model, a plan and a digest.** `full` now plans the site and
+  spends that plan through the v5 fetch engine, returning page cards with stable `pN` handles
+  instead of a page dump. `map`, `plan`, `run`, `diff`, `get`, `sites` and `forget` are the
+  crawl contract. Page cards keep headings and focus passages; `crawl get pN` returns the full
+  stored page with no network; dataset rows are schema v3.
+- **A repeat crawl is cheap and honest.** The dossier records the inventory hash, source,
+  lastmod trust, page-list stability and bounded per-URL fingerprint/lastmod memory. `crawl diff`
+  fetches only changed/new pages and reports removed URLs; `crawl sites`/`forget` manage the
+  bounded host dossiers.
+
+### Removed
+
+- **The old crawl execution path.** The best-first frontier walk, its scheduler and worker pool,
+  the 30-minute resume store and the page-dump renderer are gone. `full` no longer walks a
+  frontier; one plan, one executor, one digest and one job store remain. The tool name, the
+  four-tool cap and the `web_crawl` surface stay.
+
+### Fixed
+
+- **The crawl tool definition matches the shipped contract.** `content` is no longer advertised;
+  `full`, `map`, `plan`, `run`, `diff`, `get`, `sites`, `forget`, `refresh`, `job`, `handle` and
+  dataset v3 are documented in the generated schema and fixtures.
+
 All notable changes to DonSeTch are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [5.4.1] - 2026-11-15
+
+### Fixed
+
+- **The updater downloads release assets over parallel ranges.** A single stream from the release
+  CDN is throttled per connection on some networks — measured 4-28 KB/s while the same 40 MB asset
+  came down at 200+ KB/s over several connections — so an upgrade that should take minutes gave up
+  after twenty. The downloader now probes with one range request, splits what is missing across
+  eight connections, resumes each segment on a stall, and keeps the buffer a resumable prefix for
+  the next route; a server that ignores `Range` is streamed exactly as before. An asset below 2 MB
+  still takes the streaming path.
+
+## [5.4.0] - 2026-11-15
+
+### Added
+
+- **Fetch: a JavaScript application's own program now runs for content.** A thin shell or a
+  JS-required page boots its own scripts in the in-process engine and returns the document it
+  assembles, which enters the pipeline exactly where a fetched document does. There is no browser,
+  no layout and no raster: the page's program runs against a data-plane DOM, as the identity that
+  fetched the document, through the same wire, cookies and pacing, and its own network requests are
+  recorded as they leave. A document that already answers never runs anything (10-13 ms, zero
+  requests), so ordinary pages cost what they cost today.
+- **Fetch: the request the app makes for its content is remembered.** A first run mines that
+  request (method, URL template, headers, body) per host, identity and URL shape; the next
+  encounter replays it as plain HTTP before any JavaScript, checks the answer's structure, and
+  mines a fresh one if it breaks. Measured on the same page: 2.3 s to 3,072 characters on the
+  first fetch, then 1.23 s for 30 items with no JS, against curl's 1.53 s on the document alone.
+- **Fetch: the JS-visible surface is measured, not guessed.** Window geometry, `screen`, media
+  queries (range syntax included) and the observer family answer from the identity's captured
+  client, and a test holds every one of them to a real browser's capture of the same probe page.
+  An element's box is its declared size; positions are 0, because there is no layout.
 
 ### Security
 
@@ -38,10 +358,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries one. Latin-script queries default to English as a language, not a country; non-Latin
   queries send no language unless `lang` is set. The script-level native/foreign filter, the
   Wikipedia-edition guess and the per-provider `setlang`/`cc`/`kl`/`vl` inference are removed.
-- **Fetch: the content lane mines and replays the app's own request (M3).** The wire tap records
-  the request; a first content run mines a request contract per host/identity/URL shape, and the
-  next encounter replays it as plain HTTP before any JS, with a structural check and a re-mine on
-  break.
+- **The repo has no release gates.** The 220×3 cold pool, the 50-query blind review and the peer
+  matrix are gone, with the tools that ran them (`bench/release_gate*.py`, `bench/blind_review.py`,
+  `bench/headtohead.py`, `bench/rubric.md`). They cost hours of wall clock and hammered the egress
+  IP for a number; search is now judged by one cold run over the held rows plus live queries, and
+  the rule against time-consuming gates is in `project.md`. `just gates` is gone too: the payload
+  checks (`scripts/gates.sh`) run only inside the release pipeline, on every artifact.
+- **Fetch: the content lane's budget follows the measurement.** 96 ops and a 5 s ceiling, from
+  the heaviest measured shell (455 KB, 70 requests) quiescing at 4.0-4.3 s. Under the previous 64
+  ops its own last requests were refused, so the run ended on the wall instead of its own
+  quiescence. A budget is measurable without a rebuild: `V5_CONTENT_OPS`.
 
 ## [5.3.0] - 2026-11-12
 

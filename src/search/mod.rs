@@ -30,7 +30,10 @@ mod lane_cache;
 mod lang;
 pub(crate) mod ledger;
 pub use lang::{Lang, native_script};
+mod exa_mcp;
+mod keenable;
 mod news;
+pub(crate) mod parallel_mcp;
 mod persist;
 pub mod quality;
 mod render;
@@ -538,6 +541,10 @@ pub struct Searcher {
     pool: std::sync::Arc<EgressPool>,
     google: engines::google_wml::ProfileSelector,
     cse: cse::Client,
+    parallel_mcp: parallel_mcp::Client,
+    /// Round-robin cursor spreading primary slots across healthy Tier-1
+    /// keyless engines so no single upstream bears 100% of query load.
+    tier1_cursor: std::sync::atomic::AtomicUsize,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
     /// Persisted to disk: an engine that learned "this walled me"
     /// keeps that memory across daemon restarts instead of
@@ -705,6 +712,8 @@ impl Searcher {
             pool,
             google: engines::google_wml::ProfileSelector::from_env(),
             cse: cse::Client::load(),
+            parallel_mcp: parallel_mcp::Client::load(),
+            tier1_cursor: std::sync::atomic::AtomicUsize::new(0),
             trust: Mutex::new(trust),
             trust_intent: Mutex::new(trust_intent),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -909,8 +918,16 @@ impl Searcher {
                 if let Some(hit) = self.byok_cache_get(query, intent, max) {
                     return Ok(hit);
                 }
+                let still_running = self
+                    .byok_inflight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&key);
+                if !still_running {
+                    break;
+                }
             }
-            // Leader died or stalled : compute ourselves.
+            // Leader failed or stalled: compute ourselves.
         }
         let _guard = InflightGuard {
             map: &self.byok_inflight,
@@ -1475,6 +1492,7 @@ impl Searcher {
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
         // The caller's language, or the English default for a Latin query.
         // No script is turned into a language or a market here.
+        let explicit_lang = lang.is_some();
         let lang = lang::effective(query, lang);
         let cache_key = format!(
             "{}|{}|lang={}",
@@ -1530,7 +1548,39 @@ impl Searcher {
             });
         }
 
-        let engines = intent::engines_for(intent);
+        let base_engines = intent::engines_for(intent);
+        let engines: Vec<&str> = if explicit_lang {
+            base_engines.to_vec()
+        } else {
+            let cfg = crate::config::cfg();
+            let mut tier1: Vec<&str> = Vec::with_capacity(4);
+            if base_engines.contains(&"google-cse") {
+                tier1.push("google-cse");
+            }
+            if cfg.search.keenable {
+                tier1.push(keenable::SOURCE);
+            }
+            if cfg.search.exa_mcp {
+                tier1.push(exa_mcp::SOURCE);
+            }
+            if cfg.search.parallel_mcp {
+                tier1.push(parallel_mcp::SOURCE);
+            }
+            if tier1.len() > 1 {
+                let shift = self
+                    .tier1_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % tier1.len();
+                tier1.rotate_left(shift);
+            }
+            let mut ordered = tier1;
+            for &e in base_engines {
+                if !ordered.contains(&e) {
+                    ordered.push(e);
+                }
+            }
+            ordered
+        };
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
         // polluted with the literal token).
@@ -1559,8 +1609,11 @@ impl Searcher {
         let mut used_egresses: Vec<String> = Vec::new();
         // Engines get the original query; the recall variant
         // goes only to the first two engines (top trust).
-        let benched =
-            |e: &str| self.quarantined(engine_health_key(e)) || self.resting(engine_health_key(e));
+        let benched = |e: &str| {
+            self.quarantined(engine_health_key(e))
+                || self.resting(engine_health_key(e))
+                || (e == keenable::SOURCE && keenable::is_cooling())
+        };
         let mut live: Vec<&str> = engines.iter().filter(|e| !benched(e)).copied().collect();
         // Every source resting at once means the roster, not the sources, is
         // wrong: try them all rather than answering from nothing.
@@ -1600,7 +1653,10 @@ impl Searcher {
                     .copied()
                     .unwrap_or(1.0)
             };
-            live.sort_by(|a, b| score(b).total_cmp(&score(a)));
+            // Bucket trust into coarse 0.15 bands so healthy Tier-1 peers keep
+            // their load-spreading rotation order while degraded lanes drop behind.
+            let band = |e: &str| (score(e) / 0.15).floor() as i64;
+            live.sort_by_key(|a| std::cmp::Reverse(band(a)));
         }
         // ── Adaptive fan-out width: the governor. Under
         // stress the system shrinks its appetite instead of
@@ -1617,7 +1673,23 @@ impl Searcher {
             .iter()
             .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
-        let mut priority_sources = vec!["google-cse".to_string()];
+        // Only mark the initial active wave (first 3 lanes) as priority so
+        // additional healthy Tier-1 engines stay eligible for the reserve queue.
+        let mut priority_sources: Vec<String> = live
+            .iter()
+            .take(3)
+            .copied()
+            .filter(|e| {
+                matches!(
+                    *e,
+                    "google-cse" | parallel_mcp::SOURCE | keenable::SOURCE | exa_mcp::SOURCE
+                )
+            })
+            .map(String::from)
+            .collect();
+        if priority_sources.is_empty() {
+            priority_sources.push("google-cse".to_string());
+        }
         // Authority cannot lift a source absent from the candidate pool.
         // Two scoped recalls join the initial wave, on an engine that honors
         // site:, only while the pool is healthy. Results still need ranking.
@@ -1665,6 +1737,7 @@ impl Searcher {
             pool: self.pool.as_ref(),
             google: &self.google,
             cse: &self.cse,
+            parallel_mcp: &self.parallel_mcp,
             lang: lang.clone(),
             requests: &engine_allowance,
             facts: Some(&query_facts),
@@ -1691,6 +1764,8 @@ impl Searcher {
                     0
                 } else if name == "google-cse" {
                     self.cse.request_cost(eg.proxy.as_ref())
+                } else if name == parallel_mcp::SOURCE {
+                    self.parallel_mcp.request_cost(eg.proxy.as_ref())
                 } else {
                     1
                 },
@@ -1892,9 +1967,12 @@ impl Searcher {
             let is_news = |name: &str| matches!(name, "bing-news" | "feed" | "gdelt");
             futures.sort_by_key(|(name, _)| !is_news(name));
         }
-        if query.split_whitespace().count() == 1
-            && futures.iter().any(|(name, _)| name == "registry")
-        {
+        // A bare word is where the registry record can be the answer, but
+        // only when it is written like a package name. A proper noun
+        // ("Calgary", "React") is a topic for the web indexes: spending
+        // three of the six request exchanges on a registry guess is how a
+        // first search planned one engine and answered from nothing.
+        if guess_is_the_answer(query) && futures.iter().any(|(name, _)| name == "registry") {
             futures.sort_by_key(|(name, _)| name != "registry");
             priority_sources.push("registry".into());
         }
@@ -1929,7 +2007,7 @@ impl Searcher {
             // served by another general index than by a third vertical.
             let vert_cap = if intent == Intent::Paper { 3 } else { 2 };
             let room = match class {
-                0 => engines_kept < 4,
+                0 => engines_kept < 5,
                 1 => verticals_kept < vert_cap,
                 2 => news_kept < 2,
                 _ => guesses_kept < 1,
@@ -2149,13 +2227,14 @@ impl Searcher {
             }
             // A source that answered "nothing relevant" is an answer: the web
             // has nothing for this query, and that is not a tool failure. Only
-            // a call where nothing could be asked at all is an error.
-            let answered = report.iter().any(|r| {
-                matches!(
-                    r.status.split(':').next().unwrap_or(""),
-                    "off-query" | "no-results" | "empty-parse" | "thin"
-                )
-            });
+            // a call where nothing could be asked at all is an error. A
+            // first-party lookup is not that answer: "no package by that
+            // name" or "that item has no docs page" says nothing about the
+            // web, and it must not dress a fan-out where every engine failed
+            // as a finished "no results".
+            let answered = report
+                .iter()
+                .any(|r| !first_party_lookup(&r.engine) && web_answer(&r.status));
             if !answered {
                 return Err(FetchError::Http(format!(
                     "search: all engines failed : {}",
@@ -2612,6 +2691,34 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
     } else {
         available.min(3)
     }
+}
+
+/// True when a registry guess should claim the budget before the general
+/// engines: one bare word, written like a package name. Package names are
+/// lower case (npm, crates and PyPI all resolve them lower case anyway); a
+/// capitalised word names a place or a thing, and the web index is the
+/// source that answers it.
+fn guess_is_the_answer(query: &str) -> bool {
+    let mut words = query.split_whitespace();
+    let Some(word) = words.next() else {
+        return false;
+    };
+    words.next().is_none() && !word.chars().any(|c| c.is_uppercase())
+}
+
+/// A lane that resolves a name against its own index instead of searching
+/// the web (`docs.rs`, the package registries).
+fn first_party_lookup(engine: &str) -> bool {
+    engine == "docs" || engine.starts_with("registry")
+}
+
+/// A status that answers the query — even with nothing — as opposed to a
+/// scheduling or transport outcome.
+fn web_answer(status: &str) -> bool {
+    matches!(
+        status.split(':').next().unwrap_or(""),
+        "off-query" | "no-results" | "empty-parse" | "thin"
+    )
 }
 
 /// Enforce `site:domain.com` operator: extract the target domain
@@ -3599,7 +3706,11 @@ mod tests {
     /// "all engines failed" instead of reaching the network.
     fn bench_every_source(s: &Searcher, queries: &[&str]) {
         let mut failures = s.failures.lock().unwrap();
-        let engines = intent::engines_for(Intent::Web).iter().copied();
+        let engines = intent::engines_for(Intent::Web).iter().copied().chain([
+            parallel_mcp::SOURCE,
+            keenable::SOURCE,
+            exa_mcp::SOURCE,
+        ]);
         for e in engines.map(engine_health_key) {
             failures.insert(e.to_string(), (3, Instant::now()));
         }
@@ -4747,5 +4858,61 @@ mod tests {
             ],
             "site:github.com/tokio-rs must keep the github.com/tokio-rs results"
         );
+    }
+
+    // A first search on a fresh state must not spend its request budget on
+    // a registry guess for a word that names a place or a thing: three of
+    // six exchanges bought "Calgary is not a package" while four engines
+    // were never asked.
+    #[test]
+    fn a_proper_noun_does_not_claim_the_registry_priority() {
+        for (query, expected) in [
+            ("zod", true),
+            ("serde_json", true),
+            ("react-router", true),
+            ("@tanstack/query", true),
+            ("Calgary", false),
+            ("React", false),
+            ("Calgary Flames", false),
+            ("", false),
+        ] {
+            assert_eq!(guess_is_the_answer(query), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_first_party_lookup_never_answers_for_the_web() {
+        let report = |engine: &str, status: &str| EngineReport {
+            cache_age_ms: None,
+            engine: engine.into(),
+            profile: None,
+            status: status.into(),
+            hits: 0,
+            ms: 0,
+            egress: "-".into(),
+            requests: 1,
+        };
+        assert!(first_party_lookup("registry-any"));
+        assert!(first_party_lookup("registry@crates"));
+        assert!(first_party_lookup("docs"));
+        assert!(!first_party_lookup("bing"));
+        assert!(!first_party_lookup("feed"));
+
+        let answered = |r: &[EngineReport]| {
+            r.iter()
+                .any(|r| !first_party_lookup(&r.engine) && web_answer(&r.status))
+        };
+        // "no package by that name" beside a captcha'd engine is not an
+        // answer: the call reports the failure instead of "no results".
+        assert!(!answered(&[
+            report("registry-any", "no-results"),
+            report("bing", "blocked:captcha"),
+        ]));
+        // An engine that came back empty is.
+        assert!(answered(&[
+            report("registry-any", "no-results"),
+            report("ddg", "no-results"),
+        ]));
+        assert!(answered(&[report("bing", "off-query")]));
     }
 }

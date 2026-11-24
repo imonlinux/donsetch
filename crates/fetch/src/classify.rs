@@ -389,11 +389,28 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
     }
 
     for signature in SIGNATURES {
-        if let Some(marker) = signature
-            .markers
-            .iter()
-            .find(|marker| lower.contains(&marker.to_ascii_lowercase()))
-        {
+        if let Some(marker) = signature.markers.iter().find(|marker| {
+            let m_low = marker.to_ascii_lowercase();
+            if !lower.contains(&m_low) {
+                return false;
+            }
+            // Cloudflare injects passive JS Detections (`/cdn-cgi/challenge-platform/scripts/jsd/`)
+            // at the bottom of ordinary 200 OK application pages (including SPAs like Bundlephobia).
+            // Only treat `/cdn-cgi/challenge-platform/` as a challenge on 2xx when real interstitial
+            // markers (`cf_chl_opt`, `__cf_chl`, `/h/`, `just a moment`) are also present.
+            if signature.vendor == "cloudflare"
+                && **marker == "/cdn-cgi/challenge-platform/"
+                && (200..300).contains(&evidence.status)
+                && !lower.contains("/cdn-cgi/challenge-platform/h/")
+                && !lower.contains("cf_chl_opt")
+                && !lower.contains("__cf_chl")
+                && !lower.contains("<title>just a moment")
+                && !lower.contains("performing security verification")
+            {
+                return false;
+            }
+            true
+        }) {
             found.push(format!("{}:{}", signature.vendor, marker));
             if wall.is_none() {
                 let (asks, class) = asks(signature.vendor, &lower);
@@ -440,7 +457,7 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         };
     }
 
-    if matches!(evidence.status, 401 | 403 | 407 | 429 | 503) {
+    if matches!(evidence.status, 401 | 403 | 407 | 429 | 503 | 999) {
         if let Some(phrase) = REFUSALS.iter().find(|phrase| lower.contains(*phrase)) {
             found.push(format!("refusal:{phrase}"));
         }
@@ -525,6 +542,20 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
     let text = text_chars(&lower);
     if scripts >= 3 && text < 400 {
         found.push(format!("shell:scripts={scripts},text={text}"));
+        return Verdict {
+            class: Class::Shell,
+            wall: None,
+            evidence: found,
+        };
+    }
+    let shd = crate::hydrate::assess_html_shell(evidence.body, "");
+    if shd.is_unhydrated_shell {
+        found.push(format!(
+            "shell:{},app_scripts={},main_text={}",
+            shd.reason.unwrap_or("shd"),
+            shd.app_scripts,
+            shd.main_text_chars
+        ));
         return Verdict {
             class: Class::Shell,
             wall: None,
@@ -755,6 +786,27 @@ async function submitSolve(nonce) { await fetch("/_pow/solve", {method: "POST"})
     fn managed_challenge_is_the_page_program() {
         let body = "<script>window._cf_chl_opt={cvId:'3'}</script>";
         assert_eq!(class_of(403, body, false), Class::WallProgram);
+        // The same payload on a 200 is still the challenge, not a page.
+        assert_eq!(class_of(200, body, false), Class::WallProgram);
+    }
+
+    #[test]
+    fn a_passive_cloudflare_beacon_on_a_served_page_is_not_a_wall() {
+        // Cloudflare injects its JS-detections loader into ordinary 200 pages.
+        let served = format!(
+            "<title>Bundlephobia</title><p>{}</p>\
+             <script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script>",
+            "A paragraph of real documentation text that a reader came for. ".repeat(6)
+        );
+        let served = served.as_str();
+        assert_eq!(class_of(200, served, false), Class::Incomplete);
+        // The loader plus the interstitial title is the challenge, at any status.
+        let challenge =
+            "<title>Just a moment...</title><p>Enable JavaScript and cookies to continue</p>\
+                         <script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script>";
+        assert_eq!(class_of(200, challenge, false), Class::WallProgram);
+        // A 403 carrying only the loader is the edge's refusal, not a served page.
+        assert_eq!(class_of(403, served, false), Class::WallProgram);
     }
 
     #[test]
@@ -780,6 +832,12 @@ async function submitSolve(nonce) { await fetch("/_pow/solve", {method: "POST"})
     #[test]
     fn refusal_without_a_page_is_identity() {
         assert_eq!(class_of(403, "Forbidden", false), Class::WallIdentity);
+        // LinkedIn answers a refused client with its own 999 rather than 403.
+        assert_eq!(
+            class_of(999, "Request Denied", false),
+            Class::WallIdentity,
+            "999 is a refusal of this client, not a server error"
+        );
         assert_eq!(
             class_of(429, "Too Many Requests", false),
             Class::WallIdentity

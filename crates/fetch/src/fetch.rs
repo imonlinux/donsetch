@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -197,18 +197,28 @@ enum Interface {
     Unanswered,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum WireGuardKey {
+    /// No resolver SSRF guard (`once()` or proxied egress).
+    None,
+    /// Shared public-only SSRF guard (all `allow_private == false` hosts).
+    PublicOnly,
+    /// Host-scoped private-allowed SSRF guard (evicted on `release()`).
+    PrivateHost(String),
+}
+
 /// One fetching context: its own clients (one per identity and egress) and the
 /// state it learns into. Single-threaded; `donsetch_fetch::Session` pools these.
 pub struct Worker {
     state: State,
-    wires: HashMap<(&'static str, Option<String>, Option<String>), Wire>,
+    wires: HashMap<(&'static str, Option<String>, WireGuardKey), Wire>,
     /// The egress of the fetch in progress.
     proxy: Option<String>,
     /// The document guard for this fetch: its resolver pins every name the
     /// document's connection resolves, redirects included. None through a
     /// proxy, where the proxy resolves.
     guard: Option<Arc<crate::envelope::Guard>>,
-    guard_host: Option<String>,
+    guard_key: WireGuardKey,
     /// The redirect and header rules of the fetch in progress.
     policy: crate::http::Policy,
     /// Learn from encounters: scores, cookies, credentials.
@@ -274,7 +284,7 @@ impl Worker {
             wires: HashMap::new(),
             proxy: None,
             guard: None,
-            guard_host: None,
+            guard_key: WireGuardKey::None,
             policy: crate::http::Policy::default(),
             persist,
             saves,
@@ -571,7 +581,17 @@ impl Worker {
         attempts: &mut Vec<Attempt>,
         spent_state: bool,
     ) -> Option<Outcome> {
-        let (contract, _values) = self.state.contract_any(host, &document.url)?;
+        let doc_host = url::Url::parse(&document.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| host.to_string());
+        let (contract_host, contract) =
+            if let Some((c, _)) = self.state.contract_any(&doc_host, &document.url) {
+                (doc_host, c)
+            } else {
+                let (c, _) = self.state.contract_any(host, &document.url)?;
+                (host.to_string(), c)
+            };
         // The contract is bound to the identity that mined it: the document may
         // have been fetched by another client, but the app's own request is
         // replayed on the wire and jar that witnessed it.
@@ -582,8 +602,11 @@ impl Worker {
         }
         let (request_url, headers, body) = contract.materialize(&document.url, &document.url)?;
         let limits = options.content.clone();
-        let guard =
-            crate::envelope::Guard::with_policy(limits.clone(), host, options.allow_private);
+        let guard = crate::envelope::Guard::with_policy(
+            limits.clone(),
+            &contract_host,
+            options.allow_private,
+        );
         if let Err(error) = guard.check_url(&request_url) {
             attempts.push(Attempt {
                 identity: identity.name.to_string(),
@@ -597,7 +620,7 @@ impl Worker {
                 note: Some(format!("replay: {error}")),
             });
             self.state
-                .drop_contract(host, identity.name, &contract.shape);
+                .drop_contract(&contract_host, identity.name, &contract.shape);
             return None;
         }
         let Ok(wire) = Wire::guarded(identity, &guard, self.proxy.as_deref()) else {
@@ -658,8 +681,13 @@ impl Worker {
         match response {
             Ok(response) if (200..300).contains(&response.status) => {
                 let body_text = &response.body;
-                match contract.extract(body_text, &request_url) {
-                    Some(items) => {
+                match contract.extract_payload(
+                    body_text,
+                    &request_url,
+                    &document.url,
+                    &contract_host,
+                ) {
+                    Some(payload) => {
                         attempts.push(Attempt {
                             identity: identity.name.to_string(),
                             transport: "replay".to_string(),
@@ -668,47 +696,49 @@ impl Worker {
                             ms,
                             bytes: response.body.len(),
                             version: response.version.clone(),
-                            title: items
-                                .first()
-                                .map(|item| item.title.clone())
-                                .unwrap_or_default(),
+                            title: payload.title.clone(),
                             note: Some(format!(
-                                "replay: {} items (min {}) from {} {safe_url}, shape {}",
-                                items.len(),
+                                "replay ({:?}): {} items (min {}) from {} {safe_url}, shape {}",
+                                contract.kind,
+                                payload.items,
                                 contract.min_items,
                                 contract.method,
                                 contract.shape
                             )),
                         });
                         if self.persist {
-                            self.state.record(host, identity.name, "content", true, ms);
                             self.state
-                                .record_contract(host, identity.name, &contract.shape, true);
-                            self.state.origin_mut(host).route = Some("replay".into());
+                                .record(&contract_host, identity.name, "content", true, ms);
+                            self.state.record_contract(
+                                &contract_host,
+                                identity.name,
+                                &contract.shape,
+                                true,
+                            );
+                            self.state.origin_mut(&contract_host).route = Some("replay".into());
                             self.save_state();
                         }
-                        let text_chars: usize =
-                            items.iter().map(|item| item.title.chars().count()).sum();
+                        let rendered = payload.html;
                         return Some(Outcome {
                             url: url.to_string(),
                             cache: None,
                             host: host.to_string(),
-                            // The caller asked for the document; the API it
-                            // names is an implementation of that answer.
-                            final_url: url.to_string(),
+                            // Preserve any redirect the document followed,
+                            // while keeping the internal API URL private.
+                            final_url: document.url.clone(),
                             class: Class::Content,
                             identity: Some(identity.name.to_string()),
                             status: response.status,
                             ms_total: started.elapsed().as_secs_f64() * 1000.0,
                             ms_first: first_ms,
                             attempts: std::mem::take(attempts),
-                            title: format!("replay {host}"),
-                            text_chars,
+                            title: payload.title,
+                            text_chars: payload.text_chars,
                             wall: None,
                             evidence: vec![
                                 format!(
                                     "replay: {} items from {} {safe_url} (mined contract, shape {})",
-                                    items.len(),
+                                    payload.items,
                                     contract.method,
                                     contract.shape
                                 ),
@@ -720,20 +750,15 @@ impl Worker {
                             failures: Vec::new(),
                             spent_state: spent_state || cookie.is_some(),
                             transport: "replay".to_string(),
-                            items: items.len(),
-                            sample: items
-                                .iter()
-                                .take(5)
-                                .map(|item| item.title.clone())
-                                .collect(),
-                            sample_urls: items
-                                .iter()
-                                .filter_map(|item| item.url.clone())
-                                .take(5)
-                                .collect(),
-                            body_text: crate::mine::render(host, &items),
-                            body: None,
-                            headers: Vec::new(),
+                            items: payload.items,
+                            sample: payload.sample,
+                            sample_urls: payload.sample_urls,
+                            body: options.capture_body.then(|| rendered.clone()),
+                            body_text: rendered,
+                            headers: vec![(
+                                "content-type".to_string(),
+                                "text/html; charset=utf-8".to_string(),
+                            )],
                             bytes: None,
                         });
                     }
@@ -744,7 +769,7 @@ impl Worker {
                             break_note("the answer no longer has the mined shape".into()),
                         );
                         self.state
-                            .drop_contract(host, identity.name, &contract.shape);
+                            .drop_contract(&contract_host, identity.name, &contract.shape);
                     }
                 }
             }
@@ -755,12 +780,12 @@ impl Worker {
                     break_note(format!("status {} broke the contract", response.status)),
                 );
                 self.state
-                    .drop_contract(host, identity.name, &contract.shape);
+                    .drop_contract(&contract_host, identity.name, &contract.shape);
             }
             Err(error) => {
                 fail(attempts, 0, break_note(format!("request failed: {error}")));
                 self.state
-                    .drop_contract(host, identity.name, &contract.shape);
+                    .drop_contract(&contract_host, identity.name, &contract.shape);
             }
         }
         None
@@ -790,17 +815,103 @@ impl Worker {
         // Replay a mined contract before any JavaScript: the app's own request,
         // as plain HTTP, on the identity and jar that mined it. A break falls
         // through to the lane, which mines a fresh contract when it passes.
-        if let Some(outcome) = self.replay_contract(
-            url,
-            host,
-            response,
-            options,
-            started,
-            first_ms,
-            attempts,
-            spent_state,
-        ) {
-            return Some(outcome);
+        let has_custom_predicates = contract.title_contains.is_some()
+            || contract.text_contains.is_some()
+            || contract.selectors.is_some()
+            || contract.allowed_origins.is_some();
+        if !has_custom_predicates {
+            if let Some(outcome) = self.replay_contract(
+                url,
+                host,
+                response,
+                options,
+                started,
+                first_ms,
+                attempts,
+                spent_state,
+            ) {
+                return Some(outcome);
+            }
+            // Stage 0: Zero-JS Universal Inline State Materializer.
+            // When the shell HTML already embeds full structured state (such as
+            // `window.__appData`, `data-page`, or populated script JSON), render
+            // semantic HTML directly in sub-millisecond time without booting V8.
+            let inline_started = Instant::now();
+            if let Some(inline) =
+                crate::hydrate::materialize_inline_state(&response.body, &response.url)
+            {
+                let content = crate::contract::verify_response(
+                    200,
+                    &[],
+                    &inline.html,
+                    &response.url,
+                    contract,
+                    generic,
+                );
+                if content.passed {
+                    let inline_ms = inline_started.elapsed().as_secs_f64() * 1000.0;
+                    let html_headers = vec![(
+                        "content-type".to_string(),
+                        "text/html; charset=utf-8".to_string(),
+                    )];
+                    attempts.push(Attempt {
+                        identity: identity.name.to_string(),
+                        transport: "program".to_string(),
+                        class: Class::Content,
+                        status: 200,
+                        ms: inline_ms,
+                        bytes: inline.html.len(),
+                        version: String::new(),
+                        title: content.title.clone(),
+                        note: Some(format!(
+                            "inline state ({}): {} text chars, 0 JS",
+                            inline.source_name, content.text_chars
+                        )),
+                    });
+                    if self.persist {
+                        self.state
+                            .record(host, identity.name, "content", true, inline_ms);
+                        self.save_state();
+                    }
+                    let cookie = self.state.cookie_header_for(&response.url, identity.name);
+                    self.captured = Some(Captured {
+                        identity: identity.name,
+                        final_url: response.url.clone(),
+                        status: 200,
+                        headers: html_headers.clone(),
+                        bytes: inline.html.clone().into_bytes(),
+                        cookie,
+                        revalidated: None,
+                    });
+                    let mut outcome = answer(
+                        url,
+                        host.to_string(),
+                        response,
+                        Class::Content,
+                        identity.name,
+                        Ended {
+                            started,
+                            first_ms,
+                            attempts: std::mem::take(attempts),
+                            spent_state,
+                            capture: options.capture_body,
+                        },
+                    );
+                    outcome.title = content.title;
+                    outcome.text_chars = content.text_chars;
+                    outcome.transport = "program".to_string();
+                    outcome.evidence.push(format!(
+                        "inline state materialized from {} in {:.2} ms ({} text chars, 0 V8)",
+                        inline.source_name, inline_ms, content.text_chars
+                    ));
+                    if options.capture_body {
+                        outcome.body = Some(inline.html);
+                        outcome.headers = html_headers;
+                        outcome.bytes = None;
+                    }
+                    return Some(outcome);
+                }
+            }
         }
         let lane_started = Instant::now();
         // The lane spends what the encounter has left, never more: an encounter
@@ -822,9 +933,13 @@ impl Worker {
             return None;
         }
         let mut limits = options.content.clone();
-        limits.wall = limits.wall.min(remaining);
+        // The ceiling is not a delay: a lane that finishes quiescent stops at
+        // once, and a lane that needs a moment past the 5 s default (an app's
+        // last data request) is not cut at the boundary. The encounter's own
+        // budget still wins.
+        limits.wall = limits.wall.max(Duration::from_secs(8)).min(remaining);
         let cookie = self.state.cookie_header_for(&response.url, identity.name);
-        let lane = match crate::engine::content_within_via_policy(
+        let mut lane = match crate::engine::content_within_via_policy(
             &limits,
             &response.url,
             &response.body,
@@ -850,16 +965,168 @@ impl Worker {
                 return None;
             }
         };
+        // A program that installs a clearance cookie and reloads has not
+        // finished: the browser would request the URL again with that cookie,
+        // and the origin answers with the page. One hop, same URL, bounded by
+        // the encounter. This is the shape of most JS challenge gates (a
+        // proof of work writes a cookie, then reloads); without it the lane
+        // can only ever see the waiting page.
+        let mut reload_note: Option<String> = None;
+        if std::env::var("V5_ENGINE_LOG").is_ok() {
+            eprintln!(
+                "[engine] reload check: navigate={:?} cookies={} url={}",
+                lane.navigate,
+                lane.cookies.len(),
+                response.url
+            );
+        }
+        // Only a waiting page hops: a lane that already produced text has the
+        // document it came for, and a router's own navigation is not a gate.
+        if lane.text_chars < 200
+            && lane
+                .navigate
+                .as_deref()
+                .is_some_and(|next| same_url(next, &response.url))
+            && !lane.cookies.is_empty()
+        {
+            let budget = options.deadline.saturating_sub(started.elapsed());
+            if budget.as_millis() >= 800 {
+                // A reload carries the whole jar a browser would: the cookies
+                // the document's own headers set, the caller's cookies, and the
+                // ones the program wrote while it ran. Sending only the last
+                // group dropped the session cookies the app then needed.
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or(0);
+                let mut jar: Vec<(String, String)> = Vec::new();
+                if let Some(header) = cookie.as_deref() {
+                    for pair in header.split(';') {
+                        if let Some((name, value)) = pair.trim().split_once('=') {
+                            let name = name.trim();
+                            if !name.is_empty() {
+                                jar.retain(|(key, _)| key != name);
+                                jar.push((name.to_string(), value.trim().to_string()));
+                            }
+                        }
+                    }
+                }
+                for set in &response.cookies {
+                    if set.expires_unix.is_some_and(|expires| expires <= now) {
+                        continue;
+                    }
+                    jar.retain(|(key, _)| key != &set.name);
+                    jar.push((set.name.clone(), set.value.clone()));
+                }
+                for stored in &lane.cookies {
+                    jar.retain(|(key, _)| key != &stored.name);
+                    jar.push((stored.name.clone(), stored.value.clone()));
+                }
+                let reload_cookie = jar
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if std::env::var("V5_ENGINE_LOG").is_ok() {
+                    eprintln!("[engine] reload cookies: {} in the jar", jar.len());
+                }
+                let reloaded = match self.wire(identity) {
+                    Ok(wire) => wire
+                        .get_arriving(
+                            &response.url,
+                            Some(&reload_cookie),
+                            identity,
+                            budget,
+                            &response.url,
+                        )
+                        .ok(),
+                    Err(_) => None,
+                };
+                if let Some(reloaded) = reloaded {
+                    if std::env::var("V5_ENGINE_LOG").is_ok() {
+                        eprintln!(
+                            "[engine] reload -> {} {}B",
+                            reloaded.status,
+                            reloaded.body.len()
+                        );
+                    }
+                    // The reloaded answer is the real document, not the gate:
+                    // a heavy app needs longer to settle than the lane's own
+                    // 5 s, and the encounter has the time once the challenge
+                    // is spent. Still bounded, still one hop.
+                    let mut second_limits = options.content.clone();
+                    second_limits.wall = options
+                        .deadline
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_secs(20));
+                    if (200..300).contains(&reloaded.status)
+                        && second_limits.wall.as_millis() >= 500
+                    {
+                        match crate::engine::content_within_via_policy(
+                            &second_limits,
+                            &reloaded.url,
+                            &reloaded.body,
+                            identity,
+                            Some(&reload_cookie),
+                            self.proxy.as_deref(),
+                            200,
+                            options.allow_private,
+                        ) {
+                            Ok(second) => {
+                                if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                    eprintln!(
+                                        "[engine] reload lane stop={} text={} chars",
+                                        second.stop, second.text_chars
+                                    );
+                                }
+                                self.state.store_cookies(
+                                    host,
+                                    identity.name,
+                                    second.cookies.clone(),
+                                );
+                                reload_note = Some(format!(
+                                    "reload {} -> {} ({}B) as the cookie allows",
+                                    response.status,
+                                    reloaded.status,
+                                    reloaded.body.len()
+                                ));
+                                lane = second;
+                            }
+                            Err(error) => {
+                                if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                    eprintln!("[engine] reload lane error: {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let lane_ms = lane.ms.max(lane_started.elapsed().as_secs_f64() * 1000.0);
         // What the program stored is the identity's own state, bound to it.
         self.state
             .store_cookies(host, identity.name, lane.cookies.clone());
+        // Dual-Plane Fusion: when the rendered DOM is graphical/collapsed/partial
+        // (e.g. SVG dependency graphs, collapsed OpenAPI specs, or unmounted
+        // fragments), fuse verified 2xx data responses from the wire transcript.
+        let (produced_document, synth_note) = if !has_custom_predicates {
+            match crate::synthesize::fuse_dom_and_transcript(
+                &lane.document,
+                &response.url,
+                &lane.transcript,
+            ) {
+                Some(fused) => (fused.html, Some(fused.note)),
+                None => (lane.document.clone(), None),
+            }
+        } else {
+            (lane.document.clone(), None)
+        };
         // The produced document is verified by the same contract a network
         // document answers, with no header facts to lean on.
         let content = crate::contract::verify_response(
             200,
             &[],
-            &lane.document,
+            &produced_document,
             &response.url,
             contract,
             generic,
@@ -874,14 +1141,22 @@ impl Worker {
             },
             status: 200,
             ms: lane_ms,
-            bytes: lane.document.len(),
+            bytes: produced_document.len(),
             version: String::new(),
             title: content.title.clone(),
             note: Some(format!(
-                "content lane: stop={} {} text chars, {} requests{}",
+                "content lane: stop={} {} text chars, {} requests{}{}{}",
                 lane.stop,
-                lane.text_chars,
+                content.text_chars,
                 lane.transcript.len(),
+                reload_note
+                    .as_deref()
+                    .map(|n| format!("; {n}"))
+                    .unwrap_or_default(),
+                synth_note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default(),
                 if content.passed {
                     String::new()
                 } else {
@@ -906,14 +1181,15 @@ impl Worker {
         // that assembled it so every later encounter answers without JS. The
         // request URL is not printed: it may carry the app's own key.
         let mined = crate::mine::mine(
-            &lane.document,
+            &produced_document,
             &response.url,
             identity.name,
             &lane.transcript,
         );
         let mined_note = mined.as_ref().map(|contract| {
             format!(
-                "mined replay contract: {} ({} response, shape {}), at least {} items",
+                "mined replay contract ({:?}): {} ({} response, shape {}), at least {} items",
+                contract.kind,
                 contract.method,
                 contract.array_path.join("."),
                 contract.shape,
@@ -921,23 +1197,31 @@ impl Worker {
             )
         });
         let mined_ok = mined.is_some();
+        let mined_host = mined.as_ref().map(|c| c.host.clone());
         if let Some(contract) = mined {
             self.state.store_contract(contract);
         }
+        let html_headers = vec![(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
         // The page cache keeps the produced page under the identity and egress
         // that produced it, through the same capture the network path uses.
         self.captured = Some(Captured {
             identity: identity.name,
             final_url: response.url.clone(),
             status: 200,
-            headers: Vec::new(),
-            bytes: lane.document.clone().into_bytes(),
+            headers: html_headers.clone(),
+            bytes: produced_document.clone().into_bytes(),
             cookie: cookie.clone(),
             revalidated: None,
         });
         if self.persist {
             if let Some(origin) = self.state.origins.get_mut(host).map(Arc::make_mut) {
                 origin.route = mined_ok.then(|| "replay".to_string());
+            }
+            if let Some(mh) = mined_host.as_deref().filter(|mh| *mh != host) {
+                self.state.origin_mut(mh).route = Some("replay".to_string());
             }
             self.save_state();
         }
@@ -964,10 +1248,13 @@ impl Worker {
         ));
         outcome.evidence.push(format!(
             "produced document: {} text chars, {} B, {} requests",
-            lane.text_chars,
-            lane.document.len(),
+            content.text_chars,
+            produced_document.len(),
             lane.transcript.len()
         ));
+        if let Some(note) = synth_note {
+            outcome.evidence.push(note);
+        }
         if let Some(note) = mined_note {
             outcome.evidence.push(note);
         }
@@ -978,8 +1265,8 @@ impl Worker {
         }
         if options.capture_body {
             // The body a caller inspects is the produced document, not the shell.
-            outcome.body = Some(lane.document);
-            outcome.headers = Vec::new();
+            outcome.body = Some(produced_document);
+            outcome.headers = html_headers;
             outcome.bytes = None;
         }
         Some(outcome)
@@ -1079,11 +1366,12 @@ impl Worker {
     }
 
     fn wire(&mut self, identity: &'static Identity) -> Result<&Wire, String> {
-        let key = (
-            identity.name,
-            self.proxy.clone(),
-            self.guard_host.clone().filter(|_| self.guard.is_some()),
-        );
+        let guard_key = if self.guard.is_some() && self.proxy.is_none() {
+            self.guard_key.clone()
+        } else {
+            WireGuardKey::None
+        };
+        let key = (identity.name, self.proxy.clone(), guard_key);
         if !self.wires.contains_key(&key) {
             let wire = match (&self.guard, self.proxy.as_deref()) {
                 (Some(guard), None) => Wire::resolved(identity, guard, None)?,
@@ -1121,6 +1409,8 @@ impl Worker {
     /// in flight).
     fn release(&mut self) {
         let policy = std::mem::take(&mut self.policy);
+        self.guard = None;
+        let prev_guard = std::mem::replace(&mut self.guard_key, WireGuardKey::None);
         if policy
             .cancel
             .as_ref()
@@ -1128,6 +1418,12 @@ impl Worker {
         {
             self.wires.clear();
         } else {
+            // Do not accumulate unbounded per-host private-allowed wires across
+            // distinct test/local hosts; shared public-only wires stay pooled.
+            if matches!(prev_guard, WireGuardKey::PrivateHost(_)) {
+                self.wires
+                    .retain(|(_, _, k), _| !matches!(k, WireGuardKey::PrivateHost(_)));
+            }
             // `wire` sets the policy of the request that uses a wire before
             // every use, so the default left here is never applied.
             for wire in self.wires.values() {
@@ -1147,7 +1443,10 @@ impl Worker {
             .ok_or_else(|| format!("request: not a URL: {}", once.url))?;
         self.proxy = once.proxy.clone();
         self.policy = once.policy.clone();
-        let cookie = if once.cookies {
+        self.guard = None;
+        self.guard_key = WireGuardKey::None;
+        let stateless_redirect = is_stateless_redirect_url(&once.url);
+        let cookie = if once.cookies && !stateless_redirect {
             self.state.cookie_header_for(&once.url, identity.name)
         } else {
             None
@@ -1174,7 +1473,7 @@ impl Worker {
         });
         self.release();
         let response = result?;
-        if once.cookies {
+        if once.cookies && !stateless_redirect {
             let cookies = response.cookies.iter().map(stored).collect();
             self.state.store_cookies(&host, identity.name, cookies);
         }
@@ -1194,20 +1493,24 @@ impl Worker {
     pub fn fetch(&mut self, url: &str, options: &Options) -> Outcome {
         self.policy = options.policy.clone();
         self.proxy = options.proxy.clone();
-        self.guard_host = url::Url::parse(url)
+        let host = url::Url::parse(url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
-        self.guard = if self.proxy.is_none() {
-            self.guard_host.as_deref().map(|host| {
-                crate::envelope::Guard::with_policy(
-                    crate::envelope::Limits::default(),
-                    host,
-                    options.allow_private,
-                )
-            })
+        if let (None, Some(host)) = (&self.proxy, host) {
+            self.guard_key = if options.allow_private {
+                WireGuardKey::PrivateHost(host.clone())
+            } else {
+                WireGuardKey::PublicOnly
+            };
+            self.guard = Some(crate::envelope::Guard::with_policy(
+                crate::envelope::Limits::default(),
+                if options.allow_private { &host } else { "" },
+                options.allow_private,
+            ));
         } else {
-            None
-        };
+            self.guard = None;
+            self.guard_key = WireGuardKey::None;
+        }
         let outcome = self.through_cache(url, options);
         self.release();
         self.pending = None;
@@ -1943,13 +2246,21 @@ impl Worker {
                 .get(&host)
                 .and_then(|per_identity| per_identity.get(identity.name))
                 .map(|credential| credential.vendor.clone());
-            let cookie_header = self.state.cookie_header_for(url, identity.name);
+            let stateless_redirect = is_stateless_redirect_url(url);
+            let cookie_header = if stateless_redirect {
+                None
+            } else {
+                self.state.cookie_header_for(url, identity.name)
+            };
             if cookie_header.is_some() {
                 spent_state = true;
             }
             let spent_credential = credential_vendor.is_some() && cookie_header.is_some();
             let referer = format!("{}://{}/", parsed.scheme(), host);
-            let arriving = options.arrival && self.state.seen_origin(&host) && parsed.path() != "/";
+            let arriving = !stateless_redirect
+                && options.arrival
+                && self.state.seen_origin(&host)
+                && parsed.path() != "/";
             // Revisit a cached page the way a browser does: its validators, sent by
             // the client that received it.
             let conditional: Vec<(&'static str, String)> = match &self.pending {
@@ -2129,7 +2440,7 @@ impl Worker {
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case("location"))
             {
-                if self.persist {
+                if self.persist && !stateless_redirect {
                     let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
                     self.state.store_cookies(&host, identity.name, cookies);
                     self.save_state();
@@ -2228,12 +2539,12 @@ impl Worker {
                 }
             }
             let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
-            if self.persist {
+            if self.persist && !stateless_redirect {
                 self.state
                     .store_cookies(&host, identity.name, cookies.clone());
             }
             let class_name = class_name(verdict.class);
-            if self.persist {
+            if self.persist && !stateless_redirect {
                 self.state.record(
                     &host,
                     identity.name,
@@ -2688,235 +2999,267 @@ impl Worker {
                     if gate.is_ok() && is_program_page(program_vendor, &engine_body) {
                         let cookie = self.state.cookie_header_for(url, engine_identity.name);
                         let mut failure_reason: Option<String> = None;
-                        match crate::engine::mint_within_via_policy(
-                            &options.engine,
-                            &engine_url,
-                            &engine_body,
-                            engine_identity,
-                            cookie.as_deref(),
-                            self.proxy.as_deref(),
-                            options.allow_private,
-                        ) {
-                            Ok(mint) => {
-                                // The challenge's own host: the asked one, or where a
-                                // redirect (a short link) took the document.
-                                let page_host = url::Url::parse(&engine_url)
-                                    .ok()
-                                    .and_then(|parsed| {
-                                        parsed.host_str().map(str::to_ascii_lowercase)
-                                    })
-                                    .unwrap_or_else(|| host.clone());
-                                // The retry must spend what the mint produced, even
-                                // when state is not persisted to disk.
-                                self.state.store_cookies(
-                                    &page_host,
-                                    engine_identity.name,
-                                    mint.cookies.clone(),
-                                );
-                                self.state.mint_recorded(
-                                    &host,
-                                    engine_identity.name,
-                                    program_vendor,
-                                    &mint.cookies,
-                                    crate::state::now_unix(),
-                                );
-
-                                let budget = options
-                                    .deadline
-                                    .max(Duration::from_millis(8000))
-                                    .saturating_sub(started.elapsed());
-                                // Follow the navigation the page itself chose (it may
-                                // be relative), but only on the challenge's own host:
-                                // never an off-site redirect.
-                                let retry_url: String = mint
-                                    .redirect
-                                    .as_deref()
-                                    .and_then(|next| {
-                                        url::Url::parse(next)
-                                            .or_else(|_| {
-                                                url::Url::parse(&engine_url)
-                                                    .and_then(|base| base.join(next))
-                                            })
-                                            .ok()
-                                    })
-                                    .filter(|parsed| {
-                                        parsed.host_str().map(str::to_ascii_lowercase).as_deref()
-                                            == Some(page_host.as_str())
-                                    })
-                                    .map(|parsed| parsed.to_string())
-                                    .unwrap_or_else(|| url.to_string());
-                                let retry_cookie = self
-                                    .state
-                                    .cookie_header_for(&retry_url, engine_identity.name);
-                                // The credential is spent through the fetcher's own
-                                // client, as the identity that minted it.
-                                let retry: Option<Result<crate::http::Response, String>> =
-                                    if budget.as_millis() >= 800 {
-                                        match self.wire(engine_identity) {
-                                            Ok(wire) => Some(wire.get(
-                                                &retry_url,
-                                                retry_cookie.as_deref(),
-                                                engine_identity,
-                                                budget,
-                                            )),
-                                            Err(_) => None,
-                                        }
-                                    } else {
-                                        None
-                                    };
-                                let solved_url = retry
-                                    .as_ref()
-                                    .and_then(|retry| retry.as_ref().ok())
-                                    .map(|retry| retry.url.clone());
-                                let retry = retry.map(|retry| {
-                                    retry.map(|retry| {
-                                        self.follow_page_navigation(
-                                            retry,
-                                            engine_identity,
-                                            &host,
-                                            options,
-                                            started,
-                                        )
-                                    })
-                                });
-                                if let Some(Ok(retry)) = retry {
-                                    if std::env::var("V5_ENGINE_LOG").is_ok() {
-                                        eprintln!(
-                                            "[engine] retry {} cookie={} -> {} ({}B)",
-                                            retry_url,
-                                            retry_cookie.is_some(),
-                                            retry.status,
-                                            retry.body.len()
-                                        );
-                                    }
-                                    // Inspection only: the answer the mint was spent on,
-                                    // beside the requests the page made.
-                                    if let Some(directory) = std::env::var_os("V5_ENGINE_DUMP_DIR")
-                                    {
-                                        let _ = std::fs::write(
-                                            std::path::Path::new(&directory)
-                                                .join(format!("spend-{}.html", retry.status)),
-                                            &retry.body,
-                                        );
-                                    }
-                                    let content = verify_response(
-                                        retry.status,
-                                        &retry.headers,
-                                        &retry.body,
-                                        &retry.url,
-                                        &contract,
-                                        generic,
+                        // The mint spends what the encounter has left, never more
+                        // (the same rule the content lane follows): the engine's
+                        // own ceiling is for a fetch that has the time, and an
+                        // encounter with no budget must not start one. An AWS WAF
+                        // mint is 1-3 s and the challenge's own program can stretch
+                        // it, so a budget below the floor would silently turn the
+                        // class into a wall. The floor is the measured cost with
+                        // headroom; the envelope still caps a hostile run.
+                        const MINT_FLOOR: Duration = Duration::from_millis(5_000);
+                        let remaining = options.deadline.saturating_sub(started.elapsed());
+                        let mut limits = options.engine.clone();
+                        limits.wall = limits.wall.min(remaining.max(MINT_FLOOR));
+                        if remaining < Duration::from_millis(500) {
+                            // The engine did not run: the status is the wall's own.
+                            attempts.push(Attempt {
+                                identity: engine_identity.name.to_string(),
+                                transport: "document".to_string(),
+                                class: Class::WallProgram,
+                                status: response.status,
+                                ms: 0.0,
+                                bytes: 0,
+                                version: String::new(),
+                                title: String::new(),
+                                note: Some("engine: the encounter had no budget left".to_string()),
+                            });
+                            failure_reason = Some("the encounter had no budget left".to_string());
+                        } else {
+                            match crate::engine::mint_within_via_policy(
+                                &limits,
+                                &engine_url,
+                                &engine_body,
+                                engine_identity,
+                                cookie.as_deref(),
+                                self.proxy.as_deref(),
+                                options.allow_private,
+                            ) {
+                                Ok(mint) => {
+                                    // The challenge's own host: the asked one, or where a
+                                    // redirect (a short link) took the document.
+                                    let page_host = url::Url::parse(&engine_url)
+                                        .ok()
+                                        .and_then(|parsed| {
+                                            parsed.host_str().map(str::to_ascii_lowercase)
+                                        })
+                                        .unwrap_or_else(|| host.clone());
+                                    // The retry must spend what the mint produced, even
+                                    // when state is not persisted to disk.
+                                    self.state.store_cookies(
+                                        &page_host,
+                                        engine_identity.name,
+                                        mint.cookies.clone(),
                                     );
-                                    let verdict2 = classify(Evidence {
-                                        status: retry.status,
-                                        body: &retry.body,
-                                        content_ok: content.passed,
-                                        headers: &retry.headers,
+                                    self.state.mint_recorded(
+                                        &host,
+                                        engine_identity.name,
+                                        program_vendor,
+                                        &mint.cookies,
+                                        crate::state::now_unix(),
+                                    );
+
+                                    let budget = options
+                                        .deadline
+                                        .max(Duration::from_millis(8000))
+                                        .saturating_sub(started.elapsed());
+                                    // Follow the navigation the page itself chose (it may
+                                    // be relative), but only on the challenge's own host:
+                                    // never an off-site redirect.
+                                    let retry_url: String = mint
+                                        .redirect
+                                        .as_deref()
+                                        .and_then(|next| {
+                                            url::Url::parse(next)
+                                                .or_else(|_| {
+                                                    url::Url::parse(&engine_url)
+                                                        .and_then(|base| base.join(next))
+                                                })
+                                                .ok()
+                                        })
+                                        .filter(|parsed| {
+                                            parsed
+                                                .host_str()
+                                                .map(str::to_ascii_lowercase)
+                                                .as_deref()
+                                                == Some(page_host.as_str())
+                                        })
+                                        .map(|parsed| parsed.to_string())
+                                        .unwrap_or_else(|| url.to_string());
+                                    let retry_cookie = self
+                                        .state
+                                        .cookie_header_for(&retry_url, engine_identity.name);
+                                    // The credential is spent through the fetcher's own
+                                    // client, as the identity that minted it.
+                                    let retry: Option<Result<crate::http::Response, String>> =
+                                        if budget.as_millis() >= 800 {
+                                            match self.wire(engine_identity) {
+                                                Ok(wire) => Some(wire.get(
+                                                    &retry_url,
+                                                    retry_cookie.as_deref(),
+                                                    engine_identity,
+                                                    budget,
+                                                )),
+                                                Err(_) => None,
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                    let solved_url = retry
+                                        .as_ref()
+                                        .and_then(|retry| retry.as_ref().ok())
+                                        .map(|retry| retry.url.clone());
+                                    let retry = retry.map(|retry| {
+                                        retry.map(|retry| {
+                                            self.follow_page_navigation(
+                                                retry,
+                                                engine_identity,
+                                                &host,
+                                                options,
+                                                started,
+                                            )
+                                        })
                                     });
+                                    if let Some(Ok(retry)) = retry {
+                                        if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                            eprintln!(
+                                                "[engine] retry {} cookie={} -> {} ({}B)",
+                                                retry_url,
+                                                retry_cookie.is_some(),
+                                                retry.status,
+                                                retry.body.len()
+                                            );
+                                        }
+                                        // Inspection only: the answer the mint was spent on,
+                                        // beside the requests the page made.
+                                        if let Some(directory) =
+                                            std::env::var_os("V5_ENGINE_DUMP_DIR")
+                                        {
+                                            let _ = std::fs::write(
+                                                std::path::Path::new(&directory)
+                                                    .join(format!("spend-{}.html", retry.status)),
+                                                &retry.body,
+                                            );
+                                        }
+                                        let content = verify_response(
+                                            retry.status,
+                                            &retry.headers,
+                                            &retry.body,
+                                            &retry.url,
+                                            &contract,
+                                            generic,
+                                        );
+                                        let verdict2 = classify(Evidence {
+                                            status: retry.status,
+                                            body: &retry.body,
+                                            content_ok: content.passed,
+                                            headers: &retry.headers,
+                                        });
+                                        attempts.push(Attempt {
+                                            identity: engine_identity.name.to_string(),
+                                            transport: "document".to_string(),
+                                            class: verdict2.class,
+                                            status: retry.status,
+                                            ms: retry.elapsed_ms,
+                                            bytes: retry.body.len(),
+                                            version: retry.version.clone(),
+                                            title: content.title.clone(),
+                                            note: Some(format!(
+                                                "engine: {} cookies, {} surfaces, {} ms",
+                                                mint.cookies.len(),
+                                                mint.surfaces.len(),
+                                                mint.ms.round()
+                                            )),
+                                        });
+                                        if verdict2.class == Class::Content {
+                                            let now = crate::state::now_unix();
+                                            self.state.mint_succeeded(&host);
+                                            self.state.credential_verdict(
+                                                &host,
+                                                engine_identity.name,
+                                                true,
+                                                now,
+                                            );
+                                            // The answer to a spent challenge is
+                                            // itself state: the session it opens
+                                            // (cookies on the retry) is carried, so
+                                            // the next read of this origin is one
+                                            // request.
+                                            let spent: Vec<StoredCookie> =
+                                                retry.cookies.iter().map(stored).collect();
+                                            self.state.store_cookies(
+                                                &host,
+                                                engine_identity.name,
+                                                spent,
+                                            );
+                                            if self.persist {
+                                                self.state.record(
+                                                    &host,
+                                                    engine_identity.name,
+                                                    "content",
+                                                    true,
+                                                    retry.elapsed_ms,
+                                                );
+                                                self.save_state();
+                                            }
+                                            return Outcome {
+                                                // The document the challenge stood in
+                                                // front of, or where the page then
+                                                // navigated. A challenge hand-off is a
+                                                // handshake, not a redirect: its solved
+                                                // URL carries a single-use token and is
+                                                // not the page's identity.
+                                                final_url: if solved_url.as_deref()
+                                                    == Some(retry.url.as_str())
+                                                {
+                                                    engine_url.clone()
+                                                } else {
+                                                    retry.url.clone()
+                                                },
+                                                title: content.title,
+                                                text_chars: content.text_chars,
+                                                evidence: vec![format!(
+                                                    "engine: minted in {} ms",
+                                                    mint.ms.round()
+                                                )],
+                                                ..answer(
+                                                    url,
+                                                    host,
+                                                    &retry,
+                                                    Class::Content,
+                                                    engine_identity.name,
+                                                    Ended {
+                                                        started,
+                                                        first_ms,
+                                                        attempts,
+                                                        spent_state: true,
+                                                        capture: options.capture_body,
+                                                    },
+                                                )
+                                            };
+                                        }
+                                        failure_reason = Some(format!(
+                                            "origin answered {} to the minted credential",
+                                            retry.status
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    failure_reason = Some(error.to_string());
+                                    // The engine did not finish: the status is the
+                                    // wall's own, not a made-up zero.
                                     attempts.push(Attempt {
                                         identity: engine_identity.name.to_string(),
                                         transport: "document".to_string(),
-                                        class: verdict2.class,
-                                        status: retry.status,
-                                        ms: retry.elapsed_ms,
-                                        bytes: retry.body.len(),
-                                        version: retry.version.clone(),
-                                        title: content.title.clone(),
-                                        note: Some(format!(
-                                            "engine: {} cookies, {} surfaces, {} ms",
-                                            mint.cookies.len(),
-                                            mint.surfaces.len(),
-                                            mint.ms.round()
-                                        )),
+                                        class: Class::WallProgram,
+                                        status: response.status,
+                                        ms: 0.0,
+                                        bytes: 0,
+                                        version: String::new(),
+                                        title: String::new(),
+                                        note: Some(format!("engine: {error}")),
                                     });
-                                    if verdict2.class == Class::Content {
-                                        let now = crate::state::now_unix();
-                                        self.state.mint_succeeded(&host);
-                                        self.state.credential_verdict(
-                                            &host,
-                                            engine_identity.name,
-                                            true,
-                                            now,
-                                        );
-                                        // The answer to a spent challenge is
-                                        // itself state: the session it opens
-                                        // (cookies on the retry) is carried, so
-                                        // the next read of this origin is one
-                                        // request.
-                                        let spent: Vec<StoredCookie> =
-                                            retry.cookies.iter().map(stored).collect();
-                                        self.state.store_cookies(
-                                            &host,
-                                            engine_identity.name,
-                                            spent,
-                                        );
-                                        if self.persist {
-                                            self.state.record(
-                                                &host,
-                                                engine_identity.name,
-                                                "content",
-                                                true,
-                                                retry.elapsed_ms,
-                                            );
-                                            self.save_state();
-                                        }
-                                        return Outcome {
-                                            // The document the challenge stood in
-                                            // front of, or where the page then
-                                            // navigated. A challenge hand-off is a
-                                            // handshake, not a redirect: its solved
-                                            // URL carries a single-use token and is
-                                            // not the page's identity.
-                                            final_url: if solved_url.as_deref()
-                                                == Some(retry.url.as_str())
-                                            {
-                                                engine_url.clone()
-                                            } else {
-                                                retry.url.clone()
-                                            },
-                                            title: content.title,
-                                            text_chars: content.text_chars,
-                                            evidence: vec![format!(
-                                                "engine: minted in {} ms",
-                                                mint.ms.round()
-                                            )],
-                                            ..answer(
-                                                url,
-                                                host,
-                                                &retry,
-                                                Class::Content,
-                                                engine_identity.name,
-                                                Ended {
-                                                    started,
-                                                    first_ms,
-                                                    attempts,
-                                                    spent_state: true,
-                                                    capture: options.capture_body,
-                                                },
-                                            )
-                                        };
-                                    }
-                                    failure_reason = Some(format!(
-                                        "origin answered {} to the minted credential",
-                                        retry.status
-                                    ));
                                 }
-                            }
-                            Err(error) => {
-                                failure_reason = Some(error.to_string());
-                                // The engine did not finish: the status is the
-                                // wall's own, not a made-up zero.
-                                attempts.push(Attempt {
-                                    identity: engine_identity.name.to_string(),
-                                    transport: "document".to_string(),
-                                    class: Class::WallProgram,
-                                    status: response.status,
-                                    ms: 0.0,
-                                    bytes: 0,
-                                    version: String::new(),
-                                    title: String::new(),
-                                    note: Some(format!("engine: {error}")),
-                                });
                             }
                         }
                         // Reaching here means the mint did not end in content (the
@@ -3437,9 +3780,55 @@ mod retry_hint_tests {
     }
 }
 
+/// Stateless search-engine redirect hops (currently Google's signed-out
+/// `/goto?url=…` links) must never carry stored origin cookies or persist
+/// tracking cookies/verdicts under the redirector host (#456).
+fn is_stateless_redirect_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.path() != "/goto" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = lower.split('.').collect();
+    let is_google = match labels.as_slice() {
+        [.., "google", tld] => !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_alphabetic()),
+        [.., "google", second, cc] => {
+            matches!(*second, "co" | "com" | "org" | "net" | "ac")
+                && cc.len() == 2
+                && cc.bytes().all(|b| b.is_ascii_alphabetic())
+        }
+        _ => false,
+    };
+    is_google
+        && parsed
+            .query_pairs()
+            .any(|(k, v)| k == "url" && !v.trim().is_empty())
+}
+
 #[cfg(test)]
 mod navigation_tests {
-    use super::page_navigation;
+    use super::{is_stateless_redirect_url, page_navigation};
+
+    #[test]
+    fn google_goto_urls_are_stateless_redirects() {
+        assert!(is_stateless_redirect_url(
+            "https://www.google.com/goto?url=CAES123&gsessionid=abc"
+        ));
+        assert!(is_stateless_redirect_url(
+            "https://www.google.co.uk/goto?url=CAES123"
+        ));
+        assert!(!is_stateless_redirect_url(
+            "https://www.google.com/search?q=rust"
+        ));
+        assert!(!is_stateless_redirect_url(
+            "https://example.com/goto?url=CAES123"
+        ));
+    }
 
     #[test]
     fn reddits_redirect_shell_names_its_target() {

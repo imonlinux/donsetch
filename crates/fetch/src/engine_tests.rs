@@ -72,6 +72,55 @@ fn quiet() -> Server {
 // ---- the program itself --------------------------------------------------------
 
 #[test]
+fn unpadded_base64_decodes_to_the_bytes_a_browser_produces() {
+    // A WAF challenge carries unpadded base64 JSON in an attribute (TikTok's
+    // `cs` class is 234 characters, length mod 4 of 2); JSON.parse must see no
+    // extra bytes.
+    let script = r#"
+        var short = JSON.parse(atob("eyJ2IjoxLCJzIjoiYWJjIn0"));
+        if (short.v !== 1 || short.s !== "abc") throw new Error("atob short mismatch");
+        var padded = JSON.parse(atob("eyJhIjoxfQ=="));
+        if (padded.a !== 1) throw new Error("atob padded mismatch");
+        document.cookie = "atob=ok; Path=/";
+    "#;
+    let mint =
+        run("https://challenge.test/", script, &limits()).expect("the page program should run");
+    assert_eq!(cookie(&mint, "atob").as_deref(), Some("ok"));
+}
+
+#[test]
+fn performance_carries_the_navigation_timing_a_signature_sdk_reads() {
+    // webmssdk (TikTok's signature SDK) reads connectEnd from the navigation
+    // entry and fails the boot when it is undefined; Chrome exposes the full
+    // Navigation Timing entry and the legacy `performance.timing` mirror.
+    let script = r#"
+        var nav = performance.getEntriesByType("navigation")[0];
+        if (!nav || typeof nav.connectEnd !== "number" || nav.connectEnd <= 0) throw new Error("connectEnd missing");
+        if (typeof nav.responseStart !== "number" || nav.responseStart <= 0) throw new Error("responseStart missing");
+        if (!performance.timing || typeof performance.timing.connectEnd !== "number") throw new Error("timing missing");
+        if (!performance.getEntries().length) throw new Error("entries missing");
+        document.cookie = "timing=ok; Path=/";
+    "#;
+    let mint = run("https://timing.test/", script, &limits()).expect("the page program should run");
+    assert_eq!(cookie(&mint, "timing").as_deref(), Some("ok"));
+}
+
+#[test]
+fn performance_observer_lists_the_entry_types_a_page_tests() {
+    // webapp-desktop reads PerformanceObserver.supportedEntryTypes.includes
+    // before it constructs an observer; an empty surface throws and stops the
+    // app's boot.
+    let script = r#"
+        if (!Array.isArray(PerformanceObserver.supportedEntryTypes)) throw new Error("not an array");
+        if (!PerformanceObserver.supportedEntryTypes.includes("event")) throw new Error("event missing");
+        if (!PerformanceObserver.supportedEntryTypes.includes("resource")) throw new Error("resource missing");
+        document.cookie = "po=ok; Path=/";
+    "#;
+    let mint = run("https://po.test/", script, &limits()).expect("the page program should run");
+    assert_eq!(cookie(&mint, "po").as_deref(), Some("ok"));
+}
+
+#[test]
 fn a_benign_challenge_mints_inside_the_envelope() {
     let server = Server::start(|request| match request.path.as_str() {
         "/challenge.js" => Reply::ok("document.cookie = 'half=1; Path=/';"),
@@ -889,4 +938,36 @@ fn media_and_plugins_answer_as_desktop_chrome() {
     assert_eq!(get("mse").as_deref(), Some("true"));
     assert_eq!(get("plugins").as_deref(), Some("5,2,true"));
     assert_eq!(get("plugin").as_deref(), Some("PDF Viewer|application/pdf"));
+}
+
+#[test]
+fn text_encoder_encode_into_stops_at_utf8_codepoint_boundaries() {
+    let server = quiet();
+    let script = r#"
+      const set = (k, v) => { document.cookie = k + "=" + encodeURIComponent(v) + "; Path=/"; };
+      const enc = new TextEncoder();
+      const s = "é😀hello";
+      const b3 = new Uint8Array(3);
+      const r3 = enc.encodeInto(s, b3);
+      set("r3", r3.read + "," + r3.written + ":" + Array.from(b3).join("."));
+      const b6 = new Uint8Array(6);
+      const r6 = enc.encodeInto(s, b6);
+      set("r6", r6.read + "," + r6.written + ":" + Array.from(b6).join("."));
+      const full = new Uint8Array(32);
+      const rf = enc.encodeInto(s, full);
+      set("rf", rf.read + "," + rf.written + ":" + new TextDecoder().decode(full.subarray(0, rf.written)));
+    "#;
+    let mint = run(&server.url("/"), script, &limits()).expect("mint");
+    let dec = |name: &str| {
+        cookie(&mint, name).map(|v| {
+            url::form_urlencoded::parse(format!("v={v}").as_bytes())
+                .next()
+                .unwrap()
+                .1
+                .into_owned()
+        })
+    };
+    assert_eq!(dec("r3").as_deref(), Some("1,2:195.169.0"));
+    assert_eq!(dec("r6").as_deref(), Some("3,6:195.169.240.159.152.128"));
+    assert_eq!(dec("rf").as_deref(), Some("8,11:é😀hello"));
 }
